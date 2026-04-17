@@ -456,7 +456,12 @@ fn parse_cue_track_positions(
 /// Best-effort scan of the byte range `[start, end)` looking for a top-level
 /// Cues element whose header we can find intact. Used when the Cues element
 /// appears after the last Cluster in the file (the common ffmpeg layout
-/// when muxing in a single pass with index-at-end).
+/// when muxing in a single pass with index-at-end, and also what our own
+/// muxer emits).
+///
+/// Unknown-size Clusters are walked element-by-element until a sibling
+/// top-level element terminates them, so Cues that sit after an
+/// unknown-size final Cluster are still found.
 fn scan_cues_from(
     r: &mut dyn ReadSeek,
     start: u64,
@@ -467,32 +472,85 @@ fn scan_cues_from(
     while r.stream_position()? < end {
         let pos = r.stream_position()?;
         let e = read_element_header(r)?;
-        let body_start = r.stream_position()?;
-        let body_end = if e.size == VINT_UNKNOWN_SIZE {
-            end
-        } else {
-            body_start + e.size
-        };
-        if body_end > end {
-            // Truncated or invalid — abort scan.
+        if e.id == ids::CUES {
+            let body_start = r.stream_position()?;
+            let body_end = if e.size == VINT_UNKNOWN_SIZE {
+                end
+            } else {
+                body_start + e.size
+            };
+            if body_end > end {
+                r.seek(SeekFrom::Start(pos))?;
+                return Ok(());
+            }
+            parse_cues(r, body_end, out)?;
+            return Ok(());
+        }
+        if e.size == VINT_UNKNOWN_SIZE {
+            if e.id == ids::CLUSTER {
+                // Walk cluster children until we meet a sibling top-level
+                // element (another Cluster, Cues, Tags, ...). Push any
+                // skip we can't interpret up to the parent loop's guard.
+                if !walk_unknown_cluster(r, end)? {
+                    return Ok(());
+                }
+                continue;
+            }
+            // Unknown-size, non-cluster element we can't interpret — stop.
             r.seek(SeekFrom::Start(pos))?;
             return Ok(());
         }
-        match e.id {
-            ids::CUES => {
-                parse_cues(r, body_end, out)?;
-                return Ok(());
-            }
-            _ => {
-                if e.size == VINT_UNKNOWN_SIZE {
-                    // Can't blindly skip unknown-size elements that aren't Cues.
-                    return Ok(());
-                }
-                r.seek(SeekFrom::Start(body_end))?;
-            }
+        let body_start = r.stream_position()?;
+        let body_end = body_start + e.size;
+        if body_end > end {
+            r.seek(SeekFrom::Start(pos))?;
+            return Ok(());
         }
+        r.seek(SeekFrom::Start(body_end))?;
     }
     Ok(())
+}
+
+/// Walk the children of an unknown-size Cluster starting at the current
+/// reader position. Returns `true` after positioning the reader on the
+/// next top-level element (so the outer scan can continue from there) and
+/// `false` if we hit EOF / end of segment before finding one. Any non-child
+/// element id that's a valid Segment child terminates the walk.
+fn walk_unknown_cluster(r: &mut dyn ReadSeek, end: u64) -> Result<bool> {
+    while r.stream_position()? < end {
+        let pos = r.stream_position()?;
+        let e = match read_element_header(r) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        // Cluster children we know and can size correctly.
+        let is_cluster_child = matches!(
+            e.id,
+            ids::TIMECODE
+                | ids::SIMPLE_BLOCK
+                | ids::BLOCK_GROUP
+                | ids::BLOCK
+                | ids::BLOCK_DURATION
+                | ids::REFERENCE_BLOCK
+                | ids::VOID
+                | ids::CRC32
+        );
+        if !is_cluster_child {
+            // Treat as a sibling of Cluster — rewind and let caller handle.
+            r.seek(SeekFrom::Start(pos))?;
+            return Ok(true);
+        }
+        if e.size == VINT_UNKNOWN_SIZE {
+            // Unexpected inside a cluster; bail.
+            return Ok(false);
+        }
+        let body_end = r.stream_position()? + e.size;
+        if body_end > end {
+            return Ok(false);
+        }
+        r.seek(SeekFrom::Start(body_end))?;
+    }
+    Ok(false)
 }
 
 fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Result<()> {
@@ -767,6 +825,21 @@ impl MkvDemuxer {
                     ids::BLOCK_GROUP => {
                         let bg_end = self.input.stream_position()? + e.size;
                         self.parse_block_group(bg_end, cluster_timecode)?;
+                    }
+                    // An unknown-size Cluster (body_end == segment_data_end)
+                    // terminates when a sibling Segment-child element is
+                    // encountered. Rewind to the start of that element and
+                    // fall back to Idle so the outer loop can dispatch it.
+                    ids::CLUSTER
+                    | ids::CUES
+                    | ids::TAGS
+                    | ids::ATTACHMENTS
+                    | ids::CHAPTERS
+                    | ids::SEEK_HEAD
+                    | ids::INFO
+                    | ids::TRACKS => {
+                        self.input.seek(SeekFrom::Start(pos))?;
+                        self.cluster_state = ClusterState::Idle;
                     }
                     _ => skip(&mut *self.input, e.size)?,
                 }

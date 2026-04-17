@@ -10,11 +10,15 @@
 //!   Cluster (one per ~5 s of media, or one per file for short input)
 //!     Timecode
 //!     SimpleBlock × N
+//!   Cues (seek index; written in write_trailer)
 //! ```
 //!
-//! Both Segment and Cluster use the EBML "unknown size" sentinel so the muxer
-//! is streaming-friendly (no seek-back needed). All packet timestamps are
-//! converted to milliseconds using the standard 1 ms `TIMECODE_SCALE`.
+//! Segment and Cluster use the EBML "unknown size" sentinel so the muxer is
+//! streaming-friendly during packet writes (no seek-back for Segment size).
+//! Cues are emitted at the end of the file — the demuxer supports
+//! end-of-file Cues by scanning past the last cluster, and mpv / ffmpeg /
+//! Chromium accept the same layout. Timestamps are converted to milliseconds
+//! using the standard 1 ms `TIMECODE_SCALE`.
 
 use std::io::Write;
 
@@ -69,9 +73,36 @@ pub struct MkvMuxer {
     cluster_open: bool,
     /// Timecode (in ms) at the start of the currently open cluster.
     cluster_timecode_ms: i64,
+    /// Byte offset of the currently open cluster header, relative to the
+    /// Segment payload start. Used to fill in `CueClusterPosition`.
+    cluster_offset_rel: u64,
+    /// Absolute file offset of the Segment payload start (first byte after
+    /// the Segment element header). `CueClusterPosition` values are stored
+    /// relative to this position, per the Matroska spec.
+    segment_data_start: u64,
+    /// Cue index built up while writing. One entry per (cluster, track) pair
+    /// where the track produced a keyframe in that cluster — plus the first
+    /// audio packet of each audio track in each cluster (audio frames are
+    /// always decodable on their own, so we index every cluster-start).
+    cues: Vec<CueRecord>,
+    /// Per-cluster, per-track "already recorded a cue for this" flag —
+    /// reset whenever a new cluster opens. Keeps us from emitting a Cue
+    /// for every keyframe in a cluster when the first is enough.
+    cue_seen_in_cluster: Vec<bool>,
     header_written: bool,
     trailer_written: bool,
     doc_type: DocType,
+}
+
+/// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
+#[derive(Clone, Copy, Debug)]
+struct CueRecord {
+    /// MKV TrackNumber (1-indexed).
+    track: u64,
+    /// Timestamp in milliseconds (matches our `TIMECODE_SCALE = 1_000_000` ns).
+    time_ms: u64,
+    /// Offset of the Cluster header relative to the Segment payload start.
+    cluster_offset: u64,
 }
 
 impl MkvMuxer {
@@ -92,13 +123,18 @@ impl MkvMuxer {
             }
         }
         let stream_track_numbers: Vec<u64> = (0..streams.len() as u64).map(|i| i + 1).collect();
+        let n = streams.len();
         Ok(MkvMuxer {
             output,
             streams: streams.to_vec(),
             track_numbers: stream_track_numbers,
-            stream_pts: vec![0i64; streams.len()],
+            stream_pts: vec![0i64; n],
             cluster_open: false,
             cluster_timecode_ms: 0,
+            cluster_offset_rel: 0,
+            segment_data_start: 0,
+            cues: Vec::new(),
+            cue_seen_in_cluster: vec![false; n],
             header_written: false,
             trailer_written: false,
             doc_type,
@@ -129,6 +165,9 @@ impl Muxer for MkvMuxer {
         if self.header_written {
             return Err(Error::other("MKV muxer: write_header called twice"));
         }
+        // Anchor so segment_data_start is an absolute file offset even when
+        // the output stream already has bytes before us.
+        let base_pos = self.output.stream_position().unwrap_or(0);
         // EBML header element.
         let mut ebml_body = Vec::new();
         write_uint_element(&mut ebml_body, ids::EBML_VERSION, 1);
@@ -146,6 +185,9 @@ impl Muxer for MkvMuxer {
         // Segment with unknown size.
         all.extend_from_slice(&write_element_id(ids::SEGMENT));
         all.extend_from_slice(&write_vint(VINT_UNKNOWN_SIZE, 0));
+        // Record the file offset of the Segment payload start — Cues
+        // cluster positions are stored as byte offsets from this point.
+        let segment_data_start_in_buf = all.len() as u64;
 
         // Info element.
         let mut info_body = Vec::new();
@@ -218,6 +260,7 @@ impl Muxer for MkvMuxer {
         }
         write_master_element(&mut all, ids::TRACKS, &tracks_body);
 
+        self.segment_data_start = base_pos + segment_data_start_in_buf;
         self.output.write_all(&all)?;
         self.header_written = true;
         Ok(())
@@ -234,13 +277,14 @@ impl Muxer for MkvMuxer {
                 stream_idx
             )));
         }
-        let stream = &self.streams[stream_idx];
         let track_number = self.track_numbers[stream_idx];
+        let stream_time_base = self.streams[stream_idx].time_base;
+        let media_type = self.streams[stream_idx].params.media_type;
+        let codec = self.streams[stream_idx].params.codec_id.as_str().to_owned();
 
         // Effective per-packet pts. If the source set one, use it; otherwise
         // derive from accumulated stream_pts and codec-specific durations.
-        let codec = stream.params.codec_id.as_str();
-        let derived_duration: Option<i64> = match codec {
+        let derived_duration: Option<i64> = match codec.as_str() {
             "opus" => opus_packet_duration_samples(&packet.data).map(|s| s as i64),
             _ => packet.duration,
         };
@@ -255,7 +299,7 @@ impl Muxer for MkvMuxer {
             self.stream_pts[stream_idx] = effective_pts;
         }
 
-        let pts_ms = pts_to_ms(effective_pts, stream.time_base);
+        let pts_ms = pts_to_ms(effective_pts, stream_time_base);
 
         // Decide whether to start a new cluster.
         if !self.cluster_open
@@ -272,6 +316,26 @@ impl Muxer for MkvMuxer {
                 "MKV muxer: packet timecode delta exceeds i16 range",
             ));
         }
+
+        // Cue index: record the first indexable packet per (cluster, track).
+        // For video we only index keyframes (random-access points). For
+        // audio/subtitle we index the cluster-start regardless, since every
+        // audio frame is independently decodable.
+        if !self.cue_seen_in_cluster[stream_idx] {
+            let indexable = match media_type {
+                MediaType::Video => packet.flags.keyframe,
+                _ => true,
+            };
+            if indexable {
+                self.cues.push(CueRecord {
+                    track: track_number,
+                    time_ms: pts_ms.max(0) as u64,
+                    cluster_offset: self.cluster_offset_rel,
+                });
+                self.cue_seen_in_cluster[stream_idx] = true;
+            }
+        }
+
         let block_bytes =
             build_simple_block(track_number, timecode_offset as i16, packet, &packet.data);
         self.output.write_all(&block_bytes)?;
@@ -282,8 +346,10 @@ impl Muxer for MkvMuxer {
         if self.trailer_written {
             return Ok(());
         }
-        // Cluster has unknown size, so just stop writing — the EBML reader on
-        // the other end will hit EOF cleanly.
+        // Emit a Cues element after the last Cluster. The prior clusters are
+        // left with unknown size (their EBML parser stops when it meets the
+        // top-level Cues element id, which is outside the cluster subtree).
+        self.write_cues()?;
         self.output.flush()?;
         self.trailer_written = true;
         Ok(())
@@ -292,6 +358,11 @@ impl Muxer for MkvMuxer {
 
 impl MkvMuxer {
     fn start_cluster(&mut self, timecode_ms: i64) -> Result<()> {
+        // Capture the absolute file offset of the Cluster element header —
+        // Cues will store (offset - segment_data_start) as
+        // CueClusterPosition.
+        let cluster_abs = self.output.stream_position().unwrap_or(0);
+        self.cluster_offset_rel = cluster_abs.saturating_sub(self.segment_data_start);
         // Write Cluster element id + unknown-size sentinel.
         self.output.write_all(&write_element_id(ids::CLUSTER))?;
         self.output.write_all(&write_vint(VINT_UNKNOWN_SIZE, 0))?;
@@ -301,6 +372,41 @@ impl MkvMuxer {
         self.output.write_all(&tc)?;
         self.cluster_timecode_ms = timecode_ms.max(0);
         self.cluster_open = true;
+        // New cluster → clear the "already cued this track" flags.
+        for s in self.cue_seen_in_cluster.iter_mut() {
+            *s = false;
+        }
+        Ok(())
+    }
+
+    /// Build a Cues element from the `cues` vector and write it out, then
+    /// return the bytes written. Called from `write_trailer`.
+    fn write_cues(&mut self) -> Result<()> {
+        if self.cues.is_empty() {
+            return Ok(());
+        }
+        // Group cues by time, combining the per-track entries of a single
+        // cluster into one CuePoint (matches ffmpeg's layout).
+        let mut by_time: std::collections::BTreeMap<u64, Vec<CueRecord>> =
+            std::collections::BTreeMap::new();
+        for c in &self.cues {
+            by_time.entry(c.time_ms).or_default().push(*c);
+        }
+        let mut body = Vec::new();
+        for (time, entries) in by_time {
+            let mut cp = Vec::new();
+            write_uint_element(&mut cp, ids::CUE_TIME, time);
+            for e in entries {
+                let mut ctp = Vec::new();
+                write_uint_element(&mut ctp, ids::CUE_TRACK, e.track);
+                write_uint_element(&mut ctp, ids::CUE_CLUSTER_POSITION, e.cluster_offset);
+                write_master_element(&mut cp, ids::CUE_TRACK_POSITIONS, &ctp);
+            }
+            write_master_element(&mut body, ids::CUE_POINT, &cp);
+        }
+        let mut out = Vec::with_capacity(body.len() + 8);
+        write_master_element(&mut out, ids::CUES, &body);
+        self.output.write_all(&out)?;
         Ok(())
     }
 }
