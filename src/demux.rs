@@ -9,8 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat, StreamInfo,
-    TimeBase,
+    CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, Result, SampleFormat,
+    StreamInfo, TimeBase,
 };
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
@@ -19,7 +19,7 @@ use crate::ebml::{
 };
 use crate::ids;
 
-pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Validate EBML header.
     let hdr = read_element_header(&mut *input)?;
     if hdr.id != ids::EBML_HEADER {
@@ -155,7 +155,13 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     for t in &tracks {
         let idx = streams.len() as u32;
         track_index_by_number.insert(t.number, idx);
-        let codec_id = from_matroska(&t.codec_id_string, &t.codec_private);
+        // Ask the CodecResolver registry first (codec crates can claim
+        // Matroska CodecID strings). Fall back to the static `from_matroska`
+        // table when no crate owns this id — keeps PCM, legacy MS/VFW
+        // FourCC tracks, WebM-specific VP tags, etc. working unchanged.
+        let codec_id = codecs
+            .resolve_tag(&CodecTag::matroska(t.codec_id_string.clone()), None)
+            .unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private));
         let mut params = match t.track_type {
             ids::TRACK_TYPE_VIDEO => CodecParameters::video(codec_id.clone()),
             ids::TRACK_TYPE_AUDIO => CodecParameters::audio(codec_id.clone()),
