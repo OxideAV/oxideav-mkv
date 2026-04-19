@@ -71,7 +71,9 @@ fn pcm_mkv_demux_decode_roundtrip() {
     oxideav_basic::register_codecs(&mut codecs);
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = containers.open_demuxer("matroska", rs).expect("open mkv");
+    let mut dmx = containers
+        .open_demuxer("matroska", rs, &oxideav_core::NullCodecResolver)
+        .expect("open mkv");
     assert_eq!(dmx.streams().len(), 1, "exactly one track expected");
     let stream_info = dmx.streams()[0].clone();
     assert_eq!(

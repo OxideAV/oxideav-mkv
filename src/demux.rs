@@ -9,7 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecParameters, Error, MediaType, Packet, Result, SampleFormat, StreamInfo, TimeBase,
+    CodecParameters, CodecResolver, Error, MediaType, Packet, Result, SampleFormat, StreamInfo,
+    TimeBase,
 };
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
@@ -18,7 +19,7 @@ use crate::ebml::{
 };
 use crate::ids;
 
-pub fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     // Validate EBML header.
     let hdr = read_element_header(&mut *input)?;
     if hdr.id != ids::EBML_HEADER {

@@ -234,7 +234,8 @@ fn build_mkv_with_cues(include_cues: bool) -> (Vec<u8>, Vec<u64>) {
 fn seek_to_lands_on_exact_cue() {
     let (bytes, _offsets) = build_mkv_with_cues(true);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux open");
+    let mut dmx =
+        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
     assert_eq!(dmx.streams().len(), 1);
 
     // Seek to exactly the middle cue (pts=1000). The timebase is 1ms per
@@ -256,7 +257,8 @@ fn seek_to_lands_on_exact_cue() {
 fn seek_to_between_cues_picks_earlier() {
     let (bytes, _) = build_mkv_with_cues(true);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux open");
+    let mut dmx =
+        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
 
     // Request pts=1500 — no exact cue, should land on the cue @ 1000.
     let landed = dmx.seek_to(0, 1500).expect("seek_to between");
@@ -278,7 +280,8 @@ fn seek_to_between_cues_picks_earlier() {
 fn seek_to_past_end_lands_on_last_cue() {
     let (bytes, _) = build_mkv_with_cues(true);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux open");
+    let mut dmx =
+        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
 
     // Way past the end — should land on the last cue (2000).
     let landed = dmx.seek_to(0, 100_000).expect("seek past end");
@@ -292,7 +295,8 @@ fn seek_to_past_end_lands_on_last_cue() {
 fn seek_to_before_start_uses_first_cue() {
     let (bytes, _) = build_mkv_with_cues(true);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux open");
+    let mut dmx =
+        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
 
     // Negative / zero target — the first cue is at t=0 so we always
     // have a valid landing point.
@@ -307,7 +311,8 @@ fn seek_to_before_start_uses_first_cue() {
 fn seek_to_without_cues_is_unsupported() {
     let (bytes, _) = build_mkv_with_cues(false);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux open");
+    let mut dmx =
+        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
 
     match dmx.seek_to(0, 1000) {
         Err(Error::Unsupported(_)) => {}
@@ -319,7 +324,8 @@ fn seek_to_without_cues_is_unsupported() {
 fn seek_to_invalid_stream_is_invalid() {
     let (bytes, _) = build_mkv_with_cues(true);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux open");
+    let mut dmx =
+        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
 
     match dmx.seek_to(99, 0) {
         Err(Error::InvalidData(_)) => {}
@@ -334,7 +340,8 @@ fn seek_to_resets_pending_packets() {
     // post-seek packet is from the cue target, not from the stale queue.
     let (bytes, _) = build_mkv_with_cues(true);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux open");
+    let mut dmx =
+        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
 
     // Consume the first cluster's packet to populate demuxer state.
     let first = dmx.next_packet().expect("first");

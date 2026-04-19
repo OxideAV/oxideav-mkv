@@ -232,7 +232,7 @@ fn webm_file_roundtrip_through_filesystem() {
 
     // Re-open with the demuxer and verify.
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux");
+    let mut dmx = oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux");
     assert_eq!(dmx.streams().len(), 2);
     let (video_idx, audio_idx) = {
         let s = dmx.streams();

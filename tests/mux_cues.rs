@@ -133,7 +133,7 @@ fn muxer_writes_cues_and_demuxer_can_seek() {
 
     // Re-open with the demuxer, find the video stream.
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux");
+    let mut dmx = oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux");
     let video_idx = dmx
         .streams()
         .iter()
@@ -208,7 +208,7 @@ fn audio_only_mux_emits_cues() {
     }
 
     let rs: Box<dyn ReadSeek> = Box::new(std::fs::File::open(&tmp).unwrap());
-    let mut dmx = oxideav_mkv::demux::open(rs).expect("demux");
+    let mut dmx = oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux");
     assert_eq!(dmx.streams().len(), 1);
     let audio_idx = dmx.streams()[0].index;
     // Seek into the second cluster — must succeed.
