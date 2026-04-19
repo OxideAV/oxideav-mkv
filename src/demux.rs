@@ -180,9 +180,30 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         if t.height > 0 {
             ctx = ctx.height(t.height as u32);
         }
-        let codec_id = codecs
-            .resolve_tag(&ctx)
-            .unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private));
+        let mut codec_id = codecs.resolve_tag(&ctx);
+        // V_MS/VFW/FOURCC tunnels a BITMAPINFOHEADER in CodecPrivate. The
+        // registry has no "Matroska" tag for this case (every codec claims
+        // the inner FourCC directly — that's how AVI resolves the same
+        // stream). Extract the FourCC from CodecPrivate bytes 16..20 and
+        // retry via the Fourcc tag path.
+        if codec_id.is_none()
+            && t.codec_id_string == "V_MS/VFW/FOURCC"
+            && t.codec_private.len() >= 20
+        {
+            let mut fcc = [0u8; 4];
+            fcc.copy_from_slice(&t.codec_private[16..20]);
+            let fcc_tag = CodecTag::fourcc(&fcc);
+            let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
+            if t.width > 0 {
+                fcc_ctx = fcc_ctx.width(t.width as u32);
+            }
+            if t.height > 0 {
+                fcc_ctx = fcc_ctx.height(t.height as u32);
+            }
+            codec_id = codecs.resolve_tag(&fcc_ctx);
+        }
+        let codec_id =
+            codec_id.unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private));
         let mut params = match t.track_type {
             ids::TRACK_TYPE_VIDEO => CodecParameters::video(codec_id.clone()),
             ids::TRACK_TYPE_AUDIO => CodecParameters::audio(codec_id.clone()),
