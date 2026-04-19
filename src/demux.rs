@@ -9,8 +9,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, Result, SampleFormat,
-    StreamInfo, TimeBase,
+    CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext, Result,
+    SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
@@ -159,8 +159,29 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         // Matroska CodecID strings). Fall back to the static `from_matroska`
         // table when no crate owns this id — keeps PCM, legacy MS/VFW
         // FourCC tracks, WebM-specific VP tags, etc. working unchanged.
+        let tag = CodecTag::matroska(t.codec_id_string.clone());
+        let mut ctx = ProbeContext::new(&tag);
+        if !t.codec_private.is_empty() {
+            ctx = ctx.header(&t.codec_private);
+        }
+        if t.bit_depth > 0 {
+            ctx = ctx.bits(t.bit_depth as u16);
+        }
+        if t.channels > 0 {
+            ctx = ctx.channels(t.channels as u16);
+        }
+        let sr = t.sample_rate.round() as u32;
+        if sr > 0 {
+            ctx = ctx.sample_rate(sr);
+        }
+        if t.width > 0 {
+            ctx = ctx.width(t.width as u32);
+        }
+        if t.height > 0 {
+            ctx = ctx.height(t.height as u32);
+        }
         let codec_id = codecs
-            .resolve_tag(&CodecTag::matroska(t.codec_id_string.clone()), None)
+            .resolve_tag(&ctx)
             .unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private));
         let mut params = match t.track_type {
             ids::TRACK_TYPE_VIDEO => CodecParameters::video(codec_id.clone()),
