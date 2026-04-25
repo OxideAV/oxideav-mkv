@@ -22,8 +22,8 @@
 
 use std::io::Write;
 
-use oxideav_container::{Muxer, WriteSeek};
 use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
+use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
 use crate::ebml::{write_element_id, write_vint, VINT_UNKNOWN_SIZE};

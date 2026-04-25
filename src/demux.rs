@@ -7,11 +7,11 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
     CodecParameters, CodecResolver, CodecTag, Error, MediaType, Packet, ProbeContext, Result,
     SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
 use crate::ebml::{

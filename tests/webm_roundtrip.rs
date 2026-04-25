@@ -8,8 +8,8 @@
 
 use std::io::{Cursor, Read, SeekFrom};
 
-use oxideav_container::{ReadSeek, WriteSeek};
 use oxideav_core::{CodecId, CodecParameters, Error, MediaType, Packet, StreamInfo, TimeBase};
+use oxideav_core::{ReadSeek, WriteSeek};
 
 /// Build a minimal OpusHead extradata blob (RFC 7845 §5.1) for a stereo
 /// 48 kHz stream.

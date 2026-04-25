@@ -10,8 +10,8 @@
 //! 3. Seeking to a non-indexed timestamp snaps back to the previous cue
 //!    without overshooting the target.
 
-use oxideav_container::{ReadSeek, WriteSeek};
 use oxideav_core::{CodecId, CodecParameters, MediaType, Packet, StreamInfo, TimeBase};
+use oxideav_core::{ReadSeek, WriteSeek};
 
 fn opus_head(channels: u8, sample_rate: u32, pre_skip: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(19);
@@ -165,10 +165,7 @@ fn muxer_writes_cues_and_demuxer_can_seek() {
 }
 
 /// Pull packets until one matches `stream_idx`, discarding others.
-fn next_stream_packet(
-    dmx: &mut Box<dyn oxideav_container::Demuxer>,
-    stream_idx: u32,
-) -> Option<Packet> {
+fn next_stream_packet(dmx: &mut Box<dyn oxideav_core::Demuxer>, stream_idx: u32) -> Option<Packet> {
     loop {
         match dmx.next_packet() {
             Ok(p) => {

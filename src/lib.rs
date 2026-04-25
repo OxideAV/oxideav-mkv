@@ -19,7 +19,7 @@ pub mod ebml;
 pub mod ids;
 pub mod mux;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 
 /// Register both the `"matroska"` and `"webm"` containers.
 ///
@@ -60,7 +60,7 @@ const SCORE_SIGNATURE_ONLY: u8 = 60;
 
 /// Matroska probe: high score if DocType reads "matroska", moderate
 /// score on any EBML file (accepts WebM as a fallback).
-fn probe_matroska(p: &oxideav_container::ProbeData) -> u8 {
+fn probe_matroska(p: &oxideav_core::ProbeData) -> u8 {
     match probe_doctype(p.buf) {
         DocTypeProbe::Matroska => SCORE_DOCTYPE_MATCH,
         DocTypeProbe::Webm => SCORE_SIGNATURE_ONLY,
@@ -73,7 +73,7 @@ fn probe_matroska(p: &oxideav_container::ProbeData) -> u8 {
 /// plain .mkv does not get reported as webm. (A truly ambiguous case —
 /// EBML magic but no readable DocType — falls through to the matroska
 /// entry, which is what ffmpeg/Chromium do.)
-fn probe_webm(p: &oxideav_container::ProbeData) -> u8 {
+fn probe_webm(p: &oxideav_core::ProbeData) -> u8 {
     match probe_doctype(p.buf) {
         DocTypeProbe::Webm => SCORE_DOCTYPE_MATCH,
         DocTypeProbe::Matroska => 0,
@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn webm_probe_prefers_webm() {
         let head = synth_ebml_head("webm");
-        let p = oxideav_container::ProbeData {
+        let p = oxideav_core::ProbeData {
             buf: &head,
             ext: None,
         };
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn matroska_probe_prefers_matroska() {
         let head = synth_ebml_head("matroska");
-        let p = oxideav_container::ProbeData {
+        let p = oxideav_core::ProbeData {
             buf: &head,
             ext: None,
         };

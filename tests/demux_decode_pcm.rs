@@ -7,9 +7,9 @@
 //! which proves that demux packet slicing, codec ID mapping, and audio
 //! track parameters all survive a round trip.
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::{ContainerRegistry, ReadSeek, WriteSeek};
+use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, SampleFormat, StreamInfo, TimeBase};
+use oxideav_core::{ContainerRegistry, ReadSeek, WriteSeek};
 
 fn pcm_stream() -> StreamInfo {
     let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));

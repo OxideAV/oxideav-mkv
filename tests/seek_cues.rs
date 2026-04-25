@@ -17,8 +17,8 @@
 
 use std::io::Cursor;
 
-use oxideav_container::ReadSeek;
 use oxideav_core::Error;
+use oxideav_core::ReadSeek;
 
 // Re-export the EBML primitives we need — the test drops down below the
 // muxer API and writes raw elements because we want to control the Cues
