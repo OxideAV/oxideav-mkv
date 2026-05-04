@@ -58,6 +58,21 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "V_FFV1" => "ffv1",
         "V_THEORA" => "theora",
         "V_MS/VFW/FOURCC" => return from_bitmapinfoheader(codec_private),
+        // Subtitles. Matroska's "S_TEXT/*" family carries plain UTF-8 with
+        // per-format markup; "S_HDMV/PGS" carries Blu-ray bitmap subs;
+        // "S_VOBSUB" carries DVD bitmap subs. We map them to short oxideav
+        // codec ids so downstream decoders / muxers can recognise the
+        // format without parsing the Matroska string themselves.
+        "S_TEXT/UTF8" => "subrip",
+        "S_TEXT/SSA" => "ssa",
+        "S_TEXT/ASS" => "ass",
+        "S_TEXT/WEBVTT" => "webvtt",
+        "S_TEXT/USF" => "usf",
+        "S_VOBSUB" => "dvd_subtitle",
+        "S_HDMV/PGS" => "hdmv_pgs_subtitle",
+        "S_HDMV/TEXTST" => "hdmv_text_subtitle",
+        "S_DVBSUB" => "dvb_subtitle",
+        "S_KATE" => "kate",
         other => return CodecId::new(format!("mkv:{other}")),
     };
     CodecId::new(id)
@@ -111,6 +126,16 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "h264" => "V_MPEG4/ISO/AVC",
         "h265" => "V_MPEGH/ISO/HEVC",
         "ffv1" => "V_FFV1",
+        "subrip" => "S_TEXT/UTF8",
+        "ssa" => "S_TEXT/SSA",
+        "ass" => "S_TEXT/ASS",
+        "webvtt" => "S_TEXT/WEBVTT",
+        "usf" => "S_TEXT/USF",
+        "dvd_subtitle" => "S_VOBSUB",
+        "hdmv_pgs_subtitle" => "S_HDMV/PGS",
+        "hdmv_text_subtitle" => "S_HDMV/TEXTST",
+        "dvb_subtitle" => "S_DVBSUB",
+        "kate" => "S_KATE",
         _ => return None,
     })
 }

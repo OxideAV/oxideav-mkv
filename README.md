@@ -97,6 +97,11 @@ implemented for roundtrip:
 - Video: `V_VP8`, `V_VP9`, `V_AV1`, `V_MPEG4/ISO/AVC`,
   `V_MPEGH/ISO/HEVC`, `V_FFV1`, `V_THEORA`, plus `V_MS/VFW/FOURCC` with
   BITMAPINFOHEADER fourcc extraction (e.g. `FFV1`).
+- Subtitle: `S_TEXT/UTF8` (subrip), `S_TEXT/SSA`, `S_TEXT/ASS`,
+  `S_TEXT/WEBVTT`, `S_TEXT/USF`, `S_VOBSUB` (DVD), `S_HDMV/PGS` /
+  `S_HDMV/TEXTST` (Blu-ray), `S_DVBSUB`, `S_KATE`. Subtitle tracks
+  surface with `MediaType::Subtitle`; their payload bytes pass through
+  unchanged.
 
 Unknown MKV codec IDs fall back to a pass-through `mkv:<raw-id>` form
 so the demuxer never hides an unrecognised track.
@@ -122,7 +127,6 @@ so the demuxer never hides an unrecognised track.
   Attachment payload bytes are skipped (not loaded into memory); only
   filename / mime / on-disk size surface.
 - CRC-32 elements are parsed (skipped) but not validated.
-- Subtitle tracks pass through as opaque packets with `MediaType::Data`.
 
 ## License
 

@@ -16,6 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `attachment:N:filename` / `:mime_type` / `:size_bytes`. Payload bytes
   are skipped via seek (no allocation), so a multi-megabyte embedded
   font no longer pulls a copy into RAM just to read its filename.
+- codec_id: map Matroska subtitle CodecIDs (`S_TEXT/UTF8`, `S_TEXT/SSA`,
+  `S_TEXT/ASS`, `S_TEXT/WEBVTT`, `S_TEXT/USF`, `S_VOBSUB`, `S_HDMV/PGS`,
+  `S_HDMV/TEXTST`, `S_DVBSUB`, `S_KATE`) to short oxideav codec ids
+  both ways, so subtitle tracks no longer pass through as
+  `mkv:S_TEXT/UTF8` opaque ids.
+
+### Fixed
+
+- demux: subtitle tracks (TrackType=17) now surface with
+  `MediaType::Subtitle` rather than `MediaType::Data`. Downstream
+  filtering / probing tools that key on `media_type == Subtitle` can
+  now find them.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.4...v0.0.5) - 2026-04-25
 

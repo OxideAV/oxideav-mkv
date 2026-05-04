@@ -215,7 +215,11 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         let mut params = match t.track_type {
             ids::TRACK_TYPE_VIDEO => CodecParameters::video(codec_id.clone()),
             ids::TRACK_TYPE_AUDIO => CodecParameters::audio(codec_id.clone()),
+            ids::TRACK_TYPE_SUBTITLE => CodecParameters::subtitle(codec_id.clone()),
             _ => {
+                // Unknown TrackType (button, control, etc.) — fall back to
+                // an opaque Data stream so the demuxer doesn't reject the
+                // file outright.
                 let mut p = CodecParameters::audio(codec_id.clone());
                 p.media_type = MediaType::Data;
                 p
