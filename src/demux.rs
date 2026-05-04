@@ -100,6 +100,10 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let end = body_end_known.unwrap_or(segment_data_end);
                 parse_chapters(&mut *input, end, &mut metadata)?;
             }
+            ids::ATTACHMENTS => {
+                let end = body_end_known.unwrap_or(segment_data_end);
+                parse_attachments(&mut *input, end, &mut metadata)?;
+            }
             ids::CLUSTER => {
                 if first_cluster_offset.is_none() {
                     first_cluster_offset = Some(body_start - e.header_len as u64);
@@ -524,6 +528,75 @@ fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<String
         }
     }
     Ok(s)
+}
+
+/// Parse an `Attachments` master element. Each `AttachedFile` surfaces as
+/// up to three metadata keys: `attachment:N:filename`,
+/// `attachment:N:mime_type`, `attachment:N:size_bytes`. The actual file
+/// payload is not returned — callers that want the bytes (e.g. embedded
+/// fonts, cover art) should ask for a structured API once we have one;
+/// surfacing the index keeps the demuxer's contract small while still
+/// telling downstream tooling what's in the file.
+///
+/// File payloads are skipped via seek so we don't pull megabytes of data
+/// into memory just to expose a filename. Sizes are reported from the
+/// `FileData` element header so the `size_bytes` value is the on-disk size
+/// (no compression decoded).
+fn parse_attachments(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    metadata: &mut Vec<(String, String)>,
+) -> Result<()> {
+    let mut idx: u32 = 0;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::ATTACHED_FILE => {
+                let af_end = r.stream_position()? + e.size;
+                idx += 1;
+                parse_attached_file(r, af_end, metadata, idx)?;
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+fn parse_attached_file(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    metadata: &mut Vec<(String, String)>,
+    index: u32,
+) -> Result<()> {
+    let mut filename: Option<String> = None;
+    let mut mime: Option<String> = None;
+    let mut size: Option<u64> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::FILE_NAME => filename = Some(read_string(r, e.size as usize)?),
+            ids::FILE_MIME_TYPE => mime = Some(read_string(r, e.size as usize)?),
+            ids::FILE_DATA => {
+                size = Some(e.size);
+                skip(r, e.size)?;
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    if let Some(n) = filename {
+        if !n.is_empty() {
+            metadata.push((format!("attachment:{index}:filename"), n));
+        }
+    }
+    if let Some(m) = mime {
+        if !m.is_empty() {
+            metadata.push((format!("attachment:{index}:mime_type"), m));
+        }
+    }
+    if let Some(sz) = size {
+        metadata.push((format!("attachment:{index}:size_bytes"), sz.to_string()));
+    }
+    Ok(())
 }
 
 /// Format a unix timestamp (seconds since 1970-01-01 UTC) as an ISO-8601 date.

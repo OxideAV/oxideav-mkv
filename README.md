@@ -60,8 +60,10 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - Clusters: `SimpleBlock` and `BlockGroup -> Block`, all three lacing
   modes (Xiph, fixed, EBML-signed-delta).
 - Metadata lift: title, muxer, encoder, date (Matroska `DateUTC` ->
-  ISO-8601), Tags `SimpleTag` name/value pairs, and `Chapters`
-  (`chapter:N:start_ms` / `:end_ms` / `:title`, ns→ms).
+  ISO-8601), Tags `SimpleTag` name/value pairs, `Chapters`
+  (`chapter:N:start_ms` / `:end_ms` / `:title`, ns→ms), and
+  `Attachments` (`attachment:N:filename` / `:mime_type` / `:size_bytes`;
+  payload is skipped, only the index surfaces).
 - Duration: `Segment\Info\Duration` translated to microseconds.
 - Seek: `seek_to(stream, pts)` uses the Cues index. Handles Cues at
   either end of the Segment, and walks an unknown-size final Cluster to
@@ -115,9 +117,10 @@ so the demuxer never hides an unrecognised track.
   confirms ffmpeg accepts this layout).
 - No block lacing on write; every frame becomes a standalone
   SimpleBlock. The read side handles all three lacing modes.
-- No `Attachments` (skipped). `Chapters` are read into metadata only — the
-  demuxer doesn't yet expose a structured chapter list, just per-atom
-  `start_ms` / `end_ms` / `title` keys.
+- `Chapters` and `Attachments` are read into the metadata vector only —
+  the demuxer doesn't yet expose a structured chapter or attachment list.
+  Attachment payload bytes are skipped (not loaded into memory); only
+  filename / mime / on-disk size surface.
 - CRC-32 elements are parsed (skipped) but not validated.
 - Subtitle tracks pass through as opaque packets with `MediaType::Data`.
 

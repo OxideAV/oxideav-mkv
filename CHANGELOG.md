@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - demux: parse `Chapters` master element — chapter atoms now surface in
   `Demuxer::metadata()` as `chapter:N:start_ms` / `chapter:N:end_ms` /
   `chapter:N:title` keys (ns→ms, 1-indexed).
+- demux: parse `Attachments` — `AttachedFile` entries surface as
+  `attachment:N:filename` / `:mime_type` / `:size_bytes`. Payload bytes
+  are skipped via seek (no allocation), so a multi-megabyte embedded
+  font no longer pulls a copy into RAM just to read its filename.
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.4...v0.0.5) - 2026-04-25
 
