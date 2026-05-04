@@ -112,13 +112,16 @@ fn muxer_writes_cues_and_demuxer_can_seek() {
     }
 
     // The file must contain the Cues element ID (0x1C 0x53 0xBB 0x6B).
+    // Search past the SeekHead, since the SeekHead embeds Cues' SeekID as
+    // a 4-byte payload that would otherwise match the naive byte scan.
     {
         use std::io::Read;
         let raw = std::fs::read(&tmp).unwrap();
         let needle = [0x1Cu8, 0x53, 0xBB, 0x6B];
+        let scan_from = first_post_seek_head_offset(&raw);
         assert!(
-            raw.windows(4).any(|w| w == needle),
-            "written file must contain a Cues element"
+            raw[scan_from..].windows(4).any(|w| w == needle),
+            "written file must contain a Cues element after the SeekHead"
         );
         // Sanity: also still a valid WebM header.
         let mut f = std::fs::File::open(&tmp).unwrap();
@@ -253,10 +256,15 @@ fn cues_are_emitted_at_end() {
     let raw = std::fs::read(&tmp).unwrap();
     let cues_id = [0x1Cu8, 0x53, 0xBB, 0x6B];
     let cluster_id = [0x1Fu8, 0x43, 0xB6, 0x75];
-    let cues_pos = raw
+    // The SeekHead embeds the Cues element-id as a SeekID payload, which
+    // would otherwise match `cues_id` ahead of the real Cues element.
+    // Skip past the SeekHead before scanning.
+    let scan_from = first_post_seek_head_offset(&raw);
+    let cues_pos_rel = raw[scan_from..]
         .windows(4)
         .position(|w| w == cues_id)
         .expect("Cues element present");
+    let cues_pos = scan_from + cues_pos_rel;
     let last_cluster_pos = raw
         .windows(4)
         .enumerate()
@@ -275,4 +283,30 @@ fn cues_are_emitted_at_end() {
         "no Cluster should appear after the Cues element"
     );
     let _ = std::fs::remove_file(&tmp);
+}
+
+/// Locate the first byte past the SeekHead element. Used by tests that scan
+/// the muxer output for top-level element IDs by raw byte windows — the
+/// SeekHead's SeekID payloads contain literal copies of those IDs and would
+/// otherwise yield false positives.
+///
+/// Returns 0 if no SeekHead is found (e.g. a future muxer change drops it),
+/// so callers degrade gracefully into a "scan whole file" mode.
+fn first_post_seek_head_offset(raw: &[u8]) -> usize {
+    let seek_head_id = [0x11u8, 0x4D, 0x9B, 0x74];
+    let pos = match raw.windows(4).position(|w| w == seek_head_id) {
+        Some(p) => p,
+        None => return 0,
+    };
+    // After the 4-byte ID is a VINT-encoded size. Decode the 1-byte VINT
+    // (the muxer's SeekHead always fits in a 1-byte size — 63 bytes payload).
+    let size_byte = raw.get(pos + 4).copied().unwrap_or(0);
+    if size_byte & 0x80 == 0 {
+        // Size VINT wider than 1 byte — be conservative and skip just past
+        // the SeekHead start to avoid false-positive matches in the
+        // SeekHead body. Tests that hit this branch should be updated.
+        return pos + 4;
+    }
+    let body_size = (size_byte & 0x7F) as usize;
+    pos + 4 + 1 + body_size
 }

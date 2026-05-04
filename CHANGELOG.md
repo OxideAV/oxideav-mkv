@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- mux: emit `SeekHead` at the top of the Segment with Seek entries for
+  Info, Tracks, and Cues. Players that pre-walk the SeekHead (mpv,
+  Chromium) can now jump to Cues without scanning the file. The Cues
+  SeekPosition is patched in `write_trailer` once the real Cues offset
+  is known; if no packets were written, the Cues slot is rewritten as
+  a Void so the SeekHead doesn't point at offset 0.
 - demux: parse `Chapters` master element — chapter atoms now surface in
   `Demuxer::metadata()` as `chapter:N:start_ms` / `chapter:N:end_ms` /
   `chapter:N:title` keys (ns→ms, 1-indexed).

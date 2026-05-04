@@ -5,6 +5,7 @@
 //! ```text
 //! EBML header
 //! Segment (unknown size)
+//!   SeekHead (Info, Tracks, Cues — Cues offset patched at trailer time)
 //!   Info (timecode scale, muxing/writing app)
 //!   Tracks (one TrackEntry per input stream)
 //!   Cluster (one per ~5 s of media, or one per file for short input)
@@ -17,8 +18,12 @@
 //! streaming-friendly during packet writes (no seek-back for Segment size).
 //! Cues are emitted at the end of the file — the demuxer supports
 //! end-of-file Cues by scanning past the last cluster, and mpv / ffmpeg /
-//! Chromium accept the same layout. Timestamps are converted to milliseconds
-//! using the standard 1 ms `TIMECODE_SCALE`.
+//! Chromium accept the same layout. The SeekHead lets players that prefer
+//! up-front index lookup (mpv, Chromium) jump directly to Cues without
+//! scanning the whole file; the Cues entry's SeekPosition is patched once
+//! the Cues element is actually written (or replaced with a Void if no
+//! packets were muxed). Timestamps are converted to milliseconds using the
+//! standard 1 ms `TIMECODE_SCALE`.
 
 use std::io::Write;
 
@@ -89,6 +94,16 @@ pub struct MkvMuxer {
     /// reset whenever a new cluster opens. Keeps us from emitting a Cue
     /// for every keyframe in a cluster when the first is enough.
     cue_seen_in_cluster: Vec<bool>,
+    /// Absolute file offset of the Seek (Cues) entry inside the SeekHead.
+    /// In `write_trailer` we either patch the 8-byte SeekPosition payload
+    /// at `seek_cues_entry_offset + SEEK_POS_PAYLOAD_OFFSET` with the real
+    /// Cues offset, or rewrite the entire 21-byte Seek as a Void element
+    /// if no Cues was actually emitted.
+    seek_cues_entry_offset: u64,
+    /// True after the muxer has emitted a SeekHead at the start of the
+    /// Segment payload. Kept so `write_trailer` can decide whether the
+    /// Cues SeekPosition needs patching.
+    seek_head_written: bool,
     header_written: bool,
     trailer_written: bool,
     doc_type: DocType,
@@ -135,6 +150,8 @@ impl MkvMuxer {
             segment_data_start: 0,
             cues: Vec::new(),
             cue_seen_in_cluster: vec![false; n],
+            seek_cues_entry_offset: 0,
+            seek_head_written: false,
             header_written: false,
             trailer_written: false,
             doc_type,
@@ -189,7 +206,32 @@ impl Muxer for MkvMuxer {
         // cluster positions are stored as byte offsets from this point.
         let segment_data_start_in_buf = all.len() as u64;
 
+        // SeekHead with three Seek entries (Info, Tracks, Cues). Each Seek
+        // is written at a fixed width (SeekID 4 bytes, SeekPosition 8 bytes)
+        // so we know exactly where to patch in the real positions later.
+        // Info and Tracks SeekPositions are filled in below before the
+        // buffer is flushed; Cues stays as a placeholder zero and gets
+        // patched in `write_trailer` (or rewritten as a Void element if
+        // no Cues was actually emitted).
+        let seek_head_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
+        let seek_head_bytes = build_initial_seek_head();
+        let seek_head_start_in_buf = all.len();
+        all.extend_from_slice(&seek_head_bytes);
+        // Compute where each Seek entry starts inside `all` so we can patch
+        // in the real offsets without rebuilding the buffer. The fixed
+        // layout is documented in `build_initial_seek_head`: each Seek is
+        // exactly `SEEK_ENTRY_LEN` bytes; the SeekPosition payload sits at
+        // `entry_start + SEEK_POS_PAYLOAD_OFFSET`.
+        let info_seek_entry_in_buf = seek_head_start_in_buf + SEEK_HEAD_HEADER_LEN;
+        let tracks_seek_entry_in_buf = info_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        let cues_seek_entry_in_buf = tracks_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        // Sanity: SeekHead occupies a known total size; the next element
+        // starts immediately after.
+        debug_assert_eq!(seek_head_bytes.len(), SEEK_HEAD_TOTAL_LEN);
+        let _ = seek_head_offset_in_buf; // SeekHead always sits at offset 0 — kept for clarity.
+
         // Info element.
+        let info_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
         let mut info_body = Vec::new();
         write_uint_element(&mut info_body, ids::TIMECODE_SCALE, 1_000_000); // 1 ms
         write_string_element(&mut info_body, ids::MUXING_APP, "oxideav");
@@ -197,6 +239,7 @@ impl Muxer for MkvMuxer {
         write_master_element(&mut all, ids::INFO, &info_body);
 
         // Tracks element.
+        let tracks_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
         let mut tracks_body = Vec::new();
         for (i, s) in self.streams.iter().enumerate() {
             let track_number = self.track_numbers[i];
@@ -260,7 +303,26 @@ impl Muxer for MkvMuxer {
         }
         write_master_element(&mut all, ids::TRACKS, &tracks_body);
 
+        // Patch the Info / Tracks SeekPositions in the SeekHead now that we
+        // know where each element landed inside `all`. Cues stays as zero
+        // and is patched in `write_trailer`.
+        write_u64_be_at(
+            &mut all,
+            info_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+            info_offset_in_buf,
+        );
+        write_u64_be_at(
+            &mut all,
+            tracks_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+            tracks_offset_in_buf,
+        );
+
         self.segment_data_start = base_pos + segment_data_start_in_buf;
+        // Absolute file offset of the Cues Seek entry — used in
+        // write_trailer to patch in the real Cues offset (or rewrite the
+        // 21-byte slot as a Void element when no Cues was emitted).
+        self.seek_cues_entry_offset = base_pos + cues_seek_entry_in_buf as u64;
+        self.seek_head_written = true;
         self.output.write_all(&all)?;
         self.header_written = true;
         Ok(())
@@ -349,7 +411,15 @@ impl Muxer for MkvMuxer {
         // Emit a Cues element after the last Cluster. The prior clusters are
         // left with unknown size (their EBML parser stops when it meets the
         // top-level Cues element id, which is outside the cluster subtree).
-        self.write_cues()?;
+        let cues_offset_rel = self.write_cues()?;
+        // Patch the Cues entry in the SeekHead. If we did emit Cues, write
+        // its offset (relative to the Segment payload start). If not, replace
+        // the 21-byte Seek slot with a Void so the SeekHead stays self-
+        // consistent — players that pre-walk the SeekHead would otherwise
+        // chase a placeholder zero offset that points at the SeekHead itself.
+        if self.seek_head_written {
+            self.patch_cues_seek_entry(cues_offset_rel)?;
+        }
         self.output.flush()?;
         self.trailer_written = true;
         Ok(())
@@ -379,11 +449,13 @@ impl MkvMuxer {
         Ok(())
     }
 
-    /// Build a Cues element from the `cues` vector and write it out, then
-    /// return the bytes written. Called from `write_trailer`.
-    fn write_cues(&mut self) -> Result<()> {
+    /// Build a Cues element from the `cues` vector and write it out. Returns
+    /// the absolute file offset of the Cues element header relative to the
+    /// Segment payload start, or `None` if the muxer had no cues to emit.
+    /// Called from `write_trailer`.
+    fn write_cues(&mut self) -> Result<Option<u64>> {
         if self.cues.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         // Group cues by time, combining the per-track entries of a single
         // cluster into one CuePoint (matches ffmpeg's layout).
@@ -406,7 +478,38 @@ impl MkvMuxer {
         }
         let mut out = Vec::with_capacity(body.len() + 8);
         write_master_element(&mut out, ids::CUES, &body);
+        let cues_abs = self.output.stream_position().unwrap_or(0);
         self.output.write_all(&out)?;
+        Ok(Some(cues_abs.saturating_sub(self.segment_data_start)))
+    }
+
+    /// Seek back to the SeekHead and either write the real Cues offset into
+    /// the Cues SeekPosition slot, or replace the entire 21-byte Seek entry
+    /// with a Void filler if `cues_offset_rel` is `None`. Restores the
+    /// stream position to end-of-file before returning so subsequent writes
+    /// (in case anyone calls `write_trailer` followed by more output) see a
+    /// consistent cursor.
+    fn patch_cues_seek_entry(&mut self, cues_offset_rel: Option<u64>) -> Result<()> {
+        use std::io::SeekFrom;
+        let resume_pos = self.output.stream_position().unwrap_or(0);
+        match cues_offset_rel {
+            Some(off) => {
+                // Patch the 8-byte SeekPosition payload only; the rest of
+                // the Seek entry was written correctly up front.
+                let payload_pos = self.seek_cues_entry_offset + SEEK_POS_PAYLOAD_OFFSET as u64;
+                self.output.seek(SeekFrom::Start(payload_pos))?;
+                self.output.write_all(&off.to_be_bytes())?;
+            }
+            None => {
+                // Rewrite the whole 21-byte slot as a Void element.
+                self.output
+                    .seek(SeekFrom::Start(self.seek_cues_entry_offset))?;
+                self.output.write_all(&void_seek_entry())?;
+            }
+        }
+        // Return the cursor to where the trailer left it — keeps the file's
+        // logical end-of-write at the post-Cues position.
+        self.output.seek(SeekFrom::Start(resume_pos))?;
         Ok(())
     }
 }
@@ -541,4 +644,89 @@ fn write_master_element(buf: &mut Vec<u8>, id: u32, body: &[u8]) {
     buf.extend_from_slice(&write_element_id(id));
     buf.extend_from_slice(&write_vint(body.len() as u64, 0));
     buf.extend_from_slice(body);
+}
+
+// --- SeekHead helpers -----------------------------------------------------
+//
+// We emit a fixed-size SeekHead at the very start of the Segment payload so
+// the muxer never has to "grow" the SeekHead after the fact. Each Seek
+// entry is built with the maximum widths we'd ever need (4-byte SeekID, 8-byte
+// SeekPosition), giving a constant per-entry size. The trailer rewrites the
+// Cues entry's SeekPosition (or replaces the whole entry with a Void) once
+// the real Cues offset is known — Info and Tracks offsets are known up
+// front, so they're patched directly into the buffer before we flush.
+
+/// Number of bytes consumed by the SeekHead header (id + size VINT) before
+/// the first Seek child. `4 + 1 = 5` for our 63-byte body.
+const SEEK_HEAD_HEADER_LEN: usize = 5;
+/// Total size of the SeekHead element on disk: header + 3 × 21-byte Seek
+/// entries (Info, Tracks, Cues).
+const SEEK_HEAD_TOTAL_LEN: usize = SEEK_HEAD_HEADER_LEN + 3 * SEEK_ENTRY_LEN;
+/// Size of one Seek entry on disk. The body is 7-byte SeekID +
+/// 11-byte SeekPosition = 18 bytes; the entry header (id + size) adds 3
+/// bytes for a fixed total of 21.
+const SEEK_ENTRY_LEN: usize = 21;
+/// Byte offset of the SeekPosition payload (the 8-byte big-endian uint)
+/// within a 21-byte Seek entry. Layout:
+///   bytes 0..3   — Seek master header (id 0x4DBB + size VINT 0x92)
+///   bytes 3..10  — SeekID element (id 0x53AB + size VINT 0x84 + 4-byte id)
+///   bytes 10..13 — SeekPosition header (id 0x53AC + size VINT 0x88)
+///   bytes 13..21 — SeekPosition payload (big-endian u64)
+const SEEK_POS_PAYLOAD_OFFSET: usize = 13;
+
+/// Build the initial SeekHead with placeholder positions for Info, Tracks,
+/// and Cues. The caller patches in the real positions via
+/// `write_u64_be_at` once each element's offset is known.
+fn build_initial_seek_head() -> Vec<u8> {
+    let mut body = Vec::with_capacity(3 * SEEK_ENTRY_LEN);
+    body.extend_from_slice(&seek_entry(ids::INFO, 0));
+    body.extend_from_slice(&seek_entry(ids::TRACKS, 0));
+    body.extend_from_slice(&seek_entry(ids::CUES, 0));
+    debug_assert_eq!(body.len(), 3 * SEEK_ENTRY_LEN);
+    let mut out = Vec::with_capacity(SEEK_HEAD_TOTAL_LEN);
+    write_master_element(&mut out, ids::SEEK_HEAD, &body);
+    debug_assert_eq!(out.len(), SEEK_HEAD_TOTAL_LEN);
+    out
+}
+
+/// Build a single 21-byte Seek entry with `target_id` (always a 4-byte
+/// EBML class id for our top-level elements) and `position` (8-byte
+/// big-endian, may be a placeholder zero).
+fn seek_entry(target_id: u32, position: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(SEEK_ENTRY_LEN - 3);
+    // SeekID: 4-byte big-endian id payload, regardless of how few bytes the
+    // VINT encoding of the id itself would technically need. The Matroska
+    // spec stores SeekID as the literal element id (with marker), so the
+    // value 0x1654AE6B is written as 4 bytes 16 54 AE 6B.
+    body.extend_from_slice(&write_element_id(ids::SEEK_ID));
+    body.extend_from_slice(&write_vint(4, 0));
+    body.extend_from_slice(&target_id.to_be_bytes());
+    // SeekPosition: pinned to 8 bytes so we always have room to patch in
+    // any offset later without resizing the SeekHead.
+    body.extend_from_slice(&write_element_id(ids::SEEK_POSITION));
+    body.extend_from_slice(&write_vint(8, 0));
+    body.extend_from_slice(&position.to_be_bytes());
+    debug_assert_eq!(body.len(), SEEK_ENTRY_LEN - 3);
+    let mut entry = Vec::with_capacity(SEEK_ENTRY_LEN);
+    write_master_element(&mut entry, ids::SEEK, &body);
+    debug_assert_eq!(entry.len(), SEEK_ENTRY_LEN);
+    entry
+}
+
+/// Build a Void element exactly the size of a Seek entry. Used in the
+/// trailer to neutralise the Cues SeekHead entry when no Cues was emitted.
+/// Layout: 0xEC (1 byte id) + 0x93 (size VINT for 19) + 19 bytes padding.
+fn void_seek_entry() -> Vec<u8> {
+    let mut out = Vec::with_capacity(SEEK_ENTRY_LEN);
+    out.push(ids::VOID as u8); // 0xEC
+    out.push(0x93); // size VINT, payload = 19
+    out.resize(SEEK_ENTRY_LEN, 0u8);
+    debug_assert_eq!(out.len(), SEEK_ENTRY_LEN);
+    out
+}
+
+/// Write a 64-bit big-endian value at `pos` in `buf`. Caller must ensure
+/// `pos + 8 <= buf.len()`.
+fn write_u64_be_at(buf: &mut [u8], pos: usize, value: u64) {
+    buf[pos..pos + 8].copy_from_slice(&value.to_be_bytes());
 }

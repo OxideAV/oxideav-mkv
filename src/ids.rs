@@ -19,6 +19,9 @@ pub const SEGMENT: u32 = 0x18538067;
 
 // Within Segment.
 pub const SEEK_HEAD: u32 = 0x114D9B74;
+pub const SEEK: u32 = 0x4DBB;
+pub const SEEK_ID: u32 = 0x53AB;
+pub const SEEK_POSITION: u32 = 0x53AC;
 pub const INFO: u32 = 0x1549A966;
 pub const TRACKS: u32 = 0x1654AE6B;
 pub const CLUSTER: u32 = 0x1F43B675;

@@ -74,6 +74,11 @@ the unified `oxideav` aggregator to wire decoding automatically.
 ### Muxer (`mux::open` and `mux::open_webm`)
 
 - EBML header + Segment (unknown size) for a streaming-friendly layout.
+- Fixed-size `SeekHead` at the start of the Segment with Seek entries
+  for `Info`, `Tracks`, and `Cues` - so players that pre-walk the
+  SeekHead (mpv, Chromium) jump straight to Cues without scanning. The
+  Cues `SeekPosition` is patched in `write_trailer`; if no packets were
+  written, the Cues entry is rewritten as a Void filler.
 - `Info` (1 ms `TimecodeScale`), `Tracks`, rolling ~5 s `Cluster`s with
   `SimpleBlock` payload.
 - `Cues` element emitted in `write_trailer` - index entries for every
@@ -117,9 +122,6 @@ so the demuxer never hides an unrecognised track.
 
 ## What's NOT implemented
 
-- No `SeekHead` on write (players scan the file head for Info/Tracks,
-  then find Cues past the last Cluster - the existing interop test
-  confirms ffmpeg accepts this layout).
 - No block lacing on write; every frame becomes a standalone
   SimpleBlock. The read side handles all three lacing modes.
 - `Chapters` and `Attachments` are read into the metadata vector only —
