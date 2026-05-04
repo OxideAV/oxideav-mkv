@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.5...v0.0.6) - 2026-05-04
+
+### Other
+
+- emit SeekHead at top of Segment for Info / Tracks / Cues
+- surface subtitle tracks with MediaType::Subtitle + map S_* codec ids
+- surface Matroska Attachments in metadata
+- surface Matroska Chapters in metadata
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - mux: emit `SeekHead` at the top of the Segment with Seek entries for
