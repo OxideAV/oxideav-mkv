@@ -88,6 +88,26 @@ pub const CUE_RELATIVE_POSITION: u32 = 0xF0;
 pub const CUE_DURATION: u32 = 0xB2;
 pub const CUE_BLOCK_NUMBER: u32 = 0x5378;
 
+// Chapters (Segment\Chapters\EditionEntry\ChapterAtom\ChapterDisplay\ChapString).
+pub const EDITION_ENTRY: u32 = 0x45B9;
+pub const CHAPTER_ATOM: u32 = 0xB6;
+pub const CHAPTER_UID: u32 = 0x73C4;
+pub const CHAPTER_TIME_START: u32 = 0x91;
+pub const CHAPTER_TIME_END: u32 = 0x92;
+pub const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+pub const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
+pub const CHAPTER_DISPLAY: u32 = 0x80;
+pub const CHAP_STRING: u32 = 0x85;
+pub const CHAP_LANGUAGE: u32 = 0x437C;
+
+// Attachments (Segment\Attachments\AttachedFile\...).
+pub const ATTACHED_FILE: u32 = 0x61A7;
+pub const FILE_DESCRIPTION: u32 = 0x467E;
+pub const FILE_NAME: u32 = 0x466E;
+pub const FILE_MIME_TYPE: u32 = 0x4660;
+pub const FILE_DATA: u32 = 0x465C;
+pub const FILE_UID: u32 = 0x46AE;
+
 // TrackType values.
 pub const TRACK_TYPE_VIDEO: u64 = 1;
 pub const TRACK_TYPE_AUDIO: u64 = 2;

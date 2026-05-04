@@ -96,6 +96,10 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
                 let end = body_end_known.unwrap_or(segment_data_end);
                 parse_cues(&mut *input, end, &mut cues)?;
             }
+            ids::CHAPTERS => {
+                let end = body_end_known.unwrap_or(segment_data_end);
+                parse_chapters(&mut *input, end, &mut metadata)?;
+            }
             ids::CLUSTER => {
                 if first_cluster_offset.is_none() {
                     first_cluster_offset = Some(body_start - e.header_len as u64);
@@ -406,6 +410,120 @@ fn parse_simple_tag(
         }
     }
     Ok(())
+}
+
+/// Parse a `Chapters` master element. Each `EditionEntry` is walked, and
+/// each `ChapterAtom` inside it is lifted into the metadata vector as
+/// three entries: `chapter:N:start_ms`, `chapter:N:end_ms` (when present),
+/// and `chapter:N:title` (first non-empty `ChapterDisplay\ChapString`).
+/// Chapters are 1-indexed in metadata to match ffprobe's display order.
+///
+/// `ChapterTimeStart` / `ChapterTimeEnd` carry **nanoseconds**, not
+/// timecode-scale ticks — that's spec-defined and independent of the
+/// segment's `TimecodeScale`. We surface them as integer milliseconds so
+/// downstream tooling doesn't have to think about ns-precision strings.
+fn parse_chapters(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    metadata: &mut Vec<(String, String)>,
+) -> Result<()> {
+    let mut chapter_index: u32 = 0;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::EDITION_ENTRY => {
+                let ee_end = r.stream_position()? + e.size;
+                parse_edition_entry(r, ee_end, metadata, &mut chapter_index)?;
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+fn parse_edition_entry(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    metadata: &mut Vec<(String, String)>,
+    chapter_index: &mut u32,
+) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CHAPTER_ATOM => {
+                let ca_end = r.stream_position()? + e.size;
+                *chapter_index += 1;
+                parse_chapter_atom(r, ca_end, metadata, *chapter_index)?;
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+fn parse_chapter_atom(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    metadata: &mut Vec<(String, String)>,
+    index: u32,
+) -> Result<()> {
+    let mut start_ns: Option<u64> = None;
+    let mut end_ns: Option<u64> = None;
+    let mut title: Option<String> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CHAPTER_TIME_START => start_ns = Some(read_uint(r, e.size as usize)?),
+            ids::CHAPTER_TIME_END => end_ns = Some(read_uint(r, e.size as usize)?),
+            ids::CHAPTER_DISPLAY => {
+                let cd_end = r.stream_position()? + e.size;
+                if title.is_none() {
+                    title = parse_chapter_display(r, cd_end)?;
+                } else {
+                    skip(r, e.size)?;
+                }
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    if let Some(ns) = start_ns {
+        metadata.push((
+            format!("chapter:{index}:start_ms"),
+            (ns / 1_000_000).to_string(),
+        ));
+    }
+    if let Some(ns) = end_ns {
+        metadata.push((
+            format!("chapter:{index}:end_ms"),
+            (ns / 1_000_000).to_string(),
+        ));
+    }
+    if let Some(t) = title {
+        if !t.is_empty() {
+            metadata.push((format!("chapter:{index}:title"), t));
+        }
+    }
+    Ok(())
+}
+
+/// Pull the first non-empty `ChapString` out of a `ChapterDisplay`. Skips
+/// `ChapLanguage` and other unknowns — the demuxer doesn't currently expose
+/// per-language chapter titles, just the first one we see.
+fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<String>> {
+    let mut s: Option<String> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CHAP_STRING => {
+                let v = read_string(r, e.size as usize)?;
+                if s.is_none() && !v.is_empty() {
+                    s = Some(v);
+                }
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(s)
 }
 
 /// Format a unix timestamp (seconds since 1970-01-01 UTC) as an ISO-8601 date.
