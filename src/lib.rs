@@ -51,9 +51,16 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 /// Convenience wrapper around [`register_containers`] that matches the
 /// uniform `register(&mut RuntimeContext)` entry point every sibling
 /// crate exposes.
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick MKV/WebM
+/// up without any explicit umbrella plumbing.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_containers(&mut ctx.containers);
 }
+
+oxideav_core::register!("mkv", register);
 
 /// EBML signature at offset 0 — common to both Matroska and WebM.
 const EBML_MAGIC: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
