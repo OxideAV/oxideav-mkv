@@ -85,7 +85,7 @@ fn pcm_mkv_demux_decode_roundtrip() {
     assert_eq!(stream_info.params.channels, Some(2));
 
     let mut decoder = codecs
-        .make_decoder(&stream_info.params)
+        .first_decoder(&stream_info.params)
         .expect("pcm decoder available");
 
     let mut decoded_interleaved_s16le: Vec<u8> = Vec::new();
