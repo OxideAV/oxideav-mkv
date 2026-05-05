@@ -27,7 +27,7 @@ use oxideav_core::ContainerRegistry;
 /// factory, so callers asking for `"webm"` explicitly get the WebM muxer
 /// (codec whitelist enforced, `DocType="webm"` in the EBML header) and
 /// callers asking for `"matroska"` get the general muxer.
-pub fn register(reg: &mut ContainerRegistry) {
+pub fn register_containers(reg: &mut ContainerRegistry) {
     // Matroska entry.
     reg.register_demuxer("matroska", demux::open);
     reg.register_muxer("matroska", mux::open);
@@ -43,6 +43,16 @@ pub fn register(reg: &mut ContainerRegistry) {
     reg.register_extension("mka", "matroska");
     reg.register_extension("mks", "matroska");
     reg.register_extension("webm", "webm");
+}
+
+/// Install the Matroska / WebM containers into a
+/// [`oxideav_core::RuntimeContext`].
+///
+/// Convenience wrapper around [`register_containers`] that matches the
+/// uniform `register(&mut RuntimeContext)` entry point every sibling
+/// crate exposes.
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_containers(&mut ctx.containers);
 }
 
 /// EBML signature at offset 0 — common to both Matroska and WebM.
@@ -239,10 +249,21 @@ mod tests {
     #[test]
     fn registry_extension_mapping() {
         let mut reg = ContainerRegistry::new();
-        register(&mut reg);
+        register_containers(&mut reg);
         assert_eq!(reg.container_for_extension("webm"), Some("webm"));
         assert_eq!(reg.container_for_extension("mkv"), Some("matroska"));
         assert_eq!(reg.container_for_extension("mka"), Some("matroska"));
         assert_eq!(reg.container_for_extension("mks"), Some("matroska"));
+    }
+
+    #[test]
+    fn register_via_runtime_context_installs_container() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        assert_eq!(
+            ctx.containers.container_for_extension("mkv"),
+            Some("matroska")
+        );
+        assert_eq!(ctx.containers.container_for_extension("webm"), Some("webm"));
     }
 }

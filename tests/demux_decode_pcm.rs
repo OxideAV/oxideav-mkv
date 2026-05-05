@@ -65,7 +65,7 @@ fn pcm_mkv_demux_decode_roundtrip() {
 
     // Drive the full pipeline: registry.open → decoder.send_packet → receive_frame.
     let mut containers = ContainerRegistry::new();
-    oxideav_mkv::register(&mut containers);
+    oxideav_mkv::register_containers(&mut containers);
 
     let mut codecs = CodecRegistry::new();
     oxideav_basic::register_codecs(&mut codecs);
