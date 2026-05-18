@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.7...v0.0.8) - 2026-05-18
+
+### Other
+
+- ground the cue-point grouping comment in the EBML spec
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other
