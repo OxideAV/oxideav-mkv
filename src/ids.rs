@@ -44,6 +44,14 @@ pub const DATE_UTC: u32 = 0x4461;
 // Tags (Segment\Tags\Tag\SimpleTag).
 pub const TAG: u32 = 0x7373;
 pub const TARGETS: u32 = 0x63C0;
+// Children of Targets (RFC 9559 §5.1.8.1.1.x). UID children all default to 0
+// which is the "applies to everything in the segment" sentinel.
+pub const TARGET_TYPE_VALUE: u32 = 0x68CA;
+pub const TARGET_TYPE: u32 = 0x63CA;
+pub const TAG_TRACK_UID: u32 = 0x63C5;
+pub const TAG_EDITION_UID: u32 = 0x63C9;
+pub const TAG_CHAPTER_UID: u32 = 0x63C4;
+pub const TAG_ATTACHMENT_UID: u32 = 0x63C6;
 pub const SIMPLE_TAG: u32 = 0x67C8;
 pub const TAG_NAME: u32 = 0x45A3;
 pub const TAG_STRING: u32 = 0x4487;
@@ -93,6 +101,7 @@ pub const CUE_BLOCK_NUMBER: u32 = 0x5378;
 
 // Chapters (Segment\Chapters\EditionEntry\ChapterAtom\ChapterDisplay\ChapString).
 pub const EDITION_ENTRY: u32 = 0x45B9;
+pub const EDITION_UID: u32 = 0x45BC;
 pub const CHAPTER_ATOM: u32 = 0xB6;
 pub const CHAPTER_UID: u32 = 0x73C4;
 pub const CHAPTER_TIME_START: u32 = 0x91;

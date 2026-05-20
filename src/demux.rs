@@ -70,6 +70,19 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
     let mut first_cluster_offset: Option<u64> = None;
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut cues: Vec<CueEntry> = Vec::new();
+    // Chapter / attachment / edition UID maps populated during the segment
+    // walk, then consulted when we resolve `Tags.Targets` UIDs at the very
+    // end. Tags can appear before *or* after Tracks/Chapters/Attachments per
+    // RFC 9559, so we defer resolution until the whole segment has been
+    // walked. Map values are 1-indexed to match the public `chapter:N:*` /
+    // `attachment:N:*` metadata keys.
+    let mut chapter_uid_to_index: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::new();
+    let mut attachment_uid_to_index: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::new();
+    let mut edition_uid_to_index: std::collections::HashMap<u64, u32> =
+        std::collections::HashMap::new();
+    let mut pending_tags: Vec<RawTag> = Vec::new();
 
     while input.stream_position()? < segment_data_end {
         let e = read_element_header(&mut *input)?;
@@ -90,7 +103,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             }
             ids::TAGS => {
                 let end = body_end_known.unwrap_or(segment_data_end);
-                parse_tags(&mut *input, end, &mut metadata)?;
+                parse_tags(&mut *input, end, &mut pending_tags)?;
             }
             ids::CUES => {
                 let end = body_end_known.unwrap_or(segment_data_end);
@@ -98,11 +111,22 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
             }
             ids::CHAPTERS => {
                 let end = body_end_known.unwrap_or(segment_data_end);
-                parse_chapters(&mut *input, end, &mut metadata)?;
+                parse_chapters(
+                    &mut *input,
+                    end,
+                    &mut metadata,
+                    &mut chapter_uid_to_index,
+                    &mut edition_uid_to_index,
+                )?;
             }
             ids::ATTACHMENTS => {
                 let end = body_end_known.unwrap_or(segment_data_end);
-                parse_attachments(&mut *input, end, &mut metadata)?;
+                parse_attachments(
+                    &mut *input,
+                    end,
+                    &mut metadata,
+                    &mut attachment_uid_to_index,
+                )?;
             }
             ids::CLUSTER => {
                 if first_cluster_offset.is_none() {
@@ -267,6 +291,24 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         });
     }
 
+    // Resolve `Tags.Targets.Tag*UID` references now that the full segment
+    // has been walked. Tags appearing before Tracks in segment order are
+    // valid per RFC 9559, so this has to happen after the loop above.
+    let track_uid_to_index: std::collections::HashMap<u64, u32> = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.uid != 0)
+        .map(|(i, t)| (t.uid, i as u32))
+        .collect();
+    resolve_tags(
+        pending_tags,
+        &track_uid_to_index,
+        &chapter_uid_to_index,
+        &attachment_uid_to_index,
+        &edition_uid_to_index,
+        &mut metadata,
+    );
+
     // Position at the first Cluster.
     let cluster_pos = first_cluster_offset.ok_or_else(|| Error::invalid("MKV: no clusters"))?;
     input.seek(SeekFrom::Start(cluster_pos))?;
@@ -311,6 +353,11 @@ struct SegmentInfo {
 #[derive(Default)]
 struct TrackEntry {
     number: u64,
+    /// `TrackUID` (RFC 9559 §5.1.4.1.2); needed for resolving
+    /// `Tags.Targets.TagTrackUID` references back to a stream index.
+    /// Zero means "not present in the file" which is technically illegal
+    /// (TrackUID is mandatory) but we tolerate it.
+    uid: u64,
     track_type: u64,
     codec_id_string: String,
     codec_private: Vec<u8>,
@@ -368,13 +415,41 @@ fn parse_info(
     Ok(())
 }
 
-fn parse_tags(r: &mut dyn ReadSeek, end: u64, metadata: &mut Vec<(String, String)>) -> Result<()> {
+/// A `Tags.Tag` element captured during the segment walk, before its
+/// `Targets.Tag*UID` references have been resolved against the corresponding
+/// tracks / chapters / attachments. Each tag emits one or more `SimpleTag`
+/// entries, all of which share the same `Targets` scope.
+struct RawTag {
+    /// Zero means "applies to all tracks in the segment" per RFC 9559
+    /// §5.1.8.1.1.3 (also §5.1.8.1.1.4..§5.1.8.1.1.6 for the others). Any
+    /// non-zero value MUST match a UID found in this segment.
+    track_uid: u64,
+    edition_uid: u64,
+    chapter_uid: u64,
+    attachment_uid: u64,
+    /// `(name, value)` pairs from `SimpleTag` children. We lower-case the
+    /// name when emitting into `metadata` to match the keying convention
+    /// used by the rest of the demuxer.
+    simple_tags: Vec<(String, String)>,
+}
+
+fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::TAG => {
                 let tag_end = r.stream_position()? + e.size;
-                parse_tag(r, tag_end, metadata)?;
+                let mut t = RawTag {
+                    track_uid: 0,
+                    edition_uid: 0,
+                    chapter_uid: 0,
+                    attachment_uid: 0,
+                    simple_tags: Vec::new(),
+                };
+                parse_tag(r, tag_end, &mut t)?;
+                if !t.simple_tags.is_empty() {
+                    out.push(t);
+                }
             }
             _ => skip(r, e.size)?,
         }
@@ -382,14 +457,35 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, metadata: &mut Vec<(String, String
     Ok(())
 }
 
-fn parse_tag(r: &mut dyn ReadSeek, end: u64, metadata: &mut Vec<(String, String)>) -> Result<()> {
+fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
+            ids::TARGETS => {
+                let tg_end = r.stream_position()? + e.size;
+                parse_targets(r, tg_end, t)?;
+            }
             ids::SIMPLE_TAG => {
                 let st_end = r.stream_position()? + e.size;
-                parse_simple_tag(r, st_end, metadata)?;
+                parse_simple_tag(r, st_end, &mut t.simple_tags)?;
             }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::TAG_TRACK_UID => t.track_uid = read_uint(r, e.size as usize)?,
+            ids::TAG_EDITION_UID => t.edition_uid = read_uint(r, e.size as usize)?,
+            ids::TAG_CHAPTER_UID => t.chapter_uid = read_uint(r, e.size as usize)?,
+            ids::TAG_ATTACHMENT_UID => t.attachment_uid = read_uint(r, e.size as usize)?,
+            // TargetType / TargetTypeValue are read but not consumed: the
+            // string label is purely informational per RFC 9559 §5.1.8.1.1.2
+            // and we already key by the UID scope. Skip cleanly.
             _ => skip(r, e.size)?,
         }
     }
@@ -399,7 +495,7 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, metadata: &mut Vec<(String, String)
 fn parse_simple_tag(
     r: &mut dyn ReadSeek,
     end: u64,
-    metadata: &mut Vec<(String, String)>,
+    simple_tags: &mut Vec<(String, String)>,
 ) -> Result<()> {
     let mut name: Option<String> = None;
     let mut value: Option<String> = None;
@@ -412,12 +508,72 @@ fn parse_simple_tag(
         }
     }
     if let (Some(n), Some(v)) = (name, value) {
-        let key = n.to_ascii_lowercase();
-        if !key.is_empty() && !v.is_empty() {
-            metadata.push((key, v));
+        if !n.is_empty() && !v.is_empty() {
+            simple_tags.push((n, v));
         }
     }
     Ok(())
+}
+
+/// Resolve every captured tag's `Targets` UIDs against the per-segment
+/// track / chapter / attachment / edition index tables, then emit each
+/// `(name, value)` pair into the public `metadata` view with a key that
+/// describes the scope:
+///
+/// * Global (all UIDs zero):                          `<name>`
+/// * Track UID matched stream index N (zero-indexed): `tag:track:<N>:<name>`
+/// * Chapter UID matched chapter index N (1-indexed): `tag:chapter:<N>:<name>`
+/// * Attachment UID matched index N (1-indexed):     `tag:attachment:<N>:<name>`
+/// * Edition UID matched edition index N (1-indexed): `tag:edition:<N>:<name>`
+///
+/// A tag whose UID is non-zero but doesn't match any known target is
+/// dropped — RFC 9559 §5.1.8.1.1.3 mandates "MUST match the TrackUID value
+/// of a track found in this Segment", so unresolved references are
+/// non-conformant and we don't try to salvage them. The same logic applies
+/// to all four `Tag*UID` flavours.
+///
+/// Names are lower-cased on emit to match `parse_info`'s convention.
+#[allow(clippy::too_many_arguments)]
+fn resolve_tags(
+    raw_tags: Vec<RawTag>,
+    track_uid_to_index: &std::collections::HashMap<u64, u32>,
+    chapter_uid_to_index: &std::collections::HashMap<u64, u32>,
+    attachment_uid_to_index: &std::collections::HashMap<u64, u32>,
+    edition_uid_to_index: &std::collections::HashMap<u64, u32>,
+    metadata: &mut Vec<(String, String)>,
+) {
+    for tag in raw_tags {
+        // Build the key prefix. Precedence (track > chapter > attachment >
+        // edition) is arbitrary but stable; in practice RFC 9559 doesn't
+        // ban combining UIDs, but real files set at most one.
+        let prefix: Option<String> = if tag.track_uid != 0 {
+            track_uid_to_index
+                .get(&tag.track_uid)
+                .map(|i| format!("tag:track:{i}:"))
+        } else if tag.chapter_uid != 0 {
+            chapter_uid_to_index
+                .get(&tag.chapter_uid)
+                .map(|i| format!("tag:chapter:{i}:"))
+        } else if tag.attachment_uid != 0 {
+            attachment_uid_to_index
+                .get(&tag.attachment_uid)
+                .map(|i| format!("tag:attachment:{i}:"))
+        } else if tag.edition_uid != 0 {
+            edition_uid_to_index
+                .get(&tag.edition_uid)
+                .map(|i| format!("tag:edition:{i}:"))
+        } else {
+            // All UIDs zero → global scope.
+            Some(String::new())
+        };
+        let Some(prefix) = prefix else {
+            continue; // non-zero UID but no match — drop per RFC 9559.
+        };
+        for (name, value) in tag.simple_tags {
+            let key = format!("{prefix}{}", name.to_ascii_lowercase());
+            metadata.push((key, value));
+        }
+    }
 }
 
 /// Parse a `Chapters` master element. Each `EditionEntry` is walked, and
@@ -434,14 +590,26 @@ fn parse_chapters(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
+    chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
 ) -> Result<()> {
     let mut chapter_index: u32 = 0;
+    let mut edition_index: u32 = 0;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::EDITION_ENTRY => {
                 let ee_end = r.stream_position()? + e.size;
-                parse_edition_entry(r, ee_end, metadata, &mut chapter_index)?;
+                edition_index += 1;
+                parse_edition_entry(
+                    r,
+                    ee_end,
+                    metadata,
+                    &mut chapter_index,
+                    edition_index,
+                    chapter_uid_to_index,
+                    edition_uid_to_index,
+                )?;
             }
             _ => skip(r, e.size)?,
         }
@@ -449,19 +617,29 @@ fn parse_chapters(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_edition_entry(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
     chapter_index: &mut u32,
+    edition_index: u32,
+    chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
 ) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
+            ids::EDITION_UID => {
+                let uid = read_uint(r, e.size as usize)?;
+                if uid != 0 {
+                    edition_uid_to_index.insert(uid, edition_index);
+                }
+            }
             ids::CHAPTER_ATOM => {
                 let ca_end = r.stream_position()? + e.size;
                 *chapter_index += 1;
-                parse_chapter_atom(r, ca_end, metadata, *chapter_index)?;
+                parse_chapter_atom(r, ca_end, metadata, *chapter_index, chapter_uid_to_index)?;
             }
             _ => skip(r, e.size)?,
         }
@@ -474,6 +652,7 @@ fn parse_chapter_atom(
     end: u64,
     metadata: &mut Vec<(String, String)>,
     index: u32,
+    chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
 ) -> Result<()> {
     let mut start_ns: Option<u64> = None;
     let mut end_ns: Option<u64> = None;
@@ -481,6 +660,12 @@ fn parse_chapter_atom(
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
+            ids::CHAPTER_UID => {
+                let uid = read_uint(r, e.size as usize)?;
+                if uid != 0 {
+                    chapter_uid_to_index.insert(uid, index);
+                }
+            }
             ids::CHAPTER_TIME_START => start_ns = Some(read_uint(r, e.size as usize)?),
             ids::CHAPTER_TIME_END => end_ns = Some(read_uint(r, e.size as usize)?),
             ids::CHAPTER_DISPLAY => {
@@ -550,6 +735,7 @@ fn parse_attachments(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
+    attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
 ) -> Result<()> {
     let mut idx: u32 = 0;
     while r.stream_position()? < end {
@@ -558,7 +744,7 @@ fn parse_attachments(
             ids::ATTACHED_FILE => {
                 let af_end = r.stream_position()? + e.size;
                 idx += 1;
-                parse_attached_file(r, af_end, metadata, idx)?;
+                parse_attached_file(r, af_end, metadata, idx, attachment_uid_to_index)?;
             }
             _ => skip(r, e.size)?,
         }
@@ -571,6 +757,7 @@ fn parse_attached_file(
     end: u64,
     metadata: &mut Vec<(String, String)>,
     index: u32,
+    attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
 ) -> Result<()> {
     let mut filename: Option<String> = None;
     let mut mime: Option<String> = None;
@@ -580,6 +767,12 @@ fn parse_attached_file(
         match e.id {
             ids::FILE_NAME => filename = Some(read_string(r, e.size as usize)?),
             ids::FILE_MIME_TYPE => mime = Some(read_string(r, e.size as usize)?),
+            ids::FILE_UID => {
+                let uid = read_uint(r, e.size as usize)?;
+                if uid != 0 {
+                    attachment_uid_to_index.insert(uid, index);
+                }
+            }
             ids::FILE_DATA => {
                 size = Some(e.size);
                 skip(r, e.size)?;
@@ -818,6 +1011,7 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
         let e = read_element_header(r)?;
         match e.id {
             ids::TRACK_NUMBER => t.number = read_uint(r, e.size as usize)?,
+            ids::TRACK_UID => t.uid = read_uint(r, e.size as usize)?,
             ids::TRACK_TYPE => t.track_type = read_uint(r, e.size as usize)?,
             ids::CODEC_ID => t.codec_id_string = read_string(r, e.size as usize)?,
             ids::CODEC_PRIVATE => t.codec_private = read_bytes(r, e.size as usize)?,

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- demux: resolve `Tags.Targets.Tag*UID` against track / chapter /
+  attachment / edition UIDs and emit scope-prefixed metadata keys
+  (`tag:track:N:<name>` etc.); unresolved non-zero UIDs are dropped per
+  RFC 9559 §5.1.8.1.1.x
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.6...v0.0.7) - 2026-05-06
 
 ### Other

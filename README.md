@@ -60,7 +60,12 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - Clusters: `SimpleBlock` and `BlockGroup -> Block`, all three lacing
   modes (Xiph, fixed, EBML-signed-delta).
 - Metadata lift: title, muxer, encoder, date (Matroska `DateUTC` ->
-  ISO-8601), Tags `SimpleTag` name/value pairs, `Chapters`
+  ISO-8601), Tags `SimpleTag` name/value pairs with **target-scope
+  resolution** (`Tags.Targets.TagTrackUID` -> `tag:track:N:<name>`,
+  `TagChapterUID` -> `tag:chapter:N:<name>`, `TagAttachmentUID` ->
+  `tag:attachment:N:<name>`, `TagEditionUID` -> `tag:edition:N:<name>`;
+  all-zero UIDs -> bare `<name>` global key; unresolved non-zero UIDs
+  are dropped per RFC 9559 §5.1.8.1.1.x "MUST match"), `Chapters`
   (`chapter:N:start_ms` / `:end_ms` / `:title`, ns→ms), and
   `Attachments` (`attachment:N:filename` / `:mime_type` / `:size_bytes`;
   payload is skipped, only the index surfaces).
