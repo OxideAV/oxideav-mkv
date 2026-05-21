@@ -107,6 +107,67 @@ pub struct MkvMuxer {
     header_written: bool,
     trailer_written: bool,
     doc_type: DocType,
+    /// Chapter atoms queued via [`MkvMuxer::add_chapter`] /
+    /// [`MkvMuxer::add_chapter_full`]. Materialised into a `Chapters`
+    /// master right after `Tracks` in [`MkvMuxer::write_header`]; the
+    /// `Chapters` SeekHead entry is patched at the same time. Empty list
+    /// → no `Chapters` element written and the SeekHead slot is voided.
+    chapters: Vec<MkvChapter>,
+}
+
+/// One chapter atom as fed to the muxer.
+///
+/// Round-trips through `Chapters → EditionEntry → ChapterAtom` per RFC
+/// 9559 §5.1.7. Timestamps are in nanoseconds (matches
+/// `ChapterTimeStart` / `ChapterTimeEnd` units, which are spec-defined as
+/// ns and independent of the segment's `TimecodeScale`).
+///
+/// `end_time_ns == None` is permitted — the muxer simply omits
+/// `ChapterTimeEnd`. The demuxer surfaces such an atom without an
+/// `end_ms` metadata key, matching ffprobe behaviour on real files.
+#[derive(Clone, Debug, Default)]
+pub struct MkvChapter {
+    /// `ChapterTimeStart`, in nanoseconds.
+    pub time_start_ns: u64,
+    /// `ChapterTimeEnd`, in nanoseconds. `None` → element omitted.
+    pub time_end_ns: Option<u64>,
+    /// Zero or more `ChapterDisplay` children. Each one carries one
+    /// language-tagged title string. A chapter with zero displays is
+    /// legal per RFC 9559 §5.1.7 but produces an "untitled" atom that
+    /// most players surface as `Chapter N` — the convenience constructor
+    /// [`MkvMuxer::add_chapter`] always emits exactly one display.
+    pub display: Vec<ChapterDisplay>,
+}
+
+/// One `ChapterDisplay` row — a chapter title in one language.
+///
+/// `language` follows the `ChapLanguage` element convention (RFC 9559
+/// §5.1.7.4.1): 3-letter ISO-639-2 alpha-3 code (`"eng"`, `"jpn"`,
+/// `"fre"`, …). Use `"und"` for "undetermined", which is also the
+/// default `ChapLanguage` value when the element is omitted entirely.
+/// `country`, when set, follows RFC 9559 §5.1.7.4.2 (`ChapCountry`,
+/// IETF BCP 47 region subtag, e.g. `"us"`, `"jp"`).
+#[derive(Clone, Debug)]
+pub struct ChapterDisplay {
+    /// `ChapString` — UTF-8 title text.
+    pub title: String,
+    /// `ChapLanguage` — ISO-639-2 alpha-3 code (e.g. `"eng"`). Pass
+    /// `"und"` if no specific language applies.
+    pub language: String,
+    /// Optional `ChapCountry` — BCP 47 region subtag (e.g. `"us"`).
+    /// Skipped when `None`.
+    pub country: Option<String>,
+}
+
+impl ChapterDisplay {
+    /// Convenience constructor: `language` is `"und"`, `country` is `None`.
+    pub fn untitled_in(language: impl Into<String>) -> Self {
+        Self {
+            title: String::new(),
+            language: language.into(),
+            country: None,
+        }
+    }
 }
 
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
@@ -155,7 +216,67 @@ impl MkvMuxer {
             header_written: false,
             trailer_written: false,
             doc_type,
+            chapters: Vec::new(),
         })
+    }
+
+    /// Queue a chapter atom with one English-language `ChapterDisplay`
+    /// carrying `title`. Must be called before [`MkvMuxer::write_header`];
+    /// returns [`Error::other`] if the header has already been emitted.
+    ///
+    /// `end_time_ns == None` omits the `ChapterTimeEnd` element entirely.
+    /// This matches how DVD-derived chapters are typically expressed:
+    /// each program-chain cell has a start PTM but no explicit end
+    /// (it's implicit from the next chapter's start, or end-of-program).
+    ///
+    /// Surface model: a `Chapters → EditionEntry → ChapterAtom →
+    /// ChapterDisplay` master per RFC 9559 §5.1.7. Use
+    /// [`MkvMuxer::add_chapter_full`] for multilingual displays or
+    /// explicit `ChapCountry` tagging.
+    pub fn add_chapter(
+        &mut self,
+        start_time_ns: u64,
+        end_time_ns: Option<u64>,
+        title: impl Into<String>,
+    ) -> Result<()> {
+        self.add_chapter_full(MkvChapter {
+            time_start_ns: start_time_ns,
+            time_end_ns: end_time_ns,
+            display: vec![ChapterDisplay {
+                title: title.into(),
+                language: "eng".into(),
+                country: None,
+            }],
+        })
+    }
+
+    /// Queue a fully-specified [`MkvChapter`] (zero or more displays,
+    /// each with its own language / country). Same call-ordering
+    /// constraint as [`MkvMuxer::add_chapter`]: must happen before
+    /// `write_header`.
+    pub fn add_chapter_full(&mut self, chapter: MkvChapter) -> Result<()> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: add_chapter_full called after write_header",
+            ));
+        }
+        if let Some(end) = chapter.time_end_ns {
+            if end < chapter.time_start_ns {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: chapter end_time_ns ({end}) < start_time_ns ({})",
+                    chapter.time_start_ns
+                )));
+            }
+        }
+        self.chapters.push(chapter);
+        Ok(())
+    }
+
+    /// Read-only view of the queued chapter list. Useful for tests and
+    /// for upstream callers (e.g. DVD-to-MKV) that want to confirm the
+    /// chapter table they handed to the muxer before sealing the header.
+    pub fn chapters(&self) -> &[MkvChapter] {
+        &self.chapters
     }
 
     /// Construct a plain Matroska muxer. Thin wrapper around the boxed
@@ -206,13 +327,15 @@ impl Muxer for MkvMuxer {
         // cluster positions are stored as byte offsets from this point.
         let segment_data_start_in_buf = all.len() as u64;
 
-        // SeekHead with three Seek entries (Info, Tracks, Cues). Each Seek
-        // is written at a fixed width (SeekID 4 bytes, SeekPosition 8 bytes)
-        // so we know exactly where to patch in the real positions later.
-        // Info and Tracks SeekPositions are filled in below before the
-        // buffer is flushed; Cues stays as a placeholder zero and gets
-        // patched in `write_trailer` (or rewritten as a Void element if
-        // no Cues was actually emitted).
+        // SeekHead with four Seek entries (Info, Tracks, Chapters, Cues).
+        // Each Seek is written at a fixed width (SeekID 4 bytes,
+        // SeekPosition 8 bytes) so we know exactly where to patch in the
+        // real positions later. Info and Tracks SeekPositions are filled
+        // in below before the buffer is flushed; Chapters is filled in
+        // immediately after the Tracks emit (or voided if no chapters
+        // were queued); Cues stays as a placeholder zero and gets patched
+        // in `write_trailer` (or rewritten as a Void element if no Cues
+        // was actually emitted).
         let seek_head_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
         let seek_head_bytes = build_initial_seek_head();
         let seek_head_start_in_buf = all.len();
@@ -224,7 +347,8 @@ impl Muxer for MkvMuxer {
         // `entry_start + SEEK_POS_PAYLOAD_OFFSET`.
         let info_seek_entry_in_buf = seek_head_start_in_buf + SEEK_HEAD_HEADER_LEN;
         let tracks_seek_entry_in_buf = info_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        let cues_seek_entry_in_buf = tracks_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        let chapters_seek_entry_in_buf = tracks_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        let cues_seek_entry_in_buf = chapters_seek_entry_in_buf + SEEK_ENTRY_LEN;
         // Sanity: SeekHead occupies a known total size; the next element
         // starts immediately after.
         debug_assert_eq!(seek_head_bytes.len(), SEEK_HEAD_TOTAL_LEN);
@@ -303,6 +427,23 @@ impl Muxer for MkvMuxer {
         }
         write_master_element(&mut all, ids::TRACKS, &tracks_body);
 
+        // Chapters (optional). If `add_chapter` calls were made before
+        // `write_header`, materialise them now as a single EditionEntry
+        // master sandwiched between Tracks and the first Cluster. RFC
+        // 9559 §5.1.7 lets Chapters appear anywhere in the Segment, but
+        // putting it here keeps the demuxer's pre-Cluster header walk
+        // single-pass and matches the order ffmpeg / mkvmerge prefer.
+        // If no chapters were queued, the SeekHead Chapters slot stays
+        // at its placeholder zero and gets voided below.
+        let chapters_offset_opt: Option<u64> = if self.chapters.is_empty() {
+            None
+        } else {
+            let chapters_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
+            let chapters_bytes = build_chapters_element(&self.chapters);
+            all.extend_from_slice(&chapters_bytes);
+            Some(chapters_offset_in_buf)
+        };
+
         // Patch the Info / Tracks SeekPositions in the SeekHead now that we
         // know where each element landed inside `all`. Cues stays as zero
         // and is patched in `write_trailer`.
@@ -316,6 +457,21 @@ impl Muxer for MkvMuxer {
             tracks_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
             tracks_offset_in_buf,
         );
+        match chapters_offset_opt {
+            Some(off) => write_u64_be_at(
+                &mut all,
+                chapters_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                off,
+            ),
+            None => {
+                // No Chapters element emitted — rewrite the 21-byte slot
+                // as a Void so SeekHead walkers don't chase a placeholder
+                // zero that resolves to the SeekHead itself.
+                let void = void_seek_entry();
+                all[chapters_seek_entry_in_buf..chapters_seek_entry_in_buf + SEEK_ENTRY_LEN]
+                    .copy_from_slice(&void);
+            }
+        }
 
         self.segment_data_start = base_pos + segment_data_start_in_buf;
         // Absolute file offset of the Cues Seek entry — used in
@@ -664,11 +820,15 @@ fn write_master_element(buf: &mut Vec<u8>, id: u32, body: &[u8]) {
 // front, so they're patched directly into the buffer before we flush.
 
 /// Number of bytes consumed by the SeekHead header (id + size VINT) before
-/// the first Seek child. `4 + 1 = 5` for our 63-byte body.
+/// the first Seek child. `4 + 1 = 5` for our 84-byte body (4 × 21).
 const SEEK_HEAD_HEADER_LEN: usize = 5;
-/// Total size of the SeekHead element on disk: header + 3 × 21-byte Seek
-/// entries (Info, Tracks, Cues).
-const SEEK_HEAD_TOTAL_LEN: usize = SEEK_HEAD_HEADER_LEN + 3 * SEEK_ENTRY_LEN;
+/// Number of Seek entries the SeekHead reserves: Info, Tracks, Chapters,
+/// Cues. Chapters and Cues are voided in `write_header` /
+/// `write_trailer` respectively when those elements turn out to be empty.
+const SEEK_HEAD_ENTRY_COUNT: usize = 4;
+/// Total size of the SeekHead element on disk: header + N × 21-byte
+/// Seek entries.
+const SEEK_HEAD_TOTAL_LEN: usize = SEEK_HEAD_HEADER_LEN + SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN;
 /// Size of one Seek entry on disk. The body is 7-byte SeekID +
 /// 11-byte SeekPosition = 18 bytes; the entry header (id + size) adds 3
 /// bytes for a fixed total of 21.
@@ -681,15 +841,17 @@ const SEEK_ENTRY_LEN: usize = 21;
 ///   bytes 13..21 — SeekPosition payload (big-endian u64)
 const SEEK_POS_PAYLOAD_OFFSET: usize = 13;
 
-/// Build the initial SeekHead with placeholder positions for Info, Tracks,
-/// and Cues. The caller patches in the real positions via
-/// `write_u64_be_at` once each element's offset is known.
+/// Build the initial SeekHead with placeholder positions for Info,
+/// Tracks, Chapters, and Cues. The caller patches in the real positions
+/// via `write_u64_be_at` once each element's offset is known (or rewrites
+/// the slot as a Void if the element ends up not being emitted).
 fn build_initial_seek_head() -> Vec<u8> {
-    let mut body = Vec::with_capacity(3 * SEEK_ENTRY_LEN);
+    let mut body = Vec::with_capacity(SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN);
     body.extend_from_slice(&seek_entry(ids::INFO, 0));
     body.extend_from_slice(&seek_entry(ids::TRACKS, 0));
+    body.extend_from_slice(&seek_entry(ids::CHAPTERS, 0));
     body.extend_from_slice(&seek_entry(ids::CUES, 0));
-    debug_assert_eq!(body.len(), 3 * SEEK_ENTRY_LEN);
+    debug_assert_eq!(body.len(), SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN);
     let mut out = Vec::with_capacity(SEEK_HEAD_TOTAL_LEN);
     write_master_element(&mut out, ids::SEEK_HEAD, &body);
     debug_assert_eq!(out.len(), SEEK_HEAD_TOTAL_LEN);
@@ -736,4 +898,73 @@ fn void_seek_entry() -> Vec<u8> {
 /// `pos + 8 <= buf.len()`.
 fn write_u64_be_at(buf: &mut [u8], pos: usize, value: u64) {
     buf[pos..pos + 8].copy_from_slice(&value.to_be_bytes());
+}
+
+// --- Chapters --------------------------------------------------------------
+//
+// One `Chapters` master per file. Inside it we always emit exactly one
+// `EditionEntry` — Matroska allows multiple editions (alternate cuts /
+// language-versions / etc.) but the muxer's public surface
+// (`add_chapter`) is single-edition-shaped, which matches every
+// upstream use case so far (DVD ⟶ MKV: one VTS = one program chain =
+// one chapter list).
+//
+// Element layout (RFC 9559 §5.1.7):
+//
+//   Chapters (0x1043A770)
+//     EditionEntry (0x45B9)
+//       EditionUID (0x45BC)        — 1-based, derived from edition index
+//       EditionFlagDefault — omitted (default 0)
+//       EditionFlagHidden  — omitted (default 0)
+//       ChapterAtom (0xB6) × N
+//         ChapterUID (0x73C4)      — 1-based atom index
+//         ChapterTimeStart (0x91)  — ns, uint
+//         ChapterTimeEnd   (0x92)  — ns, uint, optional
+//         ChapterDisplay (0x80)
+//           ChapString   (0x85)    — UTF-8 title
+//           ChapLanguage (0x437C)  — ISO-639-2 3-letter
+//           ChapCountry  (0x437E)  — optional BCP-47 region subtag
+
+/// One stable edition UID used by every file we mux. The value is
+/// arbitrary (UIDs are scope-local within a segment) — what matters is
+/// that it's non-zero so that downstream `Tags.Targets.TagEditionUID`
+/// references can resolve.
+const EDITION_UID_DEFAULT: u64 = 1;
+
+/// Build the bytes of a complete `Chapters` master element from the
+/// queued chapter list. Caller appends the returned slice into the
+/// muxer's outgoing buffer.
+fn build_chapters_element(chapters: &[MkvChapter]) -> Vec<u8> {
+    let mut edition_body = Vec::new();
+    write_uint_element(&mut edition_body, ids::EDITION_UID, EDITION_UID_DEFAULT);
+    for (i, ch) in chapters.iter().enumerate() {
+        let atom = build_chapter_atom(i as u64 + 1, ch);
+        write_master_element(&mut edition_body, ids::CHAPTER_ATOM, &atom);
+    }
+    let mut chapters_body = Vec::new();
+    write_master_element(&mut chapters_body, ids::EDITION_ENTRY, &edition_body);
+    let mut out = Vec::with_capacity(chapters_body.len() + 8);
+    write_master_element(&mut out, ids::CHAPTERS, &chapters_body);
+    out
+}
+
+/// Body of one `ChapterAtom` master (the caller wraps it in
+/// `ids::CHAPTER_ATOM`).
+fn build_chapter_atom(uid: u64, ch: &MkvChapter) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_uint_element(&mut body, ids::CHAPTER_UID, uid);
+    write_uint_element(&mut body, ids::CHAPTER_TIME_START, ch.time_start_ns);
+    if let Some(end) = ch.time_end_ns {
+        write_uint_element(&mut body, ids::CHAPTER_TIME_END, end);
+    }
+    for disp in &ch.display {
+        let mut display_body = Vec::new();
+        write_string_element(&mut display_body, ids::CHAP_STRING, &disp.title);
+        write_string_element(&mut display_body, ids::CHAP_LANGUAGE, &disp.language);
+        if let Some(country) = &disp.country {
+            write_string_element(&mut display_body, ids::CHAP_COUNTRY, country);
+        }
+        write_master_element(&mut body, ids::CHAPTER_DISPLAY, &display_body);
+    }
+    body
 }

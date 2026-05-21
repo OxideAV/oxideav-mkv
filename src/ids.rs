@@ -111,6 +111,7 @@ pub const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
 pub const CHAPTER_DISPLAY: u32 = 0x80;
 pub const CHAP_STRING: u32 = 0x85;
 pub const CHAP_LANGUAGE: u32 = 0x437C;
+pub const CHAP_COUNTRY: u32 = 0x437E;
 
 // Attachments (Segment\Attachments\AttachedFile\...).
 pub const ATTACHED_FILE: u32 = 0x61A7;

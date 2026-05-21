@@ -92,6 +92,14 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - Codec-specific fields: `CodecPrivate` normalisation for FLAC (`fLaC`
   magic prepended), Opus `CodecDelay` derived from the `OpusHead`
   pre-skip plus an 80 ms `SeekPreRoll` per the WebM spec.
+- `Chapters` (RFC 9559 §5.1.7): `MkvMuxer::add_chapter(start_ns,
+  end_ns, title)` queues a single English-language `ChapterAtom`;
+  `add_chapter_full(MkvChapter)` takes a fully-specified record with
+  multilingual `ChapterDisplay` rows (`ChapString` + `ChapLanguage`
+  + optional `ChapCountry`). Chapters must be added before
+  `write_header`; the muxer emits a single `EditionEntry` between
+  Tracks and the first Cluster and patches the SeekHead `Chapters`
+  slot to point at it (slot is voided if no chapters were queued).
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.

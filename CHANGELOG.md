@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- mux: add `Chapters` encoding (RFC 9559 §5.1.7). New
+  `MkvMuxer::add_chapter(start_ns, end_ns, title)` queues an
+  English-language `ChapterAtom`; `add_chapter_full(MkvChapter)`
+  supports multilingual `ChapterDisplay` rows with optional
+  `ChapCountry`. Chapters are materialised as one `EditionEntry`
+  between Tracks and the first Cluster, with the SeekHead
+  `Chapters` slot patched to its real offset (or voided if no
+  chapters were queued). Unblocks DVD Phase 3b
+  (chapter names from the IFO program-chain into MKV output).
 - demux: resolve `Tags.Targets.Tag*UID` against track / chapter /
   attachment / edition UIDs and emit scope-prefixed metadata keys
   (`tag:track:N:<name>` etc.); unresolved non-zero UIDs are dropped per
