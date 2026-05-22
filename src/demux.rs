@@ -19,7 +19,16 @@ use crate::ebml::{
 };
 use crate::ids;
 
-pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    open_typed(input, codecs).map(|d| Box::new(d) as Box<dyn Demuxer>)
+}
+
+/// Concrete-typed variant of [`open`] returning [`MkvDemuxer`] directly,
+/// so callers can reach typed accessors like [`MkvDemuxer::tags`] that
+/// the [`Demuxer`] trait does not expose. Same parsing contract as
+/// [`open`] — the trait-returning wrapper is implemented in terms of
+/// this one.
+pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<MkvDemuxer> {
     // Validate EBML header.
     let hdr = read_element_header(&mut *input)?;
     if hdr.id != ids::EBML_HEADER {
@@ -300,6 +309,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         .filter(|(_, t)| t.uid != 0)
         .map(|(i, t)| (t.uid, i as u32))
         .collect();
+    let mut typed_tags: Vec<Tag> = Vec::new();
     resolve_tags(
         pending_tags,
         &track_uid_to_index,
@@ -307,6 +317,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         &attachment_uid_to_index,
         &edition_uid_to_index,
         &mut metadata,
+        &mut typed_tags,
     );
 
     // Position at the first Cluster.
@@ -327,7 +338,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         track_number_by_index[idx as usize] = *num;
     }
 
-    Ok(Box::new(MkvDemuxer {
+    Ok(MkvDemuxer {
         input,
         streams,
         track_index_by_number,
@@ -341,7 +352,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<
         duration_micros,
         cues,
         timecode_scale_ns,
-    }))
+        tags: typed_tags,
+    })
 }
 
 #[derive(Default)]
@@ -419,18 +431,46 @@ fn parse_info(
 /// `Targets.Tag*UID` references have been resolved against the corresponding
 /// tracks / chapters / attachments. Each tag emits one or more `SimpleTag`
 /// entries, all of which share the same `Targets` scope.
+///
+/// We keep this as a parser-private staging type and translate it into the
+/// public [`Tag`] / [`Targets`] / [`SimpleTag`] family during `resolve_tags`
+/// — that pass also drops tags whose UID is non-zero but doesn't point at
+/// any element in this Segment, per RFC 9559 §5.1.8.1.1.3..§5.1.8.1.1.6.
 struct RawTag {
-    /// Zero means "applies to all tracks in the segment" per RFC 9559
-    /// §5.1.8.1.1.3 (also §5.1.8.1.1.4..§5.1.8.1.1.6 for the others). Any
-    /// non-zero value MUST match a UID found in this segment.
-    track_uid: u64,
-    edition_uid: u64,
-    chapter_uid: u64,
-    attachment_uid: u64,
-    /// `(name, value)` pairs from `SimpleTag` children. We lower-case the
-    /// name when emitting into `metadata` to match the keying convention
-    /// used by the rest of the demuxer.
-    simple_tags: Vec<(String, String)>,
+    /// Zero, one, or many TrackUID references. RFC 9559 §5.1.8.1.1.3 marks
+    /// `TagTrackUID` with no maxOccurs cap, so multiple per-Targets is
+    /// legal — typically used to scope a tag like ARTIST to a chosen set
+    /// of audio tracks within a multi-track Segment.
+    track_uids: Vec<u64>,
+    edition_uids: Vec<u64>,
+    chapter_uids: Vec<u64>,
+    attachment_uids: Vec<u64>,
+    /// Optional `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1, default 50) and
+    /// `TargetType` informational string (§5.1.8.1.1.2). Both are kept as
+    /// captured — the typed [`Targets`] surface lets consumers decide
+    /// whether to filter on them.
+    target_type_value: Option<u64>,
+    target_type: Option<String>,
+    /// Parsed `SimpleTag` children, including language / default / binary
+    /// fields that the legacy `(name, value)` summary throws away.
+    simple_tags: Vec<RawSimpleTag>,
+}
+
+/// Mirror of a `SimpleTag` element (RFC 9559 §5.1.8.1.2) as parsed from
+/// the file. Translates 1:1 to the public [`SimpleTag`] via `From`.
+#[derive(Default)]
+struct RawSimpleTag {
+    name: String,
+    value: SimpleTagValue,
+    /// `TagLanguage` (RFC 9559 §5.1.8.1.2.2) — three-letter Matroska code,
+    /// default `"und"`.
+    language: String,
+    /// `TagLanguageBCP47` (RFC 9559 §5.1.8.1.2.3) — RFC 5646 tag. When
+    /// present, `language` MUST be ignored per the spec; we keep both and
+    /// let consumers pick.
+    language_bcp47: Option<String>,
+    /// `TagDefault` (RFC 9559 §5.1.8.1.2.4) — default 1.
+    default: bool,
 }
 
 fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<()> {
@@ -440,10 +480,12 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<(
             ids::TAG => {
                 let tag_end = r.stream_position()? + e.size;
                 let mut t = RawTag {
-                    track_uid: 0,
-                    edition_uid: 0,
-                    chapter_uid: 0,
-                    attachment_uid: 0,
+                    track_uids: Vec::new(),
+                    edition_uids: Vec::new(),
+                    chapter_uids: Vec::new(),
+                    attachment_uids: Vec::new(),
+                    target_type_value: None,
+                    target_type: None,
                     simple_tags: Vec::new(),
                 };
                 parse_tag(r, tag_end, &mut t)?;
@@ -467,7 +509,19 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
             }
             ids::SIMPLE_TAG => {
                 let st_end = r.stream_position()? + e.size;
-                parse_simple_tag(r, st_end, &mut t.simple_tags)?;
+                let mut s = RawSimpleTag {
+                    name: String::new(),
+                    value: SimpleTagValue::None,
+                    language: String::from("und"),
+                    language_bcp47: None,
+                    default: true,
+                };
+                parse_simple_tag(r, st_end, &mut s)?;
+                // Drop SimpleTags with no name — they're malformed per
+                // RFC 9559 §5.1.8.1.2.1 (TagName has minOccurs 1).
+                if !s.name.is_empty() {
+                    t.simple_tags.push(s);
+                }
             }
             _ => skip(r, e.size)?,
         }
@@ -479,60 +533,104 @@ fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::TAG_TRACK_UID => t.track_uid = read_uint(r, e.size as usize)?,
-            ids::TAG_EDITION_UID => t.edition_uid = read_uint(r, e.size as usize)?,
-            ids::TAG_CHAPTER_UID => t.chapter_uid = read_uint(r, e.size as usize)?,
-            ids::TAG_ATTACHMENT_UID => t.attachment_uid = read_uint(r, e.size as usize)?,
-            // TargetType / TargetTypeValue are read but not consumed: the
-            // string label is purely informational per RFC 9559 §5.1.8.1.1.2
-            // and we already key by the UID scope. Skip cleanly.
+            ids::TAG_TRACK_UID => {
+                let v = read_uint(r, e.size as usize)?;
+                t.track_uids.push(v);
+            }
+            ids::TAG_EDITION_UID => {
+                let v = read_uint(r, e.size as usize)?;
+                t.edition_uids.push(v);
+            }
+            ids::TAG_CHAPTER_UID => {
+                let v = read_uint(r, e.size as usize)?;
+                t.chapter_uids.push(v);
+            }
+            ids::TAG_ATTACHMENT_UID => {
+                let v = read_uint(r, e.size as usize)?;
+                t.attachment_uids.push(v);
+            }
+            ids::TARGET_TYPE_VALUE => {
+                t.target_type_value = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::TARGET_TYPE => {
+                let s = read_string(r, e.size as usize)?;
+                if !s.is_empty() {
+                    t.target_type = Some(s);
+                }
+            }
             _ => skip(r, e.size)?,
         }
     }
     Ok(())
 }
 
-fn parse_simple_tag(
-    r: &mut dyn ReadSeek,
-    end: u64,
-    simple_tags: &mut Vec<(String, String)>,
-) -> Result<()> {
-    let mut name: Option<String> = None;
-    let mut value: Option<String> = None;
+fn parse_simple_tag(r: &mut dyn ReadSeek, end: u64, s: &mut RawSimpleTag) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::TAG_NAME => name = Some(read_string(r, e.size as usize)?),
-            ids::TAG_STRING => value = Some(read_string(r, e.size as usize)?),
+            ids::TAG_NAME => s.name = read_string(r, e.size as usize)?,
+            ids::TAG_STRING => {
+                let v = read_string(r, e.size as usize)?;
+                // RFC 9559 §5.1.8.1.2.5/§5.1.8.1.2.6 say TagString and
+                // TagBinary are mutually exclusive within one SimpleTag;
+                // if a producer violates this, the last one wins.
+                s.value = SimpleTagValue::String(v);
+            }
+            ids::TAG_BINARY => {
+                let v = read_bytes(r, e.size as usize)?;
+                s.value = SimpleTagValue::Binary(v);
+            }
+            ids::TAG_LANGUAGE => {
+                let v = read_string(r, e.size as usize)?;
+                if !v.is_empty() {
+                    s.language = v;
+                }
+            }
+            ids::TAG_LANGUAGE_BCP47 => {
+                let v = read_string(r, e.size as usize)?;
+                if !v.is_empty() {
+                    s.language_bcp47 = Some(v);
+                }
+            }
+            ids::TAG_DEFAULT => {
+                let v = read_uint(r, e.size as usize)?;
+                s.default = v != 0;
+            }
             _ => skip(r, e.size)?,
-        }
-    }
-    if let (Some(n), Some(v)) = (name, value) {
-        if !n.is_empty() && !v.is_empty() {
-            simple_tags.push((n, v));
         }
     }
     Ok(())
 }
 
 /// Resolve every captured tag's `Targets` UIDs against the per-segment
-/// track / chapter / attachment / edition index tables, then emit each
-/// `(name, value)` pair into the public `metadata` view with a key that
-/// describes the scope:
+/// track / chapter / attachment / edition index tables, then emit two
+/// parallel surfaces:
 ///
-/// * Global (all UIDs zero):                          `<name>`
-/// * Track UID matched stream index N (zero-indexed): `tag:track:<N>:<name>`
-/// * Chapter UID matched chapter index N (1-indexed): `tag:chapter:<N>:<name>`
-/// * Attachment UID matched index N (1-indexed):     `tag:attachment:<N>:<name>`
-/// * Edition UID matched edition index N (1-indexed): `tag:edition:<N>:<name>`
+/// 1. The legacy flattened `metadata` view, where each `SimpleTag` becomes
+///    one `(key, value)` entry with the scope encoded in the key:
+///    * Global (all UIDs zero):                          `<name>`
+///    * Track UID matched stream index N (zero-indexed): `tag:track:<N>:<name>`
+///    * Chapter UID matched chapter index N (1-indexed): `tag:chapter:<N>:<name>`
+///    * Attachment UID matched index N (1-indexed):     `tag:attachment:<N>:<name>`
+///    * Edition UID matched edition index N (1-indexed): `tag:edition:<N>:<name>`
+/// 2. The typed `tags_out` vector — one [`Tag`] per *Tag* element in the
+///    file, retaining `TargetType` / `TargetTypeValue` / language / default
+///    / multi-UID scoping that the flat view discards. Each UID inside a
+///    `Tag` is resolved to a [`TargetUid`] pointing at its 0-indexed
+///    stream or 1-indexed chapter/attachment/edition slot.
 ///
-/// A tag whose UID is non-zero but doesn't match any known target is
-/// dropped — RFC 9559 §5.1.8.1.1.3 mandates "MUST match the TrackUID value
-/// of a track found in this Segment", so unresolved references are
-/// non-conformant and we don't try to salvage them. The same logic applies
-/// to all four `Tag*UID` flavours.
+/// A `Tag` whose `Targets` master contains *only* unresolved non-zero UIDs
+/// (i.e. every reference points outside the Segment) is dropped from
+/// **both** surfaces — RFC 9559 §5.1.8.1.1.3 mandates "MUST match the
+/// TrackUID value of a track found in this Segment", so unresolved
+/// references are non-conformant and we don't try to salvage them. The
+/// same logic applies to all four `Tag*UID` flavours. Within a `Targets`
+/// master that has a *mix* of resolvable and dangling UIDs, only the
+/// resolved ones surface in [`Targets::uids`].
 ///
-/// Names are lower-cased on emit to match `parse_info`'s convention.
+/// Names are lower-cased in the flat view to match `parse_info`'s
+/// convention but preserved verbatim in [`SimpleTag::name`] for round-trip
+/// fidelity.
 #[allow(clippy::too_many_arguments)]
 fn resolve_tags(
     raw_tags: Vec<RawTag>,
@@ -541,39 +639,247 @@ fn resolve_tags(
     attachment_uid_to_index: &std::collections::HashMap<u64, u32>,
     edition_uid_to_index: &std::collections::HashMap<u64, u32>,
     metadata: &mut Vec<(String, String)>,
+    tags_out: &mut Vec<Tag>,
 ) {
     for tag in raw_tags {
-        // Build the key prefix. Precedence (track > chapter > attachment >
-        // edition) is arbitrary but stable; in practice RFC 9559 doesn't
-        // ban combining UIDs, but real files set at most one.
-        let prefix: Option<String> = if tag.track_uid != 0 {
-            track_uid_to_index
-                .get(&tag.track_uid)
-                .map(|i| format!("tag:track:{i}:"))
-        } else if tag.chapter_uid != 0 {
-            chapter_uid_to_index
-                .get(&tag.chapter_uid)
-                .map(|i| format!("tag:chapter:{i}:"))
-        } else if tag.attachment_uid != 0 {
-            attachment_uid_to_index
-                .get(&tag.attachment_uid)
-                .map(|i| format!("tag:attachment:{i}:"))
-        } else if tag.edition_uid != 0 {
-            edition_uid_to_index
-                .get(&tag.edition_uid)
-                .map(|i| format!("tag:edition:{i}:"))
-        } else {
-            // All UIDs zero → global scope.
-            Some(String::new())
-        };
-        let Some(prefix) = prefix else {
-            continue; // non-zero UID but no match — drop per RFC 9559.
-        };
-        for (name, value) in tag.simple_tags {
-            let key = format!("{prefix}{}", name.to_ascii_lowercase());
-            metadata.push((key, value));
+        // Translate every non-zero UID to a TargetUid, dropping the ones
+        // that don't resolve. A Tag with no UIDs at all is a global tag
+        // (RFC 9559 §5.1.8.1.1, "If empty or omitted, then the tag value
+        // describes everything in the Segment").
+        let mut resolved_uids: Vec<TargetUid> = Vec::new();
+        let mut had_any_uid = false;
+        for &uid in &tag.track_uids {
+            had_any_uid = true;
+            if uid == 0 {
+                continue; // 0 = "all tracks", carried via the no-UID branch.
+            }
+            if let Some(&idx) = track_uid_to_index.get(&uid) {
+                resolved_uids.push(TargetUid::Track {
+                    stream_index: idx,
+                    track_uid: uid,
+                });
+            }
         }
+        for &uid in &tag.edition_uids {
+            had_any_uid = true;
+            if uid == 0 {
+                continue;
+            }
+            if let Some(&idx) = edition_uid_to_index.get(&uid) {
+                resolved_uids.push(TargetUid::Edition {
+                    edition_index: idx,
+                    edition_uid: uid,
+                });
+            }
+        }
+        for &uid in &tag.chapter_uids {
+            had_any_uid = true;
+            if uid == 0 {
+                continue;
+            }
+            if let Some(&idx) = chapter_uid_to_index.get(&uid) {
+                resolved_uids.push(TargetUid::Chapter {
+                    chapter_index: idx,
+                    chapter_uid: uid,
+                });
+            }
+        }
+        for &uid in &tag.attachment_uids {
+            had_any_uid = true;
+            if uid == 0 {
+                continue;
+            }
+            if let Some(&idx) = attachment_uid_to_index.get(&uid) {
+                resolved_uids.push(TargetUid::Attachment {
+                    attachment_index: idx,
+                    attachment_uid: uid,
+                });
+            }
+        }
+        // Drop the whole Tag if every UID it carried was non-zero but
+        // failed to resolve. RFC 9559 §5.1.8.1.1.3..§5.1.8.1.1.6 use
+        // "MUST match" phrasing so dangling references are not just
+        // unfortunate — they make the Tag non-conformant.
+        if had_any_uid && resolved_uids.is_empty() {
+            continue;
+        }
+
+        // Build the legacy flat-view key prefix. Precedence is
+        // track > edition > chapter > attachment, mirroring the order
+        // RFC 9559 §5.1.8.1.1 lists the UID children. Real-world files
+        // set at most one UID anyway.
+        let prefix: String = if let Some(t) = resolved_uids.iter().find_map(|u| match u {
+            TargetUid::Track { stream_index, .. } => Some(*stream_index),
+            _ => None,
+        }) {
+            format!("tag:track:{t}:")
+        } else if let Some(e) = resolved_uids.iter().find_map(|u| match u {
+            TargetUid::Edition { edition_index, .. } => Some(*edition_index),
+            _ => None,
+        }) {
+            format!("tag:edition:{e}:")
+        } else if let Some(c) = resolved_uids.iter().find_map(|u| match u {
+            TargetUid::Chapter { chapter_index, .. } => Some(*chapter_index),
+            _ => None,
+        }) {
+            format!("tag:chapter:{c}:")
+        } else if let Some(a) = resolved_uids.iter().find_map(|u| match u {
+            TargetUid::Attachment {
+                attachment_index, ..
+            } => Some(*attachment_index),
+            _ => None,
+        }) {
+            format!("tag:attachment:{a}:")
+        } else {
+            // No resolved UIDs → global scope (all UIDs zero, or no UID
+            // children at all).
+            String::new()
+        };
+
+        // Build the typed surface. Each `SimpleTag` keeps its original
+        // case / language / default flag / binary payload — none of which
+        // the flat view exposes.
+        let mut typed_simple: Vec<SimpleTag> = Vec::with_capacity(tag.simple_tags.len());
+        for raw in &tag.simple_tags {
+            typed_simple.push(SimpleTag {
+                name: raw.name.clone(),
+                value: raw.value.clone(),
+                language: raw.language.clone(),
+                language_bcp47: raw.language_bcp47.clone(),
+                default: raw.default,
+            });
+            // Project into the legacy flat view only when the value is a
+            // non-empty string. Binary tag values (cover art, etc.) and
+            // empty placeholders are skipped to match the pre-typed
+            // behaviour where only `(name, str)` pairs surfaced.
+            if let SimpleTagValue::String(ref v) = raw.value {
+                if !raw.name.is_empty() && !v.is_empty() {
+                    let key = format!("{prefix}{}", raw.name.to_ascii_lowercase());
+                    metadata.push((key, v.clone()));
+                }
+            }
+        }
+
+        tags_out.push(Tag {
+            targets: Targets {
+                target_type_value: tag.target_type_value,
+                target_type: tag.target_type.clone(),
+                uids: resolved_uids,
+            },
+            simple_tags: typed_simple,
+        });
     }
+}
+
+/// A typed `Tag` element (RFC 9559 §5.1.8.1) with its `Targets` UIDs
+/// resolved against the per-Segment track / edition / chapter / attachment
+/// tables. Exposed via [`MkvDemuxer::tags`] so consumers can walk per-track
+/// and per-chapter metadata without re-parsing the file.
+///
+/// Companion to the flattened `metadata()` view: every `(key, value)` pair
+/// surfaced in metadata corresponds to a [`SimpleTag`] inside one of these
+/// `Tag`s, but [`SimpleTag`] additionally preserves language, default
+/// flag, original case, and binary payloads that the flat view discards.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tag {
+    /// Scope of this tag — see [`Targets`] for the per-field semantics.
+    pub targets: Targets,
+    /// One or more `(name, value)` descriptors that share this `Targets`
+    /// scope (RFC 9559 §5.1.8.1.2). Order matches the on-disk order.
+    pub simple_tags: Vec<SimpleTag>,
+}
+
+/// `Targets` master (RFC 9559 §5.1.8.1.1) — the scope of a [`Tag`].
+///
+/// An empty / omitted `Targets` master is a global scope (`uids` empty,
+/// `target_type` / `target_type_value` both `None`). When `uids` is empty
+/// but a `target_type` / `target_type_value` is set, the tag is still
+/// global as far as scoping is concerned — those fields are purely
+/// informational display hints per RFC 9559 §5.1.8.1.1.1 / §5.1.8.1.1.2.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Targets {
+    /// `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1). Default per spec is 50
+    /// ("ALBUM / OPERA / CONCERT / MOVIE / EPISODE") but we surface
+    /// `None` when the element was absent so consumers can distinguish.
+    pub target_type_value: Option<u64>,
+    /// `TargetType` informational string (RFC 9559 §5.1.8.1.1.2) — e.g.
+    /// `"ALBUM"`, `"MOVIE"`, `"TRACK"`. The spec says this MUST match
+    /// `target_type_value`'s row in Table 34 if both are present; we
+    /// don't enforce — we just surface what the file says.
+    pub target_type: Option<String>,
+    /// Resolved scope references. Empty means global scope.
+    ///
+    /// All UIDs are resolved against the Segment's tables: a
+    /// [`TargetUid::Track`] only appears here when the file actually
+    /// contains a matching `TrackUID`. Dangling references are dropped
+    /// per RFC 9559 §5.1.8.1.1.3..§5.1.8.1.1.6.
+    pub uids: Vec<TargetUid>,
+}
+
+/// One resolved entry in [`Targets::uids`]. The `_uid` field preserves
+/// the on-disk UID so consumers that want to cross-reference (e.g. emit
+/// the same tag back into a re-mux) can do so without re-reading the
+/// file; the `_index` field is the 0- or 1-indexed slot the demuxer
+/// assigned, matching the indices used in the flat `metadata()` keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetUid {
+    /// Resolved `TagTrackUID` (RFC 9559 §5.1.8.1.1.3). `stream_index` is
+    /// 0-indexed, matching [`oxideav_core::StreamInfo::index`].
+    Track { stream_index: u32, track_uid: u64 },
+    /// Resolved `TagEditionUID` (RFC 9559 §5.1.8.1.1.4). 1-indexed to
+    /// match the flat `tag:edition:N:*` key convention.
+    Edition {
+        edition_index: u32,
+        edition_uid: u64,
+    },
+    /// Resolved `TagChapterUID` (RFC 9559 §5.1.8.1.1.5). 1-indexed.
+    Chapter {
+        chapter_index: u32,
+        chapter_uid: u64,
+    },
+    /// Resolved `TagAttachmentUID` (RFC 9559 §5.1.8.1.1.6). 1-indexed.
+    Attachment {
+        attachment_index: u32,
+        attachment_uid: u64,
+    },
+}
+
+/// One `SimpleTag` element (RFC 9559 §5.1.8.1.2). Preserves the on-disk
+/// `TagName` case (the flat view lower-cases) plus language metadata and
+/// binary-payload tags (e.g. cover-art bytes) that the legacy
+/// `(key, value)` view can't represent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SimpleTag {
+    /// `TagName` (RFC 9559 §5.1.8.1.2.1).
+    pub name: String,
+    /// `TagString` / `TagBinary` payload. Mutually exclusive per the
+    /// spec, so we model them as one enum.
+    pub value: SimpleTagValue,
+    /// `TagLanguage` (RFC 9559 §5.1.8.1.2.2). Defaults to `"und"` per
+    /// the spec; we materialise the default rather than leaving it empty
+    /// so consumers don't have to special-case the absent element.
+    pub language: String,
+    /// `TagLanguageBCP47` (RFC 9559 §5.1.8.1.2.3). When present, `language`
+    /// MUST be ignored per spec.
+    pub language_bcp47: Option<String>,
+    /// `TagDefault` (RFC 9559 §5.1.8.1.2.4). Default per spec is true.
+    pub default: bool,
+}
+
+/// `TagString` vs `TagBinary` payload — mutually exclusive within one
+/// `SimpleTag` per RFC 9559 §5.1.8.1.2.5 / §5.1.8.1.2.6.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SimpleTagValue {
+    /// `TagString` (RFC 9559 §5.1.8.1.2.5) — UTF-8 text payload.
+    String(String),
+    /// `TagBinary` (RFC 9559 §5.1.8.1.2.6) — opaque bytes, used for e.g.
+    /// embedded cover art that's referenced from a SimpleTag.
+    Binary(Vec<u8>),
+    /// Neither `TagString` nor `TagBinary` was present. RFC 9559 doesn't
+    /// give either of them a mandatory minOccurs, so this case is
+    /// reachable for well-formed files.
+    #[default]
+    None,
 }
 
 /// Parse a `Chapters` master element. Each `EditionEntry` is walked, and
@@ -1066,7 +1372,13 @@ enum ClusterState {
     },
 }
 
-struct MkvDemuxer {
+/// Matroska / WebM demuxer.
+///
+/// Constructed via [`open`] (returning a boxed [`Demuxer`] trait object,
+/// the common path used by the container registry) or [`open_typed`]
+/// (returning this struct directly so consumers can call typed accessors
+/// like [`MkvDemuxer::tags`] that the trait does not expose).
+pub struct MkvDemuxer {
     input: Box<dyn ReadSeek>,
     streams: Vec<StreamInfo>,
     track_index_by_number: std::collections::HashMap<u64, u32>,
@@ -1089,6 +1401,9 @@ struct MkvDemuxer {
     /// Nanoseconds per Matroska timecode tick (the Segment\Info\TimecodeScale
     /// value, defaulted to 1_000_000 when absent).
     timecode_scale_ns: u64,
+    /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) — see
+    /// [`MkvDemuxer::tags`].
+    tags: Vec<Tag>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -1201,6 +1516,24 @@ impl Demuxer for MkvDemuxer {
 }
 
 impl MkvDemuxer {
+    /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) parsed from the
+    /// Segment, with every `Targets\Tag*UID` already resolved against the
+    /// Segment's track / edition / chapter / attachment tables.
+    ///
+    /// Surfaces information the flattened [`Demuxer::metadata`] view drops:
+    /// `TargetType` / `TargetTypeValue` informational hints
+    /// ([`Targets::target_type`] / [`Targets::target_type_value`]),
+    /// per-`SimpleTag` language ([`SimpleTag::language`] /
+    /// [`SimpleTag::language_bcp47`]), the [`SimpleTag::default`] flag,
+    /// binary tag payloads ([`SimpleTagValue::Binary`]), and the original
+    /// case of [`SimpleTag::name`] (metadata keys are lower-cased).
+    ///
+    /// Returned in segment order. Tags whose `Targets` master had only
+    /// dangling non-zero UIDs are dropped per RFC 9559 §5.1.8.1.1.3..6.
+    pub fn tags(&self) -> &[Tag] {
+        &self.tags
+    }
+
     fn advance(&mut self) -> Result<()> {
         match self.cluster_state {
             ClusterState::Idle => {

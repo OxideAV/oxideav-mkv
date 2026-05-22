@@ -69,6 +69,15 @@ the unified `oxideav` aggregator to wire decoding automatically.
   (`chapter:N:start_ms` / `:end_ms` / `:title`, ns→ms), and
   `Attachments` (`attachment:N:filename` / `:mime_type` / `:size_bytes`;
   payload is skipped, only the index surfaces).
+- **Typed `Tag` accessor**: `demux::open_typed` returns the concrete
+  `MkvDemuxer`, whose `.tags() -> &[Tag]` exposes RFC 9559 §5.1.8.1
+  fields the flat metadata view drops — `TargetType` /
+  `TargetTypeValue` informational hints, multi-UID `Targets` masters
+  (one `Tag` can scope to several tracks/chapters at once), per-
+  `SimpleTag` `TagLanguage` / `TagLanguageBCP47` / `TagDefault`,
+  and binary `TagBinary` payloads (e.g. embedded cover-art bytes).
+  Tags with only dangling non-zero UIDs are filtered out per
+  §5.1.8.1.1.3..§5.1.8.1.1.6; mixed Targets keep their resolvable UIDs.
 - Duration: `Segment\Info\Duration` translated to microseconds.
 - Seek: `seek_to(stream, pts)` uses the Cues index. Handles Cues at
   either end of the Segment, and walks an unknown-size final Cluster to

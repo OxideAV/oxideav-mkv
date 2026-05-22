@@ -56,6 +56,13 @@ pub const SIMPLE_TAG: u32 = 0x67C8;
 pub const TAG_NAME: u32 = 0x45A3;
 pub const TAG_STRING: u32 = 0x4487;
 pub const TAG_LANGUAGE: u32 = 0x447A;
+// `TagLanguageBCP47` (RFC 9559 §5.1.8.1.2.3), `TagDefault` (§5.1.8.1.2.4)
+// and `TagBinary` (§5.1.8.1.2.6) — needed by the typed [`Tag`] surface so
+// consumers can see per-language and binary-payload SimpleTags without
+// having to re-parse the file.
+pub const TAG_LANGUAGE_BCP47: u32 = 0x447B;
+pub const TAG_DEFAULT: u32 = 0x4484;
+pub const TAG_BINARY: u32 = 0x4485;
 
 // Tracks > TrackEntry.
 pub const TRACK_ENTRY: u32 = 0xAE;

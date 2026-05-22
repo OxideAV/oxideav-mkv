@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: typed `MkvDemuxer::tags() -> &[Tag]` accessor exposes
+  `Targets` (`TargetType` string + `TargetTypeValue` + resolved
+  `TargetUid` references), per-`SimpleTag` language /
+  `TagLanguageBCP47` / `TagDefault` flag, and binary `TagBinary`
+  payloads (cover-art bytes etc.) that the legacy flat
+  `metadata()` view drops. Multi-UID `Targets` masters preserve
+  every resolvable reference; dangling non-zero UIDs are filtered
+  out per RFC 9559 §5.1.8.1.1.3..§5.1.8.1.1.6. New
+  `demux::open_typed` returns the concrete `MkvDemuxer` so callers
+  can reach the new accessor; the trait-returning `demux::open`
+  is unchanged.
 - mux: add `Chapters` encoding (RFC 9559 §5.1.7). New
   `MkvMuxer::add_chapter(start_ns, end_ns, title)` queues an
   English-language `ChapterAtom`; `add_chapter_full(MkvChapter)`
