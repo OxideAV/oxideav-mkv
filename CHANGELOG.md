@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- mux: opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5,
+  §10.3). New `MkvMuxer::with_block_lacing(LacingMode)` aggregates
+  same-track, same-keyframe-status consecutive frames into a
+  single laced `SimpleBlock` — Xiph (255-additive octets), EBML
+  (signed-VINT deltas), or fixed-size (no per-frame header).
+  Defaults to `LacingMode::None` (one frame per Block, byte-
+  identical with prior versions). Per-Block frame cap is 8;
+  cluster boundaries flush. When opted in, the muxer writes
+  `TrackEntry.FlagLacing = 1` and sets the LACING bits in the
+  SimpleBlock flags byte per §10.2.
 - demux: typed `MkvDemuxer::tags() -> &[Tag]` accessor exposes
   `Targets` (`TargetType` string + `TargetTypeValue` + resolved
   `TargetUid` references), per-`SimpleTag` language /

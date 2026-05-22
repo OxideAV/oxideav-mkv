@@ -112,6 +112,21 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.
+- Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
+  `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
+  before `write_header` aggregates same-track, same-keyframe-status
+  consecutive frames (up to 8 per Block, never crossing a cluster
+  boundary) into a single laced `SimpleBlock`. Default stays
+  `LacingMode::None` (one frame per Block, `FlagLacing = 0`) for
+  byte-identical back-compat. When lacing is on, the muxer writes
+  `TrackEntry.FlagLacing = 1`, sets the LACING bits in the
+  SimpleBlock flags byte to the requested mode, and encodes the
+  per-frame size header (Xiph 255-additive octets,
+  EBML signed-VINT deltas, or no header for fixed-size). For
+  fixed-size mode, a frame whose size differs from the buffered run
+  flushes the lace and starts a new one. Demuxer side already
+  handles all three modes — the new write path completes the
+  round-trip in-tree.
 
 ### Codec ID mapping (`codec_id` module)
 
@@ -144,8 +159,6 @@ so the demuxer never hides an unrecognised track.
 
 ## What's NOT implemented
 
-- No block lacing on write; every frame becomes a standalone
-  SimpleBlock. The read side handles all three lacing modes.
 - `Chapters` and `Attachments` are read into the metadata vector only —
   the demuxer doesn't yet expose a structured chapter or attachment list.
   Attachment payload bytes are skipped (not loaded into memory); only

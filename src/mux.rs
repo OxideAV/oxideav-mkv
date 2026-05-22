@@ -66,6 +66,67 @@ impl DocType {
     }
 }
 
+/// Opt-in block-lacing mode for the muxer (RFC 9559 §5.1.4.5.5,
+/// §10.3). When enabled, the muxer aggregates small consecutive
+/// same-track frames into a single laced [`SimpleBlock`] instead of
+/// emitting one Block per packet. Default is [`LacingMode::None`] —
+/// every packet still becomes a standalone SimpleBlock, matching the
+/// pre-lacing-on-write behaviour.
+///
+/// Aggregation rules (applied uniformly across all three lacing
+/// modes):
+/// - Same-track only (lacing across tracks is not supported by the
+///   on-disk format).
+/// - Same cluster only (a Block timestamp is a signed 16-bit offset
+///   from the cluster timecode; a new cluster flushes any pending
+///   lace).
+/// - Same keyframe status — all frames in one lace either are
+///   keyframes or are not, since the SimpleBlock KEY bit applies to
+///   the whole Block.
+/// - Up to 8 frames per Block. The on-disk format allows up to 256
+///   (the lacing head is `n_frames - 1`, max 255); 8 is the cap the
+///   muxer applies in practice to keep individual Blocks bounded and
+///   to match the "small frames" recommendation in RFC 9559 §10.3
+///   (lacing is for size economy on small frames, not for assembling
+///   very large composite payloads).
+/// - For [`LacingMode::FixedSize`], all frames in a lace must have
+///   the exact same size — a candidate frame whose size differs from
+///   the buffered run flushes the lace as-is and starts a new one.
+///
+/// When lacing is enabled, the [`MkvMuxer`] also writes
+/// `TrackEntry.FlagLacing = 1` (RFC 9559 §5.1.4.1.12) instead of the
+/// default-off `0`. Players that key on `FlagLacing` know they need
+/// to decode lacing modes on the affected tracks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LacingMode {
+    /// No lacing — one frame per Block (the default).
+    #[default]
+    None,
+    /// Xiph lacing (RFC 9559 §10.3.2): per-frame sizes encoded as
+    /// 255-additive runs of unsigned octets, the same scheme as Ogg.
+    Xiph,
+    /// EBML lacing (RFC 9559 §10.3.3): first frame size as an
+    /// unsigned VINT, subsequent sizes as signed VINT deltas.
+    Ebml,
+    /// Fixed-size lacing (RFC 9559 §10.3.4): no per-frame size
+    /// header; every frame in the lace must have identical size.
+    FixedSize,
+}
+
+impl LacingMode {
+    /// LACING bits (positions 1..3 of the SimpleBlock flags byte)
+    /// per RFC 9559 §10.2: 00 = none, 01 = Xiph, 10 = fixed-size,
+    /// 11 = EBML.
+    fn flag_bits(self) -> u8 {
+        match self {
+            LacingMode::None => 0b00,
+            LacingMode::Xiph => 0b01,
+            LacingMode::FixedSize => 0b10,
+            LacingMode::Ebml => 0b11,
+        }
+    }
+}
+
 pub struct MkvMuxer {
     output: Box<dyn WriteSeek>,
     streams: Vec<StreamInfo>,
@@ -113,7 +174,48 @@ pub struct MkvMuxer {
     /// `Chapters` SeekHead entry is patched at the same time. Empty list
     /// → no `Chapters` element written and the SeekHead slot is voided.
     chapters: Vec<MkvChapter>,
+    /// Opt-in block lacing mode (RFC 9559 §10.3). Default is
+    /// [`LacingMode::None`] which preserves the legacy
+    /// one-SimpleBlock-per-packet behaviour. Anything else causes
+    /// [`MkvMuxer::write_packet`] to buffer same-track packets into
+    /// a per-track [`LaceBuffer`] and emit them as a single laced
+    /// SimpleBlock on the next flush point (track switch, cluster
+    /// boundary, write_trailer, lace-cap, or a fixed-size mismatch).
+    lacing_mode: LacingMode,
+    /// Per-stream packet buffer for lace aggregation. Always empty
+    /// when `lacing_mode == LacingMode::None`. At most one stream's
+    /// buffer is non-empty at a time — emitting a packet for a
+    /// different track flushes whichever buffer was previously
+    /// pending. The buffer carries each pending packet's bytes plus
+    /// the keyframe flag of the first packet (the SimpleBlock KEY
+    /// bit applies to the whole Block).
+    lace_pending: Vec<LaceBuffer>,
 }
+
+/// Per-stream packet aggregation buffer used when lacing is on.
+/// Holds the in-flight frames for one track up to the point where
+/// the muxer decides to flush the lace — either because the next
+/// packet has different track / keyframe / cluster / size
+/// properties, or because the per-Block frame cap was reached.
+#[derive(Clone, Debug, Default)]
+struct LaceBuffer {
+    /// Encoded frame payloads queued for this track in arrival
+    /// order. First frame's timestamp becomes the Block timestamp.
+    frames: Vec<Vec<u8>>,
+    /// Cluster-relative timecode (ms) of the first frame, captured
+    /// at append time. Lacing flushes carry this verbatim into the
+    /// SimpleBlock header.
+    first_timecode_offset: i16,
+    /// KEY bit value to write on the resulting SimpleBlock —
+    /// inherits from the first frame in the lace.
+    keyframe: bool,
+}
+
+/// Soft cap on frames-per-Block. The on-disk format permits 256
+/// (lacing head is `n_frames - 1`, max 255 → 256 frames). 8 keeps
+/// individual Blocks bounded and matches the "small frames"
+/// recommendation in RFC 9559 §10.3.
+const MAX_FRAMES_PER_LACE: usize = 8;
 
 /// One chapter atom as fed to the muxer.
 ///
@@ -217,7 +319,41 @@ impl MkvMuxer {
             trailer_written: false,
             doc_type,
             chapters: Vec::new(),
+            lacing_mode: LacingMode::None,
+            lace_pending: vec![LaceBuffer::default(); n],
         })
+    }
+
+    /// Opt the muxer in to block lacing (RFC 9559 §10.3). Must be
+    /// called before [`Muxer::write_header`]; returns
+    /// [`Error::other`] otherwise — `FlagLacing` is part of the
+    /// `Tracks` element and we don't rewrite Tracks once it's been
+    /// emitted.
+    ///
+    /// `LacingMode::None` is the default and matches the legacy
+    /// behaviour (one SimpleBlock per packet, `FlagLacing = 0`).
+    /// Any other mode causes the muxer to aggregate same-track
+    /// frames (subject to the rules listed on [`LacingMode`]) into
+    /// laced SimpleBlocks, and writes `FlagLacing = 1` on every
+    /// `TrackEntry`.
+    ///
+    /// Returns a mutable reference back so calls can chain
+    /// builder-style if the caller has a `&mut MkvMuxer`.
+    pub fn with_block_lacing(&mut self, mode: LacingMode) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_block_lacing called after write_header",
+            ));
+        }
+        self.lacing_mode = mode;
+        Ok(self)
+    }
+
+    /// Read-only accessor for the currently configured lacing mode.
+    /// Returns [`LacingMode::None`] when the muxer is in default
+    /// (no-lacing) state. Useful for tests + diagnostics.
+    pub fn block_lacing_mode(&self) -> LacingMode {
+        self.lacing_mode
     }
 
     /// Queue a chapter atom with one English-language `ChapterDisplay`
@@ -377,7 +513,19 @@ impl Muxer for MkvMuxer {
                 _ => 17, // treat as subtitle/data fallback
             };
             write_uint_element(&mut t, ids::TRACK_TYPE, track_type);
-            write_uint_element(&mut t, ids::FLAG_LACING, 0);
+            // RFC 9559 §5.1.4.1.12: FlagLacing = 1 advertises that
+            // this track MAY carry laced Blocks. We write 1
+            // unconditionally once any lacing mode is opted in,
+            // since the per-track choice of whether a given Block
+            // ends up laced is made at write time based on packet
+            // sizes / keyframe boundaries. With LacingMode::None the
+            // muxer never laces, so FlagLacing stays at 0.
+            let flag_lacing = if self.lacing_mode == LacingMode::None {
+                0
+            } else {
+                1
+            };
+            write_uint_element(&mut t, ids::FLAG_LACING, flag_lacing);
             if let Some(name) = codec_id::to_matroska(&s.params.codec_id) {
                 write_string_element(&mut t, ids::CODEC_ID, name);
             } else {
@@ -519,12 +667,35 @@ impl Muxer for MkvMuxer {
 
         let pts_ms = pts_to_ms(effective_pts, stream_time_base);
 
+        // Flush any pending lace on a different track than this packet,
+        // and flush the current track's lace before any cluster
+        // restart — both because a lace is bounded to a single
+        // cluster (the Block timestamp is a cluster-relative
+        // signed 16-bit offset; spanning clusters would orphan the
+        // tail frames' implicit timestamps) and because the
+        // SimpleBlock KEY bit applies to the whole Block.
+        if self.lacing_mode != LacingMode::None {
+            for other_idx in 0..self.lace_pending.len() {
+                if other_idx != stream_idx && !self.lace_pending[other_idx].frames.is_empty() {
+                    self.flush_lace(other_idx)?;
+                }
+            }
+        }
+
         // Decide whether to start a new cluster.
-        if !self.cluster_open
+        let needs_new_cluster = !self.cluster_open
             || pts_ms - self.cluster_timecode_ms > CLUSTER_DURATION_MS
             || pts_ms - self.cluster_timecode_ms > i16::MAX as i64
-            || pts_ms - self.cluster_timecode_ms < 0
-        {
+            || pts_ms - self.cluster_timecode_ms < 0;
+        if needs_new_cluster {
+            // Flush the in-flight lace on the SAME track before
+            // moving to a new cluster — its frames belong to the
+            // old cluster's timecode space.
+            if self.lacing_mode != LacingMode::None
+                && !self.lace_pending[stream_idx].frames.is_empty()
+            {
+                self.flush_lace(stream_idx)?;
+            }
             self.start_cluster(pts_ms)?;
         }
 
@@ -554,15 +725,37 @@ impl Muxer for MkvMuxer {
             }
         }
 
-        let block_bytes =
-            build_simple_block(track_number, timecode_offset as i16, packet, &packet.data);
-        self.output.write_all(&block_bytes)?;
+        if self.lacing_mode == LacingMode::None {
+            // Fast path: emit a standalone SimpleBlock with lacing
+            // bits = 00 (RFC 9559 §10.3.1). Matches the
+            // pre-with_block_lacing behaviour byte-for-byte.
+            let block_bytes = build_simple_block(
+                track_number,
+                timecode_offset as i16,
+                packet.flags.keyframe,
+                LacingMode::None,
+                std::slice::from_ref(&packet.data),
+            );
+            self.output.write_all(&block_bytes)?;
+        } else {
+            self.append_to_lace(stream_idx, timecode_offset as i16, packet)?;
+        }
         Ok(())
     }
 
     fn write_trailer(&mut self) -> Result<()> {
         if self.trailer_written {
             return Ok(());
+        }
+        // Flush any in-flight lace buffers before the last Cluster is
+        // sealed by the Cues element — otherwise the buffered frames
+        // would be silently dropped.
+        if self.lacing_mode != LacingMode::None {
+            for i in 0..self.lace_pending.len() {
+                if !self.lace_pending[i].frames.is_empty() {
+                    self.flush_lace(i)?;
+                }
+            }
         }
         // Emit a Cues element after the last Cluster. The prior clusters are
         // left with unknown size (their EBML parser stops when it meets the
@@ -646,6 +839,82 @@ impl MkvMuxer {
         Ok(Some(cues_abs.saturating_sub(self.segment_data_start)))
     }
 
+    /// Append one frame to the lace buffer for `stream_idx`.
+    ///
+    /// The append flushes the existing buffer first when the new
+    /// packet cannot extend it — different keyframe flag, the
+    /// per-Block frame cap reached, or (for `LacingMode::FixedSize`)
+    /// a size mismatch with the buffered run. After the flush, the
+    /// new packet seeds the buffer with its own timecode + keyframe
+    /// flag.
+    ///
+    /// The buffer's first frame anchors the resulting Block's
+    /// timecode (per RFC 9559 §10.3.5: a Block carries one
+    /// timestamp value, which "applies to the first frame in the
+    /// lace"). Subsequent frames' presentation timestamps are
+    /// inferred by the demuxer from `DefaultDuration` or the
+    /// laced-frames spec, and the muxer doesn't write per-frame
+    /// timestamps anywhere on disk.
+    fn append_to_lace(
+        &mut self,
+        stream_idx: usize,
+        timecode_offset: i16,
+        packet: &Packet,
+    ) -> Result<()> {
+        // Decide if the buffer can absorb this frame. Conditions
+        // for "incompatible with current lace" (flush + restart):
+        //   * keyframe flag differs (KEY bit applies to the whole
+        //     Block)
+        //   * we've hit the frame cap
+        //   * (FixedSize only) frame size differs from the
+        //     buffered run
+        let must_flush = {
+            let buf = &self.lace_pending[stream_idx];
+            if buf.frames.is_empty() {
+                false
+            } else {
+                buf.keyframe != packet.flags.keyframe
+                    || buf.frames.len() >= MAX_FRAMES_PER_LACE
+                    || (self.lacing_mode == LacingMode::FixedSize
+                        && buf.frames[0].len() != packet.data.len())
+            }
+        };
+        if must_flush {
+            self.flush_lace(stream_idx)?;
+        }
+        let buf = &mut self.lace_pending[stream_idx];
+        if buf.frames.is_empty() {
+            buf.first_timecode_offset = timecode_offset;
+            buf.keyframe = packet.flags.keyframe;
+        }
+        buf.frames.push(packet.data.clone());
+        Ok(())
+    }
+
+    /// Drain the lace buffer for `stream_idx` to disk as a single
+    /// SimpleBlock — laced if more than one frame is queued, or as
+    /// a `LacingMode::None` Block if exactly one frame is queued
+    /// (the spec forbids lacing a single frame; see RFC 9559
+    /// §10.3 "Lacing MUST NOT be used to store a single frame").
+    fn flush_lace(&mut self, stream_idx: usize) -> Result<()> {
+        let frames = std::mem::take(&mut self.lace_pending[stream_idx].frames);
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let track_number = self.track_numbers[stream_idx];
+        let tc_offset = self.lace_pending[stream_idx].first_timecode_offset;
+        let keyframe = self.lace_pending[stream_idx].keyframe;
+        // Per §10.3, a single-frame lace MUST use no-lacing mode.
+        let mode = if frames.len() == 1 {
+            LacingMode::None
+        } else {
+            self.lacing_mode
+        };
+        let block_bytes = build_simple_block(track_number, tc_offset, keyframe, mode, &frames);
+        self.output.write_all(&block_bytes)?;
+        Ok(())
+    }
+
     /// Seek back to the SeekHead and either write the real Cues offset into
     /// the Cues SeekPosition slot, or replace the entire 21-byte Seek entry
     /// with a Void filler if `cues_offset_rel` is `None`. Restores the
@@ -677,22 +946,189 @@ impl MkvMuxer {
     }
 }
 
-/// Build a SimpleBlock element: track number (vint) + timecode (s16) + flags
-/// + frame data, wrapped in id + size.
-fn build_simple_block(track: u64, tc_offset: i16, packet: &Packet, data: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(4 + data.len());
+/// Build a SimpleBlock element (RFC 9559 §10.2). `frames` is the
+/// ordered list of frame payloads — exactly one for `LacingMode::None`,
+/// two or more for a laced Block. The KEY bit (`keyframe`) applies
+/// to the whole Block; lacing bits come from `mode.flag_bits()`.
+///
+/// Block layout (matches Figure 13 / §10.2 of RFC 9559):
+///   - TrackNumber as a VINT (1..8 bytes)
+///   - Timestamp as signed 16-bit big-endian
+///   - 8-bit flags: KEY | rsvd(3) | INV | LACING(2) | DIS
+///   - lacing-payload header (FrameSizes; absent for `None` /
+///     `FixedSize` rules differ — see emit_*_lacing functions)
+///   - frame payloads concatenated
+fn build_simple_block(
+    track: u64,
+    tc_offset: i16,
+    keyframe: bool,
+    mode: LacingMode,
+    frames: &[Vec<u8>],
+) -> Vec<u8> {
+    // Conservative initial capacity: header + sum of frame sizes.
+    let payload_total: usize = frames.iter().map(|f| f.len()).sum();
+    let mut body = Vec::with_capacity(4 + payload_total + 8 * frames.len());
     body.extend_from_slice(&write_vint(track, 0));
     body.extend_from_slice(&tc_offset.to_be_bytes());
     let mut flags: u8 = 0;
-    if packet.flags.keyframe {
+    if keyframe {
         flags |= 0x80;
     }
+    // LACING bits sit in positions 1..3 of the flags byte (RFC 9559
+    // §10.2). `mode.flag_bits()` returns the 2-bit value; shift
+    // left by 1 to place it correctly.
+    flags |= mode.flag_bits() << 1;
     body.push(flags);
-    body.extend_from_slice(data);
+
+    match mode {
+        LacingMode::None => {
+            debug_assert_eq!(
+                frames.len(),
+                1,
+                "no-lacing Block must carry exactly 1 frame"
+            );
+            body.extend_from_slice(&frames[0]);
+        }
+        LacingMode::Xiph => {
+            emit_xiph_lacing(&mut body, frames);
+        }
+        LacingMode::Ebml => {
+            emit_ebml_lacing(&mut body, frames);
+        }
+        LacingMode::FixedSize => {
+            emit_fixed_lacing(&mut body, frames);
+        }
+    }
+
     let mut out = Vec::with_capacity(8 + body.len());
     out.extend_from_slice(&write_element_id(ids::SIMPLE_BLOCK));
     out.extend_from_slice(&write_vint(body.len() as u64, 0));
     out.extend_from_slice(&body);
+    out
+}
+
+/// Append a Xiph-lacing payload to `body` (RFC 9559 §10.3.2):
+/// `n_frames-1` octet, then for every frame except the last the
+/// size as a sum of 255-additive unsigned octets (e.g. 500 →
+/// `0xFF 0xF5`; 765 → `0xFF 0xFF 0xFF 0x00`), then the frame
+/// payloads concatenated. The last frame's size is implicit
+/// (Block size minus everything else).
+fn emit_xiph_lacing(body: &mut Vec<u8>, frames: &[Vec<u8>]) {
+    debug_assert!(frames.len() >= 2 && frames.len() <= 256);
+    body.push((frames.len() - 1) as u8);
+    // Per-frame size for every frame except the last.
+    for f in &frames[..frames.len() - 1] {
+        let mut remaining = f.len();
+        while remaining >= 255 {
+            body.push(0xFF);
+            remaining -= 255;
+        }
+        body.push(remaining as u8);
+    }
+    for f in frames {
+        body.extend_from_slice(f);
+    }
+}
+
+/// Append a fixed-size-lacing payload to `body` (RFC 9559 §10.3.4):
+/// `n_frames-1` octet, then the frame payloads concatenated. No
+/// per-frame size header — every frame must have identical size,
+/// which the caller ([`MkvMuxer::append_to_lace`]) enforces by
+/// flushing on a size mismatch.
+fn emit_fixed_lacing(body: &mut Vec<u8>, frames: &[Vec<u8>]) {
+    debug_assert!(frames.len() >= 2 && frames.len() <= 256);
+    debug_assert!(
+        frames.iter().all(|f| f.len() == frames[0].len()),
+        "fixed-size lacing requires equal-size frames"
+    );
+    body.push((frames.len() - 1) as u8);
+    for f in frames {
+        body.extend_from_slice(f);
+    }
+}
+
+/// Append an EBML-lacing payload to `body` (RFC 9559 §10.3.3):
+/// `n_frames-1` octet, first frame size as an unsigned VINT,
+/// remaining sizes as signed VINT deltas (signed → unsigned with
+/// `+ 2^(7n-1) - 1` bias, per Table 37), then frame payloads
+/// concatenated. The last frame's size is implicit.
+fn emit_ebml_lacing(body: &mut Vec<u8>, frames: &[Vec<u8>]) {
+    debug_assert!(frames.len() >= 2 && frames.len() <= 256);
+    body.push((frames.len() - 1) as u8);
+    // First frame size: unsigned VINT.
+    body.extend_from_slice(&write_vint(frames[0].len() as u64, 0));
+    // Remaining sizes (except the last): signed deltas.
+    let mut prev = frames[0].len() as i64;
+    for f in &frames[1..frames.len() - 1] {
+        let cur = f.len() as i64;
+        let delta = cur - prev;
+        body.extend_from_slice(&write_signed_vint(delta));
+        prev = cur;
+    }
+    for f in frames {
+        body.extend_from_slice(f);
+    }
+}
+
+/// Encode a signed integer as a VINT with the §10.3.3 sign-to-
+/// unsigned mapping. The smallest valid width is chosen so the
+/// signed value fits exactly in its range (Table 37):
+///
+/// | width | range                                  |
+/// |-------|----------------------------------------|
+/// | 1     | -2^6 + 1 ..= 2^6                       |
+/// | 2     | -2^13 + 1 ..= 2^13                     |
+/// | 3     | -2^20 + 1 ..= 2^20                     |
+/// | 4     | -2^27 + 1 ..= 2^27                     |
+///
+/// Unsigned encoding: `unsigned = signed + 2^(7n-1) - 1` for
+/// width n. The result is then written as a fixed-width VINT —
+/// the decoder reads the width from the leading-zeros prefix and
+/// derives the bias from `n`, so emitting at a larger-than-
+/// necessary width would land at the wrong bias and decode to a
+/// different signed value. The bias-encoded value for the maximum
+/// positive end of the range collides with that width's
+/// "unknown-size sentinel" (`all-payload-ones`) for element-size
+/// VINTs, so we use the lacing-specific helper [`write_vint_fixed`]
+/// that emits the literal bit pattern without the sentinel
+/// rejection that [`write_vint`] applies.
+fn write_signed_vint(value: i64) -> Vec<u8> {
+    for width in 1u8..=8 {
+        let bias = (1i64 << (7 * width as i64 - 1)) - 1;
+        let max_pos = 1i64 << (7 * width as i64 - 1);
+        let min_neg = -(max_pos - 1);
+        if value >= min_neg && value <= max_pos {
+            let unsigned = (value + bias) as u64;
+            return write_vint_fixed(unsigned, width);
+        }
+    }
+    panic!("EBML signed VINT: value {value} out of range");
+}
+
+/// Emit `value` as a VINT at exactly `width` bytes, without the
+/// "value equals the all-ones unknown-size sentinel" rejection
+/// that [`write_vint`] applies. The sentinel rule applies to
+/// element-size VINTs (RFC 8794 §6.1); lacing-payload sizes
+/// (RFC 9559 §10.3.3) carry the literal bit pattern, so for those
+/// we deliberately allow the all-payload-ones encoding.
+///
+/// Caller must guarantee `value < 2^(7*width)` — otherwise the
+/// value would not fit and the function panics. Width must be in
+/// `1..=8`.
+fn write_vint_fixed(value: u64, width: u8) -> Vec<u8> {
+    assert!((1..=8).contains(&width), "VINT width must be 1..=8");
+    let payload_bits = 7u32 * width as u32;
+    if payload_bits < 64 && value >= (1u64 << payload_bits) {
+        panic!("write_vint_fixed: value {value} exceeds {width}-byte VINT range");
+    }
+    let mut out = vec![0u8; width as usize];
+    // Marker bit at top of byte 0.
+    out[0] = 1u8 << (8 - width);
+    let mut v = value;
+    for i in (0..width as usize).rev() {
+        out[i] |= (v & 0xFF) as u8;
+        v >>= 8;
+    }
     out
 }
 
