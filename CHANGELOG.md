@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **`TrackOperation` typed decode** (RFC 9559 §5.1.4.1.30). A
+  virtual track assembled from other tracks now surfaces through
+  `MkvDemuxer::track_operation(stream_index)` and the per-stream
+  `track_operations()` slice. `TrackCombinePlanes` (§5.1.4.1.30.1) decodes
+  into a `Vec<TrackPlane>` — each `TrackPlane` pairs a referenced track
+  with its `TrackPlaneType` (`LeftEye` / `RightEye` / `Background`, with
+  `Other(u64)` preserving FCFS-registry values per §27.17) — and
+  `TrackJoinBlocks` (§5.1.4.1.30.5) into a `Vec<TrackRef>`. Every
+  `TrackPlaneUID` / `TrackJoinUID` is resolved back to a `TrackRef`
+  carrying both the on-disk `TrackUID` and the matching 0-indexed stream
+  index (`None` for a dangling reference, kept rather than dropped). A
+  `TrackPlane` missing its mandatory `TrackPlaneUID` and a zero
+  `TrackJoinUID` ("not 0" per spec) are dropped. New public
+  `demux::{TrackOperation, TrackPlane, TrackPlaneType, TrackRef}` types.
 - demux: **CRC-32 validation** on Top-Level master elements (RFC 8794
   §11.3.1, RFC 9559 §6.2). When `Info` / `Tracks` / `Tags` / `Cues` /
   `Chapters` / `Attachments` / `SeekHead` carries a leading `CRC-32`

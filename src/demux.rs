@@ -345,6 +345,31 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         &mut typed_tags,
     );
 
+    // Resolve each track's `TrackOperation` (RFC 9559 §5.1.4.1.30): map the
+    // raw `TrackPlaneUID` / `TrackJoinUID` references onto stream indices via
+    // the same `TrackUID -> index` table the tag resolver uses. Indexed by
+    // stream index so the typed accessor is a direct lookup.
+    let resolve_ref = |uid: u64| TrackRef {
+        track_uid: uid,
+        stream_index: track_uid_to_index.get(&uid).copied(),
+    };
+    let track_operations: Vec<Option<TrackOperation>> = tracks
+        .iter()
+        .map(|t| {
+            t.track_operation.as_ref().map(|raw| TrackOperation {
+                planes: raw
+                    .planes
+                    .iter()
+                    .map(|&(uid, ty)| TrackPlane {
+                        track: resolve_ref(uid),
+                        plane_type: TrackPlaneType::from_raw(ty),
+                    })
+                    .collect(),
+                join_tracks: raw.join_uids.iter().map(|&uid| resolve_ref(uid)).collect(),
+            })
+        })
+        .collect();
+
     // Position at the first Cluster.
     let cluster_pos = first_cluster_offset.ok_or_else(|| Error::invalid("MKV: no clusters"))?;
     input.seek(SeekFrom::Start(cluster_pos))?;
@@ -379,6 +404,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         timecode_scale_ns,
         tags: typed_tags,
         crc_status,
+        track_operations,
     })
 }
 
@@ -503,6 +529,26 @@ struct TrackEntry {
     bit_depth: u64,
     width: u64,
     height: u64,
+    /// Raw `TrackOperation` (RFC 9559 §5.1.4.1.30) captured during the
+    /// segment walk. Its `TrackPlaneUID` / `TrackJoinUID` references point
+    /// at other tracks by `TrackUID`; they're resolved to stream indices
+    /// after the full Tracks list is known. `None` when the TrackEntry has
+    /// no `TrackOperation` child (the common case for ordinary tracks).
+    track_operation: Option<RawTrackOperation>,
+}
+
+/// Parser-private staging form of `TrackOperation` — the plane / join
+/// references are still raw `TrackUID`s here. Resolved into the public
+/// [`TrackOperation`] (with `TrackUID` -> stream-index mapping) once the
+/// whole Tracks list has been parsed.
+#[derive(Default)]
+struct RawTrackOperation {
+    /// `(TrackPlaneUID, TrackPlaneType)` pairs from `TrackCombinePlanes`
+    /// (RFC 9559 §5.1.4.1.30.1). A `TrackPlane` with no `TrackPlaneUID`
+    /// is illegal (minOccurs=1) and dropped.
+    planes: Vec<(u64, u64)>,
+    /// `TrackJoinUID`s from `TrackJoinBlocks` (RFC 9559 §5.1.4.1.30.5).
+    join_uids: Vec<u64>,
 }
 
 fn parse_info(
@@ -1007,6 +1053,97 @@ pub enum SimpleTagValue {
     None,
 }
 
+/// A resolved `TrackOperation` (RFC 9559 §5.1.4.1.30) describing a virtual
+/// track that is built by combining other tracks. Surfaced per stream via
+/// [`MkvDemuxer::track_operations`].
+///
+/// Two independent mechanisms can appear (a single virtual track MAY use
+/// both):
+///
+/// * `TrackCombinePlanes` (§5.1.4.1.30.1) — the [`planes`](Self::planes)
+///   list names video tracks combined into one stereoscopic 3D track,
+///   each tagged with its [`TrackPlaneType`] (left / right eye, background).
+/// * `TrackJoinBlocks` (§5.1.4.1.30.5) — the
+///   [`join_tracks`](Self::join_tracks) list names tracks whose Blocks are
+///   joined into a single timeline.
+///
+/// Each referenced track is reported as a [`TrackRef`] carrying both the
+/// on-disk `TrackUID` and, when that UID matches a track in the same
+/// Segment, the resolved 0-indexed stream index. References that don't
+/// resolve to a present track keep their `stream_index == None` rather than
+/// being dropped — the spec lets a virtual track reference a track that a
+/// reader chose not to surface.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackOperation {
+    /// Resolved `TrackCombinePlanes` planes, in on-disk order. Empty when
+    /// the operation has no `TrackCombinePlanes` child.
+    pub planes: Vec<TrackPlane>,
+    /// Resolved `TrackJoinBlocks` track references, in on-disk order. Empty
+    /// when the operation has no `TrackJoinBlocks` child.
+    pub join_tracks: Vec<TrackRef>,
+}
+
+impl TrackOperation {
+    /// True when this operation carries neither planes nor join references —
+    /// i.e. an empty `TrackOperation` master. Such a track is not really a
+    /// virtual track, but the element is legal so we still surface it.
+    pub fn is_empty(&self) -> bool {
+        self.planes.is_empty() && self.join_tracks.is_empty()
+    }
+}
+
+/// One `TrackPlane` (RFC 9559 §5.1.4.1.30.2) inside a
+/// [`TrackOperation::planes`] list: a referenced video track plus the role
+/// it plays in the combined 3D track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackPlane {
+    /// The plane's source track, resolved from its `TrackPlaneUID`.
+    pub track: TrackRef,
+    /// `TrackPlaneType` (RFC 9559 §5.1.4.1.30.4).
+    pub plane_type: TrackPlaneType,
+}
+
+/// `TrackPlaneType` (RFC 9559 §5.1.4.1.30.4, Table 20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackPlaneType {
+    /// `0` — left eye.
+    LeftEye,
+    /// `1` — right eye.
+    RightEye,
+    /// `2` — background.
+    Background,
+    /// `3..` — a value registered under the IANA "Matroska Track Plane
+    /// Types" registry (RFC 9559 §27.17) that this build doesn't name.
+    Other(u64),
+}
+
+impl TrackPlaneType {
+    /// Map a raw `TrackPlaneType` integer onto the enum, preserving
+    /// unrecognised values via [`TrackPlaneType::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::TRACK_PLANE_TYPE_LEFT_EYE => TrackPlaneType::LeftEye,
+            ids::TRACK_PLANE_TYPE_RIGHT_EYE => TrackPlaneType::RightEye,
+            ids::TRACK_PLANE_TYPE_BACKGROUND => TrackPlaneType::Background,
+            other => TrackPlaneType::Other(other),
+        }
+    }
+}
+
+/// A reference to a track from within a [`TrackOperation`], keyed by
+/// `TrackUID`. The `stream_index` is the resolved 0-indexed position in
+/// [`Demuxer::streams`](oxideav_core::Demuxer::streams) when the UID
+/// matches a track in the same Segment, or `None` for a dangling
+/// reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackRef {
+    /// The referenced `TrackUID` as stored in the file.
+    pub track_uid: u64,
+    /// Resolved 0-indexed stream index, or `None` when no track in the
+    /// Segment carries this `TrackUID`.
+    pub stream_index: Option<u32>,
+}
+
 /// Parse a `Chapters` master element. Each `EditionEntry` is walked, and
 /// each `ChapterAtom` inside it is lifted into the metadata vector as
 /// three entries: `chapter:N:start_ms`, `chapter:N:end_ms` (when present),
@@ -1454,6 +1591,86 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 let body_end = r.stream_position()? + e.size;
                 parse_video(r, body_end, t)?;
             }
+            ids::TRACK_OPERATION => {
+                let body_end = r.stream_position()? + e.size;
+                let mut op = RawTrackOperation::default();
+                parse_track_operation(r, body_end, &mut op)?;
+                t.track_operation = Some(op);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse `TrackOperation` (RFC 9559 §5.1.4.1.30): a virtual track built
+/// from other tracks via `TrackCombinePlanes` (3D plane combining) and/or
+/// `TrackJoinBlocks` (block timeline joining).
+fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::TRACK_COMBINE_PLANES => {
+                let body_end = r.stream_position()? + e.size;
+                parse_combine_planes(r, body_end, op)?;
+            }
+            ids::TRACK_JOIN_BLOCKS => {
+                let body_end = r.stream_position()? + e.size;
+                parse_join_blocks(r, body_end, op)?;
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse `TrackCombinePlanes` (RFC 9559 §5.1.4.1.30.1) — a list of
+/// `TrackPlane` masters, each carrying a `TrackPlaneUID` + `TrackPlaneType`.
+fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::TRACK_PLANE => {
+                let body_end = r.stream_position()? + e.size;
+                let mut uid: Option<u64> = None;
+                // Default per Table 20 / §5.1.4.1.30.4: absent type means 0
+                // (left eye), but we only keep it when a UID is present.
+                let mut plane_type: u64 = ids::TRACK_PLANE_TYPE_LEFT_EYE;
+                while r.stream_position()? < body_end {
+                    let ce = read_element_header(r)?;
+                    match ce.id {
+                        ids::TRACK_PLANE_UID => uid = Some(read_uint(r, ce.size as usize)?),
+                        ids::TRACK_PLANE_TYPE => plane_type = read_uint(r, ce.size as usize)?,
+                        _ => skip(r, ce.size)?,
+                    }
+                }
+                // TrackPlaneUID is mandatory (minOccurs=1) and "not 0"; a
+                // plane without one is malformed and dropped.
+                if let Some(u) = uid {
+                    if u != 0 {
+                        op.planes.push((u, plane_type));
+                    }
+                }
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse `TrackJoinBlocks` (RFC 9559 §5.1.4.1.30.5) — a list of
+/// `TrackJoinUID`s naming tracks whose Blocks are joined into this one.
+fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::TRACK_JOIN_UID => {
+                let u = read_uint(r, e.size as usize)?;
+                // "not 0" per §5.1.4.1.30.6.
+                if u != 0 {
+                    op.join_uids.push(u);
+                }
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -1532,6 +1749,10 @@ pub struct MkvDemuxer {
     /// Per-Top-Level-element `CRC-32` validation results (RFC 8794
     /// §11.3.1) — see [`MkvDemuxer::crc_status`].
     crc_status: Vec<CrcStatus>,
+    /// Per-stream `TrackOperation` (RFC 9559 §5.1.4.1.30), indexed by
+    /// stream index. `None` for tracks that aren't virtual tracks — see
+    /// [`MkvDemuxer::track_operations`].
+    track_operations: Vec<Option<TrackOperation>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -1681,6 +1902,32 @@ impl MkvDemuxer {
     /// Returned in the order the elements appear in the Segment.
     pub fn crc_status(&self) -> &[CrcStatus] {
         &self.crc_status
+    }
+
+    /// `TrackOperation` (RFC 9559 §5.1.4.1.30) for the stream at
+    /// `stream_index`, or `None` when that track is an ordinary (non-virtual)
+    /// track.
+    ///
+    /// A `TrackOperation` marks a *virtual* track assembled from other
+    /// tracks: either a stereoscopic 3D track combining video planes
+    /// ([`TrackOperation::planes`]) or a track joining several other tracks'
+    /// Blocks into one timeline ([`TrackOperation::join_tracks`]). The
+    /// referenced tracks are reported as [`TrackRef`]s carrying both the
+    /// on-disk `TrackUID` and, when resolvable, the matching stream index.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn track_operation(&self, stream_index: u32) -> Option<&TrackOperation> {
+        self.track_operations
+            .get(stream_index as usize)
+            .and_then(|o| o.as_ref())
+    }
+
+    /// All per-stream `TrackOperation`s (RFC 9559 §5.1.4.1.30), indexed by
+    /// stream index. The slice has one entry per stream — `None` for
+    /// ordinary tracks, `Some` for virtual tracks. See
+    /// [`MkvDemuxer::track_operation`] for the semantics.
+    pub fn track_operations(&self) -> &[Option<TrackOperation>] {
+        &self.track_operations
     }
 
     fn advance(&mut self) -> Result<()> {

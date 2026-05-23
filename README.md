@@ -95,6 +95,19 @@ the unified `oxideav` aggregator to wire decoding automatically.
   abort the open (RFC 8794 §12: a reader MAY ignore the data); strict
   callers reject any non-valid status. Elements with no `CRC-32` child
   produce no status (omission is spec-legal).
+- **`TrackOperation` typed decode** (RFC 9559 §5.1.4.1.30): a *virtual*
+  track assembled from other tracks. `MkvDemuxer::track_operation(stream_index)`
+  (and the per-stream `track_operations()` slice) returns a typed
+  `TrackOperation` for any `TrackEntry` carrying the element, `None` for an
+  ordinary track. `TrackCombinePlanes` (§5.1.4.1.30.1) surfaces as a
+  `Vec<TrackPlane>` — each pairs a referenced track with its
+  `TrackPlaneType` (`LeftEye` / `RightEye` / `Background`, with `Other(u64)`
+  preserving FCFS-registry values per §27.17) — and `TrackJoinBlocks`
+  (§5.1.4.1.30.5) surfaces as a `Vec<TrackRef>`. Every `TrackPlaneUID` /
+  `TrackJoinUID` is resolved back to a `TrackRef` carrying both the on-disk
+  `TrackUID` and the matching 0-indexed stream index (`None` for a dangling
+  reference, kept rather than dropped). A `TrackPlane` missing its mandatory
+  `TrackPlaneUID` and a zero `TrackJoinUID` ("not 0" per spec) are dropped.
 
 ### Muxer (`mux::open` and `mux::open_webm`)
 
@@ -178,6 +191,11 @@ so the demuxer never hides an unrecognised track.
   late best-effort Cues rescan (when Cues sit after the final Cluster) and
   per-Cluster CRC-32 children are not yet validated. CRC-32 is never
   written on the mux side.
+- `TrackOperation` is decoded and surfaced (left/right-eye plane combining,
+  block joining) but the demuxer does not yet *apply* it — virtual tracks
+  are reported alongside their source tracks rather than being synthesised
+  into a single combined output stream. `TrackOperation` is never written
+  on the mux side.
 
 ## License
 

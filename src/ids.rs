@@ -81,6 +81,20 @@ pub const CODEC_DELAY: u32 = 0x56AA;
 pub const SEEK_PRE_ROLL: u32 = 0x56BB;
 pub const VIDEO: u32 = 0xE0;
 pub const AUDIO: u32 = 0xE1;
+
+// TrackOperation (RFC 9559 §5.1.4.1.30): describes a virtual track built
+// by combining other tracks — either combining video planes into one 3D
+// track (TrackCombinePlanes) or joining several tracks' Blocks into one
+// timeline (TrackJoinBlocks). The plane / join references point at other
+// tracks by their TrackUID.
+pub const TRACK_OPERATION: u32 = 0xE2;
+pub const TRACK_COMBINE_PLANES: u32 = 0xE3;
+pub const TRACK_PLANE: u32 = 0xE4;
+pub const TRACK_PLANE_UID: u32 = 0xE5;
+pub const TRACK_PLANE_TYPE: u32 = 0xE6;
+pub const TRACK_JOIN_BLOCKS: u32 = 0xE9;
+pub const TRACK_JOIN_UID: u32 = 0xED;
+
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
 pub const SAMPLING_FREQUENCY: u32 = 0xB5;
@@ -132,3 +146,9 @@ pub const FILE_UID: u32 = 0x46AE;
 pub const TRACK_TYPE_VIDEO: u64 = 1;
 pub const TRACK_TYPE_AUDIO: u64 = 2;
 pub const TRACK_TYPE_SUBTITLE: u64 = 17;
+
+// TrackPlaneType values (RFC 9559 §5.1.4.1.30.4, Table 20). Values
+// 3..=u64::MAX are "First Come First Served" registrations (§27.17).
+pub const TRACK_PLANE_TYPE_LEFT_EYE: u64 = 0;
+pub const TRACK_PLANE_TYPE_RIGHT_EYE: u64 = 1;
+pub const TRACK_PLANE_TYPE_BACKGROUND: u64 = 2;
