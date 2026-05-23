@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **CRC-32 validation** on Top-Level master elements (RFC 8794
+  §11.3.1, RFC 9559 §6.2). When `Info` / `Tracks` / `Tags` / `Cues` /
+  `Chapters` / `Attachments` / `SeekHead` carries a leading `CRC-32`
+  child, the demuxer recomputes the IEEE CRC-32 (reflected poly
+  `0xEDB88320`, init `0xFFFFFFFF`, final ones-complement, little-endian
+  storage) over the rest of the element and records a `CrcStatus
+  { element_id, stored, computed }`. New `MkvDemuxer::crc_status() ->
+  &[CrcStatus]` accessor (with `CrcStatus::is_valid()`) surfaces the
+  results. Validation is informational: a mismatch does not abort the
+  open (RFC 8794 §12 lets a reader MAY-ignore the data); strict callers
+  inspect the slice. New public `ebml::crc32_ieee` helper (table built
+  at runtime — no numeric table transcribed). Pinned by the canonical
+  `crc32("123456789") == 0xCBF43926` check value.
 - mux: opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5,
   §10.3). New `MkvMuxer::with_block_lacing(LacingMode)` aggregates
   same-track, same-keyframe-status consecutive frames into a

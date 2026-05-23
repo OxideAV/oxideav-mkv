@@ -84,6 +84,17 @@ the unified `oxideav` aggregator to wire decoding automatically.
   find Cues that sit past it.
 - An unknown-size Cluster is terminated cleanly when a sibling Segment-
   child element follows it (no more "Cues silently eaten as payload").
+- **CRC-32 validation** (RFC 8794 §11.3.1, RFC 9559 §6.2): when a Top-Level
+  master element (`Info`, `Tracks`, `Tags`, `Cues`, `Chapters`,
+  `Attachments`, `SeekHead`) carries a leading `CRC-32` child, the demuxer
+  recomputes the IEEE CRC-32 (reflected poly `0xEDB88320`, init
+  `0xFFFFFFFF`, final XOR, little-endian storage) over the rest of the
+  element and records the result. `MkvDemuxer::crc_status() -> &[CrcStatus]`
+  exposes each `{element_id, stored, computed}` triple with an
+  `is_valid()` helper. Validation is informational — a mismatch does **not**
+  abort the open (RFC 8794 §12: a reader MAY ignore the data); strict
+  callers reject any non-valid status. Elements with no `CRC-32` child
+  produce no status (omission is spec-legal).
 
 ### Muxer (`mux::open` and `mux::open_webm`)
 
@@ -163,7 +174,10 @@ so the demuxer never hides an unrecognised track.
   the demuxer doesn't yet expose a structured chapter or attachment list.
   Attachment payload bytes are skipped (not loaded into memory); only
   filename / mime / on-disk size surface.
-- CRC-32 elements are parsed (skipped) but not validated.
+- CRC-32 validation covers Top-Level master elements parsed up front; the
+  late best-effort Cues rescan (when Cues sit after the final Cluster) and
+  per-Cluster CRC-32 children are not yet validated. CRC-32 is never
+  written on the mux side.
 
 ## License
 

@@ -209,6 +209,49 @@ pub fn skip<R: Seek + ?Sized>(r: &mut R, n: u64) -> Result<()> {
     Ok(())
 }
 
+/// Compute the IEEE CRC-32 of `data`, as required by the EBML `CRC-32`
+/// element (RFC 8794 §11.3.1).
+///
+/// The spec mandates "the IEEE-CRC-32 algorithm as used in the [ISO3309]
+/// standard and in Section 8.1.1.6.2 of [ITU.V42], with initial value of
+/// 0xFFFFFFFF" and that "the CRC value MUST be computed on a little-endian
+/// bytestream and MUST use little-endian storage." That is the reflected
+/// CRC-32 with reversed polynomial `0xEDB88320`, initial register all-ones,
+/// and a final ones-complement — the same parameterisation PNG/zlib use.
+/// Callers store / compare the result via [`u32::to_le_bytes`] to satisfy
+/// the little-endian-storage requirement.
+///
+/// The table is built once on first call rather than stored as a literal,
+/// so no numeric table is transcribed into source.
+pub fn crc32_ieee(data: &[u8]) -> u32 {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        let mut n = 0usize;
+        while n < 256 {
+            let mut c = n as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            t[n] = c;
+            n += 1;
+        }
+        t
+    });
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +306,28 @@ mod tests {
         let mut c = Cursor::new(&[0xFFu8]);
         let (v, _) = read_vint(&mut c, false).unwrap();
         assert_eq!(v, VINT_UNKNOWN_SIZE);
+    }
+
+    #[test]
+    fn crc32_check_value() {
+        // The canonical IEEE CRC-32 "check" value: the CRC of the ASCII
+        // string "123456789" is 0xCBF43926. This pins the polynomial,
+        // init value, reflection, and final XOR all at once.
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn crc32_empty_is_zero() {
+        // With init 0xFFFFFFFF and final ones-complement, the CRC of the
+        // empty string is 0x00000000.
+        assert_eq!(crc32_ieee(b""), 0);
+    }
+
+    #[test]
+    fn crc32_little_endian_storage() {
+        // RFC 8794 §11.3.1: the value is stored little-endian. The CRC-32
+        // element body for "123456789" is therefore 26 39 F4 CB.
+        let crc = crc32_ieee(b"123456789");
+        assert_eq!(crc.to_le_bytes(), [0x26, 0x39, 0xF4, 0xCB]);
     }
 }

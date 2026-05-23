@@ -15,7 +15,8 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
 use crate::ebml::{
-    read_bytes, read_element_header, read_float, read_string, read_uint, skip, VINT_UNKNOWN_SIZE,
+    crc32_ieee, read_bytes, read_element_header, read_float, read_string, read_uint, read_vint,
+    skip, VINT_UNKNOWN_SIZE,
 };
 use crate::ids;
 
@@ -92,6 +93,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut edition_uid_to_index: std::collections::HashMap<u64, u32> =
         std::collections::HashMap::new();
     let mut pending_tags: Vec<RawTag> = Vec::new();
+    // Per-element CRC-32 validation results (RFC 8794 §11.3.1, RFC 9559
+    // §6.2). Populated as each Top-Level master with a leading CRC-32
+    // child is walked; surfaced via `MkvDemuxer::crc_status`.
+    let mut crc_status: Vec<CrcStatus> = Vec::new();
 
     while input.stream_position()? < segment_data_end {
         let e = read_element_header(&mut *input)?;
@@ -101,6 +106,26 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         } else {
             Some(body_start + e.size)
         };
+        // Validate a leading CRC-32 child against the rest of the element
+        // when the element size is known (CRC needs a bounded body). The
+        // helper rewinds the reader to `body_start` so the parse below is
+        // unaffected.
+        if let Some(end) = body_end_known {
+            if matches!(
+                e.id,
+                ids::INFO
+                    | ids::TRACKS
+                    | ids::TAGS
+                    | ids::CUES
+                    | ids::CHAPTERS
+                    | ids::ATTACHMENTS
+                    | ids::SEEK_HEAD
+            ) {
+                if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
+                    crc_status.push(s);
+                }
+            }
+        }
         match e.id {
             ids::INFO => {
                 let end = body_end_known.unwrap_or(segment_data_end);
@@ -353,6 +378,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         cues,
         timecode_scale_ns,
         tags: typed_tags,
+        crc_status,
     })
 }
 
@@ -360,6 +386,105 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
 struct SegmentInfo {
     timecode_scale: u64,
     duration: f64,
+}
+
+/// Result of validating the `CRC-32` element (RFC 8794 §11.3.1) on one
+/// Top-Level master element of the Segment.
+///
+/// In Matroska, every Top-Level master element SHOULD carry a `CRC-32`
+/// child as its first element (RFC 9559 §6.2). The demuxer checks each
+/// such element it parses up front (Info, Tracks, Tags, Cues, Chapters,
+/// Attachments, SeekHead) and records whether the stored CRC matched the
+/// IEEE CRC-32 of the rest of the element's data. Elements with no
+/// `CRC-32` child are not represented here — absence of a status means
+/// "no CRC to check," which the spec explicitly permits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CrcStatus {
+    /// EBML element ID of the Top-Level master that carried the `CRC-32`
+    /// child (e.g. [`ids::TRACKS`], [`ids::INFO`]).
+    pub element_id: u32,
+    /// CRC-32 value stored in the file (little-endian decoded).
+    pub stored: u32,
+    /// CRC-32 the demuxer computed over the element's remaining data.
+    pub computed: u32,
+}
+
+impl CrcStatus {
+    /// True when the stored CRC matched the recomputed one — i.e. the
+    /// element's data is intact per its own checksum.
+    pub fn is_valid(&self) -> bool {
+        self.stored == self.computed
+    }
+}
+
+/// Check a Top-Level master element for a leading `CRC-32` child and, if
+/// present, validate it. `body_start` / `body_end` bracket the element's
+/// data (the bytes after its EBML header). On return the reader is left at
+/// `body_start` so the caller's normal parse can proceed unchanged.
+///
+/// Per RFC 8794 §11.3.1 the `CRC-32` element, if used, MUST be the first
+/// ordered child of its parent, and its 4-byte value is the IEEE CRC-32 of
+/// all the parent's Element Data *except* the `CRC-32` element itself,
+/// computed and stored little-endian. So we read the body once, peel off a
+/// leading `CRC-32` child if there is one, and CRC the remainder.
+///
+/// Returns `Ok(None)` when the element has no leading `CRC-32` child (the
+/// common, spec-permitted case) and `Ok(Some(status))` when one was found
+/// and checked. Any short read leaves the reader rewound and yields
+/// `Ok(None)` rather than failing the whole open — a torn checksum should
+/// not make an otherwise-readable file un-demuxable.
+fn validate_top_level_crc(
+    r: &mut dyn ReadSeek,
+    element_id: u32,
+    body_start: u64,
+    body_end: u64,
+) -> Result<Option<CrcStatus>> {
+    let len = body_end.saturating_sub(body_start);
+    // A CRC-32 child is 2 header bytes (id 0xBF + size 0x84) + 4 value
+    // bytes. Anything shorter cannot carry one.
+    if len < 6 {
+        r.seek(SeekFrom::Start(body_start))?;
+        return Ok(None);
+    }
+    r.seek(SeekFrom::Start(body_start))?;
+    let body = read_bytes(r, len as usize)?;
+    // Always rewind for the caller before returning, regardless of outcome.
+    r.seek(SeekFrom::Start(body_start))?;
+
+    let mut cur = std::io::Cursor::new(&body[..]);
+    let (id, _) = match read_vint(&mut cur, true) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if id != ids::CRC32 as u64 {
+        return Ok(None);
+    }
+    let (size, _) = match read_vint(&mut cur, false) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if size != 4 {
+        // A CRC-32 element is fixed at 4 bytes; a different size is
+        // malformed — treat as "no CRC to check" rather than erroring.
+        return Ok(None);
+    }
+    let header_len = cur.position() as usize;
+    if header_len + 4 > body.len() {
+        return Ok(None);
+    }
+    let stored = u32::from_le_bytes([
+        body[header_len],
+        body[header_len + 1],
+        body[header_len + 2],
+        body[header_len + 3],
+    ]);
+    let rest = &body[header_len + 4..];
+    let computed = crc32_ieee(rest);
+    Ok(Some(CrcStatus {
+        element_id,
+        stored,
+        computed,
+    }))
 }
 
 #[derive(Default)]
@@ -1404,6 +1529,9 @@ pub struct MkvDemuxer {
     /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) — see
     /// [`MkvDemuxer::tags`].
     tags: Vec<Tag>,
+    /// Per-Top-Level-element `CRC-32` validation results (RFC 8794
+    /// §11.3.1) — see [`MkvDemuxer::crc_status`].
+    crc_status: Vec<CrcStatus>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -1532,6 +1660,27 @@ impl MkvDemuxer {
     /// dangling non-zero UIDs are dropped per RFC 9559 §5.1.8.1.1.3..6.
     pub fn tags(&self) -> &[Tag] {
         &self.tags
+    }
+
+    /// `CRC-32` validation results for the Top-Level master elements that
+    /// carried a checksum (RFC 8794 §11.3.1, RFC 9559 §6.2).
+    ///
+    /// Matroska files SHOULD put a `CRC-32` child as the first element of
+    /// each Top-Level master (Info, Tracks, Tags, Cues, Chapters,
+    /// Attachments, SeekHead). When the demuxer parses one with such a
+    /// child, it recomputes the IEEE CRC-32 over the rest of the element
+    /// and records a [`CrcStatus`]. Elements without a `CRC-32` child are
+    /// not represented — the spec lets a writer omit them.
+    ///
+    /// Validation is informational: a mismatching CRC does **not** stop
+    /// the demuxer from returning packets (the spec only says a reader
+    /// *MAY* ignore the data). Callers that want strict integrity can
+    /// inspect this slice and reject a file with any
+    /// [`CrcStatus::is_valid`] == `false`.
+    ///
+    /// Returned in the order the elements appear in the Segment.
+    pub fn crc_status(&self) -> &[CrcStatus] {
+        &self.crc_status
     }
 
     fn advance(&mut self) -> Result<()> {
