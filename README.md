@@ -78,6 +78,20 @@ the unified `oxideav` aggregator to wire decoding automatically.
   and binary `TagBinary` payloads (e.g. embedded cover-art bytes).
   Tags with only dangling non-zero UIDs are filtered out per
   §5.1.8.1.1.3..§5.1.8.1.1.6; mixed Targets keep their resolvable UIDs.
+- **Typed `Chapters` accessor** (RFC 9559 §5.1.7):
+  `MkvDemuxer::chapters() -> &[Edition]` exposes the structured chapter
+  tree the flat `chapter:N:*` metadata view collapses — every
+  `EditionEntry` keeps its `EditionUID`, `EditionFlagDefault` and
+  `EditionFlagOrdered` flags; every `ChapterAtom` keeps its
+  `ChapterUID`, `ChapterStringUID` (e.g. WebVTT cue id), full-precision
+  `ChapterTimeStart` / `ChapterTimeEnd` nanoseconds, `ChapterFlagHidden`,
+  **all** multilingual `ChapterDisplay` rows (each with `ChapString`,
+  `ChapLanguage` + `ChapLanguageBCP47`, `ChapCountry`), and any nested
+  child atoms (the spec marks `ChapterAtom` as recursive). Atoms are
+  1-indexed depth-first in document order — the same index the flat
+  `chapter:N:*` keys and `TagChapterUID`-resolved tags use, now extended
+  to nested chapters. Returns an empty slice when the file has no
+  `Chapters` element.
 - Duration: `Segment\Info\Duration` translated to microseconds.
 - Seek: `seek_to(stream, pts)` uses the Cues index. Handles Cues at
   either end of the Segment, and walks an unknown-size final Cluster to
@@ -213,10 +227,11 @@ so the demuxer never hides an unrecognised track.
 
 ## What's NOT implemented
 
-- `Chapters` and `Attachments` are read into the metadata vector only —
-  the demuxer doesn't yet expose a structured chapter or attachment list.
-  Attachment payload bytes are skipped (not loaded into memory); only
-  filename / mime / on-disk size surface.
+- `Attachments` are read into the metadata vector only — the demuxer
+  doesn't yet expose a structured attachment list. Attachment payload
+  bytes are skipped (not loaded into memory); only filename / mime /
+  on-disk size surface. (`Chapters` now has a typed accessor — see
+  `MkvDemuxer::chapters` above.)
 - CRC-32 validation covers Top-Level master elements parsed up front; the
   late best-effort Cues rescan (when Cues sit after the final Cluster) and
   per-Cluster CRC-32 children are not yet validated. CRC-32 is never

@@ -93,6 +93,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut edition_uid_to_index: std::collections::HashMap<u64, u32> =
         std::collections::HashMap::new();
     let mut pending_tags: Vec<RawTag> = Vec::new();
+    // Typed `Chapters` tree (RFC 9559 §5.1.7), surfaced via
+    // `MkvDemuxer::chapters` — populated by `parse_chapters_typed` alongside
+    // the flat metadata view.
+    let mut editions: Vec<Edition> = Vec::new();
     // Per-element CRC-32 validation results (RFC 8794 §11.3.1, RFC 9559
     // §6.2). Populated as each Top-Level master with a leading CRC-32
     // child is walked; surfaced via `MkvDemuxer::crc_status`.
@@ -145,12 +149,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             }
             ids::CHAPTERS => {
                 let end = body_end_known.unwrap_or(segment_data_end);
-                parse_chapters(
+                parse_chapters_typed(
                     &mut *input,
                     end,
                     &mut metadata,
                     &mut chapter_uid_to_index,
                     &mut edition_uid_to_index,
+                    &mut editions,
                 )?;
             }
             ids::ATTACHMENTS => {
@@ -422,6 +427,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         cues,
         timecode_scale_ns,
         tags: typed_tags,
+        editions,
         crc_status,
         track_operations,
         content_encodings,
@@ -1407,23 +1413,105 @@ impl AesCipherMode {
     }
 }
 
-/// Parse a `Chapters` master element. Each `EditionEntry` is walked, and
-/// each `ChapterAtom` inside it is lifted into the metadata vector as
-/// three entries: `chapter:N:start_ms`, `chapter:N:end_ms` (when present),
-/// and `chapter:N:title` (first non-empty `ChapterDisplay\ChapString`).
-/// Chapters are 1-indexed in metadata to match ffprobe's display order.
+/// One `Segment\Chapters\EditionEntry` (RFC 9559 §5.1.7.1) — a complete
+/// chapter edition with its tree of [`Chapter`] atoms. Surfaced via
+/// [`MkvDemuxer::chapters`].
+///
+/// The flat [`Demuxer::metadata`] view collapses every edition into one
+/// 1-indexed `chapter:N:*` namespace and keeps only the first display
+/// string; this typed view preserves the edition grouping, edition flags,
+/// nested chapters, and *all* multilingual [`ChapterDisplay`] rows.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Edition {
+    /// `EditionUID` (RFC 9559 §5.1.7.1.1). `None` when the element was
+    /// absent (it's optional); never zero (the spec bars 0).
+    pub uid: Option<u64>,
+    /// `EditionFlagDefault` (RFC 9559 §5.1.7.1.2). `true` when this edition
+    /// SHOULD be used as the default. Defaults to `false`.
+    pub default: bool,
+    /// `EditionFlagOrdered` (RFC 9559 §5.1.7.1.3). `true` for an ordered
+    /// edition (chapter playback order is enforced). Defaults to `false`.
+    pub ordered: bool,
+    /// Top-level `ChapterAtom`s in on-disk order. Nested chapters live in
+    /// each [`Chapter::children`].
+    pub chapters: Vec<Chapter>,
+}
+
+/// One `ChapterAtom` (RFC 9559 §5.1.7.1.4) — recursive: a chapter MAY
+/// contain nested child chapters. Part of [`Edition::chapters`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Chapter {
+    /// 1-based index across the whole `Chapters` element, assigned in
+    /// document order (top-level then nested, depth-first). Matches the
+    /// `chapter:N:*` keys in the flat [`Demuxer::metadata`] view and the
+    /// `chapter_index` carried by a resolved [`TargetUid::Chapter`].
+    pub index: u32,
+    /// `ChapterUID` (RFC 9559 §5.1.7.1.4.1). Mandatory per spec; `None`
+    /// only for a malformed atom that omits it. Never zero.
+    pub uid: Option<u64>,
+    /// `ChapterStringUID` (RFC 9559 §5.1.7.1.4.2) — a unique string ID,
+    /// e.g. a WebVTT cue identifier. `None` when absent.
+    pub string_uid: Option<String>,
+    /// `ChapterTimeStart` (RFC 9559 §5.1.7.1.4.3) in **nanoseconds**
+    /// (Matroska Ticks — independent of the segment `TimecodeScale`).
+    pub time_start_ns: u64,
+    /// `ChapterTimeEnd` (RFC 9559 §5.1.7.1.4.4) in **nanoseconds**. `None`
+    /// when absent (mandatory only for ordered editions / parent chapters).
+    pub time_end_ns: Option<u64>,
+    /// `ChapterFlagHidden` (RFC 9559 §5.1.7.1.4.5). Defaults to `false`.
+    pub hidden: bool,
+    /// `ChapterDisplay` rows (RFC 9559 §5.1.7.1.4.9), in on-disk order —
+    /// one per language. Empty when the atom carries no display string.
+    pub displays: Vec<ChapterDisplay>,
+    /// Nested `ChapterAtom`s (RFC 9559 §5.1.7.1.4 is `recursive`).
+    pub children: Vec<Chapter>,
+}
+
+/// One `ChapterDisplay` master (RFC 9559 §5.1.7.1.4.9) — a chapter title
+/// in one language. Part of [`Chapter::displays`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChapterDisplay {
+    /// `ChapString` (RFC 9559 §5.1.7.1.4.10) — the title text.
+    pub string: String,
+    /// `ChapLanguage` (RFC 9559 §5.1.7.1.4.11). Defaults to `"eng"` per
+    /// spec; materialised so consumers don't special-case the absent
+    /// element. MUST be ignored when [`language_bcp47`](Self::language_bcp47)
+    /// is present.
+    pub language: String,
+    /// `ChapLanguageBCP47` (RFC 9559 §5.1.7.1.4.12). When present, both
+    /// `language` and `country` MUST be ignored per spec.
+    pub language_bcp47: Option<String>,
+    /// `ChapCountry` (RFC 9559 §5.1.7.1.4.13). `None` when absent. MUST be
+    /// ignored when `language_bcp47` is present.
+    pub country: Option<String>,
+}
+
+/// Parse a `Chapters` master element. Populates two views in one pass:
+///
+/// * The flat [`Demuxer::metadata`] view — each `ChapterAtom` lifts to
+///   `chapter:N:start_ms`, `chapter:N:end_ms` (when present), and
+///   `chapter:N:title` (first non-empty `ChapterDisplay\ChapString`).
+///   Chapters are 1-indexed to match ffprobe's display order.
+/// * The typed [`Edition`] / [`Chapter`] tree returned via `editions`,
+///   surfaced by [`MkvDemuxer::chapters`].
 ///
 /// `ChapterTimeStart` / `ChapterTimeEnd` carry **nanoseconds**, not
 /// timecode-scale ticks — that's spec-defined and independent of the
-/// segment's `TimecodeScale`. We surface them as integer milliseconds so
-/// downstream tooling doesn't have to think about ns-precision strings.
-fn parse_chapters(
+/// segment's `TimecodeScale`. The flat view surfaces them as integer
+/// milliseconds; the typed view keeps the raw nanoseconds.
+#[allow(clippy::too_many_arguments)]
+fn parse_chapters_typed(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    editions: &mut Vec<Edition>,
 ) -> Result<()> {
+    // Shared 1-based counter across the whole Chapters element (every
+    // EditionEntry, every nesting level), assigned depth-first in document
+    // order. Keeps the `chapter:N:*` flat keys and `TagChapterUID`
+    // resolution stable while extending indexing to nested atoms.
     let mut chapter_index: u32 = 0;
     let mut edition_index: u32 = 0;
     while r.stream_position()? < end {
@@ -1432,7 +1520,7 @@ fn parse_chapters(
             ids::EDITION_ENTRY => {
                 let ee_end = r.stream_position()? + e.size;
                 edition_index += 1;
-                parse_edition_entry(
+                let edition = parse_edition_entry(
                     r,
                     ee_end,
                     metadata,
@@ -1441,6 +1529,7 @@ fn parse_chapters(
                     chapter_uid_to_index,
                     edition_uid_to_index,
                 )?;
+                editions.push(edition);
             }
             _ => skip(r, e.size)?,
         }
@@ -1457,7 +1546,8 @@ fn parse_edition_entry(
     edition_index: u32,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
     edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
-) -> Result<()> {
+) -> Result<Edition> {
+    let mut edition = Edition::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -1465,29 +1555,38 @@ fn parse_edition_entry(
                 let uid = read_uint(r, e.size as usize)?;
                 if uid != 0 {
                     edition_uid_to_index.insert(uid, edition_index);
+                    edition.uid = Some(uid);
                 }
             }
+            ids::EDITION_FLAG_DEFAULT => edition.default = read_uint(r, e.size as usize)? != 0,
+            ids::EDITION_FLAG_ORDERED => edition.ordered = read_uint(r, e.size as usize)? != 0,
             ids::CHAPTER_ATOM => {
                 let ca_end = r.stream_position()? + e.size;
-                *chapter_index += 1;
-                parse_chapter_atom(r, ca_end, metadata, *chapter_index, chapter_uid_to_index)?;
+                let atom =
+                    parse_chapter_atom(r, ca_end, metadata, chapter_index, chapter_uid_to_index)?;
+                edition.chapters.push(atom);
             }
             _ => skip(r, e.size)?,
         }
     }
-    Ok(())
+    Ok(edition)
 }
 
 fn parse_chapter_atom(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
-    index: u32,
+    chapter_index: &mut u32,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
-) -> Result<()> {
-    let mut start_ns: Option<u64> = None;
-    let mut end_ns: Option<u64> = None;
-    let mut title: Option<String> = None;
+) -> Result<Chapter> {
+    // Reserve this atom's index *before* descending into children so the
+    // numbering is depth-first document order (parent before its kids).
+    *chapter_index += 1;
+    let index = *chapter_index;
+    let mut atom = Chapter {
+        index,
+        ..Chapter::default()
+    };
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -1495,59 +1594,88 @@ fn parse_chapter_atom(
                 let uid = read_uint(r, e.size as usize)?;
                 if uid != 0 {
                     chapter_uid_to_index.insert(uid, index);
+                    atom.uid = Some(uid);
                 }
             }
-            ids::CHAPTER_TIME_START => start_ns = Some(read_uint(r, e.size as usize)?),
-            ids::CHAPTER_TIME_END => end_ns = Some(read_uint(r, e.size as usize)?),
+            ids::CHAPTER_STRING_UID => {
+                atom.string_uid = Some(read_string(r, e.size as usize)?);
+            }
+            ids::CHAPTER_TIME_START => atom.time_start_ns = read_uint(r, e.size as usize)?,
+            ids::CHAPTER_TIME_END => atom.time_end_ns = Some(read_uint(r, e.size as usize)?),
+            ids::CHAPTER_FLAG_HIDDEN => atom.hidden = read_uint(r, e.size as usize)? != 0,
             ids::CHAPTER_DISPLAY => {
                 let cd_end = r.stream_position()? + e.size;
-                if title.is_none() {
-                    title = parse_chapter_display(r, cd_end)?;
-                } else {
-                    skip(r, e.size)?;
+                if let Some(disp) = parse_chapter_display(r, cd_end)? {
+                    atom.displays.push(disp);
                 }
+            }
+            ids::CHAPTER_ATOM => {
+                let ca_end = r.stream_position()? + e.size;
+                let child =
+                    parse_chapter_atom(r, ca_end, metadata, chapter_index, chapter_uid_to_index)?;
+                atom.children.push(child);
             }
             _ => skip(r, e.size)?,
         }
     }
-    if let Some(ns) = start_ns {
-        metadata.push((
-            format!("chapter:{index}:start_ms"),
-            (ns / 1_000_000).to_string(),
-        ));
-    }
-    if let Some(ns) = end_ns {
+    // Flat metadata view: only top-of-atom fields, keyed by the 1-based
+    // index. `title` is the first non-empty display string (back-compat
+    // with the pre-typed behaviour).
+    metadata.push((
+        format!("chapter:{index}:start_ms"),
+        (atom.time_start_ns / 1_000_000).to_string(),
+    ));
+    if let Some(ns) = atom.time_end_ns {
         metadata.push((
             format!("chapter:{index}:end_ms"),
             (ns / 1_000_000).to_string(),
         ));
     }
-    if let Some(t) = title {
-        if !t.is_empty() {
-            metadata.push((format!("chapter:{index}:title"), t));
-        }
+    if let Some(t) = atom
+        .displays
+        .iter()
+        .map(|d| &d.string)
+        .find(|s| !s.is_empty())
+    {
+        metadata.push((format!("chapter:{index}:title"), t.clone()));
     }
-    Ok(())
+    Ok(atom)
 }
 
-/// Pull the first non-empty `ChapString` out of a `ChapterDisplay`. Skips
-/// `ChapLanguage` and other unknowns — the demuxer doesn't currently expose
-/// per-language chapter titles, just the first one we see.
-fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<String>> {
-    let mut s: Option<String> = None;
+/// Parse one `ChapterDisplay` master into a typed [`ChapterDisplay`].
+/// Returns `None` only when the master carries no (or an empty) `ChapString`
+/// — an unusable row the flat view always dropped. `ChapLanguage` defaults
+/// to `"eng"` per RFC 9559 §5.1.7.1.4.11.
+fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<ChapterDisplay>> {
+    let mut string: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut language_bcp47: Option<String> = None;
+    let mut country: Option<String> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::CHAP_STRING => {
                 let v = read_string(r, e.size as usize)?;
-                if s.is_none() && !v.is_empty() {
-                    s = Some(v);
+                if string.is_none() {
+                    string = Some(v);
                 }
             }
+            ids::CHAP_LANGUAGE => language = Some(read_string(r, e.size as usize)?),
+            ids::CHAP_LANGUAGE_BCP47 => language_bcp47 = Some(read_string(r, e.size as usize)?),
+            ids::CHAP_COUNTRY => country = Some(read_string(r, e.size as usize)?),
             _ => skip(r, e.size)?,
         }
     }
-    Ok(s)
+    let string = match string {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+    Ok(Some(ChapterDisplay {
+        string,
+        language: language.unwrap_or_else(|| "eng".to_string()),
+        language_bcp47,
+        country,
+    }))
 }
 
 /// Parse an `Attachments` master element. Each `AttachedFile` surfaces as
@@ -2146,6 +2274,10 @@ pub struct MkvDemuxer {
     /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) — see
     /// [`MkvDemuxer::tags`].
     tags: Vec<Tag>,
+    /// Typed `Chapters\EditionEntry` tree (RFC 9559 §5.1.7) — see
+    /// [`MkvDemuxer::chapters`]. Empty when the file carries no
+    /// `Chapters` element.
+    editions: Vec<Edition>,
     /// Per-Top-Level-element `CRC-32` validation results (RFC 8794
     /// §11.3.1) — see [`MkvDemuxer::crc_status`].
     crc_status: Vec<CrcStatus>,
@@ -2316,6 +2448,24 @@ impl MkvDemuxer {
     /// Returned in the order the elements appear in the Segment.
     pub fn crc_status(&self) -> &[CrcStatus] {
         &self.crc_status
+    }
+
+    /// Typed `Chapters\EditionEntry` tree (RFC 9559 §5.1.7) parsed from
+    /// the Segment.
+    ///
+    /// Surfaces information the flattened [`Demuxer::metadata`] view drops:
+    /// every [`Edition`] keeps its [`Edition::default`] /
+    /// [`Edition::ordered`] flags and [`Edition::uid`]; every [`Chapter`]
+    /// keeps its [`Chapter::uid`], [`Chapter::string_uid`],
+    /// [`Chapter::hidden`] flag, full nanosecond-precision
+    /// [`Chapter::time_start_ns`] / [`Chapter::time_end_ns`], **all**
+    /// multilingual [`Chapter::displays`] rows (the flat view picks one
+    /// title), and any nested [`Chapter::children`].
+    ///
+    /// Returned in the order editions and atoms appear in the Segment.
+    /// Empty when the file carries no `Chapters` element.
+    pub fn chapters(&self) -> &[Edition] {
+        &self.editions
     }
 
     /// `TrackOperation` (RFC 9559 §5.1.4.1.30) for the stream at

@@ -142,8 +142,11 @@ pub const CUE_BLOCK_NUMBER: u32 = 0x5378;
 // Chapters (Segment\Chapters\EditionEntry\ChapterAtom\ChapterDisplay\ChapString).
 pub const EDITION_ENTRY: u32 = 0x45B9;
 pub const EDITION_UID: u32 = 0x45BC;
+pub const EDITION_FLAG_DEFAULT: u32 = 0x45DB;
+pub const EDITION_FLAG_ORDERED: u32 = 0x45DD;
 pub const CHAPTER_ATOM: u32 = 0xB6;
 pub const CHAPTER_UID: u32 = 0x73C4;
+pub const CHAPTER_STRING_UID: u32 = 0x5654;
 pub const CHAPTER_TIME_START: u32 = 0x91;
 pub const CHAPTER_TIME_END: u32 = 0x92;
 pub const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
@@ -151,6 +154,7 @@ pub const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
 pub const CHAPTER_DISPLAY: u32 = 0x80;
 pub const CHAP_STRING: u32 = 0x85;
 pub const CHAP_LANGUAGE: u32 = 0x437C;
+pub const CHAP_LANGUAGE_BCP47: u32 = 0x437D;
 pub const CHAP_COUNTRY: u32 = 0x437E;
 
 // Attachments (Segment\Attachments\AttachedFile\...).

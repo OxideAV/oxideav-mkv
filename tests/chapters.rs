@@ -18,7 +18,7 @@
 
 use std::io::Cursor;
 
-use oxideav_core::ReadSeek;
+use oxideav_core::{Demuxer, ReadSeek};
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -181,5 +181,269 @@ fn chapters_surface_in_metadata() {
     assert!(
         get("chapter:3:end_ms").is_none(),
         "atom without ChapterTimeEnd should not emit end_ms"
+    );
+}
+
+#[test]
+fn typed_chapters_match_flat_metadata() {
+    // The new typed `chapters()` accessor must surface the same start/end
+    // and titles as the legacy flat metadata view, plus the structured
+    // edition grouping.
+    let bytes = build_mkv_with_chapters();
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver)
+        .expect("demux open_typed");
+
+    let eds = dmx.chapters();
+    assert_eq!(eds.len(), 1, "exactly one EditionEntry");
+    let ed = &eds[0];
+    // Default edition (flags absent → false).
+    assert!(!ed.default);
+    assert!(!ed.ordered);
+    assert!(ed.uid.is_none(), "no EditionUID was written");
+    assert_eq!(ed.chapters.len(), 3, "three top-level atoms");
+
+    let c1 = &ed.chapters[0];
+    assert_eq!(c1.index, 1);
+    assert_eq!(c1.uid, Some(0xC1));
+    assert_eq!(c1.time_start_ns, 0);
+    assert_eq!(c1.time_end_ns, Some(1_000_000_000));
+    assert!(!c1.hidden);
+    assert!(c1.string_uid.is_none());
+    assert!(c1.children.is_empty());
+    assert_eq!(c1.displays.len(), 1);
+    assert_eq!(c1.displays[0].string, "Intro");
+    assert_eq!(c1.displays[0].language, "eng");
+    assert!(c1.displays[0].language_bcp47.is_none());
+    assert!(c1.displays[0].country.is_none());
+
+    // Atom 3 has no ChapterTimeEnd.
+    let c3 = &ed.chapters[2];
+    assert_eq!(c3.index, 3);
+    assert_eq!(c3.time_end_ns, None);
+    assert_eq!(c3.displays[0].string, "Outro");
+}
+
+/// Build an EBML header valid for an MKV file.
+fn build_ebml_header() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&elem_uint(ids::EBML_VERSION, 1));
+    body.extend_from_slice(&elem_uint(ids::EBML_READ_VERSION, 1));
+    body.extend_from_slice(&elem_uint(ids::EBML_MAX_ID_LENGTH, 4));
+    body.extend_from_slice(&elem_uint(ids::EBML_MAX_SIZE_LENGTH, 8));
+    body.extend_from_slice(&elem_str(ids::EBML_DOC_TYPE, "matroska"));
+    body.extend_from_slice(&elem_uint(ids::EBML_DOC_TYPE_VERSION, 4));
+    body.extend_from_slice(&elem_uint(ids::EBML_DOC_TYPE_READ_VERSION, 2));
+    elem_master(ids::EBML_HEADER, &body)
+}
+
+/// Build the minimum Info + Tracks + one Cluster that the demuxer needs
+/// to accept a file. Returns the concatenated bytes ready to drop into
+/// a Segment body alongside a `Chapters` element.
+fn build_min_segment_skeleton() -> Vec<u8> {
+    let mut info_body = Vec::new();
+    info_body.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
+    info_body.extend_from_slice(&elem_float_be_f64(ids::DURATION, 3000.0));
+    let info = elem_master(ids::INFO, &info_body);
+
+    let mut track_body = Vec::new();
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_NUMBER, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_UID, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_TYPE, ids::TRACK_TYPE_AUDIO));
+    track_body.extend_from_slice(&elem_str(ids::CODEC_ID, "A_PCM/INT/LIT"));
+    let mut audio_body = Vec::new();
+    audio_body.extend_from_slice(&elem_float_be_f64(ids::SAMPLING_FREQUENCY, 48_000.0));
+    audio_body.extend_from_slice(&elem_uint(ids::CHANNELS, 2));
+    audio_body.extend_from_slice(&elem_uint(ids::BIT_DEPTH, 16));
+    track_body.extend_from_slice(&elem_master(ids::AUDIO, &audio_body));
+    let track_entry = elem_master(ids::TRACK_ENTRY, &track_body);
+    let tracks = elem_master(ids::TRACKS, &track_entry);
+
+    let mut cluster_body = Vec::new();
+    cluster_body.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster_body.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    let cluster = elem_master(ids::CLUSTER, &cluster_body);
+
+    // Caller appends Chapters between tracks and cluster.
+    let mut out = Vec::new();
+    out.extend_from_slice(&info);
+    out.extend_from_slice(&tracks);
+    // Caller inserts Chapters here.
+    out.extend_from_slice(&cluster);
+    out
+}
+
+#[test]
+fn typed_chapters_capture_multilingual_displays_and_nesting() {
+    // Build a Chapters element with:
+    //   * one ordered, default EditionEntry carrying an EditionUID
+    //   * one parent ChapterAtom with two ChapterDisplay rows (eng + fra),
+    //     a ChapterStringUID, ChapterFlagHidden = 1, and one nested child
+    //     atom with a single display in fr-CA via ChapLanguageBCP47.
+    let ebml_header = build_ebml_header();
+
+    let mut info_body = Vec::new();
+    info_body.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
+    info_body.extend_from_slice(&elem_float_be_f64(ids::DURATION, 3000.0));
+    let info = elem_master(ids::INFO, &info_body);
+
+    let mut track_body = Vec::new();
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_NUMBER, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_UID, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_TYPE, ids::TRACK_TYPE_AUDIO));
+    track_body.extend_from_slice(&elem_str(ids::CODEC_ID, "A_PCM/INT/LIT"));
+    let mut audio_body = Vec::new();
+    audio_body.extend_from_slice(&elem_float_be_f64(ids::SAMPLING_FREQUENCY, 48_000.0));
+    audio_body.extend_from_slice(&elem_uint(ids::CHANNELS, 2));
+    audio_body.extend_from_slice(&elem_uint(ids::BIT_DEPTH, 16));
+    track_body.extend_from_slice(&elem_master(ids::AUDIO, &audio_body));
+    let tracks = elem_master(ids::TRACKS, &elem_master(ids::TRACK_ENTRY, &track_body));
+
+    // Child atom: nested under parent. Single display in fr-CA via BCP-47.
+    let mut child_display = Vec::new();
+    child_display.extend_from_slice(&elem_str(ids::CHAP_STRING, "Sous-chapitre"));
+    // ChapLanguage MUST be ignored when ChapLanguageBCP47 is present, but
+    // it's still legal to write — verify the parser preserves both raw.
+    child_display.extend_from_slice(&elem_str(ids::CHAP_LANGUAGE, "fre"));
+    child_display.extend_from_slice(&elem_str(ids::CHAP_LANGUAGE_BCP47, "fr-CA"));
+    let mut child_atom = Vec::new();
+    child_atom.extend_from_slice(&elem_uint(ids::CHAPTER_UID, 0x10));
+    child_atom.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 500_000_000));
+    child_atom.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_END, 800_000_000));
+    child_atom.extend_from_slice(&elem_master(ids::CHAPTER_DISPLAY, &child_display));
+    let child_atom = elem_master(ids::CHAPTER_ATOM, &child_atom);
+
+    // Parent atom: two displays (eng + fra+country) + hidden flag + string_uid + nested child.
+    let mut display_eng = Vec::new();
+    display_eng.extend_from_slice(&elem_str(ids::CHAP_STRING, "Intro"));
+    display_eng.extend_from_slice(&elem_str(ids::CHAP_LANGUAGE, "eng"));
+
+    let mut display_fra = Vec::new();
+    display_fra.extend_from_slice(&elem_str(ids::CHAP_STRING, "Introduction"));
+    display_fra.extend_from_slice(&elem_str(ids::CHAP_LANGUAGE, "fre"));
+    display_fra.extend_from_slice(&elem_str(ids::CHAP_COUNTRY, "FR"));
+
+    let mut parent_atom = Vec::new();
+    parent_atom.extend_from_slice(&elem_uint(ids::CHAPTER_UID, 0xAA));
+    parent_atom.extend_from_slice(&elem_str(ids::CHAPTER_STRING_UID, "cue-intro-1"));
+    parent_atom.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 0));
+    parent_atom.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_END, 1_000_000_000));
+    parent_atom.extend_from_slice(&elem_uint(ids::CHAPTER_FLAG_HIDDEN, 1));
+    parent_atom.extend_from_slice(&elem_master(ids::CHAPTER_DISPLAY, &display_eng));
+    parent_atom.extend_from_slice(&elem_master(ids::CHAPTER_DISPLAY, &display_fra));
+    parent_atom.extend_from_slice(&child_atom);
+    let parent_atom = elem_master(ids::CHAPTER_ATOM, &parent_atom);
+
+    // EditionEntry with both flags set.
+    let mut edition_body = Vec::new();
+    edition_body.extend_from_slice(&elem_uint(ids::EDITION_UID, 0xBEEF));
+    edition_body.extend_from_slice(&elem_uint(ids::EDITION_FLAG_DEFAULT, 1));
+    edition_body.extend_from_slice(&elem_uint(ids::EDITION_FLAG_ORDERED, 1));
+    edition_body.extend_from_slice(&parent_atom);
+    let chapters = elem_master(
+        ids::CHAPTERS,
+        &elem_master(ids::EDITION_ENTRY, &edition_body),
+    );
+
+    let mut cluster_body = Vec::new();
+    cluster_body.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster_body.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    let cluster = elem_master(ids::CLUSTER, &cluster_body);
+
+    let mut seg_body = Vec::new();
+    seg_body.extend_from_slice(&info);
+    seg_body.extend_from_slice(&tracks);
+    seg_body.extend_from_slice(&chapters);
+    seg_body.extend_from_slice(&cluster);
+    let segment = elem_master(ids::SEGMENT, &seg_body);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ebml_header);
+    bytes.extend_from_slice(&segment);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver)
+        .expect("demux open_typed");
+
+    // Edition.
+    let eds = dmx.chapters();
+    assert_eq!(eds.len(), 1);
+    let ed = &eds[0];
+    assert_eq!(ed.uid, Some(0xBEEF));
+    assert!(ed.default);
+    assert!(ed.ordered);
+    assert_eq!(ed.chapters.len(), 1, "one top-level atom (the parent)");
+
+    // Parent atom.
+    let parent = &ed.chapters[0];
+    assert_eq!(parent.index, 1, "depth-first: parent gets index 1");
+    assert_eq!(parent.uid, Some(0xAA));
+    assert_eq!(parent.string_uid.as_deref(), Some("cue-intro-1"));
+    assert_eq!(parent.time_start_ns, 0);
+    assert_eq!(parent.time_end_ns, Some(1_000_000_000));
+    assert!(parent.hidden);
+    assert_eq!(parent.displays.len(), 2, "eng + fra");
+
+    let eng = &parent.displays[0];
+    assert_eq!(eng.string, "Intro");
+    assert_eq!(eng.language, "eng");
+    assert!(eng.language_bcp47.is_none());
+    assert!(eng.country.is_none());
+
+    let fra = &parent.displays[1];
+    assert_eq!(fra.string, "Introduction");
+    assert_eq!(fra.language, "fre");
+    assert!(fra.language_bcp47.is_none());
+    assert_eq!(fra.country.as_deref(), Some("FR"));
+
+    // Nested child.
+    assert_eq!(parent.children.len(), 1);
+    let child = &parent.children[0];
+    assert_eq!(child.index, 2, "depth-first: child gets index 2");
+    assert_eq!(child.uid, Some(0x10));
+    assert_eq!(child.time_start_ns, 500_000_000);
+    assert_eq!(child.time_end_ns, Some(800_000_000));
+    assert!(!child.hidden);
+    assert_eq!(child.displays.len(), 1);
+    assert_eq!(child.displays[0].string, "Sous-chapitre");
+    // ChapLanguageBCP47 present — parser preserves both raw fields; per
+    // RFC 9559 §5.1.7.1.4.12 the consumer ignores `language` when bcp47
+    // is set. The typed accessor surfaces both so the consumer can make
+    // that decision.
+    assert_eq!(child.displays[0].language, "fre");
+    assert_eq!(child.displays[0].language_bcp47.as_deref(), Some("fr-CA"));
+
+    // Nested atom also surfaces in the flat metadata view under its
+    // depth-first 1-based index.
+    let md: Vec<(String, String)> = dmx.metadata().to_vec();
+    let get = |k: &str| md.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.clone());
+    assert_eq!(get("chapter:1:start_ms").as_deref(), Some("0"));
+    assert_eq!(get("chapter:1:end_ms").as_deref(), Some("1000"));
+    assert_eq!(get("chapter:1:title").as_deref(), Some("Intro"));
+    assert_eq!(get("chapter:2:start_ms").as_deref(), Some("500"));
+    assert_eq!(get("chapter:2:end_ms").as_deref(), Some("800"));
+    assert_eq!(get("chapter:2:title").as_deref(), Some("Sous-chapitre"));
+}
+
+#[test]
+fn typed_chapters_empty_when_no_chapters_element() {
+    // A file with no Chapters element at all — `chapters()` must return
+    // an empty slice.
+    let ebml_header = build_ebml_header();
+    // `build_min_segment_skeleton` returns info + tracks + cluster with
+    // no Chapters element — exactly the input we need to exercise the
+    // "no chapters" branch.
+    let segment = elem_master(ids::SEGMENT, &build_min_segment_skeleton());
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ebml_header);
+    bytes.extend_from_slice(&segment);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver)
+        .expect("demux open_typed");
+
+    assert!(
+        dmx.chapters().is_empty(),
+        "file with no Chapters element should expose no editions"
     );
 }

@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed `Chapters` accessor** (RFC 9559 §5.1.7).
+  `MkvDemuxer::chapters() -> &[Edition]` exposes the structured chapter
+  tree the flat `chapter:N:*` metadata view collapses. Every
+  `EditionEntry` keeps its `EditionUID`, `EditionFlagDefault` and
+  `EditionFlagOrdered` flags; every `ChapterAtom` keeps its
+  `ChapterUID`, `ChapterStringUID`, full-precision `ChapterTimeStart` /
+  `ChapterTimeEnd` nanoseconds, `ChapterFlagHidden`, all multilingual
+  `ChapterDisplay` rows (`ChapString` + `ChapLanguage` /
+  `ChapLanguageBCP47` + `ChapCountry`), and any nested child atoms
+  (the spec marks `ChapterAtom` as recursive). Atoms are 1-indexed
+  depth-first in document order — the same index the flat
+  `chapter:N:*` keys and `TagChapterUID`-resolved tags use, now extended
+  to nested chapters (previously only top-level atoms got an index).
+  Adds `EDITION_FLAG_DEFAULT` / `EDITION_FLAG_ORDERED` /
+  `CHAPTER_STRING_UID` / `CHAP_LANGUAGE_BCP47` element IDs.
 - demux: **apply Header-Stripping on read** (RFC 9559 §5.1.4.1.31.6 algo 3,
   §5.1.4.1.31.7). Header Stripping is the one `ContentEncoding` transform
   the container can reverse without a codec: the `ContentCompSettings` bytes
