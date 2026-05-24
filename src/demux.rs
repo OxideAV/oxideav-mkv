@@ -1791,6 +1791,13 @@ struct CueEntry {
     /// Timestamp in Matroska ticks (timecode_scale ns per tick).
     time: u64,
     cluster_offset: u64,
+    /// `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) — byte offset of the
+    /// referenced `SimpleBlock` / `BlockGroup` inside the Cluster, with `0`
+    /// being the first possible position for an element inside that Cluster
+    /// (i.e. immediately after the Cluster element's id+size header). `None`
+    /// when the cue carried no `CueRelativePosition` child (legal — the
+    /// element is optional, only `maxOccurs: 1`).
+    relative_position: Option<u64>,
 }
 
 fn parse_cues(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<CueEntry>) -> Result<()> {
@@ -1831,11 +1838,15 @@ fn parse_cue_track_positions(
 ) -> Result<()> {
     let mut track: u64 = 0;
     let mut cluster_offset: Option<u64> = None;
+    let mut relative_position: Option<u64> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::CUE_TRACK => track = read_uint(r, e.size as usize)?,
             ids::CUE_CLUSTER_POSITION => cluster_offset = Some(read_uint(r, e.size as usize)?),
+            ids::CUE_RELATIVE_POSITION => {
+                relative_position = Some(read_uint(r, e.size as usize)?);
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -1844,6 +1855,7 @@ fn parse_cue_track_positions(
             track,
             time,
             cluster_offset: off,
+            relative_position,
         });
     }
     Ok(())
@@ -2387,21 +2399,47 @@ impl Demuxer for MkvDemuxer {
                 "MKV: no Cues entries for track {track_number} (stream {stream_index})"
             ))
         })?;
+        // Copy the fields out so the immutable borrow of `self.cues` can
+        // be released before we re-borrow `self` mutably to drive the
+        // input reader.
+        let cue_time = cue.time;
+        let cue_cluster_offset = cue.cluster_offset;
+        let relative_position = cue.relative_position;
 
-        let abs = self.segment_data_start + cue.cluster_offset;
+        let abs = self.segment_data_start + cue_cluster_offset;
         self.input.seek(SeekFrom::Start(abs))?;
         // Reset cluster reader state + any previously queued packets.
         self.cluster_state = ClusterState::Idle;
         self.out_queue.clear();
 
+        // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
+        // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
+        // sits `relative_position` bytes into the Cluster's body (where
+        // `0` is the first possible position for an element inside that
+        // Cluster — i.e. immediately after the Cluster element's id+size
+        // header). Honour it by pre-opening the Cluster, capturing its
+        // Timestamp (RFC 9559 §5.1.3.1 SHOULD be the first child element
+        // of the Cluster — Cluster timecode is mandatory for decoding
+        // any Block timestamp), and then jumping the reader to the exact
+        // block, skipping any earlier blocks the cue is not interested
+        // in.
+        //
+        // Without a relative position we leave the reader at the Cluster
+        // header and fall back to the regular `advance()` loop (which
+        // walks every child from the start), preserving the legacy
+        // behaviour byte-for-byte.
+        if let Some(rel) = relative_position {
+            self.apply_cue_relative_position(rel)?;
+        }
+
         // Convert the landed ticks back into the stream's time base.
         let landed_pts: i64 = if stream_tb.num == 0 || stream_tb.den == 0 {
-            cue.time as i64
+            cue_time as i64
         } else {
-            let numer = cue.time as i128 * stream_tb.den as i128 * self.timecode_scale_ns as i128;
+            let numer = cue_time as i128 * stream_tb.den as i128 * self.timecode_scale_ns as i128;
             let denom = stream_tb.num as i128 * 1_000_000_000i128;
             if denom == 0 {
-                cue.time as i64
+                cue_time as i64
             } else {
                 (numer / denom) as i64
             }
@@ -2521,6 +2559,88 @@ impl MkvDemuxer {
     /// semantics.
     pub fn all_content_encodings(&self) -> &[Option<ContentEncodings>] {
         &self.content_encodings
+    }
+
+    /// Apply a `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) after a
+    /// `seek_to` has positioned the reader at a Cluster header.
+    ///
+    /// Opens the Cluster (reads its id+size), captures the cluster
+    /// Timestamp (RFC 9559 §5.1.3.1 — SHOULD be the first child of the
+    /// Cluster; we walk children until we find it, or until we reach
+    /// `body_start + relative_position`, whichever comes first), and then
+    /// repositions the reader to `body_start + relative_position` and
+    /// installs an `InCluster` state with the captured timecode.
+    ///
+    /// `relative_position` is byte-distance from the first possible
+    /// element position inside the Cluster (i.e. immediately after the
+    /// Cluster element's id+size header).
+    ///
+    /// Best-effort: if the Cluster header doesn't look right, or the
+    /// relative position runs past the Cluster body, the helper leaves
+    /// the reader at the Cluster header and the state at `Idle` so the
+    /// regular `advance()` loop can take over — i.e. it degrades to the
+    /// legacy "scan the cluster from the start" path.
+    fn apply_cue_relative_position(&mut self, relative_position: u64) -> Result<()> {
+        let cluster_head_pos = self.input.stream_position()?;
+        let e = read_element_header(&mut *self.input)?;
+        if e.id != ids::CLUSTER {
+            // Cue offset doesn't point at a Cluster header — let the
+            // outer state machine sort it out.
+            self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+            return Ok(());
+        }
+        let body_start = self.input.stream_position()?;
+        let body_end = if e.size == VINT_UNKNOWN_SIZE {
+            self.segment_data_end
+        } else {
+            body_start + e.size
+        };
+        let target = body_start + relative_position;
+        if target > body_end {
+            // Out-of-range relative position — degrade gracefully:
+            // rewind to the cluster header so `advance()` can walk
+            // from the start.
+            self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+            return Ok(());
+        }
+
+        // Walk children from body_start until we either reach the
+        // target or pass it, capturing Timestamp on the way. Per
+        // RFC 9559 §5.1.3.1 the Timestamp SHOULD be first, so the
+        // typical iteration count is 1.
+        let mut cluster_timecode: i64 = 0;
+        let mut pos = body_start;
+        while pos < target {
+            self.input.seek(SeekFrom::Start(pos))?;
+            let child = match read_element_header(&mut *self.input) {
+                Ok(c) => c,
+                Err(_) => {
+                    self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+                    return Ok(());
+                }
+            };
+            // Compute the position right after the child (id+size+body).
+            let child_body_start = self.input.stream_position()?;
+            if child.id == ids::TIMECODE {
+                cluster_timecode = read_uint(&mut *self.input, child.size as usize)? as i64;
+            }
+            let next = child_body_start + child.size;
+            if next > body_end || next <= pos {
+                // Malformed child — degrade.
+                self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+                return Ok(());
+            }
+            pos = next;
+        }
+        // `pos` now equals `target` (or `target` was 0 and we never
+        // entered the loop). Seek to the target and install the
+        // InCluster state.
+        self.input.seek(SeekFrom::Start(target))?;
+        self.cluster_state = ClusterState::InCluster {
+            body_end,
+            cluster_timecode,
+        };
+        Ok(())
     }
 
     fn advance(&mut self) -> Result<()> {

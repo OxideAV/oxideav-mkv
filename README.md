@@ -96,6 +96,16 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - Seek: `seek_to(stream, pts)` uses the Cues index. Handles Cues at
   either end of the Segment, and walks an unknown-size final Cluster to
   find Cues that sit past it.
+- **`CueRelativePosition` honoured on seek** (RFC 9559 §5.1.5.1.2.3): when
+  a Cues entry carries the `CueRelativePosition` element, `seek_to` opens
+  the target Cluster, captures its `Timestamp` (RFC 9559 §5.1.3.1 — SHOULD
+  be the first child), and then repositions the reader directly at the
+  byte offset of the referenced `SimpleBlock` / `BlockGroup` (`0` being
+  the first possible element position inside that Cluster). The next
+  packet emitted is the cue's exact block, not the first block in the
+  Cluster — finer seek granularity than the legacy "scan from cluster
+  start" path, which is preserved as a fallback when the cue has no
+  `CueRelativePosition` or the encoded position is out of range.
 - An unknown-size Cluster is terminated cleanly when a sibling Segment-
   child element follows it (no more "Cues silently eaten as payload").
 - **CRC-32 validation** (RFC 8794 §11.3.1, RFC 9559 §6.2): when a Top-Level
@@ -165,7 +175,10 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `SimpleBlock` payload.
 - `Cues` element emitted in `write_trailer` - index entries for every
   video keyframe and every audio cluster-start, so the resulting file
-  is seekable without a second pass.
+  is seekable without a second pass. Each entry carries
+  `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3, recommended by §22.1)
+  so seek-aware readers jump straight to the indexed `SimpleBlock`
+  inside the Cluster instead of scanning from the cluster header.
 - Codec-specific fields: `CodecPrivate` normalisation for FLAC (`fLaC`
   magic prepended), Opus `CodecDelay` derived from the `OpusHead`
   pre-skip plus an 80 ms `SeekPreRoll` per the WebM spec.

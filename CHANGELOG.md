@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux + mux: **`CueRelativePosition` round-trip** (RFC 9559
+  §5.1.5.1.2.3). The demuxer parses `CueRelativePosition` from each
+  `CueTrackPositions` and, when present, repositions the input reader
+  directly at the referenced `SimpleBlock` / `BlockGroup` inside the
+  target Cluster on `seek_to` (instead of returning the first block of
+  the Cluster). The Cluster's `Timestamp` (RFC 9559 §5.1.3.1) is
+  captured first so block timecodes remain decodable. Out-of-range or
+  malformed positions degrade gracefully to the legacy
+  scan-from-cluster-start path. The muxer now writes
+  `CueRelativePosition` for every Cues entry it emits — measured from
+  the first possible element position inside the Cluster (i.e.
+  immediately after the Cluster id+size header). Adds 6 integration
+  tests covering middle / last / first / out-of-range positions, the
+  muxer's on-disk Cues bytes, and a full mux→demux round-trip.
 - demux: **typed `Chapters` accessor** (RFC 9559 §5.1.7).
   `MkvDemuxer::chapters() -> &[Edition]` exposes the structured chapter
   tree the flat `chapter:N:*` metadata view collapses. Every

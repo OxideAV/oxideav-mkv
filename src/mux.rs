@@ -142,6 +142,11 @@ pub struct MkvMuxer {
     /// Byte offset of the currently open cluster header, relative to the
     /// Segment payload start. Used to fill in `CueClusterPosition`.
     cluster_offset_rel: u64,
+    /// Absolute file offset of the first byte after the currently open
+    /// Cluster element's id+size header — i.e. the "first possible
+    /// element position" inside the Cluster, the anchor `CueRelativePosition`
+    /// (RFC 9559 §5.1.5.1.2.3) is measured against.
+    cluster_body_start_abs: u64,
     /// Absolute file offset of the Segment payload start (first byte after
     /// the Segment element header). `CueClusterPosition` values are stored
     /// relative to this position, per the Matroska spec.
@@ -281,6 +286,11 @@ struct CueRecord {
     time_ms: u64,
     /// Offset of the Cluster header relative to the Segment payload start.
     cluster_offset: u64,
+    /// `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) — byte offset of the
+    /// indexed `SimpleBlock` / `BlockGroup` element from the first possible
+    /// element position inside the Cluster (i.e. immediately after the
+    /// Cluster element's id+size header).
+    relative_position: u64,
 }
 
 impl MkvMuxer {
@@ -310,6 +320,7 @@ impl MkvMuxer {
             cluster_open: false,
             cluster_timecode_ms: 0,
             cluster_offset_rel: 0,
+            cluster_body_start_abs: 0,
             segment_data_start: 0,
             cues: Vec::new(),
             cue_seen_in_cluster: vec![false; n],
@@ -710,19 +721,35 @@ impl Muxer for MkvMuxer {
         // For video we only index keyframes (random-access points). For
         // audio/subtitle we index the cluster-start regardless, since every
         // audio frame is independently decodable.
+        //
+        // `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) is measured from the
+        // first possible element position inside the Cluster (i.e. the byte
+        // immediately after the Cluster id+size header — see
+        // `start_cluster`). For the non-lacing fast path we know the
+        // SimpleBlock will be written at the current file position, so we
+        // capture the offset before the write. For the lacing path the
+        // block is buffered and flushed later, so the relative position is
+        // computed inside `flush_lace`.
+        let pre_block_pos = self.output.stream_position().unwrap_or(0);
+        let pre_block_rel = pre_block_pos.saturating_sub(self.cluster_body_start_abs);
         if !self.cue_seen_in_cluster[stream_idx] {
             let indexable = match media_type {
                 MediaType::Video => packet.flags.keyframe,
                 _ => true,
             };
-            if indexable {
+            if indexable && self.lacing_mode == LacingMode::None {
+                // Non-lacing path: the block lands at `pre_block_pos`,
+                // emit the cue now with the correct relative position.
                 self.cues.push(CueRecord {
                     track: track_number,
                     time_ms: pts_ms.max(0) as u64,
                     cluster_offset: self.cluster_offset_rel,
+                    relative_position: pre_block_rel,
                 });
                 self.cue_seen_in_cluster[stream_idx] = true;
             }
+            // Lacing path: cue emission happens in `flush_lace` once we
+            // actually know where the (possibly laced) block lands.
         }
 
         if self.lacing_mode == LacingMode::None {
@@ -785,6 +812,11 @@ impl MkvMuxer {
         // Write Cluster element id + unknown-size sentinel.
         self.output.write_all(&write_element_id(ids::CLUSTER))?;
         self.output.write_all(&write_vint(VINT_UNKNOWN_SIZE, 0))?;
+        // Right after the id+size header is the "first possible element
+        // position" inside the Cluster — the anchor that
+        // `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) is measured
+        // against.
+        self.cluster_body_start_abs = self.output.stream_position().unwrap_or(0);
         // Write Timecode child element.
         let mut tc = Vec::new();
         write_uint_element(&mut tc, ids::TIMECODE, timecode_ms.max(0) as u64);
@@ -828,6 +860,17 @@ impl MkvMuxer {
                 let mut ctp = Vec::new();
                 write_uint_element(&mut ctp, ids::CUE_TRACK, e.track);
                 write_uint_element(&mut ctp, ids::CUE_CLUSTER_POSITION, e.cluster_offset);
+                // `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) is a
+                // SHOULD-write per §22.1: "If the referenced frame is not
+                // stored within the first SimpleBlock or first BlockGroup
+                // within its Cluster element, then the
+                // CueRelativePosition element SHOULD be written to
+                // reference where in the Cluster the reference frame is
+                // stored." We write it unconditionally — it costs at
+                // most a handful of bytes per cue entry and lets readers
+                // skip past intervening blocks instead of scanning the
+                // cluster from the start.
+                write_uint_element(&mut ctp, ids::CUE_RELATIVE_POSITION, e.relative_position);
                 write_master_element(&mut cp, ids::CUE_TRACK_POSITIONS, &ctp);
             }
             write_master_element(&mut body, ids::CUE_POINT, &cp);
@@ -904,12 +947,35 @@ impl MkvMuxer {
         let track_number = self.track_numbers[stream_idx];
         let tc_offset = self.lace_pending[stream_idx].first_timecode_offset;
         let keyframe = self.lace_pending[stream_idx].keyframe;
+        let media_type = self.streams[stream_idx].params.media_type;
         // Per §10.3, a single-frame lace MUST use no-lacing mode.
         let mode = if frames.len() == 1 {
             LacingMode::None
         } else {
             self.lacing_mode
         };
+        // Record a Cue entry for the first indexable laced block per
+        // (cluster, track). The block lands at the current file
+        // position; `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) is
+        // measured from `cluster_body_start_abs` — see `start_cluster`.
+        if !self.cue_seen_in_cluster[stream_idx] {
+            let indexable = match media_type {
+                MediaType::Video => keyframe,
+                _ => true,
+            };
+            if indexable {
+                let pre_block_pos = self.output.stream_position().unwrap_or(0);
+                let pre_block_rel = pre_block_pos.saturating_sub(self.cluster_body_start_abs);
+                let pts_ms = (self.cluster_timecode_ms + tc_offset as i64).max(0) as u64;
+                self.cues.push(CueRecord {
+                    track: track_number,
+                    time_ms: pts_ms,
+                    cluster_offset: self.cluster_offset_rel,
+                    relative_position: pre_block_rel,
+                });
+                self.cue_seen_in_cluster[stream_idx] = true;
+            }
+        }
         let block_bytes = build_simple_block(track_number, tc_offset, keyframe, mode, &frames);
         self.output.write_all(&block_bytes)?;
         Ok(())
