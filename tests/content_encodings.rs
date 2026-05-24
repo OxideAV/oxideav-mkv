@@ -87,6 +87,39 @@ fn simple_block(track: u8, tc_offset: i16, keyframe: bool, payload: u8) -> Vec<u
     elem_master(ids::SIMPLE_BLOCK, &body)
 }
 
+/// A `SimpleBlock` carrying an arbitrary (multi-byte) frame payload, no
+/// lacing.
+fn simple_block_payload(track: u8, tc_offset: i16, keyframe: bool, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&write_vint(track as u64, 0));
+    body.extend_from_slice(&tc_offset.to_be_bytes());
+    body.push(if keyframe { 0x80 } else { 0x00 });
+    body.extend_from_slice(payload);
+    elem_master(ids::SIMPLE_BLOCK, &body)
+}
+
+/// A fixed-size-laced `SimpleBlock` carrying `frames` equal-length payloads.
+/// The LACING bits are 0b10 (fixed-size) so no per-frame size header is
+/// written — the demuxer derives the per-frame size from `(n-1)` and the
+/// total payload length.
+fn fixed_laced_block(track: u8, tc_offset: i16, keyframe: bool, frames: &[&[u8]]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&write_vint(track as u64, 0));
+    body.extend_from_slice(&tc_offset.to_be_bytes());
+    // Flags: keyframe bit | fixed-size lacing (0b10 << 1).
+    let mut flags = 0x00u8;
+    if keyframe {
+        flags |= 0x80;
+    }
+    flags |= 0b10 << 1;
+    body.push(flags);
+    body.push((frames.len() - 1) as u8); // frame count minus one
+    for f in frames {
+        body.extend_from_slice(f);
+    }
+    elem_master(ids::SIMPLE_BLOCK, &body)
+}
+
 /// A plain video track header, optionally extended by `extra` (e.g. a
 /// `ContentEncodings` master).
 fn video_track(number: u64, uid: u64, extra: &[u8]) -> Vec<u8> {
@@ -131,11 +164,18 @@ fn one_cluster() -> Vec<u8> {
 
 /// Assemble EBML header + Segment(Info, Tracks, Cluster) into a file.
 fn assemble(tracks_body: &[u8]) -> Vec<u8> {
+    assemble_with_cluster(tracks_body, &one_cluster())
+}
+
+/// Like [`assemble`] but with a caller-supplied Cluster element, so a test
+/// can place specific Block payloads in the file and inspect the demuxed
+/// packets.
+fn assemble_with_cluster(tracks_body: &[u8], cluster: &[u8]) -> Vec<u8> {
     let tracks = elem_master(ids::TRACKS, tracks_body);
     let mut seg = Vec::new();
     seg.extend_from_slice(&info());
     seg.extend_from_slice(&tracks);
-    seg.extend_from_slice(&one_cluster());
+    seg.extend_from_slice(cluster);
     let segment = elem_master(ids::SEGMENT, &seg);
     let mut out = Vec::new();
     out.extend_from_slice(&ebml_header());
@@ -399,4 +439,165 @@ fn no_content_encodings_present() {
     assert_eq!(dmx.all_content_encodings().len(), 1);
     assert!(dmx.content_encodings(0).is_none());
     assert!(dmx.content_encodings(99).is_none());
+}
+
+// --- Header-Stripping application on the packet path ----------------------
+//
+// RFC 9559 §5.1.4.1.31.6 algo 3 (Header Stripping) + §5.1.4.1.31.7: the
+// `ContentCompSettings` bytes were removed from the front of each frame on
+// write. Header Stripping is the one ContentEncoding transform the container
+// can reverse without a codec — the demuxer prepends the stripped bytes to
+// every de-laced frame so `next_packet` returns the original frame data.
+
+/// Build a single-block cluster carrying `payload` on track 1.
+fn cluster_with(payload: &[u8]) -> Vec<u8> {
+    let mut cb = Vec::new();
+    cb.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cb.extend_from_slice(&simple_block_payload(1, 0, true, payload));
+    elem_master(ids::CLUSTER, &cb)
+}
+
+/// A Block-scoped Header-Stripping encoding causes the demuxer to prepend the
+/// stripped bytes to the emitted packet, restoring the original frame.
+#[test]
+fn header_stripping_is_applied_to_packets() {
+    let stripped = [0xDE, 0xAD, 0xBE, 0xEF];
+    let on_disk_frame = [0x01, 0x02, 0x03];
+    let enc = header_stripping_encoding(0, ids::CONTENT_ENCODING_SCOPE_BLOCK, &stripped);
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+
+    let mut dmx = open(assemble_with_cluster(
+        &tracks_body,
+        &cluster_with(&on_disk_frame),
+    ));
+    let pkt = dmx.next_packet().expect("packet");
+    let mut expected = stripped.to_vec();
+    expected.extend_from_slice(&on_disk_frame);
+    assert_eq!(pkt.data, expected, "stripped prefix prepended to frame");
+}
+
+/// A track with no Header-Stripping leaves packet bytes exactly as stored.
+#[test]
+fn plain_track_packet_unchanged() {
+    let frame = [0x11, 0x22, 0x33];
+    let track = video_track(1, 0x1, &[]);
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+
+    let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&frame)));
+    let pkt = dmx.next_packet().expect("packet");
+    assert_eq!(pkt.data, frame, "no encoding → untouched frame bytes");
+}
+
+/// Two chained Header-Stripping encodings are undone highest-order-first
+/// (§5.1.4.1.31.2). On write the low-order (0) step strips prefix A first,
+/// then the high-order (1) step strips prefix B from the front of the
+/// already-A-stripped frame. On read the demuxer undoes order 1 (prepend B)
+/// then order 0 (prepend A), so the restored frame is A + B + on-disk.
+#[test]
+fn chained_header_stripping_combined_in_decode_order() {
+    let a = [0xA0, 0xA1];
+    let b = [0xB0, 0xB1, 0xB2];
+    let on_disk = [0x77];
+    let mut body = Vec::new();
+    // order 0 strips A, order 1 strips B (written in either order).
+    body.extend_from_slice(&header_stripping_encoding(
+        0,
+        ids::CONTENT_ENCODING_SCOPE_BLOCK,
+        &a,
+    ));
+    body.extend_from_slice(&header_stripping_encoding(
+        1,
+        ids::CONTENT_ENCODING_SCOPE_BLOCK,
+        &b,
+    ));
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &body));
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+
+    let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&on_disk)));
+    let pkt = dmx.next_packet().expect("packet");
+    let mut expected = a.to_vec();
+    expected.extend_from_slice(&b);
+    expected.extend_from_slice(&on_disk);
+    assert_eq!(pkt.data, expected, "A + B + frame in decode order");
+}
+
+/// Block scope (§5.1.4.1.31.3 bit 0x1) is "all frame contents, excluding
+/// lacing data" — the prefix is prepended to *each* de-laced frame, not the
+/// whole laced Block once.
+#[test]
+fn header_stripping_applied_per_laced_frame() {
+    let stripped = [0xFA, 0xCE];
+    let f0 = [0x10, 0x11];
+    let f1 = [0x20, 0x21];
+    let enc = header_stripping_encoding(0, ids::CONTENT_ENCODING_SCOPE_BLOCK, &stripped);
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+
+    let mut cb = Vec::new();
+    cb.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cb.extend_from_slice(&fixed_laced_block(1, 0, true, &[&f0, &f1]));
+    let cluster = elem_master(ids::CLUSTER, &cb);
+
+    let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster));
+    let p0 = dmx.next_packet().expect("frame 0");
+    let p1 = dmx.next_packet().expect("frame 1");
+    let mut e0 = stripped.to_vec();
+    e0.extend_from_slice(&f0);
+    let mut e1 = stripped.to_vec();
+    e1.extend_from_slice(&f1);
+    assert_eq!(p0.data, e0, "prefix on first laced frame");
+    assert_eq!(p1.data, e1, "prefix on second laced frame");
+}
+
+/// A Header-Stripping encoding that is *not* Block-scoped (e.g. Private-only,
+/// scope 0x2) touches `CodecPrivate`, not frame data — so packets are left
+/// unchanged.
+#[test]
+fn private_scope_header_stripping_does_not_touch_packets() {
+    let frame = [0x42, 0x43];
+    let enc = header_stripping_encoding(0, ids::CONTENT_ENCODING_SCOPE_PRIVATE, &[0xFF, 0xFE]);
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+
+    let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&frame)));
+    let pkt = dmx.next_packet().expect("packet");
+    assert_eq!(pkt.data, frame, "Private-scope strip leaves frames alone");
+}
+
+/// When the Block-scoped chain contains a step the container can't reverse
+/// (here an AES encryption alongside a Header-Stripping), the demuxer must
+/// NOT partially undo it — packets pass through as the encoded bytes so the
+/// caller can apply the whole chain itself.
+#[test]
+fn unsupported_step_in_chain_leaves_packets_encoded() {
+    let on_disk = [0x55, 0x66];
+    let mut body = Vec::new();
+    // order 0: header-strip (reversible); order 1: AES encryption (not).
+    body.extend_from_slice(&header_stripping_encoding(
+        0,
+        ids::CONTENT_ENCODING_SCOPE_BLOCK,
+        &[0x01, 0x02],
+    ));
+    body.extend_from_slice(&aes_encryption_encoding(
+        1,
+        &[0xAB],
+        ids::AES_CIPHER_MODE_CTR,
+    ));
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &body));
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+
+    // Sanity: the AES encoding is Block-scoped by default (scope omitted → 0x1).
+    let mut dmx = open(assemble_with_cluster(&tracks_body, &cluster_with(&on_disk)));
+    let pkt = dmx.next_packet().expect("packet");
+    assert_eq!(
+        pkt.data, on_disk,
+        "encrypted chain → packet left untouched, not partially stripped"
+    );
 }

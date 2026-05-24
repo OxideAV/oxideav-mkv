@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **apply Header-Stripping on read** (RFC 9559 §5.1.4.1.31.6 algo 3,
+  §5.1.4.1.31.7). Header Stripping is the one `ContentEncoding` transform
+  the container can reverse without a codec: the `ContentCompSettings` bytes
+  were stripped from the front of each frame on write, so the demuxer now
+  prepends them back and `next_packet` returns the original frame data.
+  Block scope (§5.1.4.1.31.3 bit 0x1, "all frame contents excluding lacing
+  data") is honoured per de-laced frame; a chain of multiple Header-
+  Stripping steps is combined in decode order (highest `ContentEncodingOrder`
+  first, §5.1.4.1.31.2). When the Block-scoped chain contains a step the
+  container can't undo (zlib / bzlib / lzo1x compression or encryption) the
+  packet passes through encoded rather than being partially stripped, and a
+  Private-scope (`CodecPrivate`-only, bit 0x2) Header-Stripping leaves frame
+  data untouched. zlib/bzlib/lzo1x decompression and decryption remain out
+  of container scope.
 - demux: **`ContentEncodings` typed decode** (RFC 9559 §5.1.4.1.31). A
   track's per-frame transformation chain (compression and/or encryption
   applied to frame data / `CodecPrivate` before the bytes hit Blocks) now

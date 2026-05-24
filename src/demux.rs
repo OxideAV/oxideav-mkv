@@ -375,6 +375,20 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let content_encodings: Vec<Option<ContentEncodings>> =
         tracks.iter().map(|t| t.content_encodings.clone()).collect();
 
+    // Per-stream Header-Stripping prefix (RFC 9559 §5.1.4.1.31.6 algo 3): the
+    // bytes to prepend to each de-laced frame to undo a Block-scoped
+    // Header-Stripping chain. Empty when there's nothing to undo or the chain
+    // contains a step the container can't reverse — see
+    // `compute_header_strip_prefix`.
+    let header_strip_prefixes: Vec<Vec<u8>> = content_encodings
+        .iter()
+        .map(|ce| {
+            ce.as_ref()
+                .and_then(compute_header_strip_prefix)
+                .unwrap_or_default()
+        })
+        .collect();
+
     // Position at the first Cluster.
     let cluster_pos = first_cluster_offset.ok_or_else(|| Error::invalid("MKV: no clusters"))?;
     input.seek(SeekFrom::Start(cluster_pos))?;
@@ -411,6 +425,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         crc_status,
         track_operations,
         content_encodings,
+        header_strip_prefixes,
     })
 }
 
@@ -1180,6 +1195,61 @@ impl ContentEncodings {
     /// `ContentEncodings` master).
     pub fn is_empty(&self) -> bool {
         self.encodings.is_empty()
+    }
+}
+
+/// Compute the byte prefix to prepend to every de-laced frame in order to
+/// undo a track's Block-scoped Header-Stripping compression (RFC 9559
+/// §5.1.4.1.31.6 algo 3, §5.1.4.1.31.7).
+///
+/// Header Stripping is the only [`ContentEncoding`] transform the container
+/// can reverse without a compression/encryption codec: the
+/// `ContentCompSettings` bytes were removed from the front of each frame on
+/// write, so prepending them restores the original frame.
+///
+/// The full chain is undone highest-`ContentEncodingOrder` first
+/// (§5.1.4.1.31.2). `enc.encodings` is already pre-sorted into that decode
+/// order, so iterating it front-to-back and prepending each step's stripped
+/// bytes ahead of the bytes accumulated so far yields the correct combined
+/// prefix.
+///
+/// This only fires when *every* Block-scoped (`ContentEncodingScope` bit
+/// `0x1`) encoding is Header Stripping. If any Block-scoped step is a
+/// different compression (zlib / bzlib / lzo1x) or an encryption, the
+/// container cannot reconstruct the raw bytes and returns `None` — the
+/// caller must undo the whole chain itself and the demuxer leaves packets
+/// encoded. Non-Block-scoped encodings (e.g. `CodecPrivate`-only, scope
+/// `0x2`) are ignored here since they never touch frame data.
+fn compute_header_strip_prefix(enc: &ContentEncodings) -> Option<Vec<u8>> {
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut saw_strip = false;
+    for e in &enc.encodings {
+        if !e.scope.block() {
+            // Doesn't touch Block frame data — irrelevant to packet bytes.
+            continue;
+        }
+        match &e.transform {
+            ContentEncodingTransform::Compression {
+                algo: ContentCompAlgo::HeaderStripping,
+                settings,
+            } => {
+                // Decode order: this (higher-order) step is undone before the
+                // ones already accumulated, so its bytes go in front.
+                let mut combined = settings.clone();
+                combined.extend_from_slice(&prefix);
+                prefix = combined;
+                saw_strip = true;
+            }
+            // Any other Block-scoped transform (real compression or
+            // encryption) is something the container can't undo — bail so the
+            // whole chain is left to the caller rather than corrupting frames.
+            _ => return None,
+        }
+    }
+    if saw_strip {
+        Some(prefix)
+    } else {
+        None
     }
 }
 
@@ -2087,6 +2157,16 @@ pub struct MkvDemuxer {
     /// stream index. `None` for tracks with no encodings — see
     /// [`MkvDemuxer::content_encodings`].
     content_encodings: Vec<Option<ContentEncodings>>,
+    /// Per-stream Header-Stripping prefix (RFC 9559 §5.1.4.1.31.6 algo 3,
+    /// §5.1.4.1.31.7), indexed by stream index. When a track's *entire*
+    /// Block-scoped `ContentEncodings` chain is composed only of
+    /// Header-Stripping compressions, this holds the bytes to prepend to
+    /// every de-laced frame so emitted packets carry the original frame
+    /// data. Empty `Vec` when there is nothing to prepend (the common case,
+    /// or when the chain contains a step this container can't undo — zlib /
+    /// encryption — in which case packets pass through encoded). See
+    /// [`compute_header_strip_prefix`].
+    header_strip_prefixes: Vec<Vec<u8>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -2457,9 +2537,28 @@ impl MkvDemuxer {
         let pts_base = cluster_timecode + timecode_offset;
         let n_frames = frames.len() as i64;
         let per_frame = explicit_duration.map(|d| d / n_frames.max(1));
+        // Header-Stripping (RFC 9559 §5.1.4.1.31.6 algo 3) prefix for this
+        // stream, prepended to each de-laced frame so the packet carries the
+        // original (un-stripped) bytes. Block scope (§5.1.4.1.31.3 bit 0x1) is
+        // "all frame contents, excluding lacing data" — i.e. each frame after
+        // lacing is split, which is exactly `f` here. Empty when the track has
+        // no reversible Header-Stripping chain (the common case).
+        let strip_prefix = self
+            .header_strip_prefixes
+            .get(stream_idx as usize)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         for (i, f) in frames.into_iter().enumerate() {
             let pts = pts_base + per_frame.unwrap_or(0) * i as i64;
-            let mut pkt = Packet::new(stream_idx, self.time_base, f);
+            let frame_bytes = if strip_prefix.is_empty() {
+                f
+            } else {
+                let mut restored = Vec::with_capacity(strip_prefix.len() + f.len());
+                restored.extend_from_slice(strip_prefix);
+                restored.extend_from_slice(&f);
+                restored
+            };
+            let mut pkt = Packet::new(stream_idx, self.time_base, frame_bytes);
             pkt.pts = Some(pts);
             pkt.dts = Some(pts);
             pkt.duration = per_frame;

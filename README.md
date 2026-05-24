@@ -124,8 +124,20 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `Ctr` / `Cbc` / `Other(u64)`). The list is pre-sorted into *decode* order
   (highest `ContentEncodingOrder` first, per §5.1.4.1.31.2). Element
   defaults are honoured (order 0, scope 0x1 Block, type 0 compression,
-  comp-algo 0 zlib). **Parse-only**: the headers are surfaced, no frame is
-  ever decompressed or decrypted.
+  comp-algo 0 zlib). The headers are surfaced; zlib/bzlib/lzo1x and
+  encryption are never decompressed or decrypted (out of container scope).
+- **Header-Stripping applied on read** (RFC 9559 §5.1.4.1.31.6 algo 3,
+  §5.1.4.1.31.7): Header Stripping is the one `ContentEncoding` transform
+  the container can reverse without a codec — the `ContentCompSettings`
+  bytes were removed from the front of each frame on write, so the demuxer
+  prepends them back to every de-laced frame, and `next_packet` returns the
+  original (un-stripped) frame data. Block scope (§5.1.4.1.31.3 bit 0x1) is
+  honoured per-frame (the prefix lands on each laced sub-frame, not the
+  Block once); a chain of several Header-Stripping steps is combined in
+  decode order. If the Block-scoped chain contains any step the container
+  can't undo (zlib/bzlib/lzo1x compression or encryption), packets pass
+  through encoded — the demuxer never *partially* strips. Private-scope
+  (`CodecPrivate`-only) Header Stripping leaves frame data untouched.
 
 ### Muxer (`mux::open` and `mux::open_webm`)
 
@@ -215,11 +227,13 @@ so the demuxer never hides an unrecognised track.
   into a single combined output stream. `TrackOperation` is never written
   on the mux side.
 - `ContentEncodings` is decoded and surfaced (compression / encryption
-  headers) but the demuxer does not *undo* it — packets are returned as the
-  encoded (compressed/encrypted) bytes on the wire; a caller that wants raw
-  codec bytes must apply the reported encoding chain itself. Compression /
-  encryption is undecoded by design (container scope) and never written on
-  the mux side.
+  headers). The demuxer *undoes* a Block-scoped Header-Stripping chain
+  (algo 3) on read — packets carry the original frame bytes — but the
+  generic compression algorithms (zlib / bzlib / lzo1x) and encryption are
+  not reversed: for those a caller that wants raw codec bytes must apply the
+  reported encoding chain itself. zlib/bzlib/lzo1x decompression and
+  decryption are out of container scope; `ContentEncodings` is never written
+  on the mux side.
 
 ## License
 
