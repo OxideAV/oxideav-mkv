@@ -370,6 +370,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         })
         .collect();
 
+    // Per-stream `ContentEncodings` (RFC 9559 §5.1.4.1.31), indexed by
+    // stream index. No UID resolution needed — encodings are self-contained.
+    let content_encodings: Vec<Option<ContentEncodings>> =
+        tracks.iter().map(|t| t.content_encodings.clone()).collect();
+
     // Position at the first Cluster.
     let cluster_pos = first_cluster_offset.ok_or_else(|| Error::invalid("MKV: no clusters"))?;
     input.seek(SeekFrom::Start(cluster_pos))?;
@@ -405,6 +410,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         tags: typed_tags,
         crc_status,
         track_operations,
+        content_encodings,
     })
 }
 
@@ -535,6 +541,11 @@ struct TrackEntry {
     /// after the full Tracks list is known. `None` when the TrackEntry has
     /// no `TrackOperation` child (the common case for ordinary tracks).
     track_operation: Option<RawTrackOperation>,
+    /// `ContentEncodings` (RFC 9559 §5.1.4.1.31) for the track, parsed in
+    /// on-disk order. Sorted into decode order (descending
+    /// `ContentEncodingOrder`) when surfaced. `None` when the track declares
+    /// no encodings (the common, uncompressed/unencrypted case).
+    content_encodings: Option<ContentEncodings>,
 }
 
 /// Parser-private staging form of `TrackOperation` — the plane / join
@@ -1144,6 +1155,188 @@ pub struct TrackRef {
     pub stream_index: Option<u32>,
 }
 
+/// A track's `ContentEncodings` (RFC 9559 §5.1.4.1.31): the ordered list of
+/// transformations applied to the track's frame data and/or `CodecPrivate`
+/// before the bytes were written into Blocks.
+///
+/// This is purely the *description* of how a track's data was encoded — the
+/// container does not decompress or decrypt anything. A reader that wants
+/// the raw codec bytes back must undo the encodings itself, in the order
+/// the spec defines: highest [`ContentEncoding::order`] first, lowest last
+/// (§5.1.4.1.31.2).
+///
+/// `encodings` is returned sorted by descending `order` so iterating it
+/// front-to-back is the spec-mandated *decode* order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentEncodings {
+    /// Each [`ContentEncoding`], sorted by descending
+    /// [`ContentEncoding::order`] (decode order — apply the first entry
+    /// first).
+    pub encodings: Vec<ContentEncoding>,
+}
+
+impl ContentEncodings {
+    /// True when the track declares no content encodings (an empty or absent
+    /// `ContentEncodings` master).
+    pub fn is_empty(&self) -> bool {
+        self.encodings.is_empty()
+    }
+}
+
+/// One `ContentEncoding` (RFC 9559 §5.1.4.1.31.1): a single compression or
+/// encryption step in a track's [`ContentEncodings`] chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContentEncoding {
+    /// `ContentEncodingOrder` (§5.1.4.1.31.2, default 0). Encodings are
+    /// applied to the data on *write* from lowest order to highest, so a
+    /// reader undoes them from highest to lowest.
+    pub order: u64,
+    /// `ContentEncodingScope` bit field (§5.1.4.1.31.3, default 0x1) naming
+    /// which parts of the track this encoding touches.
+    pub scope: ContentEncodingScope,
+    /// The transformation itself — compression or encryption settings.
+    pub transform: ContentEncodingTransform,
+}
+
+/// `ContentEncodingScope` (RFC 9559 §5.1.4.1.31.3, Table 21): a bit field
+/// describing which elements of the track an encoding was applied to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentEncodingScope(pub u64);
+
+impl ContentEncodingScope {
+    /// `0x1` — applies to all frame contents, excluding lacing data.
+    pub fn block(self) -> bool {
+        self.0 & ids::CONTENT_ENCODING_SCOPE_BLOCK != 0
+    }
+    /// `0x2` — applies to the track's `CodecPrivate` data.
+    pub fn private(self) -> bool {
+        self.0 & ids::CONTENT_ENCODING_SCOPE_PRIVATE != 0
+    }
+    /// `0x4` — applies to the next `ContentEncoding`'s settings. The spec
+    /// says this SHOULD NOT be used; surfaced for completeness.
+    pub fn next(self) -> bool {
+        self.0 & ids::CONTENT_ENCODING_SCOPE_NEXT != 0
+    }
+}
+
+/// The kind of transformation a [`ContentEncoding`] performs, selected by
+/// `ContentEncodingType` (RFC 9559 §5.1.4.1.31.4, Table 22).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentEncodingTransform {
+    /// `ContentEncodingType = 0` — compression (§5.1.4.1.31.5). Carries the
+    /// algorithm and, for header stripping, the stripped octets.
+    Compression {
+        /// `ContentCompAlgo` (§5.1.4.1.31.6).
+        algo: ContentCompAlgo,
+        /// `ContentCompSettings` (§5.1.4.1.31.7). For
+        /// [`ContentCompAlgo::HeaderStripping`] these are the bytes removed
+        /// from the front of each frame, to be prepended back on decode.
+        /// Empty when the element is absent.
+        settings: Vec<u8>,
+    },
+    /// `ContentEncodingType = 1` — encryption (§5.1.4.1.31.8). The container
+    /// surfaces the cipher description only; it does not decrypt.
+    Encryption {
+        /// `ContentEncAlgo` (§5.1.4.1.31.9).
+        algo: ContentEncAlgo,
+        /// `ContentEncKeyID` (§5.1.4.1.31.10) — the public-key ID for
+        /// public-key algorithms. Empty when absent.
+        key_id: Vec<u8>,
+        /// `AESSettingsCipherMode` (§5.1.4.1.31.12) inside
+        /// `ContentEncAESSettings` (§5.1.4.1.31.11). Only meaningful when
+        /// `algo` is [`ContentEncAlgo::Aes`]; `None` otherwise.
+        aes_cipher_mode: Option<AesCipherMode>,
+    },
+}
+
+/// `ContentCompAlgo` (RFC 9559 §5.1.4.1.31.6, Table 23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentCompAlgo {
+    /// `0` — zlib (RFC 1950).
+    Zlib,
+    /// `1` — bzip2. SHOULD NOT be used (see spec usage notes).
+    Bzlib,
+    /// `2` — LZO1X. SHOULD NOT be used (licensing).
+    Lzo1x,
+    /// `3` — header stripping: octets in `ContentCompSettings` were removed
+    /// from the front of each frame.
+    HeaderStripping,
+    /// A value registered in the IANA "Matroska Compression Algorithms"
+    /// registry (§27.2) that this build doesn't name.
+    Other(u64),
+}
+
+impl ContentCompAlgo {
+    /// Map a raw `ContentCompAlgo` integer onto the enum.
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::CONTENT_COMP_ALGO_ZLIB => ContentCompAlgo::Zlib,
+            ids::CONTENT_COMP_ALGO_BZLIB => ContentCompAlgo::Bzlib,
+            ids::CONTENT_COMP_ALGO_LZO1X => ContentCompAlgo::Lzo1x,
+            ids::CONTENT_COMP_ALGO_HEADER_STRIPPING => ContentCompAlgo::HeaderStripping,
+            other => ContentCompAlgo::Other(other),
+        }
+    }
+}
+
+/// `ContentEncAlgo` (RFC 9559 §5.1.4.1.31.9, Table 24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentEncAlgo {
+    /// `0` — not encrypted (signals only signing, per spec).
+    None,
+    /// `1` — DES. SHOULD be avoided.
+    Des,
+    /// `2` — 3DES. SHOULD be avoided.
+    TripleDes,
+    /// `3` — Twofish.
+    Twofish,
+    /// `4` — Blowfish. SHOULD be avoided.
+    Blowfish,
+    /// `5` — AES.
+    Aes,
+    /// A value registered in the IANA "Matroska Encryption Algorithms"
+    /// registry (§27.3) that this build doesn't name.
+    Other(u64),
+}
+
+impl ContentEncAlgo {
+    /// Map a raw `ContentEncAlgo` integer onto the enum.
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::CONTENT_ENC_ALGO_NONE => ContentEncAlgo::None,
+            ids::CONTENT_ENC_ALGO_DES => ContentEncAlgo::Des,
+            ids::CONTENT_ENC_ALGO_3DES => ContentEncAlgo::TripleDes,
+            ids::CONTENT_ENC_ALGO_TWOFISH => ContentEncAlgo::Twofish,
+            ids::CONTENT_ENC_ALGO_BLOWFISH => ContentEncAlgo::Blowfish,
+            ids::CONTENT_ENC_ALGO_AES => ContentEncAlgo::Aes,
+            other => ContentEncAlgo::Other(other),
+        }
+    }
+}
+
+/// `AESSettingsCipherMode` (RFC 9559 §5.1.4.1.31.12, Table 26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AesCipherMode {
+    /// `1` — AES-CTR (counter mode).
+    Ctr,
+    /// `2` — AES-CBC (cipher block chaining).
+    Cbc,
+    /// A value registered in the IANA "Matroska AES Cipher Modes" registry
+    /// (§27.4) that this build doesn't name.
+    Other(u64),
+}
+
+impl AesCipherMode {
+    /// Map a raw `AESSettingsCipherMode` integer onto the enum.
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::AES_CIPHER_MODE_CTR => AesCipherMode::Ctr,
+            ids::AES_CIPHER_MODE_CBC => AesCipherMode::Cbc,
+            other => AesCipherMode::Other(other),
+        }
+    }
+}
+
 /// Parse a `Chapters` master element. Each `EditionEntry` is walked, and
 /// each `ChapterAtom` inside it is lifted into the metadata vector as
 /// three entries: `chapter:N:start_ms`, `chapter:N:end_ms` (when present),
@@ -1597,10 +1790,147 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 parse_track_operation(r, body_end, &mut op)?;
                 t.track_operation = Some(op);
             }
+            ids::CONTENT_ENCODINGS => {
+                let body_end = r.stream_position()? + e.size;
+                t.content_encodings = Some(parse_content_encodings(r, body_end)?);
+            }
             _ => skip(r, e.size)?,
         }
     }
     Ok(())
+}
+
+/// Parse a `ContentEncodings` master (RFC 9559 §5.1.4.1.31) into the typed
+/// [`ContentEncodings`]. Each `ContentEncoding` child is decoded into a
+/// [`ContentEncoding`]; the list is then sorted by **descending**
+/// `ContentEncodingOrder` so iterating it is the spec-mandated decode order
+/// (§5.1.4.1.31.2: start with the highest order, work down).
+///
+/// Parse-only: the compression/encryption *settings* are surfaced, but no
+/// frame is ever decompressed or decrypted here.
+fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncodings> {
+    let mut encodings: Vec<ContentEncoding> = Vec::new();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CONTENT_ENCODING => {
+                let body_end = r.stream_position()? + e.size;
+                encodings.push(parse_content_encoding(r, body_end)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    // Stable-sort by descending order so equal-order entries keep on-disk
+    // order. The spec says order MUST be unique within a ContentEncodings,
+    // but a stable sort tolerates a malformed duplicate gracefully.
+    encodings.sort_by_key(|e| std::cmp::Reverse(e.order));
+    Ok(ContentEncodings { encodings })
+}
+
+/// Parse one `ContentEncoding` master (RFC 9559 §5.1.4.1.31.1).
+///
+/// `ContentEncodingType` (§5.1.4.1.31.4) selects whether the
+/// `ContentCompression` or `ContentEncryption` child is the meaningful one:
+/// type 0 → compression, type 1 → encryption. The spec requires the
+/// matching child be present and the other absent, but we tolerate either
+/// by keying off the type and defaulting a missing compression to zlib /
+/// missing encryption to "not encrypted" per the element defaults.
+fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncoding> {
+    let mut order: u64 = 0; // §5.1.4.1.31.2 default
+    let mut scope: u64 = ids::CONTENT_ENCODING_SCOPE_BLOCK; // §5.1.4.1.31.3 default 0x1
+    let mut enc_type: u64 = ids::CONTENT_ENCODING_TYPE_COMPRESSION; // §5.1.4.1.31.4 default 0
+    let mut comp: Option<(u64, Vec<u8>)> = None;
+    let mut encr: Option<(u64, Vec<u8>, Option<u64>)> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CONTENT_ENCODING_ORDER => order = read_uint(r, e.size as usize)?,
+            ids::CONTENT_ENCODING_SCOPE => scope = read_uint(r, e.size as usize)?,
+            ids::CONTENT_ENCODING_TYPE => enc_type = read_uint(r, e.size as usize)?,
+            ids::CONTENT_COMPRESSION => {
+                let body_end = r.stream_position()? + e.size;
+                comp = Some(parse_content_compression(r, body_end)?);
+            }
+            ids::CONTENT_ENCRYPTION => {
+                let body_end = r.stream_position()? + e.size;
+                encr = Some(parse_content_encryption(r, body_end)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    let transform = if enc_type == ids::CONTENT_ENCODING_TYPE_ENCRYPTION {
+        let (algo, key_id, mode) = encr.unwrap_or((ids::CONTENT_ENC_ALGO_NONE, Vec::new(), None));
+        ContentEncodingTransform::Encryption {
+            algo: ContentEncAlgo::from_raw(algo),
+            key_id,
+            aes_cipher_mode: mode.map(AesCipherMode::from_raw),
+        }
+    } else {
+        // Type 0 (compression) and any unknown type fall through to the
+        // compression branch with the §5.1.4.1.31.6 default algo (zlib).
+        let (algo, settings) = comp.unwrap_or((ids::CONTENT_COMP_ALGO_ZLIB, Vec::new()));
+        ContentEncodingTransform::Compression {
+            algo: ContentCompAlgo::from_raw(algo),
+            settings,
+        }
+    };
+    Ok(ContentEncoding {
+        order,
+        scope: ContentEncodingScope(scope),
+        transform,
+    })
+}
+
+/// Parse a `ContentCompression` master (RFC 9559 §5.1.4.1.31.5) into
+/// `(ContentCompAlgo, ContentCompSettings)`.
+fn parse_content_compression(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec<u8>)> {
+    let mut algo: u64 = ids::CONTENT_COMP_ALGO_ZLIB; // §5.1.4.1.31.6 default 0
+    let mut settings: Vec<u8> = Vec::new();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CONTENT_COMP_ALGO => algo = read_uint(r, e.size as usize)?,
+            ids::CONTENT_COMP_SETTINGS => settings = read_bytes(r, e.size as usize)?,
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok((algo, settings))
+}
+
+/// Parse a `ContentEncryption` master (RFC 9559 §5.1.4.1.31.8) into
+/// `(ContentEncAlgo, ContentEncKeyID, AESSettingsCipherMode)`. The cipher
+/// mode is read from the nested `ContentEncAESSettings` master.
+fn parse_content_encryption(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec<u8>, Option<u64>)> {
+    let mut algo: u64 = ids::CONTENT_ENC_ALGO_NONE; // §5.1.4.1.31.9 default 0
+    let mut key_id: Vec<u8> = Vec::new();
+    let mut cipher_mode: Option<u64> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CONTENT_ENC_ALGO => algo = read_uint(r, e.size as usize)?,
+            ids::CONTENT_ENC_KEY_ID => key_id = read_bytes(r, e.size as usize)?,
+            ids::CONTENT_ENC_AES_SETTINGS => {
+                let body_end = r.stream_position()? + e.size;
+                cipher_mode = parse_aes_settings(r, body_end)?;
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok((algo, key_id, cipher_mode))
+}
+
+/// Parse a `ContentEncAESSettings` master (RFC 9559 §5.1.4.1.31.11) and
+/// return its `AESSettingsCipherMode` (§5.1.4.1.31.12), if present.
+fn parse_aes_settings(r: &mut dyn ReadSeek, end: u64) -> Result<Option<u64>> {
+    let mut mode: Option<u64> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::AES_SETTINGS_CIPHER_MODE => mode = Some(read_uint(r, e.size as usize)?),
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(mode)
 }
 
 /// Parse `TrackOperation` (RFC 9559 §5.1.4.1.30): a virtual track built
@@ -1753,6 +2083,10 @@ pub struct MkvDemuxer {
     /// stream index. `None` for tracks that aren't virtual tracks — see
     /// [`MkvDemuxer::track_operations`].
     track_operations: Vec<Option<TrackOperation>>,
+    /// Per-stream `ContentEncodings` (RFC 9559 §5.1.4.1.31), indexed by
+    /// stream index. `None` for tracks with no encodings — see
+    /// [`MkvDemuxer::content_encodings`].
+    content_encodings: Vec<Option<ContentEncodings>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -1928,6 +2262,35 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::track_operation`] for the semantics.
     pub fn track_operations(&self) -> &[Option<TrackOperation>] {
         &self.track_operations
+    }
+
+    /// `ContentEncodings` (RFC 9559 §5.1.4.1.31) for the stream at
+    /// `stream_index`, or `None` when the track declares no encodings (the
+    /// common case for plain, uncompressed/unencrypted tracks).
+    ///
+    /// A track's `ContentEncodings` describes the chain of transformations —
+    /// compression and/or encryption — that were applied to its frame data
+    /// and/or `CodecPrivate` before the bytes were written into Blocks. The
+    /// container surfaces these *headers* only: it never decompresses or
+    /// decrypts a frame. A caller that wants the raw codec bytes back must
+    /// undo each [`ContentEncoding`] itself, iterating
+    /// [`ContentEncodings::encodings`] front-to-back (the demuxer pre-sorts
+    /// it into decode order — highest `ContentEncodingOrder` first, per
+    /// §5.1.4.1.31.2).
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn content_encodings(&self, stream_index: u32) -> Option<&ContentEncodings> {
+        self.content_encodings
+            .get(stream_index as usize)
+            .and_then(|o| o.as_ref())
+    }
+
+    /// All per-stream `ContentEncodings` (RFC 9559 §5.1.4.1.31), indexed by
+    /// stream index. The slice has one entry per stream — `None` for tracks
+    /// with no encodings. See [`MkvDemuxer::content_encodings`] for the
+    /// semantics.
+    pub fn all_content_encodings(&self) -> &[Option<ContentEncodings>] {
+        &self.content_encodings
     }
 
     fn advance(&mut self) -> Result<()> {

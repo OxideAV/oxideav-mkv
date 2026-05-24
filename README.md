@@ -108,6 +108,24 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `TrackUID` and the matching 0-indexed stream index (`None` for a dangling
   reference, kept rather than dropped). A `TrackPlane` missing its mandatory
   `TrackPlaneUID` and a zero `TrackJoinUID` ("not 0" per spec) are dropped.
+- **`ContentEncodings` typed decode** (RFC 9559 §5.1.4.1.31):
+  `MkvDemuxer::content_encodings(stream_index)` (and the per-stream
+  `all_content_encodings()` slice) returns the track's transformation chain
+  — compression and/or encryption applied to frame data / `CodecPrivate`
+  before the bytes hit Blocks — as typed `ContentEncodings`, `None` for an
+  ordinary track. Each `ContentEncoding` carries its `ContentEncodingOrder`,
+  `ContentEncodingScope` bit field (`block()` / `private()` / `next()`
+  accessors), and a `ContentEncodingTransform` enum: `Compression`
+  (`ContentCompAlgo` → `Zlib` / `Bzlib` / `Lzo1x` / `HeaderStripping` /
+  `Other(u64)`, plus the `ContentCompSettings` stripped bytes) or
+  `Encryption` (`ContentEncAlgo` → `None` / `Des` / `TripleDes` / `Twofish`
+  / `Blowfish` / `Aes` / `Other(u64)`, the `ContentEncKeyID`, and the
+  nested `ContentEncAESSettings` → `AESSettingsCipherMode` as
+  `Ctr` / `Cbc` / `Other(u64)`). The list is pre-sorted into *decode* order
+  (highest `ContentEncodingOrder` first, per §5.1.4.1.31.2). Element
+  defaults are honoured (order 0, scope 0x1 Block, type 0 compression,
+  comp-algo 0 zlib). **Parse-only**: the headers are surfaced, no frame is
+  ever decompressed or decrypted.
 
 ### Muxer (`mux::open` and `mux::open_webm`)
 
@@ -196,6 +214,12 @@ so the demuxer never hides an unrecognised track.
   are reported alongside their source tracks rather than being synthesised
   into a single combined output stream. `TrackOperation` is never written
   on the mux side.
+- `ContentEncodings` is decoded and surfaced (compression / encryption
+  headers) but the demuxer does not *undo* it — packets are returned as the
+  encoded (compressed/encrypted) bytes on the wire; a caller that wants raw
+  codec bytes must apply the reported encoding chain itself. Compression /
+  encryption is undecoded by design (container scope) and never written on
+  the mux side.
 
 ## License
 

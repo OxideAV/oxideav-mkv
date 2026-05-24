@@ -95,6 +95,25 @@ pub const TRACK_PLANE_TYPE: u32 = 0xE6;
 pub const TRACK_JOIN_BLOCKS: u32 = 0xE9;
 pub const TRACK_JOIN_UID: u32 = 0xED;
 
+// ContentEncodings (RFC 9559 §5.1.4.1.31): a per-track ordered list of
+// transformations (compression / encryption) applied to frame data, the
+// CodecPrivate, or both, before the bytes were placed in Blocks. The
+// container surfaces these *headers* only — it never decompresses or
+// decrypts a frame.
+pub const CONTENT_ENCODINGS: u32 = 0x6D80;
+pub const CONTENT_ENCODING: u32 = 0x6240;
+pub const CONTENT_ENCODING_ORDER: u32 = 0x5031;
+pub const CONTENT_ENCODING_SCOPE: u32 = 0x5032;
+pub const CONTENT_ENCODING_TYPE: u32 = 0x5033;
+pub const CONTENT_COMPRESSION: u32 = 0x5034;
+pub const CONTENT_COMP_ALGO: u32 = 0x4254;
+pub const CONTENT_COMP_SETTINGS: u32 = 0x4255;
+pub const CONTENT_ENCRYPTION: u32 = 0x5035;
+pub const CONTENT_ENC_ALGO: u32 = 0x47E1;
+pub const CONTENT_ENC_KEY_ID: u32 = 0x47E2;
+pub const CONTENT_ENC_AES_SETTINGS: u32 = 0x47E7;
+pub const AES_SETTINGS_CIPHER_MODE: u32 = 0x47E8;
+
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
 pub const SAMPLING_FREQUENCY: u32 = 0xB5;
@@ -152,3 +171,31 @@ pub const TRACK_TYPE_SUBTITLE: u64 = 17;
 pub const TRACK_PLANE_TYPE_LEFT_EYE: u64 = 0;
 pub const TRACK_PLANE_TYPE_RIGHT_EYE: u64 = 1;
 pub const TRACK_PLANE_TYPE_BACKGROUND: u64 = 2;
+
+// ContentEncodingType values (RFC 9559 §5.1.4.1.31.4, Table 22).
+pub const CONTENT_ENCODING_TYPE_COMPRESSION: u64 = 0;
+pub const CONTENT_ENCODING_TYPE_ENCRYPTION: u64 = 1;
+
+// ContentEncodingScope bit field (RFC 9559 §5.1.4.1.31.3, Table 21).
+// Values are big-endian and can be OR'ed; default is 0x1 (Block).
+pub const CONTENT_ENCODING_SCOPE_BLOCK: u64 = 0x1;
+pub const CONTENT_ENCODING_SCOPE_PRIVATE: u64 = 0x2;
+pub const CONTENT_ENCODING_SCOPE_NEXT: u64 = 0x4;
+
+// ContentCompAlgo values (RFC 9559 §5.1.4.1.31.6, Table 23).
+pub const CONTENT_COMP_ALGO_ZLIB: u64 = 0;
+pub const CONTENT_COMP_ALGO_BZLIB: u64 = 1;
+pub const CONTENT_COMP_ALGO_LZO1X: u64 = 2;
+pub const CONTENT_COMP_ALGO_HEADER_STRIPPING: u64 = 3;
+
+// ContentEncAlgo values (RFC 9559 §5.1.4.1.31.9, Table 24).
+pub const CONTENT_ENC_ALGO_NONE: u64 = 0;
+pub const CONTENT_ENC_ALGO_DES: u64 = 1;
+pub const CONTENT_ENC_ALGO_3DES: u64 = 2;
+pub const CONTENT_ENC_ALGO_TWOFISH: u64 = 3;
+pub const CONTENT_ENC_ALGO_BLOWFISH: u64 = 4;
+pub const CONTENT_ENC_ALGO_AES: u64 = 5;
+
+// AESSettingsCipherMode values (RFC 9559 §5.1.4.1.31.12, Table 26).
+pub const AES_CIPHER_MODE_CTR: u64 = 1;
+pub const AES_CIPHER_MODE_CBC: u64 = 2;

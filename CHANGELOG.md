@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **`ContentEncodings` typed decode** (RFC 9559 §5.1.4.1.31). A
+  track's per-frame transformation chain (compression and/or encryption
+  applied to frame data / `CodecPrivate` before the bytes hit Blocks) now
+  surfaces through `MkvDemuxer::content_encodings(stream_index)` and the
+  per-stream `all_content_encodings()` slice. Each `ContentEncoding`
+  carries its `ContentEncodingOrder`, a `ContentEncodingScope` bit field
+  (`block()` / `private()` / `next()`), and a `ContentEncodingTransform`
+  enum — `Compression { algo: ContentCompAlgo, settings }` (§5.1.4.1.31.5,
+  algo `Zlib` / `Bzlib` / `Lzo1x` / `HeaderStripping` / `Other`, settings
+  carrying the header-stripping bytes per §5.1.4.1.31.7) or `Encryption
+  { algo: ContentEncAlgo, key_id, aes_cipher_mode }` (§5.1.4.1.31.8, algo
+  `None` / `Des` / `TripleDes` / `Twofish` / `Blowfish` / `Aes` / `Other`,
+  `ContentEncKeyID` bytes, and the nested `ContentEncAESSettings`
+  `AESSettingsCipherMode` as `Ctr` / `Cbc` / `Other`). The list is
+  pre-sorted into decode order (highest `ContentEncodingOrder` first per
+  §5.1.4.1.31.2) and element defaults are honoured (order 0, scope 0x1
+  Block, type 0 compression, comp-algo 0 zlib). Parse-only: the demuxer
+  surfaces the headers and never decompresses or decrypts a frame. New
+  public `demux::{ContentEncodings, ContentEncoding, ContentEncodingScope,
+  ContentEncodingTransform, ContentCompAlgo, ContentEncAlgo,
+  AesCipherMode}` types.
 - demux: **`TrackOperation` typed decode** (RFC 9559 §5.1.4.1.30). A
   virtual track assembled from other tracks now surfaces through
   `MkvDemuxer::track_operation(stream_index)` and the per-stream
