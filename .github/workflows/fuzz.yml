@@ -1,0 +1,20 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. The
+# Matroska demuxer is the rich attack surface here — EBML VINT
+# parsing, nested Cluster / BlockGroup / SimpleBlock masters, three
+# lacing modes, optional CRC-32 validation, all driven from u64
+# attacker-controlled size prefixes. Single demux target consumes the
+# whole 30-minute budget.
+
+on:
+  schedule:
+    - cron: "37 7 * * *"   # daily 07:37 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

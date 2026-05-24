@@ -1,0 +1,39 @@
+[package]
+name = "oxideav-mkv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# The Matroska demuxer is the rich fuzz surface for this crate. EBML
+# variable-size integers feed every length prefix from the outer
+# Segment all the way down to per-Block lacing sizes, and the
+# Cluster / BlockGroup / SimpleBlock tree nests masters inside
+# masters — both classic attacker-controlled allocation and
+# stack-depth vectors. There is no external system library worth
+# pulling in as a cross-decode oracle (and the clean-room wall bars
+# every third-party Matroska implementation as a reference anyway),
+# so this fuzz crate is **demux-only**: feed arbitrary bytes through
+# `demux::open` and then drain `next_packet()` for a bounded number
+# of steps, asserting nothing panics, aborts, or OOMs.
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-mkv]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "demux"
+path = "fuzz_targets/demux.rs"
+test = false
+doc = false

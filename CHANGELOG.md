@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- fuzz: **cargo-fuzz `demux` target** under `fuzz/fuzz_targets/demux.rs`,
+  driving `demux::open` + `next_packet` + `seek_to(0, 0)` over arbitrary
+  bytes from libFuzzer. Mirrors the ico / qoi / bmp harness shape: own
+  `[workspace]`, dedicated `fuzz/Cargo.lock`, curated seed corpus in
+  `fuzz/corpus/demux/` (minimal valid Matroska + WebM + EBML-header-only
+  files, plus two regression seeds for the bugs found below).
+  Scheduled daily via `.github/workflows/fuzz.yml` against the OxideAV
+  reusable `crate-fuzz.yml` workflow (30-minute budget). The new
+  harness drove five defensive demuxer fixes in the same commit:
+  (1) `Cursor`-position + element-size arithmetic now uses
+  `u64::saturating_add` in every `body_end = pos + e.size` /
+  `ebml_end = pos + hdr.size` site so a crafted u64 VINT size cannot
+  overflow the loop bound (caught by an EBML header where the declared
+  body extended past `u64::MAX`);
+  (2) `parse_fixed_lacing` now returns `n_frames` empty sub-frames
+  when `frame_size == 0` instead of calling `<[T]>::chunks_exact(0)`,
+  which panics — caught by a `SimpleBlock` with the fixed-lacing flag
+  set and a one-byte body; (3) `parse_ebml_lacing` and
+  `parse_xiph_lacing` now use checked arithmetic for the
+  remaining-bytes / cumulative-size computation so neither integer
+  overflow nor a debug-build subtract-with-overflow can panic on
+  contrived lacing-header bytes; (4) `ebml::read_bytes` /
+  `read_string` now use `Read::take(n).read_to_end()` so the
+  allocation grows with actually-readable bytes — a 2^56-byte VINT
+  size on a 1 KB input now allocates 1 KB and returns
+  `UnexpectedEof`, not multi-terabyte vector growth; (5)
+  `parse_chapter_atom` recursion is capped at depth 64 to prevent a
+  pathologically nested `Chapters` tree from blowing the
+  libfuzzer-sized stack. 19 M fuzz iterations clean post-fix
+  (3-minute local run).
 - demux + mux: **`CueRelativePosition` round-trip** (RFC 9559
   §5.1.5.1.2.3). The demuxer parses `CueRelativePosition` from each
   `CueTrackPositions` and, when present, repositions the input reader

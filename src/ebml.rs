@@ -186,8 +186,7 @@ pub fn read_float(r: &mut dyn Read, n: usize) -> Result<f64> {
 }
 
 pub fn read_string(r: &mut dyn Read, n: usize) -> Result<String> {
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf)?;
+    let mut buf = read_bytes(r, n)?;
     // Trim trailing NULs (common in MKV strings).
     while buf.last() == Some(&0) {
         buf.pop();
@@ -195,9 +194,27 @@ pub fn read_string(r: &mut dyn Read, n: usize) -> Result<String> {
     String::from_utf8(buf).map_err(|e| Error::invalid(format!("EBML string not UTF-8: {e}")))
 }
 
+/// Read exactly `n` bytes from `r`, with allocation bounded by the
+/// reader's remaining input rather than by `n` itself.
+///
+/// EBML size VINTs can reach 2^56 - 2, all attacker-controlled. A naive
+/// `vec![0u8; n]` would attempt to allocate gigabytes (then panic /
+/// abort) before the truncated read ever fails. We instead use
+/// `Read::take(n).read_to_end()`, which grows the buffer incrementally
+/// as bytes actually arrive — so a torn or oversize length pre-allocates
+/// at most the bytes the reader can produce. The trailing length check
+/// preserves the original "exact `n` bytes required" contract: a short
+/// read returns `Error::Eof` (mapped from the I/O error) so the demuxer
+/// can decide whether to bail.
 pub fn read_bytes(r: &mut dyn Read, n: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf)?;
+    let mut buf = Vec::new();
+    let read = r.take(n as u64).read_to_end(&mut buf)?;
+    if read != n {
+        return Err(Error::from(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("EBML: short read ({read} of {n} bytes)"),
+        )));
+    }
     Ok(buf)
 }
 

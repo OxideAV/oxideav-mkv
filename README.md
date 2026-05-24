@@ -263,6 +263,30 @@ so the demuxer never hides an unrecognised track.
   decryption are out of container scope; `ContentEncodings` is never written
   on the mux side.
 
+## Fuzzing
+
+A cargo-fuzz harness for the demuxer lives in `fuzz/`. It drives
+`demux::open`, drains up to 256 packets via `next_packet`, and exercises
+the `seek_to` cluster pre-open path — over arbitrary bytes — against the
+contract that no call panics, aborts, integer-overflows (in a debug
+build), or attempts an attacker-controlled allocation that exceeds what
+the input can back. The seed corpus in `fuzz/corpus/demux/` covers a
+minimal valid Matroska file, a minimal valid WebM file, an EBML-header-
+only stream, and two regression inputs (one for an EBML size-overflow,
+one for a zero-frame-size fixed-lacing `SimpleBlock`).
+
+Run locally with a nightly toolchain:
+
+```sh
+cd fuzz
+cargo +nightly fuzz run demux            # libFuzzer drives indefinitely
+cargo +nightly fuzz run demux -- -max_total_time=60   # bounded
+```
+
+CI runs a 30-minute fuzz cycle daily via
+`.github/workflows/fuzz.yml` (the OxideAV org-level reusable
+`crate-fuzz.yml`).
+
 ## License
 
 MIT - see [LICENSE](LICENSE).

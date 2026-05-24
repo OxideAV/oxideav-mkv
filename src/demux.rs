@@ -39,7 +39,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         )));
     }
     let mut doc_type = String::from("matroska");
-    let ebml_end = input.stream_position()? + hdr.size;
+    let ebml_end = input.stream_position()?.saturating_add(hdr.size);
     while input.stream_position()? < ebml_end {
         let e = read_element_header(&mut *input)?;
         match e.id {
@@ -108,7 +108,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         let body_end_known = if e.size == VINT_UNKNOWN_SIZE {
             None
         } else {
-            Some(body_start + e.size)
+            Some(body_start.saturating_add(e.size))
         };
         // Validate a leading CRC-32 child against the rest of the element
         // when the element size is known (CRC needs a bounded body). The
@@ -681,7 +681,7 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<(
         let e = read_element_header(r)?;
         match e.id {
             ids::TAG => {
-                let tag_end = r.stream_position()? + e.size;
+                let tag_end = r.stream_position()?.saturating_add(e.size);
                 let mut t = RawTag {
                     track_uids: Vec::new(),
                     edition_uids: Vec::new(),
@@ -707,11 +707,11 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
         let e = read_element_header(r)?;
         match e.id {
             ids::TARGETS => {
-                let tg_end = r.stream_position()? + e.size;
+                let tg_end = r.stream_position()?.saturating_add(e.size);
                 parse_targets(r, tg_end, t)?;
             }
             ids::SIMPLE_TAG => {
-                let st_end = r.stream_position()? + e.size;
+                let st_end = r.stream_position()?.saturating_add(e.size);
                 let mut s = RawSimpleTag {
                     name: String::new(),
                     value: SimpleTagValue::None,
@@ -1518,7 +1518,7 @@ fn parse_chapters_typed(
         let e = read_element_header(r)?;
         match e.id {
             ids::EDITION_ENTRY => {
-                let ee_end = r.stream_position()? + e.size;
+                let ee_end = r.stream_position()?.saturating_add(e.size);
                 edition_index += 1;
                 let edition = parse_edition_entry(
                     r,
@@ -1561,9 +1561,15 @@ fn parse_edition_entry(
             ids::EDITION_FLAG_DEFAULT => edition.default = read_uint(r, e.size as usize)? != 0,
             ids::EDITION_FLAG_ORDERED => edition.ordered = read_uint(r, e.size as usize)? != 0,
             ids::CHAPTER_ATOM => {
-                let ca_end = r.stream_position()? + e.size;
-                let atom =
-                    parse_chapter_atom(r, ca_end, metadata, chapter_index, chapter_uid_to_index)?;
+                let ca_end = r.stream_position()?.saturating_add(e.size);
+                let atom = parse_chapter_atom(
+                    r,
+                    ca_end,
+                    metadata,
+                    chapter_index,
+                    chapter_uid_to_index,
+                    0,
+                )?;
                 edition.chapters.push(atom);
             }
             _ => skip(r, e.size)?,
@@ -1572,13 +1578,28 @@ fn parse_edition_entry(
     Ok(edition)
 }
 
+/// Maximum recursion depth for nested `ChapterAtom` elements. RFC 9559
+/// permits arbitrary nesting via the spec's recursive `ChapterAtom`
+/// definition (a chapter atom may carry child `ChapterAtom` elements);
+/// real files never go more than a couple of levels deep, but a crafted
+/// input can pile thousands of nested headers in a few KB and blow the
+/// (small, libfuzzer-sized) call stack. Cap at a value comfortably
+/// beyond any legitimate use.
+const MAX_CHAPTER_NESTING: u32 = 64;
+
 fn parse_chapter_atom(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
     chapter_index: &mut u32,
     chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    depth: u32,
 ) -> Result<Chapter> {
+    if depth >= MAX_CHAPTER_NESTING {
+        return Err(Error::invalid(format!(
+            "MKV: ChapterAtom nesting exceeds {MAX_CHAPTER_NESTING}"
+        )));
+    }
     // Reserve this atom's index *before* descending into children so the
     // numbering is depth-first document order (parent before its kids).
     *chapter_index += 1;
@@ -1604,15 +1625,21 @@ fn parse_chapter_atom(
             ids::CHAPTER_TIME_END => atom.time_end_ns = Some(read_uint(r, e.size as usize)?),
             ids::CHAPTER_FLAG_HIDDEN => atom.hidden = read_uint(r, e.size as usize)? != 0,
             ids::CHAPTER_DISPLAY => {
-                let cd_end = r.stream_position()? + e.size;
+                let cd_end = r.stream_position()?.saturating_add(e.size);
                 if let Some(disp) = parse_chapter_display(r, cd_end)? {
                     atom.displays.push(disp);
                 }
             }
             ids::CHAPTER_ATOM => {
-                let ca_end = r.stream_position()? + e.size;
-                let child =
-                    parse_chapter_atom(r, ca_end, metadata, chapter_index, chapter_uid_to_index)?;
+                let ca_end = r.stream_position()?.saturating_add(e.size);
+                let child = parse_chapter_atom(
+                    r,
+                    ca_end,
+                    metadata,
+                    chapter_index,
+                    chapter_uid_to_index,
+                    depth + 1,
+                )?;
                 atom.children.push(child);
             }
             _ => skip(r, e.size)?,
@@ -1701,7 +1728,7 @@ fn parse_attachments(
         let e = read_element_header(r)?;
         match e.id {
             ids::ATTACHED_FILE => {
-                let af_end = r.stream_position()? + e.size;
+                let af_end = r.stream_position()?.saturating_add(e.size);
                 idx += 1;
                 parse_attached_file(r, af_end, metadata, idx, attachment_uid_to_index)?;
             }
@@ -1805,7 +1832,7 @@ fn parse_cues(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<CueEntry>) -> Result
         let e = read_element_header(r)?;
         match e.id {
             ids::CUE_POINT => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_cue_point(r, body_end, out)?;
             }
             _ => skip(r, e.size)?,
@@ -1821,7 +1848,7 @@ fn parse_cue_point(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<CueEntry>) -> R
         match e.id {
             ids::CUE_TIME => time = read_uint(r, e.size as usize)?,
             ids::CUE_TRACK_POSITIONS => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_cue_track_positions(r, body_end, time, out)?;
             }
             _ => skip(r, e.size)?,
@@ -1885,7 +1912,7 @@ fn scan_cues_from(
             let body_end = if e.size == VINT_UNKNOWN_SIZE {
                 end
             } else {
-                body_start + e.size
+                body_start.saturating_add(e.size)
             };
             if body_end > end {
                 r.seek(SeekFrom::Start(pos))?;
@@ -1909,7 +1936,7 @@ fn scan_cues_from(
             return Ok(());
         }
         let body_start = r.stream_position()?;
-        let body_end = body_start + e.size;
+        let body_end = body_start.saturating_add(e.size);
         if body_end > end {
             r.seek(SeekFrom::Start(pos))?;
             return Ok(());
@@ -1952,7 +1979,7 @@ fn walk_unknown_cluster(r: &mut dyn ReadSeek, end: u64) -> Result<bool> {
             // Unexpected inside a cluster; bail.
             return Ok(false);
         }
-        let body_end = r.stream_position()? + e.size;
+        let body_end = r.stream_position()?.saturating_add(e.size);
         if body_end > end {
             return Ok(false);
         }
@@ -1966,7 +1993,7 @@ fn parse_tracks(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TrackEntry>) -> Re
         let e = read_element_header(r)?;
         match e.id {
             ids::TRACK_ENTRY => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut t = TrackEntry::default();
                 parse_track_entry(r, body_end, &mut t)?;
                 out.push(t);
@@ -1987,21 +2014,21 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             ids::CODEC_ID => t.codec_id_string = read_string(r, e.size as usize)?,
             ids::CODEC_PRIVATE => t.codec_private = read_bytes(r, e.size as usize)?,
             ids::AUDIO => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_audio(r, body_end, t)?;
             }
             ids::VIDEO => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_video(r, body_end, t)?;
             }
             ids::TRACK_OPERATION => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut op = RawTrackOperation::default();
                 parse_track_operation(r, body_end, &mut op)?;
                 t.track_operation = Some(op);
             }
             ids::CONTENT_ENCODINGS => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 t.content_encodings = Some(parse_content_encodings(r, body_end)?);
             }
             _ => skip(r, e.size)?,
@@ -2024,7 +2051,7 @@ fn parse_content_encodings(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEnco
         let e = read_element_header(r)?;
         match e.id {
             ids::CONTENT_ENCODING => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 encodings.push(parse_content_encoding(r, body_end)?);
             }
             _ => skip(r, e.size)?,
@@ -2058,11 +2085,11 @@ fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncod
             ids::CONTENT_ENCODING_SCOPE => scope = read_uint(r, e.size as usize)?,
             ids::CONTENT_ENCODING_TYPE => enc_type = read_uint(r, e.size as usize)?,
             ids::CONTENT_COMPRESSION => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 comp = Some(parse_content_compression(r, body_end)?);
             }
             ids::CONTENT_ENCRYPTION => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 encr = Some(parse_content_encryption(r, body_end)?);
             }
             _ => skip(r, e.size)?,
@@ -2120,7 +2147,7 @@ fn parse_content_encryption(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec<
             ids::CONTENT_ENC_ALGO => algo = read_uint(r, e.size as usize)?,
             ids::CONTENT_ENC_KEY_ID => key_id = read_bytes(r, e.size as usize)?,
             ids::CONTENT_ENC_AES_SETTINGS => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 cipher_mode = parse_aes_settings(r, body_end)?;
             }
             _ => skip(r, e.size)?,
@@ -2151,11 +2178,11 @@ fn parse_track_operation(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperat
         let e = read_element_header(r)?;
         match e.id {
             ids::TRACK_COMBINE_PLANES => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_combine_planes(r, body_end, op)?;
             }
             ids::TRACK_JOIN_BLOCKS => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_join_blocks(r, body_end, op)?;
             }
             _ => skip(r, e.size)?,
@@ -2171,7 +2198,7 @@ fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperati
         let e = read_element_header(r)?;
         match e.id {
             ids::TRACK_PLANE => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut uid: Option<u64> = None;
                 // Default per Table 20 / §5.1.4.1.30.4: absent type means 0
                 // (left eye), but we only keep it when a UID is present.
@@ -2567,8 +2594,8 @@ impl MkvDemuxer {
     /// Opens the Cluster (reads its id+size), captures the cluster
     /// Timestamp (RFC 9559 §5.1.3.1 — SHOULD be the first child of the
     /// Cluster; we walk children until we find it, or until we reach
-    /// `body_start + relative_position`, whichever comes first), and then
-    /// repositions the reader to `body_start + relative_position` and
+    /// `body_start.saturating_add(relative_position)`, whichever comes first), and then
+    /// repositions the reader to `body_start.saturating_add(relative_position)` and
     /// installs an `InCluster` state with the captured timecode.
     ///
     /// `relative_position` is byte-distance from the first possible
@@ -2593,9 +2620,9 @@ impl MkvDemuxer {
         let body_end = if e.size == VINT_UNKNOWN_SIZE {
             self.segment_data_end
         } else {
-            body_start + e.size
+            body_start.saturating_add(e.size)
         };
-        let target = body_start + relative_position;
+        let target = body_start.saturating_add(relative_position);
         if target > body_end {
             // Out-of-range relative position — degrade gracefully:
             // rewind to the cluster header so `advance()` can walk
@@ -2624,7 +2651,7 @@ impl MkvDemuxer {
             if child.id == ids::TIMECODE {
                 cluster_timecode = read_uint(&mut *self.input, child.size as usize)? as i64;
             }
-            let next = child_body_start + child.size;
+            let next = child_body_start.saturating_add(child.size);
             if next > body_end || next <= pos {
                 // Malformed child — degrade.
                 self.input.seek(SeekFrom::Start(cluster_head_pos))?;
@@ -2657,7 +2684,7 @@ impl MkvDemuxer {
                         let body_end = if e.size == VINT_UNKNOWN_SIZE {
                             self.segment_data_end
                         } else {
-                            body_start + e.size
+                            body_start.saturating_add(e.size)
                         };
                         self.cluster_state = ClusterState::InCluster {
                             body_end,
@@ -2703,7 +2730,7 @@ impl MkvDemuxer {
                         self.queue_block_packets(&bytes, cluster_timecode, false)?;
                     }
                     ids::BLOCK_GROUP => {
-                        let bg_end = self.input.stream_position()? + e.size;
+                        let bg_end = self.input.stream_position()?.saturating_add(e.size);
                         self.parse_block_group(bg_end, cluster_timecode)?;
                     }
                     // An unknown-size Cluster (body_end == segment_data_end)
@@ -2863,9 +2890,17 @@ fn parse_xiph_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         }
         sizes.push(s);
     }
-    // Last frame size is whatever's left.
+    // Last frame size is whatever's left. Guard the subtraction against
+    // a crafted lace where the encoded sizes already over-run the body
+    // (debug-build subtract would panic; release would wrap to a huge
+    // `last_size` that the per-frame bounds check below would then
+    // turn into an error — but only after a length lookup that itself
+    // could panic on a Vec growth attempt).
     let used: usize = sizes.iter().sum();
-    let last_size = body.len() - i - used;
+    let last_size = (body.len())
+        .checked_sub(i)
+        .and_then(|rem| rem.checked_sub(used))
+        .ok_or_else(|| Error::invalid("MKV xiph lacing: sizes exceed body"))?;
     sizes.push(last_size);
     let mut frames = Vec::with_capacity(n_frames);
     for s in sizes {
@@ -2888,6 +2923,13 @@ fn parse_fixed_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         return Err(Error::invalid("MKV fixed lacing: non-divisible payload"));
     }
     let frame_size = payload.len() / n_frames;
+    // `chunks_exact(0)` panics. A zero-length payload with n_frames >= 1
+    // is a legitimate "frame size unknown / zero-byte frames" case from
+    // a crafted Block — emit n_frames empty sub-frames rather than
+    // dividing by zero on the chunker.
+    if frame_size == 0 {
+        return Ok(vec![Vec::new(); n_frames]);
+    }
     let mut frames = Vec::with_capacity(n_frames);
     for c in payload.chunks_exact(frame_size) {
         frames.push(c.to_vec());
@@ -2910,26 +2952,49 @@ fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     let (first, _) = crate::ebml::read_vint(&mut cur, false)?;
     sizes.push(first as i64);
     // Remaining sizes: signed deltas (raw VINT minus mid-of-range bias).
-    for _ in 0..n_frames - 2 {
+    // `n_frames` is `body[0] + 1` so it is at least 1; guard the
+    // subtraction so a one-frame lace (which has no deltas to parse)
+    // doesn't underflow the range below.
+    let delta_count = n_frames.saturating_sub(2);
+    for _ in 0..delta_count {
         let (raw, w) = crate::ebml::read_vint(&mut cur, false)?;
         let bias = ((1i64) << (7 * w as i64 - 1)) - 1;
         let signed = (raw as i64) - bias;
         let prev = *sizes.last().unwrap();
-        sizes.push(prev + signed);
+        let next = prev
+            .checked_add(signed)
+            .ok_or_else(|| Error::invalid("MKV ebml lacing: size addition overflow"))?;
+        sizes.push(next);
     }
-    // Last frame is whatever remains.
+    // Last frame is whatever remains. The arithmetic happens in i64 so
+    // an over-sized or contrived `sum` cannot wrap a usize; the per-
+    // frame bounds check below rejects out-of-range values.
     let pos = cur.position() as usize;
-    let used: i64 = sizes.iter().sum();
-    let last = body.len() as i64 - pos as i64 - used;
+    let used: i64 = sizes
+        .iter()
+        .try_fold(0i64, |acc, s| acc.checked_add(*s))
+        .ok_or_else(|| Error::invalid("MKV ebml lacing: sizes overflow"))?;
+    let last = (body.len() as i64)
+        .checked_sub(pos as i64)
+        .and_then(|rem| rem.checked_sub(used))
+        .ok_or_else(|| Error::invalid("MKV ebml lacing: sizes exceed body"))?;
     sizes.push(last);
     let mut frames = Vec::with_capacity(n_frames);
     let mut i = pos;
     for s in sizes {
-        if s < 0 || i + s as usize > body.len() {
+        if s < 0 {
+            return Err(Error::invalid("MKV ebml lacing: negative frame size"));
+        }
+        let s_usize = usize::try_from(s)
+            .map_err(|_| Error::invalid("MKV ebml lacing: frame size overflows usize"))?;
+        let end = i
+            .checked_add(s_usize)
+            .ok_or_else(|| Error::invalid("MKV ebml lacing: frame offset overflows"))?;
+        if end > body.len() {
             return Err(Error::invalid("MKV ebml lacing: invalid frame size"));
         }
-        frames.push(body[i..i + s as usize].to_vec());
-        i += s as usize;
+        frames.push(body[i..end].to_vec());
+        i = end;
     }
     Ok(frames)
 }
