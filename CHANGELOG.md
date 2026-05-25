@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed `Attachments` accessor + on-demand payload reader** (RFC
+  9559 §5.1.6). `MkvDemuxer::attachments() -> &[Attachment]` exposes the
+  structured `AttachedFile` list the flat `attachment:N:*` metadata view
+  collapses — every entry carries the 1-based `index` (matching the flat
+  metadata keys and `tag:attachment:N:<name>` Tag scopes), `filename`
+  (§5.1.6.2), `mime_type` (§5.1.6.3), `description` (§5.1.6.1), `uid`
+  (§5.1.6.5), and the on-disk byte range (`data_offset` + `data_size`) of
+  the `FileData` payload. The payload itself stays on disk until
+  `MkvDemuxer::attachment_data(index)` is called — exactly `data_size`
+  bytes are read from `data_offset` and the demuxer's reader position is
+  restored across the fetch, so calling it between `next_packet` calls
+  (or while mid-cluster) is safe. The flat `metadata()` view also gains
+  an `attachment:N:description` key when the source element was present.
+  Adds 5 integration tests (typed list fields, on-demand payload read with
+  reader-position preservation, invalid-index rejection, FileDescription
+  round-trip, empty-attachments case) and one new public type
+  `demux::Attachment`.
 - fuzz: **cargo-fuzz `demux` target** under `fuzz/fuzz_targets/demux.rs`,
   driving `demux::open` + `next_packet` + `seek_to(0, 0)` over arbitrary
   bytes from libFuzzer. Mirrors the ico / qoi / bmp harness shape: own

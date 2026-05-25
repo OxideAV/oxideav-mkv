@@ -97,6 +97,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // `MkvDemuxer::chapters` — populated by `parse_chapters_typed` alongside
     // the flat metadata view.
     let mut editions: Vec<Edition> = Vec::new();
+    // Typed `Attachments\AttachedFile` list (RFC 9559 §5.1.6), surfaced via
+    // `MkvDemuxer::attachments` — populated by `parse_attachments` alongside
+    // the flat `attachment:N:*` metadata view. Each entry remembers the
+    // on-disk byte range of its `FileData` payload so callers can pull the
+    // bytes on demand via `MkvDemuxer::attachment_data` without paying for
+    // them at open time.
+    let mut attachments: Vec<Attachment> = Vec::new();
     // Per-element CRC-32 validation results (RFC 8794 §11.3.1, RFC 9559
     // §6.2). Populated as each Top-Level master with a leading CRC-32
     // child is walked; surfaced via `MkvDemuxer::crc_status`.
@@ -165,6 +172,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                     end,
                     &mut metadata,
                     &mut attachment_uid_to_index,
+                    &mut attachments,
                 )?;
             }
             ids::CLUSTER => {
@@ -428,6 +436,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         timecode_scale_ns,
         tags: typed_tags,
         editions,
+        attachments,
         crc_status,
         track_operations,
         content_encodings,
@@ -1705,23 +1714,24 @@ fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Chapte
     }))
 }
 
-/// Parse an `Attachments` master element. Each `AttachedFile` surfaces as
-/// up to three metadata keys: `attachment:N:filename`,
-/// `attachment:N:mime_type`, `attachment:N:size_bytes`. The actual file
-/// payload is not returned — callers that want the bytes (e.g. embedded
-/// fonts, cover art) should ask for a structured API once we have one;
-/// surfacing the index keeps the demuxer's contract small while still
-/// telling downstream tooling what's in the file.
+/// Parse an `Attachments` master element. Each `AttachedFile` surfaces in
+/// two places: the flat `Demuxer::metadata` view (up to four keys per
+/// attachment — `attachment:N:filename`, `attachment:N:mime_type`,
+/// `attachment:N:size_bytes`, `attachment:N:description`), and the typed
+/// [`MkvDemuxer::attachments`] accessor (full [`Attachment`] record with
+/// the on-disk byte range of the `FileData` payload so callers can pull
+/// the bytes on demand via [`MkvDemuxer::attachment_data`]).
 ///
-/// File payloads are skipped via seek so we don't pull megabytes of data
-/// into memory just to expose a filename. Sizes are reported from the
-/// `FileData` element header so the `size_bytes` value is the on-disk size
-/// (no compression decoded).
+/// File payloads are skipped via seek during the up-front walk so we don't
+/// pull megabytes of data into memory just to expose a filename. Sizes are
+/// reported from the `FileData` element header so the `size_bytes` value
+/// is the on-disk size (no compression decoded).
 fn parse_attachments(
     r: &mut dyn ReadSeek,
     end: u64,
     metadata: &mut Vec<(String, String)>,
     attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    attachments: &mut Vec<Attachment>,
 ) -> Result<()> {
     let mut idx: u32 = 0;
     while r.stream_position()? < end {
@@ -1730,7 +1740,14 @@ fn parse_attachments(
             ids::ATTACHED_FILE => {
                 let af_end = r.stream_position()?.saturating_add(e.size);
                 idx += 1;
-                parse_attached_file(r, af_end, metadata, idx, attachment_uid_to_index)?;
+                parse_attached_file(
+                    r,
+                    af_end,
+                    metadata,
+                    idx,
+                    attachment_uid_to_index,
+                    attachments,
+                )?;
             }
             _ => skip(r, e.size)?,
         }
@@ -1744,42 +1761,125 @@ fn parse_attached_file(
     metadata: &mut Vec<(String, String)>,
     index: u32,
     attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    attachments: &mut Vec<Attachment>,
 ) -> Result<()> {
     let mut filename: Option<String> = None;
     let mut mime: Option<String> = None;
-    let mut size: Option<u64> = None;
+    let mut description: Option<String> = None;
+    let mut uid: u64 = 0;
+    let mut data_offset: u64 = 0;
+    let mut data_size: u64 = 0;
+    let mut has_data = false;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::FILE_NAME => filename = Some(read_string(r, e.size as usize)?),
             ids::FILE_MIME_TYPE => mime = Some(read_string(r, e.size as usize)?),
+            ids::FILE_DESCRIPTION => description = Some(read_string(r, e.size as usize)?),
             ids::FILE_UID => {
-                let uid = read_uint(r, e.size as usize)?;
-                if uid != 0 {
-                    attachment_uid_to_index.insert(uid, index);
+                let v = read_uint(r, e.size as usize)?;
+                if v != 0 {
+                    uid = v;
+                    attachment_uid_to_index.insert(v, index);
                 }
             }
             ids::FILE_DATA => {
-                size = Some(e.size);
+                // Record the on-disk byte range of the payload before skipping
+                // past it. `stream_position()` here is the byte right after
+                // the `FileData` element's id+size header — i.e. the first
+                // byte of the payload itself. `attachment_data` re-reads from
+                // this offset on demand.
+                data_offset = r.stream_position()?;
+                data_size = e.size;
+                has_data = true;
                 skip(r, e.size)?;
             }
             _ => skip(r, e.size)?,
         }
     }
-    if let Some(n) = filename {
+    if let Some(ref n) = filename {
         if !n.is_empty() {
-            metadata.push((format!("attachment:{index}:filename"), n));
+            metadata.push((format!("attachment:{index}:filename"), n.clone()));
         }
     }
-    if let Some(m) = mime {
+    if let Some(ref m) = mime {
         if !m.is_empty() {
-            metadata.push((format!("attachment:{index}:mime_type"), m));
+            metadata.push((format!("attachment:{index}:mime_type"), m.clone()));
         }
     }
-    if let Some(sz) = size {
-        metadata.push((format!("attachment:{index}:size_bytes"), sz.to_string()));
+    if has_data {
+        metadata.push((
+            format!("attachment:{index}:size_bytes"),
+            data_size.to_string(),
+        ));
     }
+    if let Some(ref d) = description {
+        if !d.is_empty() {
+            metadata.push((format!("attachment:{index}:description"), d.clone()));
+        }
+    }
+    attachments.push(Attachment {
+        index,
+        filename: filename.unwrap_or_default(),
+        mime_type: mime.unwrap_or_default(),
+        description: description.unwrap_or_default(),
+        uid,
+        data_offset,
+        data_size,
+    });
     Ok(())
+}
+
+/// One `Attachments\AttachedFile` (RFC 9559 §5.1.6) parsed from the
+/// Segment.
+///
+/// Embedded fonts, cover art, lyrics, scripts, and other auxiliary files
+/// can be packed into a Matroska/WebM file as attachments. The demuxer
+/// walks the `Attachments` master up front, captures each attachment's
+/// metadata (filename / MIME / description / UID) and the on-disk byte
+/// range of its `FileData` payload, but does **not** read the payload
+/// bytes — pulling a multi-megabyte font into RAM just to see its
+/// filename would be wasteful. Use [`MkvDemuxer::attachment_data`] to
+/// fetch the payload on demand.
+///
+/// Returned in segment order. The 1-based [`Attachment::index`] is the
+/// same `N` used by the flat `attachment:N:*` metadata keys and by
+/// `tag:attachment:N:<name>` Tag scopes, so a caller can correlate the
+/// three views.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    /// 1-based position of this attachment within the Segment's
+    /// `Attachments` element. Matches the `N` in the corresponding
+    /// `attachment:N:filename` / `attachment:N:mime_type` /
+    /// `attachment:N:size_bytes` / `attachment:N:description` metadata
+    /// keys and in any `tag:attachment:N:<name>` Tag scope.
+    pub index: u32,
+    /// `FileName` (RFC 9559 §5.1.6.2). Empty string when the attachment
+    /// had no `FileName` child — spec marks it as mandatory but the
+    /// demuxer tolerates the omission rather than rejecting the whole
+    /// file.
+    pub filename: String,
+    /// `FileMimeType` (RFC 9559 §5.1.6.3). Empty string when absent.
+    pub mime_type: String,
+    /// `FileDescription` (RFC 9559 §5.1.6.1) — optional human-readable
+    /// description of the attachment's contents. Empty string when
+    /// absent.
+    pub description: String,
+    /// `FileUID` (RFC 9559 §5.1.6.5). `0` when the attachment had no
+    /// `FileUID` child or the value was an explicit `0` (which the spec
+    /// reserves as "not present"). Non-zero UIDs are what
+    /// `Tags.Targets.TagAttachmentUID` references, and the demuxer uses
+    /// them to map `tag:attachment:N:<name>` scopes back to this slot.
+    pub uid: u64,
+    /// Absolute byte offset of the `FileData` payload's first byte in
+    /// the input stream. Combined with [`Attachment::data_size`], this is
+    /// the byte range [`MkvDemuxer::attachment_data`] reads from.
+    pub data_offset: u64,
+    /// Length in bytes of the `FileData` payload as it sits on disk (no
+    /// compression decoded). `0` when the attachment had no `FileData`
+    /// child (which would be unusual — the spec marks the element as
+    /// mandatory).
+    pub data_size: u64,
 }
 
 /// Format a unix timestamp (seconds since 1970-01-01 UTC) as an ISO-8601 date.
@@ -2317,6 +2417,12 @@ pub struct MkvDemuxer {
     /// [`MkvDemuxer::chapters`]. Empty when the file carries no
     /// `Chapters` element.
     editions: Vec<Edition>,
+    /// Typed `Attachments\AttachedFile` list (RFC 9559 §5.1.6) — see
+    /// [`MkvDemuxer::attachments`]. Empty when the file carries no
+    /// `Attachments` element. Each entry records the on-disk byte range
+    /// of its `FileData` payload so [`MkvDemuxer::attachment_data`] can
+    /// pull it on demand without paying for it at open time.
+    attachments: Vec<Attachment>,
     /// Per-Top-Level-element `CRC-32` validation results (RFC 8794
     /// §11.3.1) — see [`MkvDemuxer::crc_status`].
     crc_status: Vec<CrcStatus>,
@@ -2531,6 +2637,71 @@ impl MkvDemuxer {
     /// Empty when the file carries no `Chapters` element.
     pub fn chapters(&self) -> &[Edition] {
         &self.editions
+    }
+
+    /// Typed `Attachments\AttachedFile` list (RFC 9559 §5.1.6) parsed
+    /// from the Segment.
+    ///
+    /// Surfaces information the flattened [`Demuxer::metadata`] view
+    /// drops: every [`Attachment`] keeps its 1-based [`Attachment::index`],
+    /// [`Attachment::filename`], [`Attachment::mime_type`],
+    /// [`Attachment::description`], [`Attachment::uid`] (for matching
+    /// `Tags.Targets.TagAttachmentUID` scopes), and the on-disk byte range
+    /// (`data_offset` + `data_size`) of the `FileData` payload — passed
+    /// to [`MkvDemuxer::attachment_data`] to fetch the actual bytes on
+    /// demand without paying for them at open time.
+    ///
+    /// Returned in segment order. Empty when the file carries no
+    /// `Attachments` element.
+    pub fn attachments(&self) -> &[Attachment] {
+        &self.attachments
+    }
+
+    /// Read an attachment's `FileData` payload bytes on demand.
+    ///
+    /// `index` is the 1-based [`Attachment::index`] surfaced by
+    /// [`MkvDemuxer::attachments`] — the same `N` used in the
+    /// `attachment:N:*` metadata keys.
+    ///
+    /// Reads exactly [`Attachment::data_size`] bytes from
+    /// [`Attachment::data_offset`] in the input stream. The reader's
+    /// position is restored afterwards, so calling this between
+    /// `next_packet` calls (or while the demuxer is mid-cluster) is
+    /// safe.
+    ///
+    /// Returns `Err(Error::invalid)` if `index` is out of range or
+    /// `0` (attachments are 1-indexed).
+    pub fn attachment_data(&mut self, index: u32) -> Result<Vec<u8>> {
+        if index == 0 {
+            return Err(Error::invalid(
+                "MKV: attachment index must be 1-based (got 0)",
+            ));
+        }
+        let att = self
+            .attachments
+            .iter()
+            .find(|a| a.index == index)
+            .ok_or_else(|| Error::invalid(format!("MKV: no attachment with index {index}")))?;
+        let offset = att.data_offset;
+        let size = att.data_size;
+        // Save and restore the caller's reader position so a payload fetch
+        // between `next_packet` calls doesn't shift the cluster walker.
+        let saved_pos = self.input.stream_position()?;
+        self.input.seek(SeekFrom::Start(offset))?;
+        // `Read::take(n).read_to_end()` grows the destination only as bytes
+        // actually arrive — defensive against the file being truncated below
+        // the recorded `data_size`. Matches the allocation discipline in
+        // `ebml::read_bytes`.
+        let mut out = Vec::new();
+        let n = (&mut *self.input).take(size).read_to_end(&mut out)?;
+        // Restore reader position regardless of the read outcome.
+        self.input.seek(SeekFrom::Start(saved_pos))?;
+        if (n as u64) != size {
+            return Err(Error::invalid(format!(
+                "MKV: attachment {index} payload truncated (got {n} of {size} bytes)"
+            )));
+        }
+        Ok(out)
     }
 
     /// `TrackOperation` (RFC 9559 §5.1.4.1.30) for the stream at

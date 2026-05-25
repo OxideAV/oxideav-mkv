@@ -78,6 +78,22 @@ the unified `oxideav` aggregator to wire decoding automatically.
   and binary `TagBinary` payloads (e.g. embedded cover-art bytes).
   Tags with only dangling non-zero UIDs are filtered out per
   §5.1.8.1.1.3..§5.1.8.1.1.6; mixed Targets keep their resolvable UIDs.
+- **Typed `Attachments` accessor** (RFC 9559 §5.1.6):
+  `MkvDemuxer::attachments() -> &[Attachment]` returns one
+  [`Attachment`] per `AttachedFile` parsed from the Segment, in document
+  order. Each entry carries the 1-based `index` (matching the
+  `attachment:N:*` flat metadata keys and any `tag:attachment:N:<name>`
+  Tag scope), `filename` (`FileName`, §5.1.6.2), `mime_type`
+  (`FileMimeType`, §5.1.6.3), `description` (`FileDescription`,
+  §5.1.6.1), `uid` (`FileUID`, §5.1.6.5), and the on-disk byte range
+  (`data_offset` + `data_size`) of the `FileData` payload. The payload
+  bytes are **not** read up front — a multi-megabyte embedded font
+  stays on disk until `MkvDemuxer::attachment_data(index)` is called,
+  at which point exactly `data_size` bytes are read from `data_offset`
+  and returned; the demuxer's reader position is preserved across the
+  fetch so calling it between `next_packet` calls is safe. The flat
+  `metadata()` view also gains an `attachment:N:description` key when
+  the source element was present.
 - **Typed `Chapters` accessor** (RFC 9559 §5.1.7):
   `MkvDemuxer::chapters() -> &[Edition]` exposes the structured chapter
   tree the flat `chapter:N:*` metadata view collapses — every
@@ -240,15 +256,14 @@ so the demuxer never hides an unrecognised track.
 
 ## What's NOT implemented
 
-- `Attachments` are read into the metadata vector only — the demuxer
-  doesn't yet expose a structured attachment list. Attachment payload
-  bytes are skipped (not loaded into memory); only filename / mime /
-  on-disk size surface. (`Chapters` now has a typed accessor — see
-  `MkvDemuxer::chapters` above.)
 - CRC-32 validation covers Top-Level master elements parsed up front; the
   late best-effort Cues rescan (when Cues sit after the final Cluster) and
   per-Cluster CRC-32 children are not yet validated. CRC-32 is never
   written on the mux side.
+- Attachments are never written on the mux side — the demuxer surfaces
+  `AttachedFile` entries via the typed `MkvDemuxer::attachments`
+  accessor and on-demand `MkvDemuxer::attachment_data` payload reader
+  (see above), but the muxer has no `add_attachment` API yet.
 - `TrackOperation` is decoded and surfaced (left/right-eye plane combining,
   block joining) but the demuxer does not yet *apply* it — virtual tracks
   are reported alongside their source tracks rather than being synthesised
