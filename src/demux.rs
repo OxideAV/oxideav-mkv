@@ -1448,7 +1448,12 @@ pub struct Edition {
 
 /// One `ChapterAtom` (RFC 9559 §5.1.7.1.4) — recursive: a chapter MAY
 /// contain nested child chapters. Part of [`Edition::chapters`].
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// `Default::default()` materialises the spec-defined defaults: `enabled`
+/// is `true` (RFC 9559 §5.1.7.1.4 default = 1) and `hidden` is `false`
+/// (default = 0); every other field is the zero-value equivalent of
+/// "element absent."
+#[derive(Clone, Debug, PartialEq)]
 pub struct Chapter {
     /// 1-based index across the whole `Chapters` element, assigned in
     /// document order (top-level then nested, depth-first). Matches the
@@ -1469,11 +1474,50 @@ pub struct Chapter {
     pub time_end_ns: Option<u64>,
     /// `ChapterFlagHidden` (RFC 9559 §5.1.7.1.4.5). Defaults to `false`.
     pub hidden: bool,
+    /// `ChapterFlagEnabled` (RFC 9559 §5.1.7.1.4.5a / 5.1.7.1.4 enabled
+    /// flag). The spec defaults to `1` (enabled); when the element is
+    /// absent we materialise that default as `true` so consumers don't
+    /// special-case the missing element. A `false` value means the
+    /// chapter should NOT be available for playback (Section 20.2.5).
+    pub enabled: bool,
+    /// `ChapterSegmentUUID` (RFC 9559 §5.1.7.1.4.6) — the 16-byte
+    /// SegmentUUID of another Segment to play during this chapter, used
+    /// for Medium-Linking Segments (Section 17.2). `None` when absent.
+    /// Length is exactly 16 bytes when present.
+    pub segment_uuid: Option<Vec<u8>>,
+    /// `ChapterSegmentEditionUID` (RFC 9559 §5.1.7.1.4.7) — the
+    /// `EditionUID` to play from the Segment named by `segment_uuid`.
+    /// `None` when absent (no specific edition selected). Never zero.
+    pub segment_edition_uid: Option<u64>,
+    /// `ChapterPhysicalEquiv` (RFC 9559 §5.1.7.1.4.8) — the physical
+    /// equivalent of this atom (e.g. "DVD" = 60, "SIDE" = 50). See
+    /// Section 20.4 for the full table. `None` when absent.
+    pub physical_equiv: Option<u64>,
     /// `ChapterDisplay` rows (RFC 9559 §5.1.7.1.4.9), in on-disk order —
     /// one per language. Empty when the atom carries no display string.
     pub displays: Vec<ChapterDisplay>,
     /// Nested `ChapterAtom`s (RFC 9559 §5.1.7.1.4 is `recursive`).
     pub children: Vec<Chapter>,
+}
+
+impl Default for Chapter {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            uid: None,
+            string_uid: None,
+            time_start_ns: 0,
+            time_end_ns: None,
+            hidden: false,
+            // RFC 9559 §5.1.7.1.4: ChapterFlagEnabled has spec default 1.
+            enabled: true,
+            segment_uuid: None,
+            segment_edition_uid: None,
+            physical_equiv: None,
+            displays: Vec::new(),
+            children: Vec::new(),
+        }
+    }
 }
 
 /// One `ChapterDisplay` master (RFC 9559 §5.1.7.1.4.9) — a chapter title
@@ -1633,6 +1677,25 @@ fn parse_chapter_atom(
             ids::CHAPTER_TIME_START => atom.time_start_ns = read_uint(r, e.size as usize)?,
             ids::CHAPTER_TIME_END => atom.time_end_ns = Some(read_uint(r, e.size as usize)?),
             ids::CHAPTER_FLAG_HIDDEN => atom.hidden = read_uint(r, e.size as usize)? != 0,
+            ids::CHAPTER_FLAG_ENABLED => atom.enabled = read_uint(r, e.size as usize)? != 0,
+            ids::CHAPTER_SEGMENT_UUID => {
+                // RFC 9559 §5.1.7.1.4.6: length is exactly 16 bytes.
+                // A malformed file may carry a different length; we read
+                // exactly what's there and let the consumer treat any
+                // value with `len() != 16` as malformed.
+                atom.segment_uuid = Some(crate::ebml::read_bytes(r, e.size as usize)?);
+            }
+            ids::CHAPTER_SEGMENT_EDITION_UID => {
+                let v = read_uint(r, e.size as usize)?;
+                // Spec range "not 0" — drop zero values silently rather
+                // than store a sentinel the consumer would have to filter.
+                if v != 0 {
+                    atom.segment_edition_uid = Some(v);
+                }
+            }
+            ids::CHAPTER_PHYSICAL_EQUIV => {
+                atom.physical_equiv = Some(read_uint(r, e.size as usize)?);
+            }
             ids::CHAPTER_DISPLAY => {
                 let cd_end = r.stream_position()?.saturating_add(e.size);
                 if let Some(disp) = parse_chapter_display(r, cd_end)? {

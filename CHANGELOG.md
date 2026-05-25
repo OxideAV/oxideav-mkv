@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **extend typed `Chapter` with RFC 9559 §5.1.7.1.4.5–§5.1.7.1.4.8
+  sub-elements** previously dropped during the `Chapters` walk.
+  `Chapter` now carries `enabled` (`ChapterFlagEnabled`, spec default `1`
+  materialised as `true` so consumers don't special-case the absent
+  element), `segment_uuid` (`ChapterSegmentUUID`, the raw 16-byte
+  SegmentUUID for Medium-Linking Segments per §17.2), `segment_edition_uid`
+  (`ChapterSegmentEditionUID`, with `0` suppressed to `None` per the spec's
+  "range: not 0"), and `physical_equiv` (`ChapterPhysicalEquiv` —
+  DVD/SIDE/etc. physical mapping per §20.4). Adds three element-id
+  constants (`CHAPTER_SEGMENT_UUID`, `CHAPTER_SEGMENT_EDITION_UID`,
+  `CHAPTER_PHYSICAL_EQUIV`) and a hand-rolled `Default` impl on `Chapter`
+  so `Chapter::default().enabled == true` reflects the spec default.
+  Adds two integration tests: one exercises every new field against a
+  Medium-Linking-style atom alongside a vanilla sibling that verifies
+  spec defaults, the other pins the `ChapterSegmentEditionUID = 0 → None`
+  contract so the option can be the sole presence check downstream.
 - demux: **typed `Attachments` accessor + on-demand payload reader** (RFC
   9559 §5.1.6). `MkvDemuxer::attachments() -> &[Attachment]` exposes the
   structured `AttachedFile` list the flat `attachment:N:*` metadata view

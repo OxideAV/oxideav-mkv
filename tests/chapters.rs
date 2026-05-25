@@ -211,6 +211,11 @@ fn typed_chapters_match_flat_metadata() {
     assert!(!c1.hidden);
     assert!(c1.string_uid.is_none());
     assert!(c1.children.is_empty());
+    // ChapterFlagEnabled was absent → spec default = 1 → materialised true.
+    assert!(c1.enabled);
+    assert!(c1.segment_uuid.is_none());
+    assert!(c1.segment_edition_uid.is_none());
+    assert!(c1.physical_equiv.is_none());
     assert_eq!(c1.displays.len(), 1);
     assert_eq!(c1.displays[0].string, "Intro");
     assert_eq!(c1.displays[0].language, "eng");
@@ -423,6 +428,188 @@ fn typed_chapters_capture_multilingual_displays_and_nesting() {
     assert_eq!(get("chapter:2:start_ms").as_deref(), Some("500"));
     assert_eq!(get("chapter:2:end_ms").as_deref(), Some("800"));
     assert_eq!(get("chapter:2:title").as_deref(), Some("Sous-chapitre"));
+}
+
+#[test]
+fn typed_chapters_capture_enabled_flag_segment_link_and_physical_equiv() {
+    // Build a Chapters element exercising the rest of RFC 9559 §5.1.7.1.4:
+    //   * ChapterFlagEnabled = 0 (default is 1; verify the override sticks
+    //     and the spec-default surfaces as `true` on a sibling atom that
+    //     omits the element).
+    //   * ChapterSegmentUUID (16 raw bytes) + ChapterSegmentEditionUID for
+    //     a Medium-Linking atom (§17.2).
+    //   * ChapterPhysicalEquiv = 60 ("DVD" per §20.4).
+    //
+    // The synthetic file carries two top-level atoms:
+    //   1. Linked atom: enabled=0, segment_uuid=<16 B>, segment_edition_uid=0xED,
+    //      physical_equiv=60, no displays.
+    //   2. Vanilla atom: only the mandatory fields — should default to
+    //      enabled=true with the three optional fields all None.
+    let ebml_header = build_ebml_header();
+    let mut info_body = Vec::new();
+    info_body.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
+    info_body.extend_from_slice(&elem_float_be_f64(ids::DURATION, 3000.0));
+    let info = elem_master(ids::INFO, &info_body);
+
+    let mut track_body = Vec::new();
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_NUMBER, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_UID, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_TYPE, ids::TRACK_TYPE_AUDIO));
+    track_body.extend_from_slice(&elem_str(ids::CODEC_ID, "A_PCM/INT/LIT"));
+    let mut audio_body = Vec::new();
+    audio_body.extend_from_slice(&elem_float_be_f64(ids::SAMPLING_FREQUENCY, 48_000.0));
+    audio_body.extend_from_slice(&elem_uint(ids::CHANNELS, 2));
+    audio_body.extend_from_slice(&elem_uint(ids::BIT_DEPTH, 16));
+    track_body.extend_from_slice(&elem_master(ids::AUDIO, &audio_body));
+    let tracks = elem_master(ids::TRACKS, &elem_master(ids::TRACK_ENTRY, &track_body));
+
+    // Linked atom (#1).
+    let linked_uuid: [u8; 16] = [
+        0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x0F, 0xED, 0xCB, 0xA9, 0x87, 0x65, 0x43,
+        0x21,
+    ];
+    let mut linked_atom = Vec::new();
+    linked_atom.extend_from_slice(&elem_uint(ids::CHAPTER_UID, 0xA1));
+    linked_atom.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 0));
+    linked_atom.extend_from_slice(&elem_uint(ids::CHAPTER_FLAG_ENABLED, 0));
+    // Raw 16-byte UUID via elem_master-style header (binary payload, not master).
+    let mut uuid_elem = Vec::new();
+    uuid_elem.extend_from_slice(&write_element_id(ids::CHAPTER_SEGMENT_UUID));
+    uuid_elem.extend_from_slice(&write_vint(linked_uuid.len() as u64, 0));
+    uuid_elem.extend_from_slice(&linked_uuid);
+    linked_atom.extend_from_slice(&uuid_elem);
+    linked_atom.extend_from_slice(&elem_uint(ids::CHAPTER_SEGMENT_EDITION_UID, 0xED));
+    linked_atom.extend_from_slice(&elem_uint(ids::CHAPTER_PHYSICAL_EQUIV, 60));
+    let linked_atom = elem_master(ids::CHAPTER_ATOM, &linked_atom);
+
+    // Vanilla atom (#2) — only the mandatory fields, plus one display so the
+    // flat metadata view still captures something for index 2.
+    let mut vanilla_display = Vec::new();
+    vanilla_display.extend_from_slice(&elem_str(ids::CHAP_STRING, "Plain"));
+    vanilla_display.extend_from_slice(&elem_str(ids::CHAP_LANGUAGE, "eng"));
+    let mut vanilla_atom = Vec::new();
+    vanilla_atom.extend_from_slice(&elem_uint(ids::CHAPTER_UID, 0xA2));
+    vanilla_atom.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 1_000_000_000));
+    vanilla_atom.extend_from_slice(&elem_master(ids::CHAPTER_DISPLAY, &vanilla_display));
+    let vanilla_atom = elem_master(ids::CHAPTER_ATOM, &vanilla_atom);
+
+    let mut edition_body = Vec::new();
+    edition_body.extend_from_slice(&linked_atom);
+    edition_body.extend_from_slice(&vanilla_atom);
+    let chapters = elem_master(
+        ids::CHAPTERS,
+        &elem_master(ids::EDITION_ENTRY, &edition_body),
+    );
+
+    let mut cluster_body = Vec::new();
+    cluster_body.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster_body.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    let cluster = elem_master(ids::CLUSTER, &cluster_body);
+
+    let mut seg_body = Vec::new();
+    seg_body.extend_from_slice(&info);
+    seg_body.extend_from_slice(&tracks);
+    seg_body.extend_from_slice(&chapters);
+    seg_body.extend_from_slice(&cluster);
+    let segment = elem_master(ids::SEGMENT, &seg_body);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ebml_header);
+    bytes.extend_from_slice(&segment);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver)
+        .expect("demux open_typed");
+
+    let eds = dmx.chapters();
+    assert_eq!(eds.len(), 1);
+    let ed = &eds[0];
+    assert_eq!(ed.chapters.len(), 2);
+
+    let linked = &ed.chapters[0];
+    assert_eq!(linked.uid, Some(0xA1));
+    assert!(!linked.enabled, "ChapterFlagEnabled = 0 must surface");
+    assert_eq!(
+        linked.segment_uuid.as_deref(),
+        Some(&linked_uuid[..]),
+        "16-byte ChapterSegmentUUID preserved verbatim"
+    );
+    assert_eq!(linked.segment_edition_uid, Some(0xED));
+    assert_eq!(linked.physical_equiv, Some(60));
+    assert!(linked.displays.is_empty());
+
+    let vanilla = &ed.chapters[1];
+    assert_eq!(vanilla.uid, Some(0xA2));
+    assert!(
+        vanilla.enabled,
+        "ChapterFlagEnabled spec default = 1 must materialise as true"
+    );
+    assert!(vanilla.segment_uuid.is_none());
+    assert!(vanilla.segment_edition_uid.is_none());
+    assert!(vanilla.physical_equiv.is_none());
+    assert_eq!(vanilla.displays.len(), 1);
+    assert_eq!(vanilla.displays[0].string, "Plain");
+}
+
+#[test]
+fn typed_chapters_drop_segment_edition_uid_zero() {
+    // RFC 9559 §5.1.7.1.4.7 forbids 0 as a value for ChapterSegmentEditionUID
+    // ("range: not 0"). A file that nevertheless carries 0 must surface as
+    // `None` — never as `Some(0)` — so consumers can use the option as the
+    // sole presence check.
+    let ebml_header = build_ebml_header();
+    let mut info_body = Vec::new();
+    info_body.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
+    info_body.extend_from_slice(&elem_float_be_f64(ids::DURATION, 3000.0));
+    let info = elem_master(ids::INFO, &info_body);
+
+    let mut track_body = Vec::new();
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_NUMBER, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_UID, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_TYPE, ids::TRACK_TYPE_AUDIO));
+    track_body.extend_from_slice(&elem_str(ids::CODEC_ID, "A_PCM/INT/LIT"));
+    let mut audio_body = Vec::new();
+    audio_body.extend_from_slice(&elem_float_be_f64(ids::SAMPLING_FREQUENCY, 48_000.0));
+    audio_body.extend_from_slice(&elem_uint(ids::CHANNELS, 2));
+    audio_body.extend_from_slice(&elem_uint(ids::BIT_DEPTH, 16));
+    track_body.extend_from_slice(&elem_master(ids::AUDIO, &audio_body));
+    let tracks = elem_master(ids::TRACKS, &elem_master(ids::TRACK_ENTRY, &track_body));
+
+    let mut atom_body = Vec::new();
+    atom_body.extend_from_slice(&elem_uint(ids::CHAPTER_UID, 0xB1));
+    atom_body.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 0));
+    atom_body.extend_from_slice(&elem_uint(ids::CHAPTER_SEGMENT_EDITION_UID, 0));
+    let atom = elem_master(ids::CHAPTER_ATOM, &atom_body);
+    let chapters = elem_master(ids::CHAPTERS, &elem_master(ids::EDITION_ENTRY, &atom));
+
+    let mut cluster_body = Vec::new();
+    cluster_body.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster_body.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    let cluster = elem_master(ids::CLUSTER, &cluster_body);
+
+    let mut seg_body = Vec::new();
+    seg_body.extend_from_slice(&info);
+    seg_body.extend_from_slice(&tracks);
+    seg_body.extend_from_slice(&chapters);
+    seg_body.extend_from_slice(&cluster);
+    let segment = elem_master(ids::SEGMENT, &seg_body);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ebml_header);
+    bytes.extend_from_slice(&segment);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver)
+        .expect("demux open_typed");
+
+    let eds = dmx.chapters();
+    assert_eq!(eds.len(), 1);
+    let ed = &eds[0];
+    assert_eq!(ed.chapters.len(), 1);
+    assert!(
+        ed.chapters[0].segment_edition_uid.is_none(),
+        "ChapterSegmentEditionUID=0 must surface as None (spec range: not 0)"
+    );
 }
 
 #[test]

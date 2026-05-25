@@ -101,6 +101,10 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `EditionFlagOrdered` flags; every `ChapterAtom` keeps its
   `ChapterUID`, `ChapterStringUID` (e.g. WebVTT cue id), full-precision
   `ChapterTimeStart` / `ChapterTimeEnd` nanoseconds, `ChapterFlagHidden`,
+  `ChapterFlagEnabled` (spec default `1` materialised as `true`),
+  Medium-Linking fields `ChapterSegmentUUID` (raw 16 B) +
+  `ChapterSegmentEditionUID` (zero suppressed per spec "range: not 0"),
+  `ChapterPhysicalEquiv` (DVD/SIDE physical mapping per §20.4),
   **all** multilingual `ChapterDisplay` rows (each with `ChapString`,
   `ChapLanguage` + `ChapLanguageBCP47`, `ChapCountry`), and any nested
   child atoms (the spec marks `ChapterAtom` as recursive). Atoms are
