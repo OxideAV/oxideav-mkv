@@ -1496,6 +1496,10 @@ pub struct Chapter {
     /// `ChapterDisplay` rows (RFC 9559 §5.1.7.1.4.9), in on-disk order —
     /// one per language. Empty when the atom carries no display string.
     pub displays: Vec<ChapterDisplay>,
+    /// `ChapProcess` masters (RFC 9559 §5.1.7.1.4.14), in on-disk order —
+    /// the chapter-codec commands (DVD-menu / Matroska-Script) attached to
+    /// this atom. Empty when the atom carries no process commands.
+    pub chap_processes: Vec<ChapProcess>,
     /// Nested `ChapterAtom`s (RFC 9559 §5.1.7.1.4 is `recursive`).
     pub children: Vec<Chapter>,
 }
@@ -1515,6 +1519,7 @@ impl Default for Chapter {
             segment_edition_uid: None,
             physical_equiv: None,
             displays: Vec::new(),
+            chap_processes: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -1537,6 +1542,45 @@ pub struct ChapterDisplay {
     /// `ChapCountry` (RFC 9559 §5.1.7.1.4.13). `None` when absent. MUST be
     /// ignored when `language_bcp47` is present.
     pub country: Option<String>,
+}
+
+/// One `ChapProcess` master (RFC 9559 §5.1.7.1.4.14) — the set of
+/// chapter-codec commands attached to a [`Chapter`]. The
+/// [`codec_id`](Self::codec_id) selects how the private/command bytes are
+/// interpreted (`0` = Matroska Script, `1` = DVD-menu; see Table 31). The
+/// container surfaces the raw payloads only — it never executes a chapter
+/// command. Part of [`Chapter::chap_processes`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChapProcess {
+    /// `ChapProcessCodecID` (RFC 9559 §5.1.7.1.4.15) — the chapter-codec
+    /// type. Spec default is `0` (Matroska Script); materialised so
+    /// consumers don't special-case the absent (mandatory) element.
+    pub codec_id: u64,
+    /// `ChapProcessPrivate` (RFC 9559 §5.1.7.1.4.16) — optional data
+    /// attached to the codec id (for `codec_id == 1` this is the "DVD
+    /// level" equivalent). `None` when absent. Raw bytes, never decoded.
+    pub private: Option<Vec<u8>>,
+    /// `ChapProcessCommand` masters (RFC 9559 §5.1.7.1.4.17), in on-disk
+    /// order. Each is a timing (when to run) plus a binary command
+    /// payload. Empty when the process carries no commands.
+    pub commands: Vec<ChapProcessCommand>,
+}
+
+/// One `ChapProcessCommand` master (RFC 9559 §5.1.7.1.4.17) — a single
+/// chapter-codec command and when it should run. Part of
+/// [`ChapProcess::commands`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChapProcessCommand {
+    /// `ChapProcessTime` (RFC 9559 §5.1.7.1.4.18) — when the command
+    /// SHOULD be handled: `0` during the whole chapter, `1` before
+    /// starting playback, `2` after playback (Table 32). Mandatory per
+    /// spec; defaults to `0` when the (malformed) element is absent.
+    pub time: u64,
+    /// `ChapProcessData` (RFC 9559 §5.1.7.1.4.19) — the command
+    /// information, interpreted per the owning [`ChapProcess::codec_id`]
+    /// (for `codec_id == 1` these are the binary DVD cell pre/post
+    /// commands). Raw bytes, never decoded.
+    pub data: Vec<u8>,
 }
 
 /// Parse a `Chapters` master element. Populates two views in one pass:
@@ -1702,6 +1746,10 @@ fn parse_chapter_atom(
                     atom.displays.push(disp);
                 }
             }
+            ids::CHAP_PROCESS => {
+                let cp_end = r.stream_position()?.saturating_add(e.size);
+                atom.chap_processes.push(parse_chap_process(r, cp_end)?);
+            }
             ids::CHAPTER_ATOM => {
                 let ca_end = r.stream_position()?.saturating_add(e.size);
                 let child = parse_chapter_atom(
@@ -1775,6 +1823,46 @@ fn parse_chapter_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<Chapte
         language_bcp47,
         country,
     }))
+}
+
+/// Parse one `ChapProcess` master (RFC 9559 §5.1.7.1.4.14) into a typed
+/// [`ChapProcess`]. `ChapProcessCodecID` defaults to `0` (Matroska Script)
+/// per §5.1.7.1.4.15; the private data and command payloads are surfaced
+/// as raw bytes — the container never executes a chapter command.
+fn parse_chap_process(r: &mut dyn ReadSeek, end: u64) -> Result<ChapProcess> {
+    let mut proc = ChapProcess::default();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CHAP_PROCESS_CODEC_ID => proc.codec_id = read_uint(r, e.size as usize)?,
+            ids::CHAP_PROCESS_PRIVATE => {
+                proc.private = Some(crate::ebml::read_bytes(r, e.size as usize)?);
+            }
+            ids::CHAP_PROCESS_COMMAND => {
+                let cc_end = r.stream_position()?.saturating_add(e.size);
+                proc.commands.push(parse_chap_process_command(r, cc_end)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(proc)
+}
+
+/// Parse one `ChapProcessCommand` master (RFC 9559 §5.1.7.1.4.17) into a
+/// typed [`ChapProcessCommand`]. `ChapProcessTime` defaults to `0` ("during
+/// the whole chapter") when the (mandatory) element is absent; the
+/// `ChapProcessData` payload is surfaced as raw bytes.
+fn parse_chap_process_command(r: &mut dyn ReadSeek, end: u64) -> Result<ChapProcessCommand> {
+    let mut cmd = ChapProcessCommand::default();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CHAP_PROCESS_TIME => cmd.time = read_uint(r, e.size as usize)?,
+            ids::CHAP_PROCESS_DATA => cmd.data = crate::ebml::read_bytes(r, e.size as usize)?,
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(cmd)
 }
 
 /// Parse an `Attachments` master element. Each `AttachedFile` surfaces in

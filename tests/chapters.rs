@@ -61,6 +61,14 @@ fn elem_master(id: u32, body: &[u8]) -> Vec<u8> {
     out
 }
 
+fn elem_bin(id: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&write_element_id(id));
+    out.extend_from_slice(&write_vint(data.len() as u64, 0));
+    out.extend_from_slice(data);
+    out
+}
+
 fn simple_block(track: u8, tc_offset: i16, keyframe: bool, payload: u8) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&write_vint(track as u64, 0));
@@ -633,4 +641,157 @@ fn typed_chapters_empty_when_no_chapters_element() {
         dmx.chapters().is_empty(),
         "file with no Chapters element should expose no editions"
     );
+}
+
+#[test]
+fn typed_chapters_capture_chap_process_subtree() {
+    // Exercise the ChapProcess sub-tree (RFC 9559 §5.1.7.1.4.14–19):
+    //   * Atom 1 carries a DVD-menu ChapProcess (ChapProcessCodecID = 1)
+    //     with ChapProcessPrivate and two ChapProcessCommands, each with a
+    //     distinct ChapProcessTime and binary ChapProcessData payload.
+    //   * Atom 2 carries a Matroska-Script ChapProcess that omits the
+    //     codec id entirely (must materialise the spec default of 0) and
+    //     omits ChapProcessPrivate, with a single command that omits
+    //     ChapProcessTime (must materialise the spec default of 0).
+    // The roundtrip: synthesize the EBML, demux, and assert the typed
+    // accessor surfaces every payload byte-for-byte.
+    let ebml_header = build_ebml_header();
+
+    let mut info_body = Vec::new();
+    info_body.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
+    info_body.extend_from_slice(&elem_float_be_f64(ids::DURATION, 3000.0));
+    let info = elem_master(ids::INFO, &info_body);
+
+    let mut track_body = Vec::new();
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_NUMBER, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_UID, 1));
+    track_body.extend_from_slice(&elem_uint(ids::TRACK_TYPE, ids::TRACK_TYPE_AUDIO));
+    track_body.extend_from_slice(&elem_str(ids::CODEC_ID, "A_PCM/INT/LIT"));
+    let mut audio_body = Vec::new();
+    audio_body.extend_from_slice(&elem_float_be_f64(ids::SAMPLING_FREQUENCY, 48_000.0));
+    audio_body.extend_from_slice(&elem_uint(ids::CHANNELS, 2));
+    audio_body.extend_from_slice(&elem_uint(ids::BIT_DEPTH, 16));
+    track_body.extend_from_slice(&elem_master(ids::AUDIO, &audio_body));
+    let tracks = elem_master(ids::TRACKS, &elem_master(ids::TRACK_ENTRY, &track_body));
+
+    // --- Atom 1: DVD-menu ChapProcess with two commands. ---
+    let cmd1_during = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&elem_uint(
+            ids::CHAP_PROCESS_TIME,
+            ids::CHAP_PROCESS_TIME_DURING,
+        ));
+        b.extend_from_slice(&elem_bin(ids::CHAP_PROCESS_DATA, &[0xDE, 0xAD, 0xBE, 0xEF]));
+        elem_master(ids::CHAP_PROCESS_COMMAND, &b)
+    };
+    let cmd1_after = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&elem_uint(
+            ids::CHAP_PROCESS_TIME,
+            ids::CHAP_PROCESS_TIME_AFTER,
+        ));
+        b.extend_from_slice(&elem_bin(ids::CHAP_PROCESS_DATA, &[0x01, 0x02, 0x03]));
+        elem_master(ids::CHAP_PROCESS_COMMAND, &b)
+    };
+    let chap_process1 = {
+        let mut b = Vec::new();
+        b.extend_from_slice(&elem_uint(
+            ids::CHAP_PROCESS_CODEC_ID,
+            ids::CHAP_PROCESS_CODEC_DVD_MENU,
+        ));
+        b.extend_from_slice(&elem_bin(ids::CHAP_PROCESS_PRIVATE, &[0xAA, 0xBB]));
+        b.extend_from_slice(&cmd1_during);
+        b.extend_from_slice(&cmd1_after);
+        elem_master(ids::CHAP_PROCESS, &b)
+    };
+    let atom1 = {
+        let mut a = Vec::new();
+        a.extend_from_slice(&elem_uint(ids::CHAPTER_UID, 0xA1));
+        a.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 0));
+        a.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_END, 1_000_000_000));
+        let mut disp = Vec::new();
+        disp.extend_from_slice(&elem_str(ids::CHAP_STRING, "Menu"));
+        disp.extend_from_slice(&elem_str(ids::CHAP_LANGUAGE, "eng"));
+        a.extend_from_slice(&elem_master(ids::CHAPTER_DISPLAY, &disp));
+        a.extend_from_slice(&chap_process1);
+        elem_master(ids::CHAPTER_ATOM, &a)
+    };
+
+    // --- Atom 2: Matroska-Script ChapProcess relying on defaults. ---
+    let cmd2 = {
+        // No ChapProcessTime → spec default 0.
+        let mut b = Vec::new();
+        b.extend_from_slice(&elem_bin(ids::CHAP_PROCESS_DATA, &[0xFF]));
+        elem_master(ids::CHAP_PROCESS_COMMAND, &b)
+    };
+    let chap_process2 = {
+        // No ChapProcessCodecID → spec default 0; no ChapProcessPrivate.
+        elem_master(ids::CHAP_PROCESS, &cmd2)
+    };
+    let atom2 = {
+        let mut a = Vec::new();
+        a.extend_from_slice(&elem_uint(ids::CHAPTER_UID, 0xA2));
+        a.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 1_000_000_000));
+        a.extend_from_slice(&chap_process2);
+        elem_master(ids::CHAPTER_ATOM, &a)
+    };
+
+    let mut edition_body = Vec::new();
+    edition_body.extend_from_slice(&atom1);
+    edition_body.extend_from_slice(&atom2);
+    let chapters = elem_master(
+        ids::CHAPTERS,
+        &elem_master(ids::EDITION_ENTRY, &edition_body),
+    );
+
+    let mut cluster_body = Vec::new();
+    cluster_body.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster_body.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    let cluster = elem_master(ids::CLUSTER, &cluster_body);
+
+    let mut seg_body = Vec::new();
+    seg_body.extend_from_slice(&info);
+    seg_body.extend_from_slice(&tracks);
+    seg_body.extend_from_slice(&chapters);
+    seg_body.extend_from_slice(&cluster);
+    let segment = elem_master(ids::SEGMENT, &seg_body);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ebml_header);
+    bytes.extend_from_slice(&segment);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver)
+        .expect("demux open_typed");
+
+    let eds = dmx.chapters();
+    assert_eq!(eds.len(), 1);
+    let ed = &eds[0];
+    assert_eq!(ed.chapters.len(), 2, "two top-level atoms");
+
+    // Atom 1: DVD-menu ChapProcess, private + two commands.
+    let c1 = &ed.chapters[0];
+    assert_eq!(c1.uid, Some(0xA1));
+    assert_eq!(c1.chap_processes.len(), 1, "one ChapProcess on atom 1");
+    let p1 = &c1.chap_processes[0];
+    assert_eq!(p1.codec_id, ids::CHAP_PROCESS_CODEC_DVD_MENU);
+    assert_eq!(p1.private.as_deref(), Some(&[0xAA, 0xBB][..]));
+    assert_eq!(p1.commands.len(), 2, "two ChapProcessCommands");
+    assert_eq!(p1.commands[0].time, ids::CHAP_PROCESS_TIME_DURING);
+    assert_eq!(p1.commands[0].data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    assert_eq!(p1.commands[1].time, ids::CHAP_PROCESS_TIME_AFTER);
+    assert_eq!(p1.commands[1].data, vec![0x01, 0x02, 0x03]);
+
+    // Atom 2: Matroska-Script ChapProcess relying on spec defaults.
+    let c2 = &ed.chapters[1];
+    assert_eq!(c2.uid, Some(0xA2));
+    assert_eq!(c2.chap_processes.len(), 1, "one ChapProcess on atom 2");
+    let p2 = &c2.chap_processes[0];
+    // ChapProcessCodecID omitted → spec default 0 (Matroska Script).
+    assert_eq!(p2.codec_id, ids::CHAP_PROCESS_CODEC_MATROSKA_SCRIPT);
+    assert!(p2.private.is_none(), "no ChapProcessPrivate written");
+    assert_eq!(p2.commands.len(), 1);
+    // ChapProcessTime omitted → spec default 0 (during the whole chapter).
+    assert_eq!(p2.commands[0].time, ids::CHAP_PROCESS_TIME_DURING);
+    assert_eq!(p2.commands[0].data, vec![0xFF]);
 }

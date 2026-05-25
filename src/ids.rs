@@ -160,6 +160,27 @@ pub const CHAP_LANGUAGE: u32 = 0x437C;
 pub const CHAP_LANGUAGE_BCP47: u32 = 0x437D;
 pub const CHAP_COUNTRY: u32 = 0x437E;
 
+// ChapProcess sub-tree (RFC 9559 §5.1.7.1.4.14–19): per-ChapterAtom
+// chapter-codec commands that drive DVD-menu / Matroska-Script chapter
+// actions. `ChapProcess` is a master containing the codec id, optional
+// private data, and zero or more `ChapProcessCommand` masters (each a
+// when-to-run timing plus a binary command payload).
+pub const CHAP_PROCESS: u32 = 0x6944;
+pub const CHAP_PROCESS_CODEC_ID: u32 = 0x6955;
+pub const CHAP_PROCESS_PRIVATE: u32 = 0x450D;
+pub const CHAP_PROCESS_COMMAND: u32 = 0x6911;
+pub const CHAP_PROCESS_TIME: u32 = 0x6922;
+pub const CHAP_PROCESS_DATA: u32 = 0x6933;
+
+// ChapProcessCodecID values (RFC 9559 §5.1.7.1.4.15, Table 31).
+pub const CHAP_PROCESS_CODEC_MATROSKA_SCRIPT: u64 = 0;
+pub const CHAP_PROCESS_CODEC_DVD_MENU: u64 = 1;
+
+// ChapProcessTime values (RFC 9559 §5.1.7.1.4.18, Table 32).
+pub const CHAP_PROCESS_TIME_DURING: u64 = 0;
+pub const CHAP_PROCESS_TIME_BEFORE: u64 = 1;
+pub const CHAP_PROCESS_TIME_AFTER: u64 = 2;
+
 // Attachments (Segment\Attachments\AttachedFile\...).
 pub const ATTACHED_FILE: u32 = 0x61A7;
 pub const FILE_DESCRIPTION: u32 = 0x467E;

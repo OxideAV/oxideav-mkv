@@ -106,7 +106,11 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `ChapterSegmentEditionUID` (zero suppressed per spec "range: not 0"),
   `ChapterPhysicalEquiv` (DVD/SIDE physical mapping per §20.4),
   **all** multilingual `ChapterDisplay` rows (each with `ChapString`,
-  `ChapLanguage` + `ChapLanguageBCP47`, `ChapCountry`), and any nested
+  `ChapLanguage` + `ChapLanguageBCP47`, `ChapCountry`), the `ChapProcess`
+  sub-tree (RFC 9559 §5.1.7.1.4.14–19 — `ChapProcessCodecID`,
+  `ChapProcessPrivate`, and zero or more `ChapProcessCommand` rows each
+  with `ChapProcessTime` + raw `ChapProcessData`; payloads surfaced
+  verbatim, never executed), and any nested
   child atoms (the spec marks `ChapterAtom` as recursive). Atoms are
   1-indexed depth-first in document order — the same index the flat
   `chapter:N:*` keys and `TagChapterUID`-resolved tags use, now extended

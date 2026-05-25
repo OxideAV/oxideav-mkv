@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed decode of the `ChapProcess` sub-tree** (RFC 9559
+  §5.1.7.1.4.14–§5.1.7.1.4.19). The typed `Chapter` now carries a
+  `chap_processes: Vec<ChapProcess>` field exposing the chapter-codec
+  commands (DVD-menu / Matroska-Script) attached to each `ChapterAtom`.
+  New `ChapProcess` struct holds `codec_id` (`ChapProcessCodecID`, spec
+  default `0` = Matroska Script materialised), `private`
+  (`ChapProcessPrivate`, raw optional bytes) and `commands:
+  Vec<ChapProcessCommand>`; each `ChapProcessCommand` carries `time`
+  (`ChapProcessTime`, spec default `0` = "during the whole chapter") and
+  `data` (`ChapProcessData`, raw command bytes). Payloads are surfaced
+  verbatim — the container never executes a chapter command. Adds six
+  element-id constants (`CHAP_PROCESS`, `CHAP_PROCESS_CODEC_ID`,
+  `CHAP_PROCESS_PRIVATE`, `CHAP_PROCESS_COMMAND`, `CHAP_PROCESS_TIME`,
+  `CHAP_PROCESS_DATA`) plus the Table 31 / Table 32 value constants, and
+  one roundtrip integration test covering a DVD-menu process with private
+  data + two timed commands alongside a Matroska-Script process that
+  relies on the codec-id and time spec defaults.
 - demux: **extend typed `Chapter` with RFC 9559 §5.1.7.1.4.5–§5.1.7.1.4.8
   sub-elements** previously dropped during the `Chapters` walk.
   `Chapter` now carries `enabled` (`ChapterFlagEnabled`, spec default `1`
