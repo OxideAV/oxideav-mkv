@@ -116,6 +116,13 @@ pub const AES_SETTINGS_CIPHER_MODE: u32 = 0x47E8;
 
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
+
+// Video interlacing (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2).
+// `FlagInterlaced` (spec default 0 = undetermined) marks whether the track's
+// frames are interlaced. `FieldOrder` (spec default 2 = undetermined) selects
+// the field ordering and MUST be ignored unless `FlagInterlaced == 1`.
+pub const FLAG_INTERLACED: u32 = 0x9A;
+pub const FIELD_ORDER: u32 = 0x9D;
 pub const SAMPLING_FREQUENCY: u32 = 0xB5;
 pub const OUTPUT_SAMPLING_FREQUENCY: u32 = 0x78B5;
 pub const CHANNELS: u32 = 0x9F;
@@ -193,6 +200,21 @@ pub const FILE_UID: u32 = 0x46AE;
 pub const TRACK_TYPE_VIDEO: u64 = 1;
 pub const TRACK_TYPE_AUDIO: u64 = 2;
 pub const TRACK_TYPE_SUBTITLE: u64 = 17;
+
+// FlagInterlaced values (RFC 9559 §5.1.4.1.28.1, Table 3).
+pub const FLAG_INTERLACED_UNDETERMINED: u64 = 0;
+pub const FLAG_INTERLACED_INTERLACED: u64 = 1;
+pub const FLAG_INTERLACED_PROGRESSIVE: u64 = 2;
+
+// FieldOrder values (RFC 9559 §5.1.4.1.28.2, Table 4). All 0..=14 values
+// the spec defines are listed; values outside the set pass through via the
+// typed enum's `Other` variant.
+pub const FIELD_ORDER_PROGRESSIVE: u64 = 0;
+pub const FIELD_ORDER_TFF: u64 = 1;
+pub const FIELD_ORDER_UNDETERMINED: u64 = 2;
+pub const FIELD_ORDER_BFF: u64 = 6;
+pub const FIELD_ORDER_TFF_INTERLEAVED: u64 = 9;
+pub const FIELD_ORDER_BFF_INTERLEAVED: u64 = 14;
 
 // TrackPlaneType values (RFC 9559 §5.1.4.1.30.4, Table 20). Values
 // 3..=u64::MAX are "First Come First Served" registrations (§27.17).

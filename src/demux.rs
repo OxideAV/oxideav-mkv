@@ -388,6 +388,21 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let content_encodings: Vec<Option<ContentEncodings>> =
         tracks.iter().map(|t| t.content_encodings.clone()).collect();
 
+    // Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2),
+    // indexed by stream index. `None` for non-video tracks and for video
+    // tracks whose `TrackEntry` had no `Video` master; for everything else
+    // the spec defaults (FlagInterlaced=0, FieldOrder=2) are materialised
+    // by `parse_video`.
+    let video_interlacings: Vec<Option<VideoInterlacing>> = tracks
+        .iter()
+        .map(|t| {
+            t.interlacing_raw.map(|(flag, fo)| VideoInterlacing {
+                flag: FlagInterlaced::from_raw(flag),
+                field_order_raw: fo,
+            })
+        })
+        .collect();
+
     // Per-stream Header-Stripping prefix (RFC 9559 §5.1.4.1.31.6 algo 3): the
     // bytes to prepend to each de-laced frame to undo a Block-scoped
     // Header-Stripping chain. Empty when there's nothing to undo or the chain
@@ -441,6 +456,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         track_operations,
         content_encodings,
         header_strip_prefixes,
+        video_interlacings,
     })
 }
 
@@ -565,6 +581,13 @@ struct TrackEntry {
     bit_depth: u64,
     width: u64,
     height: u64,
+    /// Raw `(FlagInterlaced, FieldOrder)` captured from the `Video` master
+    /// (RFC 9559 §5.1.4.1.28.1 / §5.1.4.1.28.2). `None` when the track is
+    /// not a video track or the `Video` master was absent. When the `Video`
+    /// master existed but neither child was present, the tuple holds the
+    /// spec defaults (`0` = undetermined, `2` = undetermined) so the
+    /// downstream typed surface materialises them.
+    interlacing_raw: Option<(u64, u64)>,
     /// Raw `TrackOperation` (RFC 9559 §5.1.4.1.30) captured during the
     /// segment walk. Its `TrackPlaneUID` / `TrackJoinUID` references point
     /// at other tracks by `TrackUID`; they're resolved to stream indices
@@ -1183,6 +1206,121 @@ pub struct TrackRef {
     /// Resolved 0-indexed stream index, or `None` when no track in the
     /// Segment carries this `TrackUID`.
     pub stream_index: Option<u32>,
+}
+
+/// A video track's interlacing settings — `FlagInterlaced` (RFC 9559
+/// §5.1.4.1.28.1) paired with `FieldOrder` (§5.1.4.1.28.2).
+///
+/// `FieldOrder` is only meaningful when [`flag`](Self::flag) reports
+/// [`FlagInterlaced::Interlaced`]; the spec is explicit ("If FlagInterlaced
+/// is not set to 1, this element MUST be ignored", §5.1.4.1.28.2 usage
+/// notes), so this struct returns [`Self::field_order`] as `None` for
+/// progressive / undetermined tracks even if the file carried a stray
+/// `FieldOrder` child. Surfaced per stream via
+/// [`MkvDemuxer::video_interlacing`].
+///
+/// Spec defaults are materialised: a `Video` master with no
+/// `FlagInterlaced` child decodes as [`FlagInterlaced::Undetermined`] (the
+/// §5.1.4.1.28.1 default value `0`), and an interlaced track with no
+/// explicit `FieldOrder` decodes as
+/// `Some(FieldOrder::Undetermined)` (the §5.1.4.1.28.2 default `2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoInterlacing {
+    flag: FlagInterlaced,
+    field_order_raw: u64,
+}
+
+impl VideoInterlacing {
+    /// `FlagInterlaced` (RFC 9559 §5.1.4.1.28.1, Table 3) for the track.
+    pub fn flag(&self) -> FlagInterlaced {
+        self.flag
+    }
+
+    /// `FieldOrder` (RFC 9559 §5.1.4.1.28.2, Table 4) — only returned for
+    /// tracks marked [`FlagInterlaced::Interlaced`]. Per §5.1.4.1.28.2 the
+    /// element MUST be ignored otherwise, so this returns `None` even if a
+    /// non-default `FieldOrder` was present on a progressive track.
+    pub fn field_order(&self) -> Option<FieldOrder> {
+        match self.flag {
+            FlagInterlaced::Interlaced => Some(FieldOrder::from_raw(self.field_order_raw)),
+            _ => None,
+        }
+    }
+}
+
+/// `FlagInterlaced` (RFC 9559 §5.1.4.1.28.1, Table 3): whether the video
+/// track's frames are interlaced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FlagInterlaced {
+    /// `0` — interlacing status is unknown. Spec default; "SHOULD be
+    /// avoided" per Table 3.
+    #[default]
+    Undetermined,
+    /// `1` — interlaced frames.
+    Interlaced,
+    /// `2` — progressive frames (no interlacing).
+    Progressive,
+    /// Any other value. The spec only registers `0`/`1`/`2`, so anything
+    /// else is malformed — surfaced rather than dropped so callers can log
+    /// it.
+    Other(u64),
+}
+
+impl FlagInterlaced {
+    /// Map a raw `FlagInterlaced` integer onto the enum, preserving
+    /// unrecognised values via [`FlagInterlaced::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::FLAG_INTERLACED_UNDETERMINED => FlagInterlaced::Undetermined,
+            ids::FLAG_INTERLACED_INTERLACED => FlagInterlaced::Interlaced,
+            ids::FLAG_INTERLACED_PROGRESSIVE => FlagInterlaced::Progressive,
+            other => FlagInterlaced::Other(other),
+        }
+    }
+}
+
+/// `FieldOrder` (RFC 9559 §5.1.4.1.28.2, Table 4): the field ordering of an
+/// interlaced video track. Only meaningful when paired with
+/// [`FlagInterlaced::Interlaced`] — the spec is explicit that the element
+/// MUST be ignored otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldOrder {
+    /// `0` — progressive. Table 4 marks this value as "SHOULD be avoided;
+    /// setting FlagInterlaced to 2 is sufficient", but it's still a legal
+    /// in-file value so we surface it.
+    Progressive,
+    /// `1` — top field displayed first, top field stored first.
+    Tff,
+    /// `2` — field order unknown. Spec default for `FieldOrder` per
+    /// §5.1.4.1.28.2 (default `2`).
+    Undetermined,
+    /// `6` — bottom field displayed first, bottom field stored first.
+    Bff,
+    /// `9` — top field displayed first, interleaved with the top line of
+    /// the top field stored first.
+    TffInterleaved,
+    /// `14` — bottom field displayed first, interleaved with the top line
+    /// of the top field stored first.
+    BffInterleaved,
+    /// Any other value. Table 4 only registers `0`/`1`/`2`/`6`/`9`/`14`,
+    /// so anything else is malformed — surfaced rather than dropped.
+    Other(u64),
+}
+
+impl FieldOrder {
+    /// Map a raw `FieldOrder` integer onto the enum, preserving
+    /// unrecognised values via [`FieldOrder::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::FIELD_ORDER_PROGRESSIVE => FieldOrder::Progressive,
+            ids::FIELD_ORDER_TFF => FieldOrder::Tff,
+            ids::FIELD_ORDER_UNDETERMINED => FieldOrder::Undetermined,
+            ids::FIELD_ORDER_BFF => FieldOrder::Bff,
+            ids::FIELD_ORDER_TFF_INTERLEAVED => FieldOrder::TffInterleaved,
+            ids::FIELD_ORDER_BFF_INTERLEAVED => FieldOrder::BffInterleaved,
+            other => FieldOrder::Other(other),
+        }
+    }
 }
 
 /// A track's `ContentEncodings` (RFC 9559 §5.1.4.1.31): the ordered list of
@@ -2509,14 +2647,23 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
 }
 
 fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
+    // The `Video` master was seen. Materialise the spec defaults for
+    // FlagInterlaced (§5.1.4.1.28.1, default 0 = undetermined) and
+    // FieldOrder (§5.1.4.1.28.2, default 2 = undetermined); explicit
+    // children below override them.
+    let mut flag_interlaced: u64 = ids::FLAG_INTERLACED_UNDETERMINED;
+    let mut field_order: u64 = ids::FIELD_ORDER_UNDETERMINED;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::PIXEL_WIDTH => t.width = read_uint(r, e.size as usize)?,
             ids::PIXEL_HEIGHT => t.height = read_uint(r, e.size as usize)?,
+            ids::FLAG_INTERLACED => flag_interlaced = read_uint(r, e.size as usize)?,
+            ids::FIELD_ORDER => field_order = read_uint(r, e.size as usize)?,
             _ => skip(r, e.size)?,
         }
     }
+    t.interlacing_raw = Some((flag_interlaced, field_order));
     Ok(())
 }
 
@@ -2595,6 +2742,11 @@ pub struct MkvDemuxer {
     /// encryption — in which case packets pass through encoded). See
     /// [`compute_header_strip_prefix`].
     header_strip_prefixes: Vec<Vec<u8>>,
+    /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
+    /// §5.1.4.1.28.2), indexed by stream index. `None` for non-video tracks
+    /// and for video tracks whose `TrackEntry` carried no `Video` master —
+    /// see [`MkvDemuxer::video_interlacing`].
+    video_interlacings: Vec<Option<VideoInterlacing>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -2908,6 +3060,35 @@ impl MkvDemuxer {
     /// semantics.
     pub fn all_content_encodings(&self) -> &[Option<ContentEncodings>] {
         &self.content_encodings
+    }
+
+    /// `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2) for the
+    /// stream at `stream_index`, or `None` when the track is not a video
+    /// track / its `TrackEntry` carried no `Video` master.
+    ///
+    /// The returned [`VideoInterlacing`] folds `FlagInterlaced` and
+    /// `FieldOrder` into a single typed pair: a `Video` master with no
+    /// `FlagInterlaced` child decodes as [`FlagInterlaced::Undetermined`]
+    /// (the spec default `0`), and an interlaced track with no explicit
+    /// `FieldOrder` decodes as `Some(FieldOrder::Undetermined)` (the spec
+    /// default `2`). `FieldOrder` is suppressed to `None` whenever the track
+    /// is not [`FlagInterlaced::Interlaced`], per §5.1.4.1.28.2's "If
+    /// FlagInterlaced is not set to 1, this element MUST be ignored".
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_interlacing(&self, stream_index: u32) -> Option<&VideoInterlacing> {
+        self.video_interlacings
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+    }
+
+    /// All per-stream `VideoInterlacing`s (RFC 9559 §5.1.4.1.28.1 +
+    /// §5.1.4.1.28.2), indexed by stream index. The slice has one entry per
+    /// stream — `None` for non-video tracks and for video tracks whose
+    /// `TrackEntry` carried no `Video` master. See
+    /// [`MkvDemuxer::video_interlacing`] for the semantics.
+    pub fn video_interlacings(&self) -> &[Option<VideoInterlacing>] {
+        &self.video_interlacings
     }
 
     /// Apply a `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) after a

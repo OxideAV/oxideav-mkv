@@ -186,6 +186,23 @@ the unified `oxideav` aggregator to wire decoding automatically.
   can't undo (zlib/bzlib/lzo1x compression or encryption), packets pass
   through encoded — the demuxer never *partially* strips. Private-scope
   (`CodecPrivate`-only) Header Stripping leaves frame data untouched.
+- **`Video > FlagInterlaced` + `FieldOrder` typed decode** (RFC 9559
+  §5.1.4.1.28.1 + §5.1.4.1.28.2):
+  `MkvDemuxer::video_interlacing(stream_index)` (and the per-stream
+  `video_interlacings()` slice) folds both elements into a typed
+  `VideoInterlacing` — `flag()` returns a `FlagInterlaced` enum
+  (`Undetermined` / `Interlaced` / `Progressive` / `Other(u64)`) and
+  `field_order()` returns `Some(FieldOrder)`
+  (`Progressive` / `Tff` / `Undetermined` / `Bff` / `TffInterleaved` /
+  `BffInterleaved` / `Other(u64)`) only when the track is actually
+  interlaced. §5.1.4.1.28.2's "If FlagInterlaced is not set to 1, this
+  element MUST be ignored" is honoured by the typed surface: a stray
+  `FieldOrder` on a progressive / undetermined track silently resolves to
+  `None`. Spec defaults materialised — bare `Video` master with no
+  `FlagInterlaced` child decodes as `Undetermined` (default `0`); an
+  interlaced track with no explicit `FieldOrder` decodes as
+  `Some(FieldOrder::Undetermined)` (default `2`). Non-video tracks (and
+  video tracks with no `Video` master) return `None`.
 
 ### Muxer (`mux::open` and `mux::open_webm`)
 
@@ -285,6 +302,15 @@ so the demuxer never hides an unrecognised track.
   reported encoding chain itself. zlib/bzlib/lzo1x decompression and
   decryption are out of container scope; `ContentEncodings` is never written
   on the mux side.
+- `Video` sub-element coverage is partial: `PixelWidth` / `PixelHeight`
+  (§5.1.4.1.28.6 / §5.1.4.1.28.7) feed the `StreamInfo` dimensions, and
+  `FlagInterlaced` / `FieldOrder` (§5.1.4.1.28.1 / §5.1.4.1.28.2) surface
+  through `video_interlacing` (see above). `StereoMode`, `AlphaMode`,
+  `PixelCrop{Top,Bottom,Left,Right}`, `DisplayWidth` / `DisplayHeight` /
+  `DisplayUnit`, `AspectRatioType`, `UncompressedFourCC` and the full
+  `Colour` master (§5.1.4.1.28.16) — including HDR metadata
+  (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — are still skipped on the
+  demux side and never written on the mux side.
 
 ## Fuzzing
 

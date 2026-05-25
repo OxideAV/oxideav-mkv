@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed `Video > FlagInterlaced` + `FieldOrder` decode** (RFC 9559
+  §5.1.4.1.28.1 + §5.1.4.1.28.2). New
+  `MkvDemuxer::video_interlacing(stream_index) -> Option<&VideoInterlacing>`
+  (and the slice-view `video_interlacings()`) exposes a track's
+  interlacing status — `FlagInterlaced` as the typed `FlagInterlaced` enum
+  (`Undetermined` / `Interlaced` / `Progressive` / `Other(u64)`) paired
+  with a `field_order()` accessor that returns `Some(FieldOrder)`
+  (`Progressive` / `Tff` / `Undetermined` / `Bff` / `TffInterleaved` /
+  `BffInterleaved` / `Other(u64)`) only when the track is actually
+  interlaced. The §5.1.4.1.28.2 "If FlagInterlaced is not set to 1, this
+  element MUST be ignored" rule is honoured by the typed surface: a stray
+  `FieldOrder` on a progressive / undetermined track silently resolves to
+  `None`. Spec defaults are materialised — a `Video` master with no
+  `FlagInterlaced` child decodes as `FlagInterlaced::Undetermined` (the
+  §5.1.4.1.28.1 default `0`), an interlaced track with no explicit
+  `FieldOrder` decodes as `Some(FieldOrder::Undetermined)` (the
+  §5.1.4.1.28.2 default `2`). Adds two element-id constants
+  (`FLAG_INTERLACED`, `FIELD_ORDER`), nine value constants from Table 3 +
+  Table 4, and four integration tests covering Tff-interlaced +
+  progressive siblings, the bare-`Video`-master default path, the
+  interlaced-with-default-FieldOrder + unknown-FieldOrder-value cases,
+  and the audio-track-has-no-interlacing contract.
 - demux: **typed decode of the `ChapProcess` sub-tree** (RFC 9559
   §5.1.7.1.4.14–§5.1.7.1.4.19). The typed `Chapter` now carries a
   `chap_processes: Vec<ChapProcess>` field exposing the chapter-codec
