@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed `Video` geometry quartet decode** (RFC 9559
+  §5.1.4.1.28.8..§5.1.4.1.28.14). New
+  `MkvDemuxer::video_geometry(stream_index) -> Option<&VideoGeometry>`
+  (and the slice-view `video_geometries()`) folds the
+  `PixelCrop{Top,Bottom,Left,Right}` hide-window plus the `DisplayWidth` /
+  `DisplayHeight` / `DisplayUnit` render-size triple into a single typed
+  record. `DisplayUnit` surfaces as the `DisplayUnit` enum (`Pixels` /
+  `Centimeters` / `Inches` / `DisplayAspectRatio` / `Unknown` /
+  `Other(u64)` for forward-compatibility with the §27.9 "Matroska Display
+  Units" registry). `display_width()` / `display_height()` return
+  `Option<u64>` — the explicit element when present, otherwise the
+  §5.1.4.1.28.12 / §5.1.4.1.28.13 derived default (`PixelWidth -
+  PixelCropLeft - PixelCropRight` / `PixelHeight - PixelCropTop -
+  PixelCropBottom`) when `DisplayUnit == 0` (pixels), and `None` for any
+  other `DisplayUnit` per the spec note "else, there is no default value".
+  The §5.1.4.1.28.8..11 PixelCrop defaults (`0`) and §5.1.4.1.28.14
+  DisplayUnit default (`0`) are always materialised. Adds seven element-id
+  constants (`PIXEL_CROP_{TOP,BOTTOM,LEFT,RIGHT}`, `DISPLAY_WIDTH`,
+  `DISPLAY_HEIGHT`, `DISPLAY_UNIT`), five Table 10 value constants, and
+  seven integration tests covering an explicit PixelCrop + Display pair,
+  the bare-`Video`-master defaults path, derived display sizes after
+  PixelCrops, a non-pixel `DisplayUnit` (DAR) with explicit values + a cm
+  `DisplayUnit` with no DisplayWidth/Height (no-default path), an
+  unregistered DisplayUnit surfacing as `Other(42)`, the
+  audio-track-has-no-geometry contract, and a malformed-file
+  underflow-returns-`None` case.
 - demux: **typed `Video > FlagInterlaced` + `FieldOrder` decode** (RFC 9559
   §5.1.4.1.28.1 + §5.1.4.1.28.2). New
   `MkvDemuxer::video_interlacing(stream_index) -> Option<&VideoInterlacing>`

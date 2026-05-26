@@ -186,6 +186,28 @@ the unified `oxideav` aggregator to wire decoding automatically.
   can't undo (zlib/bzlib/lzo1x compression or encryption), packets pass
   through encoded — the demuxer never *partially* strips. Private-scope
   (`CodecPrivate`-only) Header Stripping leaves frame data untouched.
+- **`Video` geometry quartet typed decode** (RFC 9559
+  §5.1.4.1.28.8..§5.1.4.1.28.14):
+  `MkvDemuxer::video_geometry(stream_index)` (and the per-stream
+  `video_geometries()` slice) folds the `PixelCrop{Top,Bottom,Left,Right}`
+  hide-window plus the `DisplayWidth` / `DisplayHeight` / `DisplayUnit`
+  render-size triple into a single typed `VideoGeometry`. `DisplayUnit`
+  surfaces as the `DisplayUnit` enum (`Pixels` / `Centimeters` / `Inches` /
+  `DisplayAspectRatio` / `Unknown` / `Other(u64)` for forward-compat with
+  the §27.9 "Matroska Display Units" registry). `display_width()` /
+  `display_height()` return `Option<u64>`: the explicit element when the
+  file carries it, otherwise the §5.1.4.1.28.12 / §5.1.4.1.28.13 derived
+  default (`PixelWidth - PixelCropLeft - PixelCropRight` / `PixelHeight -
+  PixelCropTop - PixelCropBottom`) — but only when `DisplayUnit == 0`
+  (pixels), since the spec explicitly states "If the DisplayUnit of the
+  same TrackEntry is 0, then the default value for DisplayWidth is ...;
+  else, there is no default value". For any other `DisplayUnit` an absent
+  element resolves to `None`. The PixelCrop defaults (`0`, §5.1.4.1.28.8..11)
+  and DisplayUnit default (`0`, §5.1.4.1.28.14) are always materialised.
+  Non-video tracks (and video tracks with no `Video` master) return `None`;
+  a derivation that would underflow (malformed file with crops larger than
+  the encoded width or height on the same axis) returns `None` on that
+  axis rather than wrapping.
 - **`Video > FlagInterlaced` + `FieldOrder` typed decode** (RFC 9559
   §5.1.4.1.28.1 + §5.1.4.1.28.2):
   `MkvDemuxer::video_interlacing(stream_index)` (and the per-stream
@@ -303,12 +325,14 @@ so the demuxer never hides an unrecognised track.
   decryption are out of container scope; `ContentEncodings` is never written
   on the mux side.
 - `Video` sub-element coverage is partial: `PixelWidth` / `PixelHeight`
-  (§5.1.4.1.28.6 / §5.1.4.1.28.7) feed the `StreamInfo` dimensions, and
+  (§5.1.4.1.28.6 / §5.1.4.1.28.7) feed the `StreamInfo` dimensions;
   `FlagInterlaced` / `FieldOrder` (§5.1.4.1.28.1 / §5.1.4.1.28.2) surface
-  through `video_interlacing` (see above). `StereoMode`, `AlphaMode`,
-  `PixelCrop{Top,Bottom,Left,Right}`, `DisplayWidth` / `DisplayHeight` /
-  `DisplayUnit`, `AspectRatioType`, `UncompressedFourCC` and the full
-  `Colour` master (§5.1.4.1.28.16) — including HDR metadata
+  through `video_interlacing`; and the `PixelCrop{Top,Bottom,Left,Right}` +
+  `DisplayWidth` / `DisplayHeight` / `DisplayUnit` quartet
+  (§5.1.4.1.28.8..§5.1.4.1.28.14) surfaces through `video_geometry`
+  (see above). `StereoMode`, `AlphaMode`, `AspectRatioType` (reclaimed
+  Appendix-A element), `UncompressedFourCC` and the full `Colour` master
+  (§5.1.4.1.28.16) — including HDR metadata
   (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — are still skipped on the
   demux side and never written on the mux side.
 

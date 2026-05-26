@@ -117,6 +117,30 @@ pub const AES_SETTINGS_CIPHER_MODE: u32 = 0x47E8;
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
 
+// Video geometry quartet (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14).
+// PixelCrop* (default 0) carve the visible window out of the encoded
+// PixelWidth × PixelHeight buffer. DisplayWidth / DisplayHeight describe
+// the target render size, in units selected by DisplayUnit
+// (`0` pixels / `1` cm / `2` inches / `3` DAR / `4` unknown — Table 10).
+// Defaults: when DisplayUnit is absent (0) DisplayWidth defaults to
+// PixelWidth - PixelCropLeft - PixelCropRight and DisplayHeight to
+// PixelHeight - PixelCropTop - PixelCropBottom; otherwise there is no
+// default (Tables 8 + 9).
+pub const PIXEL_CROP_BOTTOM: u32 = 0x54AA;
+pub const PIXEL_CROP_TOP: u32 = 0x54BB;
+pub const PIXEL_CROP_LEFT: u32 = 0x54CC;
+pub const PIXEL_CROP_RIGHT: u32 = 0x54DD;
+pub const DISPLAY_WIDTH: u32 = 0x54B0;
+pub const DISPLAY_HEIGHT: u32 = 0x54BA;
+pub const DISPLAY_UNIT: u32 = 0x54B2;
+
+// DisplayUnit values (RFC 9559 §5.1.4.1.28.14, Table 10).
+pub const DISPLAY_UNIT_PIXELS: u64 = 0;
+pub const DISPLAY_UNIT_CENTIMETERS: u64 = 1;
+pub const DISPLAY_UNIT_INCHES: u64 = 2;
+pub const DISPLAY_UNIT_DAR: u64 = 3;
+pub const DISPLAY_UNIT_UNKNOWN: u64 = 4;
+
 // Video interlacing (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2).
 // `FlagInterlaced` (spec default 0 = undetermined) marks whether the track's
 // frames are interlaced. `FieldOrder` (spec default 2 = undetermined) selects

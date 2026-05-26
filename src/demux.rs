@@ -403,6 +403,58 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         })
         .collect();
 
+    // Per-stream `VideoGeometry` (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14),
+    // indexed by stream index. `None` for tracks with no `Video` master.
+    // PixelCrop defaults (§5.1.4.1.28.8..11) are materialised as `0` by
+    // `parse_video`; the typed surface materialises the §5.1.4.1.28.12 /
+    // §5.1.4.1.28.13 derived defaults for DisplayWidth / DisplayHeight
+    // (`PixelWidth - crop_left - crop_right` and `PixelHeight - crop_top -
+    // crop_bottom`) only when DisplayUnit is `0` (pixels) and the file
+    // omitted the explicit element, per the spec note "If the DisplayUnit
+    // of the same TrackEntry is 0, then the default value ...; else, there
+    // is no default value".
+    let video_geometries: Vec<Option<VideoGeometry>> = tracks
+        .iter()
+        .map(|t| {
+            t.geometry_raw
+                .map(|(top, bottom, left, right, dw_raw, dh_raw, unit_raw)| {
+                    let unit = DisplayUnit::from_raw(unit_raw);
+                    let display_width = if dw_raw != 0 {
+                        // Explicit DisplayWidth (range "not 0") overrides the
+                        // derivation in every DisplayUnit mode.
+                        Some(dw_raw)
+                    } else if matches!(unit, DisplayUnit::Pixels) {
+                        // Derived pixel-mode default: PixelWidth - crop_left
+                        // - crop_right, only when it does not underflow
+                        // (a malformed file with crops bigger than the encoded
+                        // width produces `None` instead of an underflowed
+                        // value).
+                        t.width.checked_sub(left).and_then(|v| v.checked_sub(right))
+                    } else {
+                        None
+                    };
+                    let display_height = if dh_raw != 0 {
+                        Some(dh_raw)
+                    } else if matches!(unit, DisplayUnit::Pixels) {
+                        t.height
+                            .checked_sub(top)
+                            .and_then(|v| v.checked_sub(bottom))
+                    } else {
+                        None
+                    };
+                    VideoGeometry {
+                        pixel_crop_top: top,
+                        pixel_crop_bottom: bottom,
+                        pixel_crop_left: left,
+                        pixel_crop_right: right,
+                        display_width,
+                        display_height,
+                        display_unit: unit,
+                    }
+                })
+        })
+        .collect();
+
     // Per-stream Header-Stripping prefix (RFC 9559 §5.1.4.1.31.6 algo 3): the
     // bytes to prepend to each de-laced frame to undo a Block-scoped
     // Header-Stripping chain. Empty when there's nothing to undo or the chain
@@ -457,6 +509,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         content_encodings,
         header_strip_prefixes,
         video_interlacings,
+        video_geometries,
     })
 }
 
@@ -588,6 +641,15 @@ struct TrackEntry {
     /// spec defaults (`0` = undetermined, `2` = undetermined) so the
     /// downstream typed surface materialises them.
     interlacing_raw: Option<(u64, u64)>,
+    /// Raw video-geometry quartet captured from the `Video` master (RFC 9559
+    /// §5.1.4.1.28.8..§5.1.4.1.28.14): `(PixelCropTop, PixelCropBottom,
+    /// PixelCropLeft, PixelCropRight, DisplayWidth-or-0, DisplayHeight-or-0,
+    /// DisplayUnit)`. `None` when the track has no `Video` master.
+    /// Per §5.1.4.1.28.12 / .13 the spec ranges DisplayWidth /
+    /// DisplayHeight as "not 0" — a `0` slot signals "absent from file"
+    /// so the typed surface materialises the default (or returns `None`
+    /// when there is no spec default).
+    geometry_raw: Option<(u64, u64, u64, u64, u64, u64, u64)>,
     /// Raw `TrackOperation` (RFC 9559 §5.1.4.1.30) captured during the
     /// segment walk. Its `TrackPlaneUID` / `TrackJoinUID` references point
     /// at other tracks by `TrackUID`; they're resolved to stream indices
@@ -1319,6 +1381,128 @@ impl FieldOrder {
             ids::FIELD_ORDER_TFF_INTERLEAVED => FieldOrder::TffInterleaved,
             ids::FIELD_ORDER_BFF_INTERLEAVED => FieldOrder::BffInterleaved,
             other => FieldOrder::Other(other),
+        }
+    }
+}
+
+/// A video track's display-geometry quartet — the `PixelCrop*` window plus
+/// `DisplayWidth` / `DisplayHeight` / `DisplayUnit` (RFC 9559
+/// §5.1.4.1.28.8..§5.1.4.1.28.14).
+///
+/// `PixelCrop{Top,Bottom,Left,Right}` carve a visible rectangle out of the
+/// encoded `PixelWidth` × `PixelHeight` buffer; per §5.1.4.1.28.8..11 they
+/// default to `0` and represent "pixel rows / columns the player SHOULD hide
+/// from the user". `DisplayWidth` / `DisplayHeight` describe the rendered
+/// frame size, in units selected by `DisplayUnit` (Table 10:
+/// `0` pixels / `1` cm / `2` in / `3` display-aspect-ratio / `4` unknown).
+///
+/// Derived defaults for `DisplayWidth` / `DisplayHeight` are materialised on
+/// the typed surface as `Option<u64>`: per §5.1.4.1.28.12 / .13 a missing
+/// element defaults to `PixelWidth - PixelCropLeft - PixelCropRight` (and
+/// the analogous height) *only when DisplayUnit is `0` (pixels)*. For any
+/// other DisplayUnit there is no default; the accessor returns `None`.
+/// Surfaced per stream via [`MkvDemuxer::video_geometry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoGeometry {
+    pixel_crop_top: u64,
+    pixel_crop_bottom: u64,
+    pixel_crop_left: u64,
+    pixel_crop_right: u64,
+    display_width: Option<u64>,
+    display_height: Option<u64>,
+    display_unit: DisplayUnit,
+}
+
+impl VideoGeometry {
+    /// `PixelCropTop` (RFC 9559 §5.1.4.1.28.9): number of pixel rows to hide
+    /// at the top of the encoded image. Default `0`.
+    pub fn pixel_crop_top(&self) -> u64 {
+        self.pixel_crop_top
+    }
+
+    /// `PixelCropBottom` (RFC 9559 §5.1.4.1.28.8): number of pixel rows to
+    /// hide at the bottom of the encoded image. Default `0`.
+    pub fn pixel_crop_bottom(&self) -> u64 {
+        self.pixel_crop_bottom
+    }
+
+    /// `PixelCropLeft` (RFC 9559 §5.1.4.1.28.10): number of pixel columns to
+    /// hide on the left side of the encoded image. Default `0`.
+    pub fn pixel_crop_left(&self) -> u64 {
+        self.pixel_crop_left
+    }
+
+    /// `PixelCropRight` (RFC 9559 §5.1.4.1.28.11): number of pixel columns to
+    /// hide on the right side of the encoded image. Default `0`.
+    pub fn pixel_crop_right(&self) -> u64 {
+        self.pixel_crop_right
+    }
+
+    /// `DisplayWidth` (RFC 9559 §5.1.4.1.28.12): width of the frame to
+    /// display, in [`DisplayUnit`] units, applied to the already-cropped
+    /// image.
+    ///
+    /// Returns the explicit `DisplayWidth` element when present (the spec
+    /// ranges it as "not 0"). When the element is absent, the spec default
+    /// applies only when `DisplayUnit == 0` (pixels): the value derived from
+    /// `PixelWidth - PixelCropLeft - PixelCropRight`. For any other
+    /// [`DisplayUnit`] the spec note "there is no default value" applies
+    /// and this returns `None`. Also returns `None` when the derivation
+    /// would underflow (malformed file).
+    pub fn display_width(&self) -> Option<u64> {
+        self.display_width
+    }
+
+    /// `DisplayHeight` (RFC 9559 §5.1.4.1.28.13): height of the frame to
+    /// display, in [`DisplayUnit`] units, applied to the already-cropped
+    /// image. See [`Self::display_width`] for the default-derivation rules.
+    pub fn display_height(&self) -> Option<u64> {
+        self.display_height
+    }
+
+    /// `DisplayUnit` (RFC 9559 §5.1.4.1.28.14, Table 10): how
+    /// [`Self::display_width`] / [`Self::display_height`] are to be
+    /// interpreted. Default `0` (pixels).
+    pub fn display_unit(&self) -> DisplayUnit {
+        self.display_unit
+    }
+}
+
+/// `DisplayUnit` (RFC 9559 §5.1.4.1.28.14, Table 10): the interpretation of
+/// the `DisplayWidth` / `DisplayHeight` pair. The spec also reserves the
+/// "Matroska Display Units" registry (§27.9) for additional values; any value
+/// outside the registered set surfaces via [`DisplayUnit::Other`] rather than
+/// being dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DisplayUnit {
+    /// `0` — display dimensions are in pixels. Spec default.
+    #[default]
+    Pixels,
+    /// `1` — display dimensions are in centimeters.
+    Centimeters,
+    /// `2` — display dimensions are in inches.
+    Inches,
+    /// `3` — display dimensions encode a display aspect ratio (DAR) rather
+    /// than a physical size.
+    DisplayAspectRatio,
+    /// `4` — display dimensions' unit is unknown.
+    Unknown,
+    /// Any other value — preserved for forward-compatibility with the
+    /// "Matroska Display Units" registry (§27.9).
+    Other(u64),
+}
+
+impl DisplayUnit {
+    /// Map a raw `DisplayUnit` integer onto the enum, preserving
+    /// unrecognised values via [`DisplayUnit::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::DISPLAY_UNIT_PIXELS => DisplayUnit::Pixels,
+            ids::DISPLAY_UNIT_CENTIMETERS => DisplayUnit::Centimeters,
+            ids::DISPLAY_UNIT_INCHES => DisplayUnit::Inches,
+            ids::DISPLAY_UNIT_DAR => DisplayUnit::DisplayAspectRatio,
+            ids::DISPLAY_UNIT_UNKNOWN => DisplayUnit::Unknown,
+            other => DisplayUnit::Other(other),
         }
     }
 }
@@ -2653,6 +2837,20 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     // children below override them.
     let mut flag_interlaced: u64 = ids::FLAG_INTERLACED_UNDETERMINED;
     let mut field_order: u64 = ids::FIELD_ORDER_UNDETERMINED;
+    // Geometry quartet (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14):
+    // PixelCrop* defaults are `0` per §5.1.4.1.28.8..11; DisplayUnit
+    // default is `0` per §5.1.4.1.28.14 (pixels). DisplayWidth /
+    // DisplayHeight have no fixed default — the spec ranges them as
+    // "not 0", so a `0` here means "absent from file" and the typed
+    // surface will fall back to the §5.1.4.1.28.12 / .13 derived defaults
+    // (only valid when DisplayUnit == 0).
+    let mut crop_top: u64 = 0;
+    let mut crop_bottom: u64 = 0;
+    let mut crop_left: u64 = 0;
+    let mut crop_right: u64 = 0;
+    let mut display_width: u64 = 0;
+    let mut display_height: u64 = 0;
+    let mut display_unit: u64 = ids::DISPLAY_UNIT_PIXELS;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -2660,10 +2858,26 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::PIXEL_HEIGHT => t.height = read_uint(r, e.size as usize)?,
             ids::FLAG_INTERLACED => flag_interlaced = read_uint(r, e.size as usize)?,
             ids::FIELD_ORDER => field_order = read_uint(r, e.size as usize)?,
+            ids::PIXEL_CROP_TOP => crop_top = read_uint(r, e.size as usize)?,
+            ids::PIXEL_CROP_BOTTOM => crop_bottom = read_uint(r, e.size as usize)?,
+            ids::PIXEL_CROP_LEFT => crop_left = read_uint(r, e.size as usize)?,
+            ids::PIXEL_CROP_RIGHT => crop_right = read_uint(r, e.size as usize)?,
+            ids::DISPLAY_WIDTH => display_width = read_uint(r, e.size as usize)?,
+            ids::DISPLAY_HEIGHT => display_height = read_uint(r, e.size as usize)?,
+            ids::DISPLAY_UNIT => display_unit = read_uint(r, e.size as usize)?,
             _ => skip(r, e.size)?,
         }
     }
     t.interlacing_raw = Some((flag_interlaced, field_order));
+    t.geometry_raw = Some((
+        crop_top,
+        crop_bottom,
+        crop_left,
+        crop_right,
+        display_width,
+        display_height,
+        display_unit,
+    ));
     Ok(())
 }
 
@@ -2747,6 +2961,13 @@ pub struct MkvDemuxer {
     /// and for video tracks whose `TrackEntry` carried no `Video` master —
     /// see [`MkvDemuxer::video_interlacing`].
     video_interlacings: Vec<Option<VideoInterlacing>>,
+    /// Per-stream `VideoGeometry` (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14)
+    /// — the `PixelCrop{Top,Bottom,Left,Right}` window plus the
+    /// `DisplayWidth` / `DisplayHeight` / `DisplayUnit` render-size triple —
+    /// indexed by stream index. `None` for non-video tracks and for video
+    /// tracks whose `TrackEntry` carried no `Video` master. See
+    /// [`MkvDemuxer::video_geometry`].
+    video_geometries: Vec<Option<VideoGeometry>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -3089,6 +3310,39 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::video_interlacing`] for the semantics.
     pub fn video_interlacings(&self) -> &[Option<VideoInterlacing>] {
         &self.video_interlacings
+    }
+
+    /// `VideoGeometry` (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14) for the
+    /// stream at `stream_index`, or `None` when the track is not a video
+    /// track / its `TrackEntry` carried no `Video` master.
+    ///
+    /// The returned [`VideoGeometry`] folds `PixelCrop{Top,Bottom,Left,
+    /// Right}` and the `DisplayWidth` / `DisplayHeight` / `DisplayUnit`
+    /// triple into a single record. The §5.1.4.1.28.8..11 defaults (`0`)
+    /// are always materialised; the derived §5.1.4.1.28.12 / §5.1.4.1.28.13
+    /// defaults for `DisplayWidth` / `DisplayHeight`
+    /// (`PixelWidth - PixelCropLeft - PixelCropRight` and the analogous
+    /// height) are materialised only when `DisplayUnit == 0` (pixels), per
+    /// the spec's "If the DisplayUnit of the same TrackEntry is 0, then the
+    /// default value for DisplayWidth is ...; else, there is no default
+    /// value". For any other `DisplayUnit` an absent element surfaces as
+    /// `None`. Underflow in the derived default (a malformed file whose
+    /// crops exceed the encoded width or height) also surfaces as `None`.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_geometry(&self, stream_index: u32) -> Option<&VideoGeometry> {
+        self.video_geometries
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+    }
+
+    /// All per-stream `VideoGeometry`s (RFC 9559
+    /// §5.1.4.1.28.8..§5.1.4.1.28.14), indexed by stream index. The slice
+    /// has one entry per stream — `None` for non-video tracks and for video
+    /// tracks whose `TrackEntry` carried no `Video` master. See
+    /// [`MkvDemuxer::video_geometry`] for the semantics.
+    pub fn video_geometries(&self) -> &[Option<VideoGeometry>] {
+        &self.video_geometries
     }
 
     /// Apply a `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) after a
