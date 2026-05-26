@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed `Video > StereoMode` decode** (RFC 9559 §5.1.4.1.28.3).
+  New `MkvDemuxer::video_stereo_mode(stream_index) -> Option<StereoMode>`
+  (and the slice-view `video_stereo_modes()`) returns the typed
+  single-track stereo-3D packing for any video TrackEntry — full
+  §5.1.4.1.28.3 Table 5 enum coverage (`Mono`, the four
+  side-by-side / top-bottom / checkerboard / interleaved / anaglyph /
+  both-eyes-laced variants) plus an `Other(u64)` variant for values
+  registered after RFC 9559 (§27.7 leaves the registry open). The spec
+  default `0` (`Mono`) is materialised, so a `Video` master with no
+  explicit `StereoMode` decodes as `Some(StereoMode::Mono)`,
+  distinguishable from `None` (track has no `Video` master at all).
+  Convenience `StereoMode::is_stereo()` returns `true` for any non-`Mono`
+  packing. Adds one element-id constant (`STEREO_MODE`) plus 15 Table-5
+  value constants (`STEREO_MODE_*`), and five integration tests covering
+  the default-Mono contract, a per-Table-5 round-trip across all 15
+  registered values, multi-track + `Other(42)` forward-compat, the
+  audio-track / no-`Video`-master contract, and out-of-range
+  `stream_index` safety.
 - demux: **typed `Video > Colour` decode** (RFC 9559 §5.1.4.1.28.16,
   including §5.1.4.1.28.17..§5.1.4.1.28.40 sub-elements and the
   SMPTE 2086 / CTA-861.3 HDR `MasteringMetadata`). New

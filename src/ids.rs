@@ -148,6 +148,11 @@ pub const DISPLAY_UNIT_UNKNOWN: u64 = 4;
 pub const FLAG_INTERLACED: u32 = 0x9A;
 pub const FIELD_ORDER: u32 = 0x9D;
 
+// Stereo-3D mode (RFC 9559 §5.1.4.1.28.3). Single-track variant of 3D
+// carriage — the TrackOperation/TrackCombinePlanes path (§5.1.4.1.30.1) is
+// the multi-track alternative. Spec default is `0` (mono).
+pub const STEREO_MODE: u32 = 0x53B8;
+
 // Video > Colour master (RFC 9559 §5.1.4.1.28.16): the BT.709/2020/2100-style
 // colour-format description applied to the encoded video — chroma sub-sampling
 // and siting, signal range, transfer characteristics, colour primaries,
@@ -286,6 +291,26 @@ pub const FIELD_ORDER_UNDETERMINED: u64 = 2;
 pub const FIELD_ORDER_BFF: u64 = 6;
 pub const FIELD_ORDER_TFF_INTERLEAVED: u64 = 9;
 pub const FIELD_ORDER_BFF_INTERLEAVED: u64 = 14;
+
+// StereoMode values (RFC 9559 §5.1.4.1.28.3, Table 5). All 0..=14 values the
+// spec defines are listed; §27.7 leaves the registry open for future
+// additions, so values outside this set pass through the typed enum's
+// `Other(u64)` variant.
+pub const STEREO_MODE_MONO: u64 = 0;
+pub const STEREO_MODE_SIDE_BY_SIDE_LEFT_FIRST: u64 = 1;
+pub const STEREO_MODE_TOP_BOTTOM_RIGHT_FIRST: u64 = 2;
+pub const STEREO_MODE_TOP_BOTTOM_LEFT_FIRST: u64 = 3;
+pub const STEREO_MODE_CHECKBOARD_RIGHT_FIRST: u64 = 4;
+pub const STEREO_MODE_CHECKBOARD_LEFT_FIRST: u64 = 5;
+pub const STEREO_MODE_ROW_INTERLEAVED_RIGHT_FIRST: u64 = 6;
+pub const STEREO_MODE_ROW_INTERLEAVED_LEFT_FIRST: u64 = 7;
+pub const STEREO_MODE_COLUMN_INTERLEAVED_RIGHT_FIRST: u64 = 8;
+pub const STEREO_MODE_COLUMN_INTERLEAVED_LEFT_FIRST: u64 = 9;
+pub const STEREO_MODE_ANAGLYPH_CYAN_RED: u64 = 10;
+pub const STEREO_MODE_SIDE_BY_SIDE_RIGHT_FIRST: u64 = 11;
+pub const STEREO_MODE_ANAGLYPH_GREEN_MAGENTA: u64 = 12;
+pub const STEREO_MODE_BOTH_EYES_LACED_LEFT_FIRST: u64 = 13;
+pub const STEREO_MODE_BOTH_EYES_LACED_RIGHT_FIRST: u64 = 14;
 
 // TrackPlaneType values (RFC 9559 §5.1.4.1.30.4, Table 20). Values
 // 3..=u64::MAX are "First Come First Served" registrations (§27.17).

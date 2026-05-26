@@ -444,6 +444,15 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         })
         .collect();
 
+    // Per-stream `StereoMode` (RFC 9559 §5.1.4.1.28.3), indexed by stream
+    // index. `None` when the track has no `Video` master; the spec default
+    // `0` (mono) is already materialised in `parse_video` so a `Video`
+    // master with no explicit `StereoMode` decodes as `Some(StereoMode::Mono)`.
+    let video_stereo_modes: Vec<Option<StereoMode>> = tracks
+        .iter()
+        .map(|t| t.stereo_mode_raw.map(StereoMode::from_raw))
+        .collect();
+
     let video_geometries: Vec<Option<VideoGeometry>> = tracks
         .iter()
         .map(|t| {
@@ -542,6 +551,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_interlacings,
         video_geometries,
         video_colours,
+        video_stereo_modes,
     })
 }
 
@@ -700,6 +710,11 @@ struct TrackEntry {
     /// the spec default (e.g. `MatrixCoefficients` defaults to `2`) so the
     /// typed surface can fold defaults uniformly.
     colour_raw: Option<RawColour>,
+    /// Raw `StereoMode` (RFC 9559 §5.1.4.1.28.3) captured during the `Video`
+    /// walk. `None` when the track has no `Video` master. When the `Video`
+    /// master exists but no `StereoMode` child is present, this carries the
+    /// spec default `0` (mono) so the typed surface materialises it.
+    stereo_mode_raw: Option<u64>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -1444,6 +1459,97 @@ impl FieldOrder {
             ids::FIELD_ORDER_BFF_INTERLEAVED => FieldOrder::BffInterleaved,
             other => FieldOrder::Other(other),
         }
+    }
+}
+
+/// `StereoMode` (RFC 9559 §5.1.4.1.28.3, Table 5): the single-track
+/// stereo-3D packing used by the video track's frames. The multi-track
+/// alternative is `TrackOperation > TrackCombinePlanes` (§5.1.4.1.30.1,
+/// surfaced via [`MkvDemuxer::track_operation`]).
+///
+/// Surfaced per stream via [`MkvDemuxer::video_stereo_mode`].
+///
+/// Spec default `0` (mono) is materialised on the typed surface — a `Video`
+/// master with no explicit `StereoMode` decodes as [`StereoMode::Mono`].
+/// §27.7 leaves the StereoMode registry open for future additions, so any
+/// value outside the §5.1.4.1.28.3 Table 5 set passes through the
+/// [`StereoMode::Other`] variant rather than being dropped.
+///
+/// The naming convention "*RightFirst*" / "*LeftFirst*" matches the spec's
+/// "right eye is first" / "left eye is first" parenthetical phrasings.
+/// Per §18.10 odd values of StereoMode mean the left eye comes first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StereoMode {
+    /// `0` — mono (no stereo packing). Spec default.
+    #[default]
+    Mono,
+    /// `1` — side by side, left eye first.
+    SideBySideLeftFirst,
+    /// `2` — top-bottom, right eye first.
+    TopBottomRightFirst,
+    /// `3` — top-bottom, left eye first.
+    TopBottomLeftFirst,
+    /// `4` — checkerboard, right eye first.
+    CheckboardRightFirst,
+    /// `5` — checkerboard, left eye first.
+    CheckboardLeftFirst,
+    /// `6` — row interleaved, right eye first.
+    RowInterleavedRightFirst,
+    /// `7` — row interleaved, left eye first.
+    RowInterleavedLeftFirst,
+    /// `8` — column interleaved, right eye first.
+    ColumnInterleavedRightFirst,
+    /// `9` — column interleaved, left eye first.
+    ColumnInterleavedLeftFirst,
+    /// `10` — anaglyph (cyan / red).
+    AnaglyphCyanRed,
+    /// `11` — side by side, right eye first.
+    SideBySideRightFirst,
+    /// `12` — anaglyph (green / magenta).
+    AnaglyphGreenMagenta,
+    /// `13` — both eyes laced in one Block, left eye first.
+    BothEyesLacedLeftFirst,
+    /// `14` — both eyes laced in one Block, right eye first.
+    BothEyesLacedRightFirst,
+    /// Any value not registered in §5.1.4.1.28.3 Table 5. §27.7 leaves the
+    /// registry open for future additions; surfaced rather than dropped so
+    /// callers can log it.
+    Other(u64),
+}
+
+impl StereoMode {
+    /// Map a raw `StereoMode` integer onto the enum, preserving values
+    /// outside §5.1.4.1.28.3 Table 5 via [`StereoMode::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::STEREO_MODE_MONO => StereoMode::Mono,
+            ids::STEREO_MODE_SIDE_BY_SIDE_LEFT_FIRST => StereoMode::SideBySideLeftFirst,
+            ids::STEREO_MODE_TOP_BOTTOM_RIGHT_FIRST => StereoMode::TopBottomRightFirst,
+            ids::STEREO_MODE_TOP_BOTTOM_LEFT_FIRST => StereoMode::TopBottomLeftFirst,
+            ids::STEREO_MODE_CHECKBOARD_RIGHT_FIRST => StereoMode::CheckboardRightFirst,
+            ids::STEREO_MODE_CHECKBOARD_LEFT_FIRST => StereoMode::CheckboardLeftFirst,
+            ids::STEREO_MODE_ROW_INTERLEAVED_RIGHT_FIRST => StereoMode::RowInterleavedRightFirst,
+            ids::STEREO_MODE_ROW_INTERLEAVED_LEFT_FIRST => StereoMode::RowInterleavedLeftFirst,
+            ids::STEREO_MODE_COLUMN_INTERLEAVED_RIGHT_FIRST => {
+                StereoMode::ColumnInterleavedRightFirst
+            }
+            ids::STEREO_MODE_COLUMN_INTERLEAVED_LEFT_FIRST => {
+                StereoMode::ColumnInterleavedLeftFirst
+            }
+            ids::STEREO_MODE_ANAGLYPH_CYAN_RED => StereoMode::AnaglyphCyanRed,
+            ids::STEREO_MODE_SIDE_BY_SIDE_RIGHT_FIRST => StereoMode::SideBySideRightFirst,
+            ids::STEREO_MODE_ANAGLYPH_GREEN_MAGENTA => StereoMode::AnaglyphGreenMagenta,
+            ids::STEREO_MODE_BOTH_EYES_LACED_LEFT_FIRST => StereoMode::BothEyesLacedLeftFirst,
+            ids::STEREO_MODE_BOTH_EYES_LACED_RIGHT_FIRST => StereoMode::BothEyesLacedRightFirst,
+            other => StereoMode::Other(other),
+        }
+    }
+
+    /// `true` when this StereoMode is anything other than [`StereoMode::Mono`].
+    /// A convenience for callers that only need a yes/no "is this track 3D?"
+    /// answer without matching on the specific packing.
+    pub fn is_stereo(&self) -> bool {
+        !matches!(self, StereoMode::Mono)
     }
 }
 
@@ -3351,6 +3457,9 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     let mut display_width: u64 = 0;
     let mut display_height: u64 = 0;
     let mut display_unit: u64 = ids::DISPLAY_UNIT_PIXELS;
+    // StereoMode (§5.1.4.1.28.3, default 0 = mono). A `Video` master with
+    // no explicit `StereoMode` decodes to `Mono` on the typed surface.
+    let mut stereo_mode: u64 = ids::STEREO_MODE_MONO;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -3358,6 +3467,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::PIXEL_HEIGHT => t.height = read_uint(r, e.size as usize)?,
             ids::FLAG_INTERLACED => flag_interlaced = read_uint(r, e.size as usize)?,
             ids::FIELD_ORDER => field_order = read_uint(r, e.size as usize)?,
+            ids::STEREO_MODE => stereo_mode = read_uint(r, e.size as usize)?,
             ids::PIXEL_CROP_TOP => crop_top = read_uint(r, e.size as usize)?,
             ids::PIXEL_CROP_BOTTOM => crop_bottom = read_uint(r, e.size as usize)?,
             ids::PIXEL_CROP_LEFT => crop_left = read_uint(r, e.size as usize)?,
@@ -3398,6 +3508,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
         display_height,
         display_unit,
     ));
+    t.stereo_mode_raw = Some(stereo_mode);
     Ok(())
 }
 
@@ -3581,6 +3692,13 @@ pub struct MkvDemuxer {
     /// for video tracks whose `Video` master carried no `Colour` child. See
     /// [`MkvDemuxer::video_colour`].
     video_colours: Vec<Option<VideoColour>>,
+    /// Per-stream `StereoMode` (RFC 9559 §5.1.4.1.28.3) — the single-track
+    /// stereo-3D packing — indexed by stream index. `None` for non-video
+    /// tracks and for video tracks whose `TrackEntry` carried no `Video`
+    /// master; the spec default `0` ([`StereoMode::Mono`]) is materialised
+    /// for a `Video` master with no explicit child. See
+    /// [`MkvDemuxer::video_stereo_mode`].
+    video_stereo_modes: Vec<Option<StereoMode>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -3986,6 +4104,38 @@ impl MkvDemuxer {
     /// `Colour` child. See [`MkvDemuxer::video_colour`] for the semantics.
     pub fn video_colours(&self) -> &[Option<VideoColour>] {
         &self.video_colours
+    }
+
+    /// `StereoMode` (RFC 9559 §5.1.4.1.28.3) for the stream at
+    /// `stream_index`, or `None` when the track is not a video track / its
+    /// `TrackEntry` carried no `Video` master.
+    ///
+    /// The §5.1.4.1.28.3 default `0` ([`StereoMode::Mono`]) is materialised:
+    /// a `Video` master with no explicit `StereoMode` decodes as
+    /// `Some(StereoMode::Mono)`, distinguishable from `None` (which means
+    /// "no `Video` master at all"). Values outside §5.1.4.1.28.3 Table 5
+    /// pass through the [`StereoMode::Other`] variant — §27.7 leaves the
+    /// registry open for future additions.
+    ///
+    /// For multi-track stereo (`TrackOperation > TrackCombinePlanes`,
+    /// §5.1.4.1.30.1) use [`MkvDemuxer::track_operation`] instead — the two
+    /// surfaces are independent and a track MAY carry both (a single-track
+    /// StereoMode plus a TrackOperation referring to plane siblings).
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_stereo_mode(&self, stream_index: u32) -> Option<StereoMode> {
+        self.video_stereo_modes
+            .get(stream_index as usize)
+            .and_then(|v| *v)
+    }
+
+    /// All per-stream `StereoMode`s (RFC 9559 §5.1.4.1.28.3), indexed by
+    /// stream index. The slice has one entry per stream — `None` for
+    /// non-video tracks and for video tracks whose `TrackEntry` carried no
+    /// `Video` master. See [`MkvDemuxer::video_stereo_mode`] for the
+    /// semantics.
+    pub fn video_stereo_modes(&self) -> &[Option<StereoMode>] {
+        &self.video_stereo_modes
     }
 
     /// Apply a `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) after a

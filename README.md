@@ -231,6 +231,22 @@ the unified `oxideav` aggregator to wire decoding automatically.
   as fully-typed *unspecified* (§5.1.4.1.28.17 / .26 / .27 default `2`;
   §5.1.4.1.28.23..25 default `0`). Non-video tracks (and video tracks
   with no `Colour` child) return `None`.
+- **`Video > StereoMode` typed decode** (RFC 9559 §5.1.4.1.28.3):
+  `MkvDemuxer::video_stereo_mode(stream_index) -> Option<StereoMode>`
+  (and the per-stream `video_stereo_modes()` slice) returns the
+  single-track stereo-3D packing — `Mono` / `SideBySide{Left,Right}First`
+  / `TopBottom{Left,Right}First` / `Checkboard{Left,Right}First` /
+  `RowInterleaved{Left,Right}First` /
+  `ColumnInterleaved{Left,Right}First` / `Anaglyph{CyanRed,GreenMagenta}`
+  / `BothEyesLaced{Left,Right}First` (the full §5.1.4.1.28.3 Table 5
+  set) plus `Other(u64)` for values registered after RFC 9559 (§27.7
+  leaves the registry open). The §5.1.4.1.28.3 default `0` (`Mono`) is
+  materialised: a `Video` master with no explicit `StereoMode` decodes
+  as `Some(StereoMode::Mono)`, distinguishable from `None` (which means
+  "no `Video` master at all"). Multi-track stereo (`TrackOperation >
+  TrackCombinePlanes`, §5.1.4.1.30.1) is independent and surfaces
+  through `track_operation`; a single track MAY carry both. A convenience
+  `StereoMode::is_stereo()` returns `true` for any non-`Mono` packing.
 - **`Video > FlagInterlaced` + `FieldOrder` typed decode** (RFC 9559
   §5.1.4.1.28.1 + §5.1.4.1.28.2):
   `MkvDemuxer::video_interlacing(stream_index)` (and the per-stream
@@ -355,10 +371,12 @@ so the demuxer never hides an unrecognised track.
   (§5.1.4.1.28.8..§5.1.4.1.28.14) surfaces through `video_geometry`; and
   the full `Colour` master (§5.1.4.1.28.16) — including HDR metadata
   (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — surfaces through
-  `video_colour` (see above). `StereoMode`, `AlphaMode`, `AspectRatioType`
-  (reclaimed Appendix-A element) and `UncompressedFourCC` are still
-  skipped on the demux side. None of the `Video` sub-elements above the
-  PixelWidth/PixelHeight pair are written on the mux side.
+  `video_colour` (see above); and `StereoMode` (§5.1.4.1.28.3) surfaces
+  through `video_stereo_mode`. `AlphaMode`, `AspectRatioType` (reclaimed
+  Appendix-A element), `UncompressedFourCC` and the `Projection` master
+  (§5.1.4.1.28.41) are still skipped on the demux side. None of the
+  `Video` sub-elements above the PixelWidth/PixelHeight pair are written
+  on the mux side.
 
 ## Fuzzing
 
