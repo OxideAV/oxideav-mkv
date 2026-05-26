@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed `Video > Colour` decode** (RFC 9559 §5.1.4.1.28.16,
+  including §5.1.4.1.28.17..§5.1.4.1.28.40 sub-elements and the
+  SMPTE 2086 / CTA-861.3 HDR `MasteringMetadata`). New
+  `MkvDemuxer::video_colour(stream_index) -> Option<&VideoColour>` (and
+  the slice-view `video_colours()`) folds `MatrixCoefficients`,
+  `BitsPerChannel`, `Chroma{Subsampling,Cb}Subsampling{Horz,Vert}`,
+  `ChromaSiting{Horz,Vert}`, `Range`, `TransferCharacteristics`,
+  `Primaries`, `MaxCLL`, `MaxFALL` and the `MasteringMetadata` master
+  (`PrimaryRGBChromaticity{X,Y}` × 6, `WhitePointChromaticity{X,Y}` × 2,
+  `Luminance{Max,Min}`) into a single typed record. Enums surface unknown
+  values via an `Other(u64)` variant for forward compatibility with §27
+  registries; spec defaults are materialised on the typed surface
+  (matrix / transfer / primaries default `2` = *unspecified*; chroma
+  siting / range / bits-per-channel default `0`). Children with no spec
+  default (chroma subsampling, MaxCLL/MaxFALL, every MasteringMetadata
+  field) surface as `None` when absent. Adds 25 element-id constants
+  (`COLOUR` through `LUMINANCE_MIN`) plus eight Table-13..16 value
+  constants, and seven integration tests covering the no-Colour-master
+  contract, empty-Colour-master defaults, a BT.709 SDR round-trip, a
+  BT.2100 PQ HDR round-trip with full MasteringMetadata (8-byte floats),
+  4-byte (f32) MasteringMetadata with a sparse subset of children,
+  unknown-enum-value passthrough via `Other(_)`, and the
+  audio-track-has-no-Colour contract.
 - demux: **typed `Video` geometry quartet decode** (RFC 9559
   §5.1.4.1.28.8..§5.1.4.1.28.14). New
   `MkvDemuxer::video_geometry(stream_index) -> Option<&VideoGeometry>`

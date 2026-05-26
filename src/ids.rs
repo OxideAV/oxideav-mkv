@@ -147,6 +147,53 @@ pub const DISPLAY_UNIT_UNKNOWN: u64 = 4;
 // the field ordering and MUST be ignored unless `FlagInterlaced == 1`.
 pub const FLAG_INTERLACED: u32 = 0x9A;
 pub const FIELD_ORDER: u32 = 0x9D;
+
+// Video > Colour master (RFC 9559 §5.1.4.1.28.16): the BT.709/2020/2100-style
+// colour-format description applied to the encoded video — chroma sub-sampling
+// and siting, signal range, transfer characteristics, colour primaries,
+// matrix-derivation, plus the SMPTE ST 2086 / CTA-861.3 HDR mastering display
+// metadata (MasteringMetadata) and the MaxCLL / MaxFALL light-level pair.
+// All children are stream-copy True (§8) — semantics live in the bitstream,
+// the container only surfaces them.
+pub const COLOUR: u32 = 0x55B0;
+pub const MATRIX_COEFFICIENTS: u32 = 0x55B1;
+pub const BITS_PER_CHANNEL: u32 = 0x55B2;
+pub const CHROMA_SUBSAMPLING_HORZ: u32 = 0x55B3;
+pub const CHROMA_SUBSAMPLING_VERT: u32 = 0x55B4;
+pub const CB_SUBSAMPLING_HORZ: u32 = 0x55B5;
+pub const CB_SUBSAMPLING_VERT: u32 = 0x55B6;
+pub const CHROMA_SITING_HORZ: u32 = 0x55B7;
+pub const CHROMA_SITING_VERT: u32 = 0x55B8;
+pub const COLOUR_RANGE: u32 = 0x55B9;
+pub const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+pub const PRIMARIES: u32 = 0x55BB;
+pub const MAX_CLL: u32 = 0x55BC;
+pub const MAX_FALL: u32 = 0x55BD;
+pub const MASTERING_METADATA: u32 = 0x55D0;
+pub const PRIMARY_R_CHROMATICITY_X: u32 = 0x55D1;
+pub const PRIMARY_R_CHROMATICITY_Y: u32 = 0x55D2;
+pub const PRIMARY_G_CHROMATICITY_X: u32 = 0x55D3;
+pub const PRIMARY_G_CHROMATICITY_Y: u32 = 0x55D4;
+pub const PRIMARY_B_CHROMATICITY_X: u32 = 0x55D5;
+pub const PRIMARY_B_CHROMATICITY_Y: u32 = 0x55D6;
+pub const WHITE_POINT_CHROMATICITY_X: u32 = 0x55D7;
+pub const WHITE_POINT_CHROMATICITY_Y: u32 = 0x55D8;
+pub const LUMINANCE_MAX: u32 = 0x55D9;
+pub const LUMINANCE_MIN: u32 = 0x55DA;
+
+// ChromaSitingHorz values (RFC 9559 §5.1.4.1.28.23, Table 13).
+// ChromaSitingVert (§5.1.4.1.28.24, Table 14) shares the unspecified=0
+// value but uses `top collocated` for `1` instead of `left collocated`.
+pub const CHROMA_SITING_UNSPECIFIED: u64 = 0;
+pub const CHROMA_SITING_HORZ_LEFT_COLLOCATED: u64 = 1;
+pub const CHROMA_SITING_VERT_TOP_COLLOCATED: u64 = 1;
+pub const CHROMA_SITING_HALF: u64 = 2;
+
+// Color Range values (RFC 9559 §5.1.4.1.28.25, Table 15).
+pub const COLOUR_RANGE_UNSPECIFIED: u64 = 0;
+pub const COLOUR_RANGE_BROADCAST: u64 = 1;
+pub const COLOUR_RANGE_FULL: u64 = 2;
+pub const COLOUR_RANGE_DEFINED_BY_MATRIX_AND_TRANSFER: u64 = 3;
 pub const SAMPLING_FREQUENCY: u32 = 0xB5;
 pub const OUTPUT_SAMPLING_FREQUENCY: u32 = 0x78B5;
 pub const CHANNELS: u32 = 0x9F;

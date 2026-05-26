@@ -413,6 +413,37 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // omitted the explicit element, per the spec note "If the DisplayUnit
     // of the same TrackEntry is 0, then the default value ...; else, there
     // is no default value".
+    // Per-stream `VideoColour` (RFC 9559 §5.1.4.1.28.16), indexed by stream
+    // index. `None` for non-video tracks and for video tracks whose `Video`
+    // master carried no `Colour` child. When the `Colour` master was present
+    // but a particular child was absent, `parse_video` materialises the spec
+    // default in `RawColour` (`2` for matrix/transfer/primaries, `0` for the
+    // chroma siting / range / bits-per-channel) — see the per-field doc on
+    // [`VideoColour`].
+    let video_colours: Vec<Option<VideoColour>> = tracks
+        .iter()
+        .map(|t| {
+            t.colour_raw.as_ref().map(|c| VideoColour {
+                matrix_coefficients: MatrixCoefficients::from_raw(c.matrix_coefficients),
+                bits_per_channel: c.bits_per_channel,
+                chroma_subsampling_horz: c.chroma_subsampling_horz,
+                chroma_subsampling_vert: c.chroma_subsampling_vert,
+                cb_subsampling_horz: c.cb_subsampling_horz,
+                cb_subsampling_vert: c.cb_subsampling_vert,
+                chroma_siting_horz: ChromaSitingHorz::from_raw(c.chroma_siting_horz),
+                chroma_siting_vert: ChromaSitingVert::from_raw(c.chroma_siting_vert),
+                range: ColourRange::from_raw(c.range),
+                transfer_characteristics: TransferCharacteristics::from_raw(
+                    c.transfer_characteristics,
+                ),
+                primaries: Primaries::from_raw(c.primaries),
+                max_cll: c.max_cll,
+                max_fall: c.max_fall,
+                mastering_metadata: c.mastering_metadata,
+            })
+        })
+        .collect();
+
     let video_geometries: Vec<Option<VideoGeometry>> = tracks
         .iter()
         .map(|t| {
@@ -510,6 +541,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         header_strip_prefixes,
         video_interlacings,
         video_geometries,
+        video_colours,
     })
 }
 
@@ -661,6 +693,36 @@ struct TrackEntry {
     /// `ContentEncodingOrder`) when surfaced. `None` when the track declares
     /// no encodings (the common, uncompressed/unencrypted case).
     content_encodings: Option<ContentEncodings>,
+    /// Raw `Colour` master (RFC 9559 §5.1.4.1.28.16) for the track, captured
+    /// during the `Video` walk. `None` when the track is not a video track or
+    /// its `Video` master carried no `Colour` child. When the `Colour` master
+    /// existed but a particular sub-element was absent the raw record carries
+    /// the spec default (e.g. `MatrixCoefficients` defaults to `2`) so the
+    /// typed surface can fold defaults uniformly.
+    colour_raw: Option<RawColour>,
+}
+
+/// Parser-private staging form of `Colour` — only the bits that have a
+/// non-`Option` typed surface (each gets its spec default materialised here)
+/// are stored as bare integers; everything that surfaces as `Option<…>` keeps
+/// its `Option` so the typed builder can tell "absent" from "explicit
+/// default".
+#[derive(Default)]
+struct RawColour {
+    matrix_coefficients: u64,
+    bits_per_channel: u64,
+    chroma_subsampling_horz: Option<u64>,
+    chroma_subsampling_vert: Option<u64>,
+    cb_subsampling_horz: Option<u64>,
+    cb_subsampling_vert: Option<u64>,
+    chroma_siting_horz: u64,
+    chroma_siting_vert: u64,
+    range: u64,
+    transfer_characteristics: u64,
+    primaries: u64,
+    max_cll: Option<u64>,
+    max_fall: Option<u64>,
+    mastering_metadata: Option<MasteringMetadata>,
 }
 
 /// Parser-private staging form of `TrackOperation` — the plane / join
@@ -1504,6 +1566,444 @@ impl DisplayUnit {
             ids::DISPLAY_UNIT_UNKNOWN => DisplayUnit::Unknown,
             other => DisplayUnit::Other(other),
         }
+    }
+}
+
+/// A video track's `Colour` master (RFC 9559 §5.1.4.1.28.16): the
+/// chroma / range / transfer / primaries description plus the SMPTE
+/// ST 2086 / CTA-861.3 HDR mastering metadata. Surfaced per stream via
+/// [`MkvDemuxer::video_colour`].
+///
+/// Spec defaults are materialised on the typed surface:
+/// `MatrixCoefficients` (§5.1.4.1.28.17), `TransferCharacteristics`
+/// (§5.1.4.1.28.26) and `Primaries` (§5.1.4.1.28.27) each default to `2`
+/// (*unspecified*); `Range` (§5.1.4.1.28.25), `ChromaSitingHorz`
+/// (§5.1.4.1.28.23) and `ChromaSitingVert` (§5.1.4.1.28.24) each default to
+/// `0` (*unspecified*); `BitsPerChannel` (§5.1.4.1.28.18) defaults to `0`
+/// (*unspecified*). Elements without a spec default (`Chroma{Subsampling,
+/// Cb}Subsampling{Horz,Vert}`, `MaxCLL`, `MaxFALL`) surface as `None` when
+/// absent. The `MasteringMetadata` master (§5.1.4.1.28.30) is `Some` only
+/// when the file actually carried it.
+///
+/// Forward-compat: values outside each table's registered set surface via
+/// the enum's `Other(u64)` variant rather than being dropped, since RFC
+/// 9559 §27 reserves additional values can be added in future revisions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VideoColour {
+    matrix_coefficients: MatrixCoefficients,
+    bits_per_channel: u64,
+    chroma_subsampling_horz: Option<u64>,
+    chroma_subsampling_vert: Option<u64>,
+    cb_subsampling_horz: Option<u64>,
+    cb_subsampling_vert: Option<u64>,
+    chroma_siting_horz: ChromaSitingHorz,
+    chroma_siting_vert: ChromaSitingVert,
+    range: ColourRange,
+    transfer_characteristics: TransferCharacteristics,
+    primaries: Primaries,
+    max_cll: Option<u64>,
+    max_fall: Option<u64>,
+    mastering_metadata: Option<MasteringMetadata>,
+}
+
+impl VideoColour {
+    /// `MatrixCoefficients` (RFC 9559 §5.1.4.1.28.17, Table 12) — the matrix
+    /// used to derive luma/chroma from RGB primaries. Default `2`
+    /// (*unspecified*).
+    pub fn matrix_coefficients(&self) -> MatrixCoefficients {
+        self.matrix_coefficients
+    }
+
+    /// `BitsPerChannel` (RFC 9559 §5.1.4.1.28.18). `0` = unspecified
+    /// (spec default).
+    pub fn bits_per_channel(&self) -> u64 {
+        self.bits_per_channel
+    }
+
+    /// `ChromaSubsamplingHorz` (RFC 9559 §5.1.4.1.28.19): horizontal
+    /// chroma subsampling factor. `None` when the file did not carry the
+    /// element (no spec default).
+    pub fn chroma_subsampling_horz(&self) -> Option<u64> {
+        self.chroma_subsampling_horz
+    }
+
+    /// `ChromaSubsamplingVert` (RFC 9559 §5.1.4.1.28.20): vertical chroma
+    /// subsampling factor. `None` when the file did not carry the
+    /// element (no spec default).
+    pub fn chroma_subsampling_vert(&self) -> Option<u64> {
+        self.chroma_subsampling_vert
+    }
+
+    /// `CbSubsamplingHorz` (RFC 9559 §5.1.4.1.28.21): additional Cb-channel
+    /// horizontal subsampling, additive to `ChromaSubsamplingHorz`. `None`
+    /// when absent.
+    pub fn cb_subsampling_horz(&self) -> Option<u64> {
+        self.cb_subsampling_horz
+    }
+
+    /// `CbSubsamplingVert` (RFC 9559 §5.1.4.1.28.22): additional Cb-channel
+    /// vertical subsampling, additive to `ChromaSubsamplingVert`. `None`
+    /// when absent.
+    pub fn cb_subsampling_vert(&self) -> Option<u64> {
+        self.cb_subsampling_vert
+    }
+
+    /// `ChromaSitingHorz` (RFC 9559 §5.1.4.1.28.23, Table 13). Default `0`
+    /// (*unspecified*).
+    pub fn chroma_siting_horz(&self) -> ChromaSitingHorz {
+        self.chroma_siting_horz
+    }
+
+    /// `ChromaSitingVert` (RFC 9559 §5.1.4.1.28.24, Table 14). Default `0`
+    /// (*unspecified*).
+    pub fn chroma_siting_vert(&self) -> ChromaSitingVert {
+        self.chroma_siting_vert
+    }
+
+    /// `Range` (RFC 9559 §5.1.4.1.28.25, Table 15): clipping of the colour
+    /// ranges. Default `0` (*unspecified*).
+    pub fn range(&self) -> ColourRange {
+        self.range
+    }
+
+    /// `TransferCharacteristics` (RFC 9559 §5.1.4.1.28.26, Table 16). Default
+    /// `2` (*unspecified*).
+    pub fn transfer_characteristics(&self) -> TransferCharacteristics {
+        self.transfer_characteristics
+    }
+
+    /// `Primaries` (RFC 9559 §5.1.4.1.28.27, Table 17): the colour primaries
+    /// the video uses. Default `2` (*unspecified*).
+    pub fn primaries(&self) -> Primaries {
+        self.primaries
+    }
+
+    /// `MaxCLL` (RFC 9559 §5.1.4.1.28.28): Maximum Content Light Level in
+    /// cd/m². `None` when absent — no spec default.
+    pub fn max_cll(&self) -> Option<u64> {
+        self.max_cll
+    }
+
+    /// `MaxFALL` (RFC 9559 §5.1.4.1.28.29): Maximum Frame-Average Light Level
+    /// in cd/m². `None` when absent — no spec default.
+    pub fn max_fall(&self) -> Option<u64> {
+        self.max_fall
+    }
+
+    /// `MasteringMetadata` (RFC 9559 §5.1.4.1.28.30): the SMPTE 2086 mastering
+    /// display description. `None` when the file omitted the master entirely.
+    pub fn mastering_metadata(&self) -> Option<&MasteringMetadata> {
+        self.mastering_metadata.as_ref()
+    }
+}
+
+/// `MatrixCoefficients` (RFC 9559 §5.1.4.1.28.17, Table 12) — the matrix
+/// the video uses to derive luma / chroma from RGB primaries. Values are
+/// adopted from Table 4 of ITU-T H.273; the spec only lists `0..=14`
+/// (with `3` reserved) — any other value surfaces via
+/// [`MatrixCoefficients::Other`] for forward compatibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatrixCoefficients {
+    Identity,
+    BT709,
+    /// `2` — spec default.
+    Unspecified,
+    Reserved,
+    UsFcc73682,
+    BT470Bg,
+    Smpte170M,
+    Smpte240M,
+    YCoCg,
+    BT2020NonConstantLuminance,
+    BT2020ConstantLuminance,
+    SmpteSt2085,
+    ChromaDerivedNonConstantLuminance,
+    ChromaDerivedConstantLuminance,
+    BT2100,
+    Other(u64),
+}
+
+impl MatrixCoefficients {
+    /// Map a raw `MatrixCoefficients` integer onto the enum, preserving
+    /// unrecognised values via [`MatrixCoefficients::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            0 => Self::Identity,
+            1 => Self::BT709,
+            2 => Self::Unspecified,
+            3 => Self::Reserved,
+            4 => Self::UsFcc73682,
+            5 => Self::BT470Bg,
+            6 => Self::Smpte170M,
+            7 => Self::Smpte240M,
+            8 => Self::YCoCg,
+            9 => Self::BT2020NonConstantLuminance,
+            10 => Self::BT2020ConstantLuminance,
+            11 => Self::SmpteSt2085,
+            12 => Self::ChromaDerivedNonConstantLuminance,
+            13 => Self::ChromaDerivedConstantLuminance,
+            14 => Self::BT2100,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `ChromaSitingHorz` (RFC 9559 §5.1.4.1.28.23, Table 13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChromaSitingHorz {
+    /// `0` — spec default.
+    #[default]
+    Unspecified,
+    /// `1` — left collocated.
+    LeftCollocated,
+    /// `2` — half.
+    Half,
+    /// Any other value — preserved for the "Matroska Horizontal Chroma
+    /// Sitings" registry (§27.10).
+    Other(u64),
+}
+
+impl ChromaSitingHorz {
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::CHROMA_SITING_UNSPECIFIED => Self::Unspecified,
+            ids::CHROMA_SITING_HORZ_LEFT_COLLOCATED => Self::LeftCollocated,
+            ids::CHROMA_SITING_HALF => Self::Half,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `ChromaSitingVert` (RFC 9559 §5.1.4.1.28.24, Table 14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChromaSitingVert {
+    /// `0` — spec default.
+    #[default]
+    Unspecified,
+    /// `1` — top collocated.
+    TopCollocated,
+    /// `2` — half.
+    Half,
+    /// Any other value — preserved for the "Matroska Vertical Chroma
+    /// Sitings" registry (§27.11).
+    Other(u64),
+}
+
+impl ChromaSitingVert {
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::CHROMA_SITING_UNSPECIFIED => Self::Unspecified,
+            ids::CHROMA_SITING_VERT_TOP_COLLOCATED => Self::TopCollocated,
+            ids::CHROMA_SITING_HALF => Self::Half,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `Range` (RFC 9559 §5.1.4.1.28.25, Table 15): clipping of the colour
+/// ranges. Spec default `0` (*unspecified*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ColourRange {
+    /// `0` — spec default.
+    #[default]
+    Unspecified,
+    /// `1` — broadcast range (clipped to legal-codeword range).
+    Broadcast,
+    /// `2` — full range, no clipping.
+    Full,
+    /// `3` — defined by `MatrixCoefficients` / `TransferCharacteristics`.
+    DefinedByMatrixAndTransfer,
+    /// Any other value — preserved for the "Matroska Color Ranges" registry
+    /// (§27.12).
+    Other(u64),
+}
+
+impl ColourRange {
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::COLOUR_RANGE_UNSPECIFIED => Self::Unspecified,
+            ids::COLOUR_RANGE_BROADCAST => Self::Broadcast,
+            ids::COLOUR_RANGE_FULL => Self::Full,
+            ids::COLOUR_RANGE_DEFINED_BY_MATRIX_AND_TRANSFER => Self::DefinedByMatrixAndTransfer,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `TransferCharacteristics` (RFC 9559 §5.1.4.1.28.26, Table 16) — the
+/// transfer function the video uses; adopted from Table 3 of ITU-T H.273.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferCharacteristics {
+    Reserved0,
+    BT709,
+    /// `2` — spec default.
+    Unspecified,
+    Reserved3,
+    Gamma22BT470M,
+    Gamma28BT470Bg,
+    Smpte170M,
+    Smpte240M,
+    Linear,
+    Log,
+    LogSqrt,
+    Iec61966_2_4,
+    BT1361ExtendedColourGamut,
+    Iec61966_2_1,
+    BT2020TenBit,
+    BT2020TwelveBit,
+    BT2100Pq,
+    SmpteSt428_1,
+    AribStdB67Hlg,
+    Other(u64),
+}
+
+impl TransferCharacteristics {
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            0 => Self::Reserved0,
+            1 => Self::BT709,
+            2 => Self::Unspecified,
+            3 => Self::Reserved3,
+            4 => Self::Gamma22BT470M,
+            5 => Self::Gamma28BT470Bg,
+            6 => Self::Smpte170M,
+            7 => Self::Smpte240M,
+            8 => Self::Linear,
+            9 => Self::Log,
+            10 => Self::LogSqrt,
+            11 => Self::Iec61966_2_4,
+            12 => Self::BT1361ExtendedColourGamut,
+            13 => Self::Iec61966_2_1,
+            14 => Self::BT2020TenBit,
+            15 => Self::BT2020TwelveBit,
+            16 => Self::BT2100Pq,
+            17 => Self::SmpteSt428_1,
+            18 => Self::AribStdB67Hlg,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `Primaries` (RFC 9559 §5.1.4.1.28.27, Table 17) — the colour primaries
+/// the video uses; adopted from Table 2 of ITU-T H.273.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Primaries {
+    Reserved0,
+    BT709,
+    /// `2` — spec default.
+    Unspecified,
+    Reserved3,
+    BT470M,
+    BT470Bg,
+    BT601_525Smpte170M,
+    Smpte240M,
+    Film,
+    BT2020,
+    SmpteSt428_1,
+    SmpteRp432_2,
+    SmpteEg432_2,
+    EbuTech3213EJedecP22Phosphors,
+    Other(u64),
+}
+
+impl Primaries {
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            0 => Self::Reserved0,
+            1 => Self::BT709,
+            2 => Self::Unspecified,
+            3 => Self::Reserved3,
+            4 => Self::BT470M,
+            5 => Self::BT470Bg,
+            6 => Self::BT601_525Smpte170M,
+            7 => Self::Smpte240M,
+            8 => Self::Film,
+            9 => Self::BT2020,
+            10 => Self::SmpteSt428_1,
+            11 => Self::SmpteRp432_2,
+            12 => Self::SmpteEg432_2,
+            22 => Self::EbuTech3213EJedecP22Phosphors,
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// `MasteringMetadata` (RFC 9559 §5.1.4.1.28.30..§5.1.4.1.28.40): the
+/// SMPTE 2086 mastering-display description that accompanies HDR content.
+/// All fields default to `None` when the file omitted them; the typed
+/// surface preserves which sub-elements were actually present (the spec
+/// does not require all-or-nothing — a file may carry only LuminanceMax,
+/// for example).
+///
+/// `Primary{R,G,B}Chromaticity{X,Y}` and `WhitePointChromaticity{X,Y}` are
+/// CIE-1931 chromaticities in the range `[0.0, 1.0]` (RFC 9559 ranges them
+/// `0x0p+0..0x1p+0`). `Luminance{Max,Min}` are in cd/m² and ranged `>= 0`.
+/// The parser does not validate range — values that fall outside the spec
+/// range still surface so callers can detect them.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct MasteringMetadata {
+    primary_r_chromaticity_x: Option<f64>,
+    primary_r_chromaticity_y: Option<f64>,
+    primary_g_chromaticity_x: Option<f64>,
+    primary_g_chromaticity_y: Option<f64>,
+    primary_b_chromaticity_x: Option<f64>,
+    primary_b_chromaticity_y: Option<f64>,
+    white_point_chromaticity_x: Option<f64>,
+    white_point_chromaticity_y: Option<f64>,
+    luminance_max: Option<f64>,
+    luminance_min: Option<f64>,
+}
+
+impl MasteringMetadata {
+    /// Red X chromaticity coordinate (RFC 9559 §5.1.4.1.28.31), defined by
+    /// CIE-1931. Range `[0.0, 1.0]`.
+    pub fn primary_r_chromaticity_x(&self) -> Option<f64> {
+        self.primary_r_chromaticity_x
+    }
+
+    /// Red Y chromaticity coordinate (RFC 9559 §5.1.4.1.28.32).
+    pub fn primary_r_chromaticity_y(&self) -> Option<f64> {
+        self.primary_r_chromaticity_y
+    }
+
+    /// Green X chromaticity coordinate (RFC 9559 §5.1.4.1.28.33).
+    pub fn primary_g_chromaticity_x(&self) -> Option<f64> {
+        self.primary_g_chromaticity_x
+    }
+
+    /// Green Y chromaticity coordinate (RFC 9559 §5.1.4.1.28.34).
+    pub fn primary_g_chromaticity_y(&self) -> Option<f64> {
+        self.primary_g_chromaticity_y
+    }
+
+    /// Blue X chromaticity coordinate (RFC 9559 §5.1.4.1.28.35).
+    pub fn primary_b_chromaticity_x(&self) -> Option<f64> {
+        self.primary_b_chromaticity_x
+    }
+
+    /// Blue Y chromaticity coordinate (RFC 9559 §5.1.4.1.28.36).
+    pub fn primary_b_chromaticity_y(&self) -> Option<f64> {
+        self.primary_b_chromaticity_y
+    }
+
+    /// White-point X chromaticity coordinate (RFC 9559 §5.1.4.1.28.37).
+    pub fn white_point_chromaticity_x(&self) -> Option<f64> {
+        self.white_point_chromaticity_x
+    }
+
+    /// White-point Y chromaticity coordinate (RFC 9559 §5.1.4.1.28.38).
+    pub fn white_point_chromaticity_y(&self) -> Option<f64> {
+        self.white_point_chromaticity_y
+    }
+
+    /// Maximum luminance, in cd/m² (RFC 9559 §5.1.4.1.28.39, range `>= 0`).
+    pub fn luminance_max(&self) -> Option<f64> {
+        self.luminance_max
+    }
+
+    /// Minimum luminance, in cd/m² (RFC 9559 §5.1.4.1.28.40, range `>= 0`).
+    pub fn luminance_min(&self) -> Option<f64> {
+        self.luminance_min
     }
 }
 
@@ -2865,6 +3365,26 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::DISPLAY_WIDTH => display_width = read_uint(r, e.size as usize)?,
             ids::DISPLAY_HEIGHT => display_height = read_uint(r, e.size as usize)?,
             ids::DISPLAY_UNIT => display_unit = read_uint(r, e.size as usize)?,
+            ids::COLOUR => {
+                let body_end = r.stream_position()? + e.size;
+                // Spec defaults — set up front so an empty `Colour` master
+                // still surfaces the §5.1.4.1.28.17 / §5.1.4.1.28.26 /
+                // §5.1.4.1.28.27 default `2`s and the §5.1.4.1.28.23..
+                // §5.1.4.1.28.25 default `0`s. `parse_colour` overrides only
+                // the children the file actually carries.
+                let mut c = RawColour {
+                    matrix_coefficients: 2,
+                    transfer_characteristics: 2,
+                    primaries: 2,
+                    chroma_siting_horz: ids::CHROMA_SITING_UNSPECIFIED,
+                    chroma_siting_vert: ids::CHROMA_SITING_UNSPECIFIED,
+                    range: ids::COLOUR_RANGE_UNSPECIFIED,
+                    bits_per_channel: 0,
+                    ..Default::default()
+                };
+                parse_colour(r, body_end, &mut c)?;
+                t.colour_raw = Some(c);
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -2878,6 +3398,93 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
         display_height,
         display_unit,
     ));
+    Ok(())
+}
+
+/// Parse the `Video > Colour` master (RFC 9559 §5.1.4.1.28.16). `c` is
+/// pre-populated by `parse_video` with the spec defaults for every
+/// child that has one — this routine overrides only the children the file
+/// actually carries, so an empty `Colour` master surfaces exactly the spec
+/// defaults.
+fn parse_colour(r: &mut dyn ReadSeek, end: u64, c: &mut RawColour) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::MATRIX_COEFFICIENTS => c.matrix_coefficients = read_uint(r, e.size as usize)?,
+            ids::BITS_PER_CHANNEL => c.bits_per_channel = read_uint(r, e.size as usize)?,
+            ids::CHROMA_SUBSAMPLING_HORZ => {
+                c.chroma_subsampling_horz = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::CHROMA_SUBSAMPLING_VERT => {
+                c.chroma_subsampling_vert = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::CB_SUBSAMPLING_HORZ => {
+                c.cb_subsampling_horz = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::CB_SUBSAMPLING_VERT => {
+                c.cb_subsampling_vert = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::CHROMA_SITING_HORZ => c.chroma_siting_horz = read_uint(r, e.size as usize)?,
+            ids::CHROMA_SITING_VERT => c.chroma_siting_vert = read_uint(r, e.size as usize)?,
+            ids::COLOUR_RANGE => c.range = read_uint(r, e.size as usize)?,
+            ids::TRANSFER_CHARACTERISTICS => {
+                c.transfer_characteristics = read_uint(r, e.size as usize)?
+            }
+            ids::PRIMARIES => c.primaries = read_uint(r, e.size as usize)?,
+            ids::MAX_CLL => c.max_cll = Some(read_uint(r, e.size as usize)?),
+            ids::MAX_FALL => c.max_fall = Some(read_uint(r, e.size as usize)?),
+            ids::MASTERING_METADATA => {
+                let body_end = r.stream_position()? + e.size;
+                let mut m = MasteringMetadata::default();
+                parse_mastering_metadata(r, body_end, &mut m)?;
+                c.mastering_metadata = Some(m);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `Colour > MasteringMetadata` master (RFC 9559
+/// §5.1.4.1.28.30..§5.1.4.1.28.40). Each sub-element is independently
+/// optional — the spec does not require any of them to appear together.
+fn parse_mastering_metadata(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    m: &mut MasteringMetadata,
+) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::PRIMARY_R_CHROMATICITY_X => {
+                m.primary_r_chromaticity_x = Some(read_float(r, e.size as usize)?)
+            }
+            ids::PRIMARY_R_CHROMATICITY_Y => {
+                m.primary_r_chromaticity_y = Some(read_float(r, e.size as usize)?)
+            }
+            ids::PRIMARY_G_CHROMATICITY_X => {
+                m.primary_g_chromaticity_x = Some(read_float(r, e.size as usize)?)
+            }
+            ids::PRIMARY_G_CHROMATICITY_Y => {
+                m.primary_g_chromaticity_y = Some(read_float(r, e.size as usize)?)
+            }
+            ids::PRIMARY_B_CHROMATICITY_X => {
+                m.primary_b_chromaticity_x = Some(read_float(r, e.size as usize)?)
+            }
+            ids::PRIMARY_B_CHROMATICITY_Y => {
+                m.primary_b_chromaticity_y = Some(read_float(r, e.size as usize)?)
+            }
+            ids::WHITE_POINT_CHROMATICITY_X => {
+                m.white_point_chromaticity_x = Some(read_float(r, e.size as usize)?)
+            }
+            ids::WHITE_POINT_CHROMATICITY_Y => {
+                m.white_point_chromaticity_y = Some(read_float(r, e.size as usize)?)
+            }
+            ids::LUMINANCE_MAX => m.luminance_max = Some(read_float(r, e.size as usize)?),
+            ids::LUMINANCE_MIN => m.luminance_min = Some(read_float(r, e.size as usize)?),
+            _ => skip(r, e.size)?,
+        }
+    }
     Ok(())
 }
 
@@ -2968,6 +3575,12 @@ pub struct MkvDemuxer {
     /// tracks whose `TrackEntry` carried no `Video` master. See
     /// [`MkvDemuxer::video_geometry`].
     video_geometries: Vec<Option<VideoGeometry>>,
+    /// Per-stream `VideoColour` (RFC 9559 §5.1.4.1.28.16) — the chroma /
+    /// range / transfer / primaries description plus the SMPTE 2086 mastering
+    /// metadata — indexed by stream index. `None` for non-video tracks and
+    /// for video tracks whose `Video` master carried no `Colour` child. See
+    /// [`MkvDemuxer::video_colour`].
+    video_colours: Vec<Option<VideoColour>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -3343,6 +3956,36 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::video_geometry`] for the semantics.
     pub fn video_geometries(&self) -> &[Option<VideoGeometry>] {
         &self.video_geometries
+    }
+
+    /// `VideoColour` (RFC 9559 §5.1.4.1.28.16) for the stream at
+    /// `stream_index`, or `None` when the track is not a video track / its
+    /// `Video` master carried no `Colour` child.
+    ///
+    /// The returned [`VideoColour`] folds `MatrixCoefficients`,
+    /// `BitsPerChannel`, `Chroma{Subsampling,Cb}Subsampling{Horz,Vert}`,
+    /// `ChromaSiting{Horz,Vert}`, `Range`, `TransferCharacteristics`,
+    /// `Primaries`, `MaxCLL`, `MaxFALL` and the `MasteringMetadata` master
+    /// into a single record. Spec defaults are materialised for the children
+    /// that have one (matrix / transfer / primaries default `2` =
+    /// unspecified; chroma siting / range / bits-per-channel default `0` =
+    /// unspecified); children with no spec default (chroma subsampling,
+    /// MaxCLL/MaxFALL) surface as `None` when absent. `MasteringMetadata`
+    /// surfaces only when the file actually carried the master.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_colour(&self, stream_index: u32) -> Option<&VideoColour> {
+        self.video_colours
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+    }
+
+    /// All per-stream `VideoColour`s (RFC 9559 §5.1.4.1.28.16), indexed by
+    /// stream index. The slice has one entry per stream — `None` for
+    /// non-video tracks and for video tracks whose `Video` master carried no
+    /// `Colour` child. See [`MkvDemuxer::video_colour`] for the semantics.
+    pub fn video_colours(&self) -> &[Option<VideoColour>] {
+        &self.video_colours
     }
 
     /// Apply a `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) after a

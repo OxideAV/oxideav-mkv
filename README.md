@@ -208,6 +208,29 @@ the unified `oxideav` aggregator to wire decoding automatically.
   a derivation that would underflow (malformed file with crops larger than
   the encoded width or height on the same axis) returns `None` on that
   axis rather than wrapping.
+- **`Video > Colour` typed decode** (RFC 9559 §5.1.4.1.28.16, including
+  §5.1.4.1.28.17..§5.1.4.1.28.40 sub-elements and the SMPTE 2086 /
+  CTA-861.3 HDR `MasteringMetadata`):
+  `MkvDemuxer::video_colour(stream_index)` (and the per-stream
+  `video_colours()` slice) folds the `Colour` master's children into a
+  single typed `VideoColour`. Each of `MatrixCoefficients`,
+  `TransferCharacteristics`, `Primaries`, `ColourRange`,
+  `ChromaSitingHorz` and `ChromaSitingVert` surfaces as a typed enum;
+  forward-compat values outside the registered tables pass through
+  via an `Other(u64)` variant (§27 leaves registries open for future
+  additions). `BitsPerChannel`, `ChromaSubsampling{Horz,Vert}`,
+  `CbSubsampling{Horz,Vert}`, `MaxCLL` / `MaxFALL` surface as the raw
+  unsigned integer (Optional when the spec doesn't define a default).
+  The nested `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40)
+  surfaces as `Option<&MasteringMetadata>` with the six
+  `Primary{R,G,B}Chromaticity{X,Y}` floats, the two
+  `WhitePointChromaticity{X,Y}` floats and the
+  `Luminance{Max,Min}` cd/m² pair — each independently optional, since
+  the spec does not require all-or-nothing. Spec defaults are
+  materialised on the typed surface so an empty `Colour` master decodes
+  as fully-typed *unspecified* (§5.1.4.1.28.17 / .26 / .27 default `2`;
+  §5.1.4.1.28.23..25 default `0`). Non-video tracks (and video tracks
+  with no `Colour` child) return `None`.
 - **`Video > FlagInterlaced` + `FieldOrder` typed decode** (RFC 9559
   §5.1.4.1.28.1 + §5.1.4.1.28.2):
   `MkvDemuxer::video_interlacing(stream_index)` (and the per-stream
@@ -327,14 +350,15 @@ so the demuxer never hides an unrecognised track.
 - `Video` sub-element coverage is partial: `PixelWidth` / `PixelHeight`
   (§5.1.4.1.28.6 / §5.1.4.1.28.7) feed the `StreamInfo` dimensions;
   `FlagInterlaced` / `FieldOrder` (§5.1.4.1.28.1 / §5.1.4.1.28.2) surface
-  through `video_interlacing`; and the `PixelCrop{Top,Bottom,Left,Right}` +
+  through `video_interlacing`; the `PixelCrop{Top,Bottom,Left,Right}` +
   `DisplayWidth` / `DisplayHeight` / `DisplayUnit` quartet
-  (§5.1.4.1.28.8..§5.1.4.1.28.14) surfaces through `video_geometry`
-  (see above). `StereoMode`, `AlphaMode`, `AspectRatioType` (reclaimed
-  Appendix-A element), `UncompressedFourCC` and the full `Colour` master
-  (§5.1.4.1.28.16) — including HDR metadata
-  (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — are still skipped on the
-  demux side and never written on the mux side.
+  (§5.1.4.1.28.8..§5.1.4.1.28.14) surfaces through `video_geometry`; and
+  the full `Colour` master (§5.1.4.1.28.16) — including HDR metadata
+  (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — surfaces through
+  `video_colour` (see above). `StereoMode`, `AlphaMode`, `AspectRatioType`
+  (reclaimed Appendix-A element) and `UncompressedFourCC` are still
+  skipped on the demux side. None of the `Video` sub-elements above the
+  PixelWidth/PixelHeight pair are written on the mux side.
 
 ## Fuzzing
 
