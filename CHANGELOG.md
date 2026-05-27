@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ebml: **harden `ebml::skip` against forged oversize sizes**. The
+  helper now reads `stream_position()`, computes the target with a
+  saturating add, and calls `SeekFrom::Start(target)` instead of the
+  prior `SeekFrom::Current(n as i64)`. EBML `Size` VINTs can reach
+  `2^56 - 2` and the unknown-size sentinel (`VINT_UNKNOWN_SIZE`) is
+  `u64::MAX` itself — both wrap `n as i64` to a negative value when
+  the old impl cast it for the relative seek, letting a forged size
+  rewind the reader and stall the demuxer in a loop. The new impl
+  seeks past EOF on an attacker-controlled size (which is fine — the
+  next read returns `UnexpectedEof`) and never moves backwards. Pinned
+  by sixteen new `tests/injection_robustness.rs` tests covering: the
+  bare `skip(huge)` / `skip(u64::MAX)` no-rewind contract; demux-open
+  rejection of empty input, EBML-magic-with-truncated-header, an
+  oversize EBML-header `Size`, an oversize `DocType` string, an
+  oversize `CodecID` on a `TrackEntry`, an oversize `TagString` body,
+  and a `Segment` whose declared size extends past EoF;
+  `next_packet`-time handling of an oversize-`Size` `SimpleBlock`,
+  a Xiph-laced `SimpleBlock` whose declared sub-frame sizes overrun
+  the body, and a fixed-laced `SimpleBlock` with `n_frames = 5` over
+  an empty payload (zero-frame-size edge case); on-demand
+  `attachment_data` short-read on a forged 4 GiB `FileData` size and a
+  forged 2 GiB `FileName` string; out-of-range `CueRelativePosition`
+  in `seek_to`; and a small inline fuzz-corpus replay of five
+  malformed seed shapes. Mirrors the round-162 mov / dds robustness
+  pattern. No behaviour change on conforming inputs.
 - demux: **typed `Video > StereoMode` decode** (RFC 9559 §5.1.4.1.28.3).
   New `MkvDemuxer::video_stereo_mode(stream_index) -> Option<StereoMode>`
   (and the slice-view `video_stereo_modes()`) returns the typed

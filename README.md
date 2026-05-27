@@ -378,6 +378,24 @@ so the demuxer never hides an unrecognised track.
   `Video` sub-elements above the PixelWidth/PixelHeight pair are written
   on the mux side.
 
+## Robustness
+
+`tests/injection_robustness.rs` pins sixteen attacker-shaped byte
+patterns against the open / `next_packet` / `seek_to` / `attachment_data`
+surface: a `skip` helper that previously cast `u64 as i64` and could
+seek the reader *backwards* on a forged `Size` field; demux-open
+rejection of an empty input, an EBML-magic with a truncated header, an
+oversize EBML-header `Size`, oversize `DocType` / `CodecID` / `TagString`
+strings, and a `Segment` declared size that runs past EoF; cluster-time
+handling of an oversize `SimpleBlock`, a Xiph-laced `SimpleBlock` whose
+declared sub-frame sizes overrun the body, and a fixed-laced
+`SimpleBlock` with `n_frames = 5` over an empty payload; on-demand
+`attachment_data` short-read on a forged 4 GiB `FileData` size and a
+forged 2 GiB `FileName`; an out-of-range `CueRelativePosition` in
+`seek_to`; and an inline fuzz-corpus replay of five malformed seed
+shapes. All checks land as standard `cargo test` targets so a regression
+on any one surfaces in CI without waiting for a fuzz cycle.
+
 ## Fuzzing
 
 A cargo-fuzz harness for the demuxer lives in `fuzz/`. It drives

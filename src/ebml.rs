@@ -219,9 +219,26 @@ pub fn read_bytes(r: &mut dyn Read, n: usize) -> Result<Vec<u8>> {
 }
 
 /// Skip `n` bytes from a seekable reader.
+///
+/// Implemented via [`SeekFrom::Start`] rather than [`SeekFrom::Current`] to
+/// stay safe under attacker-controlled sizes. EBML `Size` VINTs reach
+/// `2^56 - 2` and an attacker can plant any value up to that ceiling on
+/// an element body; the unknown-size sentinel ([`VINT_UNKNOWN_SIZE`]) is
+/// `u64::MAX` itself. Casting either of those to `i64` for
+/// `SeekFrom::Current` would wrap negative and seek the reader
+/// *backwards* — a forged element could then loop a walker indefinitely
+/// or stall the demuxer.
+///
+/// We instead read the current absolute position, add `n` saturating at
+/// `u64::MAX`, and seek to that absolute offset. Off-the-end seeks are
+/// fine on `Cursor` / `File` — they succeed without I/O, and the next
+/// `read_exact` returns `UnexpectedEof`, which the demuxer's outer loop
+/// surfaces as `Error::Eof`.
 pub fn skip<R: Seek + ?Sized>(r: &mut R, n: u64) -> Result<()> {
     if n > 0 {
-        r.seek(SeekFrom::Current(n as i64))?;
+        let cur = r.stream_position()?;
+        let target = cur.saturating_add(n);
+        r.seek(SeekFrom::Start(target))?;
     }
     Ok(())
 }
