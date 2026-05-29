@@ -134,15 +134,22 @@ the unified `oxideav` aggregator to wire decoding automatically.
   child element follows it (no more "Cues silently eaten as payload").
 - **CRC-32 validation** (RFC 8794 §11.3.1, RFC 9559 §6.2): when a Top-Level
   master element (`Info`, `Tracks`, `Tags`, `Cues`, `Chapters`,
-  `Attachments`, `SeekHead`) carries a leading `CRC-32` child, the demuxer
-  recomputes the IEEE CRC-32 (reflected poly `0xEDB88320`, init
-  `0xFFFFFFFF`, final XOR, little-endian storage) over the rest of the
-  element and records the result. `MkvDemuxer::crc_status() -> &[CrcStatus]`
-  exposes each `{element_id, stored, computed}` triple with an
-  `is_valid()` helper. Validation is informational — a mismatch does **not**
-  abort the open (RFC 8794 §12: a reader MAY ignore the data); strict
-  callers reject any non-valid status. Elements with no `CRC-32` child
-  produce no status (omission is spec-legal).
+  `Attachments`, `SeekHead`) **or a `Cluster`** carries a leading `CRC-32`
+  child, the demuxer recomputes the IEEE CRC-32 (reflected poly
+  `0xEDB88320`, init `0xFFFFFFFF`, final XOR, little-endian storage) over
+  the rest of the element and records the result.
+  `MkvDemuxer::crc_status() -> &[CrcStatus]` exposes each
+  `{element_id, stored, computed}` triple with an `is_valid()` helper.
+  Up-front masters are checked at open time in segment order; Cluster
+  checks land lazily on the first `next_packet` / `seek_to` that opens
+  each Cluster (the element id on a Cluster status is `ids::CLUSTER`),
+  with a body-offset dedup so a back-then-forward seek revisiting the
+  same Cluster never produces two statuses for it. A Cluster declared
+  with the unknown-size VINT can't be CRC-checked (the spec requires a
+  bounded body) and produces no status. Validation is informational — a
+  mismatch does **not** abort the open (RFC 8794 §12: a reader MAY
+  ignore the data); strict callers reject any non-valid status. Elements
+  with no `CRC-32` child produce no status (omission is spec-legal).
 - **`TrackOperation` typed decode** (RFC 9559 §5.1.4.1.30): a *virtual*
   track assembled from other tracks. `MkvDemuxer::track_operation(stream_index)`
   (and the per-stream `track_operations()` slice) returns a typed
@@ -402,10 +409,12 @@ so the demuxer never hides an unrecognised track.
 
 ## What's NOT implemented
 
-- CRC-32 validation covers Top-Level master elements parsed up front; the
-  late best-effort Cues rescan (when Cues sit after the final Cluster) and
-  per-Cluster CRC-32 children are not yet validated. CRC-32 is never
-  written on the mux side.
+- CRC-32 validation covers Top-Level master elements parsed up front and
+  every `Cluster` the demuxer opens through `next_packet` / `seek_to`; the
+  late best-effort Cues rescan (when Cues sit after the final Cluster) is
+  not yet checksummed, and a `Cluster` declared with the unknown-size VINT
+  produces no status (RFC 8794 §11.3.1 needs a bounded body). CRC-32 is
+  never written on the mux side.
 - Attachments are never written on the mux side — the demuxer surfaces
   `AttachedFile` entries via the typed `MkvDemuxer::attachments`
   accessor and on-demand `MkvDemuxer::attachment_data` payload reader

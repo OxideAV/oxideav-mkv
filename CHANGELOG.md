@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **per-Cluster CRC-32 validation** (RFC 8794 §11.3.1, RFC 9559
+  §6.2). Each `Cluster` carrying a leading `CRC-32` child is now checked
+  against its body the first time the demuxer opens it — through the
+  legacy `next_packet` walk or through a Cue-driven `seek_to`. Statuses
+  surface through the existing `MkvDemuxer::crc_status() -> &[CrcStatus]`
+  accessor with `element_id == ids::CLUSTER`. A body-offset dedup keeps a
+  back-then-forward seek revisiting the same Cluster from producing two
+  statuses for it, and a Cluster declared with the unknown-size VINT
+  produces no status (the RFC requires a bounded body). Validation is
+  informational — a mismatch never blocks packet emission. Mirrors the
+  up-front Top-Level master check that already covered Info / Tracks /
+  Tags / Cues / Chapters / Attachments / SeekHead. Closes the
+  `What's NOT implemented` "per-Cluster CRC-32 children are not yet
+  validated" bullet.
 - demux: **typed decode for the three remaining `Video` sub-elements**:
   `AlphaMode` (RFC 9559 §5.1.4.1.28.4), `AspectRatioType` (Appendix
   A.24, reclaimed), and `UncompressedFourCC` (§5.1.4.1.28.15). New

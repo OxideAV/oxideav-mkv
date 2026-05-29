@@ -593,6 +593,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         editions,
         attachments,
         crc_status,
+        validated_cluster_starts: std::collections::HashSet::new(),
         track_operations,
         content_encodings,
         header_strip_prefixes,
@@ -617,12 +618,13 @@ struct SegmentInfo {
 /// Top-Level master element of the Segment.
 ///
 /// In Matroska, every Top-Level master element SHOULD carry a `CRC-32`
-/// child as its first element (RFC 9559 §6.2). The demuxer checks each
-/// such element it parses up front (Info, Tracks, Tags, Cues, Chapters,
-/// Attachments, SeekHead) and records whether the stored CRC matched the
-/// IEEE CRC-32 of the rest of the element's data. Elements with no
-/// `CRC-32` child are not represented here — absence of a status means
-/// "no CRC to check," which the spec explicitly permits.
+/// child as its first element (RFC 9559 §6.2). The demuxer checks the
+/// elements it parses up front (Info, Tracks, Tags, Cues, Chapters,
+/// Attachments, SeekHead) **and** each Cluster as it first opens it,
+/// recording whether the stored CRC matched the IEEE CRC-32 of the rest
+/// of the element's data. Elements with no `CRC-32` child are not
+/// represented here — absence of a status means "no CRC to check,"
+/// which the spec explicitly permits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CrcStatus {
     /// EBML element ID of the Top-Level master that carried the `CRC-32`
@@ -4030,8 +4032,23 @@ pub struct MkvDemuxer {
     /// pull it on demand without paying for it at open time.
     attachments: Vec<Attachment>,
     /// Per-Top-Level-element `CRC-32` validation results (RFC 8794
-    /// §11.3.1) — see [`MkvDemuxer::crc_status`].
+    /// §11.3.1) — see [`MkvDemuxer::crc_status`]. Holds both the up-front
+    /// statuses captured for `Info` / `Tracks` / `Tags` / `Cues` /
+    /// `Chapters` / `Attachments` / `SeekHead` at open time **and** the
+    /// statuses captured per `Cluster` as the demuxer first encounters each
+    /// one through [`MkvDemuxer::next_packet`] / [`Demuxer::seek_to`]. The
+    /// element id distinguishes the two (e.g. [`ids::CLUSTER`] for the
+    /// per-Cluster checks).
     crc_status: Vec<CrcStatus>,
+    /// Body-start offsets of Cluster elements whose `CRC-32` child has
+    /// already been validated and recorded in [`Self::crc_status`]. Used
+    /// to dedup the per-Cluster check across the multiple code paths that
+    /// open a Cluster (the legacy `advance()` walk and the Cue-driven
+    /// [`Self::apply_cue_relative_position`]) and across repeated visits
+    /// to the same Cluster (a back-then-forward seek lands on the same
+    /// Cluster more than once). Membership keyed by the absolute file
+    /// offset of the Cluster's *body* (the byte after its id+size header).
+    validated_cluster_starts: std::collections::HashSet<u64>,
     /// Per-stream `TrackOperation` (RFC 9559 §5.1.4.1.30), indexed by
     /// stream index. `None` for tracks that aren't virtual tracks — see
     /// [`MkvDemuxer::track_operations`].
@@ -4254,15 +4271,27 @@ impl MkvDemuxer {
         &self.tags
     }
 
-    /// `CRC-32` validation results for the Top-Level master elements that
-    /// carried a checksum (RFC 8794 §11.3.1, RFC 9559 §6.2).
+    /// `CRC-32` validation results for the Top-Level master and
+    /// `Cluster` elements that carried a checksum (RFC 8794 §11.3.1, RFC
+    /// 9559 §6.2).
     ///
-    /// Matroska files SHOULD put a `CRC-32` child as the first element of
-    /// each Top-Level master (Info, Tracks, Tags, Cues, Chapters,
-    /// Attachments, SeekHead). When the demuxer parses one with such a
-    /// child, it recomputes the IEEE CRC-32 over the rest of the element
-    /// and records a [`CrcStatus`]. Elements without a `CRC-32` child are
-    /// not represented — the spec lets a writer omit them.
+    /// Matroska files SHOULD put a `CRC-32` child as the first element
+    /// of each Top-Level master (Info, Tracks, Tags, Cues, Chapters,
+    /// Attachments, SeekHead) *and* each Cluster. When the demuxer
+    /// parses an element with such a child, it recomputes the IEEE
+    /// CRC-32 over the rest of the element and records a [`CrcStatus`].
+    /// Elements without a `CRC-32` child are not represented — the
+    /// spec lets a writer omit them.
+    ///
+    /// Up-front Top-Level masters land at open time. Cluster statuses
+    /// are appended as the demuxer first walks each Cluster — either
+    /// through [`Demuxer::next_packet`] driving the legacy `advance`
+    /// loop, or through a cue-driven [`Demuxer::seek_to`] that opens a
+    /// Cluster header. A Cluster is recorded at most once even if a
+    /// back-then-forward seek revisits it. The element id on a Cluster
+    /// status is [`ids::CLUSTER`]; Cluster bodies declared with the
+    /// unknown-size VINT can't be CRC-checked (the spec requires a
+    /// bounded body) and produce no status.
     ///
     /// Validation is informational: a mismatching CRC does **not** stop
     /// the demuxer from returning packets (the spec only says a reader
@@ -4270,7 +4299,9 @@ impl MkvDemuxer {
     /// inspect this slice and reject a file with any
     /// [`CrcStatus::is_valid`] == `false`.
     ///
-    /// Returned in the order the elements appear in the Segment.
+    /// Returned in the order the elements were validated — Top-Level
+    /// masters in Segment order at open time, then each Cluster in the
+    /// order it was first opened by `next_packet` / `seek_to`.
     pub fn crc_status(&self) -> &[CrcStatus] {
         &self.crc_status
     }
@@ -4685,7 +4716,8 @@ impl MkvDemuxer {
             return Ok(());
         }
         let body_start = self.input.stream_position()?;
-        let body_end = if e.size == VINT_UNKNOWN_SIZE {
+        let is_unknown_size = e.size == VINT_UNKNOWN_SIZE;
+        let body_end = if is_unknown_size {
             self.segment_data_end
         } else {
             body_start.saturating_add(e.size)
@@ -4698,6 +4730,15 @@ impl MkvDemuxer {
             self.input.seek(SeekFrom::Start(cluster_head_pos))?;
             return Ok(());
         }
+        // Validate the Cluster's leading CRC-32 child if present (RFC
+        // 8794 §11.3.1, RFC 9559 §6.2) before jumping to the cue
+        // target. Same routine the legacy advance() path uses; dedup
+        // by `body_start` means we only record once even if the
+        // demuxer revisits the Cluster after a back-and-forth seek.
+        // The helper leaves the reader at `body_start`, so the
+        // Timestamp walk below sees the same bytes.
+        self.validate_cluster_crc(body_start, body_end, is_unknown_size)?;
+        self.input.seek(SeekFrom::Start(body_start))?;
 
         // Walk children from body_start until we either reach the
         // target or pass it, capturing Timestamp on the way. Per
@@ -4738,6 +4779,62 @@ impl MkvDemuxer {
         Ok(())
     }
 
+    /// Validate a `Cluster` element's leading `CRC-32` child (RFC 8794
+    /// §11.3.1, RFC 9559 §6.2) and record the result on
+    /// [`Self::crc_status`] if not already done for this Cluster.
+    ///
+    /// `body_start` is the absolute file offset of the Cluster's body
+    /// (the byte right after the Cluster's id+size header). `body_end` is
+    /// the absolute file offset of the byte right after the last child of
+    /// the Cluster. The reader is left at `body_start` on return so the
+    /// regular Cluster walk proceeds unchanged.
+    ///
+    /// Best-effort and *informational*:
+    /// * A Cluster declared with unknown size (`body_end ==
+    ///   self.segment_data_end`) can't be CRC-checked — RFC 8794 §11.3.1
+    ///   requires a bounded body — so the check is skipped.
+    /// * A non-bounded body, a truncated read, or any other I/O hiccup
+    ///   silently degrades to "no status recorded"; the Cluster still
+    ///   demuxes normally per RFC 8794 §12 ("a reader MAY ignore the
+    ///   data").
+    /// * The dedup set keyed on `body_start` guarantees the same Cluster
+    ///   isn't recorded twice when a back-then-forward seek revisits it,
+    ///   or when both `advance` and `apply_cue_relative_position` open
+    ///   the same Cluster on the same `next_packet` call chain.
+    fn validate_cluster_crc(
+        &mut self,
+        body_start: u64,
+        body_end: u64,
+        is_unknown_size: bool,
+    ) -> Result<()> {
+        if body_end <= body_start {
+            return Ok(());
+        }
+        // An unknown-size Cluster body extends until a sibling Segment-
+        // child shows up — we can't bound the body up front, so skip
+        // (RFC 8794 §11.3.1 needs a known-size parent for the CRC).
+        if is_unknown_size {
+            return Ok(());
+        }
+        if self.validated_cluster_starts.contains(&body_start) {
+            return Ok(());
+        }
+        let status =
+            match validate_top_level_crc(&mut *self.input, ids::CLUSTER, body_start, body_end) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Make sure the reader is at body_start even on error.
+                    self.input.seek(SeekFrom::Start(body_start))?;
+                    return Ok(());
+                }
+            };
+        self.validated_cluster_starts.insert(body_start);
+        if let Some(s) = status {
+            self.crc_status.push(s);
+        }
+        Ok(())
+    }
+
     fn advance(&mut self) -> Result<()> {
         match self.cluster_state {
             ClusterState::Idle => {
@@ -4749,11 +4846,17 @@ impl MkvDemuxer {
                 match e.id {
                     ids::CLUSTER => {
                         let body_start = self.input.stream_position()?;
-                        let body_end = if e.size == VINT_UNKNOWN_SIZE {
+                        let is_unknown_size = e.size == VINT_UNKNOWN_SIZE;
+                        let body_end = if is_unknown_size {
                             self.segment_data_end
                         } else {
                             body_start.saturating_add(e.size)
                         };
+                        // Validate the Cluster's leading CRC-32 child if
+                        // present (RFC 8794 §11.3.1, RFC 9559 §6.2). The
+                        // helper rewinds the reader to `body_start` so the
+                        // child-element walk below sees the same bytes.
+                        self.validate_cluster_crc(body_start, body_end, is_unknown_size)?;
                         self.cluster_state = ClusterState::InCluster {
                             body_end,
                             cluster_timecode: 0,
