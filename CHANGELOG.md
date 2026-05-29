@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.7...v0.0.8) - 2026-05-29
+
+### Other
+
+- per-Cluster CRC-32 validation (RFC 8794 §11.3.1, RFC 9559 §6.2)
+- typed AlphaMode / AspectRatioType / UncompressedFourCC decode (RFC 9559 §5.1.4.1.28.4 / Appendix A.24 / §5.1.4.1.28.15)
+- typed Video > Projection decode (RFC 9559 §5.1.4.1.28.41)
+- harden ebml::skip + add 16 injection-robustness tests
+- typed Video > StereoMode decode (RFC 9559 §5.1.4.1.28.3)
+- typed Video > Colour + MasteringMetadata decode (RFC 9559 §5.1.4.1.28.16)
+- typed Video geometry quartet decode (RFC 9559 §5.1.4.1.28.8-14)
+- typed Video FlagInterlaced + FieldOrder decode (RFC 9559 §5.1.4.1.28.1 / §5.1.4.1.28.2)
+- typed decode of ChapProcess sub-tree (RFC 9559 §5.1.7.1.4.14-19)
+- extend typed Chapter with ChapterFlagEnabled + Medium-Linking fields (RFC 9559 §5.1.7.1.4.5-8)
+- typed Attachments accessor + on-demand payload reader (RFC 9559 §5.1.6)
+- cargo-fuzz demux target + 5 defensive demuxer fixes
+- demux + mux: CueRelativePosition round-trip (RFC 9559 §5.1.5.1.2.3)
+- typed Chapters accessor (RFC 9559 §5.1.7)
+- apply Header-Stripping ContentEncoding on read (RFC 9559 §5.1.4.1.31.6 algo 3)
+- ContentEncodings typed decode (RFC 9559 §5.1.4.1.31)
+- TrackOperation typed decode (RFC 9559 §5.1.4.1.30)
+- validate CRC-32 on Top-Level master elements
+- opt-in block lacing on write (RFC 9559 §5.1.4.5.5, §10.3)
+- typed MkvDemuxer::tags() accessor for RFC 9559 §5.1.8 Tags
+- add Chapters encoding (RFC 9559 §5.1.7)
+- resolve Tags.Targets.Tag*UID into scope-prefixed metadata keys
+- ground the cue-point grouping comment in the EBML spec
+
 ### Other
 
 - demux: **per-Cluster CRC-32 validation** (RFC 8794 §11.3.1, RFC 9559
