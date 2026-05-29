@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed `Video > Projection` decode** (RFC 9559 §5.1.4.1.28.41,
+  including §5.1.4.1.28.42..§5.1.4.1.28.46). New
+  `MkvDemuxer::video_projection(stream_index) -> Option<&Projection>`
+  (plus the per-stream `video_projections()` slice) folds the
+  `Projection` master's children into a single typed `Projection`.
+  `ProjectionType` surfaces as a typed enum
+  (`Rectangular` / `Equirectangular` / `Cubemap` / `Mesh` /
+  `Other(u64)` for values registered after RFC 9559 — §27.15 leaves the
+  registry open). `ProjectionPrivate` (the verbatim ISOBMFF box body —
+  `equi` / `cbmp` / `mshp` — that pairs with the projection type)
+  surfaces verbatim as `Option<&[u8]>`. The yaw / pitch / roll pose
+  triple (degrees) surfaces as three `f64`s. Spec defaults are
+  materialised: an empty `Projection` master decodes as a fully-typed
+  identity projection (rectangular + zero pose), distinguishable from
+  `None` (which means "no `Projection` master at all" — the common case
+  for ordinary 2D video). Convenience helpers `ProjectionType::is_spherical()`
+  and `Projection::is_rotated()` provide the headline yes/no answers.
+  Non-video tracks (and video tracks with no `Projection` child) return
+  `None`. Pinned by 10 new `tests/video_projection.rs` cases covering:
+  the missing-Projection `None` contract; empty-Projection default
+  materialisation; round-trip of every Table 18 value plus the
+  `Other(u64)` forward-compat slot; the verbatim 12-byte `equi`-shaped
+  `ProjectionPrivate` payload; the §5.1.4.1.28.46 worked example
+  `<Projection><ProjectionPoseRoll>90</ProjectionPoseRoll></Projection>`
+  (signalling a 90° counter-clockwise rotation); 4-byte float pose
+  storage as an alternative to 8-byte; the audio-track-has-no-projection
+  predicate; forward-compat skip of an unknown sub-element inside
+  `Projection`; and the out-of-range `stream_index` `None` contract.
+
 - ebml: **harden `ebml::skip` against forged oversize sizes**. The
   helper now reads `stream_position()`, computes the target with a
   saturating add, and calls `SeekFrom::Start(target)` instead of the

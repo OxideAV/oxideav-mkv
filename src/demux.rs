@@ -453,6 +453,25 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         .map(|t| t.stereo_mode_raw.map(StereoMode::from_raw))
         .collect();
 
+    // Per-stream `Projection` (RFC 9559 §5.1.4.1.28.41), indexed by stream
+    // index. `None` for non-video tracks and for video tracks whose `Video`
+    // master carried no `Projection` child. `parse_video` materialises the
+    // spec defaults inside `RawProjection` (ProjectionType `0` rectangular,
+    // pose components `0.0`) — so an empty `Projection` master decodes to a
+    // fully-typed identity projection.
+    let video_projections: Vec<Option<Projection>> = tracks
+        .iter()
+        .map(|t| {
+            t.projection_raw.as_ref().map(|p| Projection {
+                projection_type: ProjectionType::from_raw(p.projection_type_raw),
+                private: p.private.clone(),
+                pose_yaw: p.pose_yaw,
+                pose_pitch: p.pose_pitch,
+                pose_roll: p.pose_roll,
+            })
+        })
+        .collect();
+
     let video_geometries: Vec<Option<VideoGeometry>> = tracks
         .iter()
         .map(|t| {
@@ -552,6 +571,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_geometries,
         video_colours,
         video_stereo_modes,
+        video_projections,
     })
 }
 
@@ -715,6 +735,14 @@ struct TrackEntry {
     /// master exists but no `StereoMode` child is present, this carries the
     /// spec default `0` (mono) so the typed surface materialises it.
     stereo_mode_raw: Option<u64>,
+    /// Raw `Projection` master (RFC 9559 §5.1.4.1.28.41) captured during the
+    /// `Video` walk. `None` when the track is not a video track or its
+    /// `Video` master carried no `Projection` child. When the `Projection`
+    /// master existed but a particular sub-element was absent, the staging
+    /// record carries the spec default (`ProjectionType` = `0` rectangular,
+    /// pose-components `0.0`) so the typed surface can materialise an
+    /// identity projection uniformly.
+    projection_raw: Option<RawProjection>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -738,6 +766,21 @@ struct RawColour {
     max_cll: Option<u64>,
     max_fall: Option<u64>,
     mastering_metadata: Option<MasteringMetadata>,
+}
+
+/// Parser-private staging form of `Projection` (RFC 9559 §5.1.4.1.28.41).
+/// Sub-element defaults are materialised here so the typed surface only has
+/// to map the raw `ProjectionType` integer onto its enum. `private` stays
+/// `Option` so the typed surface can distinguish "absent" (the only legal
+/// state when `projection_type_raw == 0` per §5.1.4.1.28.43) from "explicit
+/// empty payload".
+#[derive(Default)]
+struct RawProjection {
+    projection_type_raw: u64,
+    private: Option<Vec<u8>>,
+    pose_yaw: f64,
+    pose_pitch: f64,
+    pose_roll: f64,
 }
 
 /// Parser-private staging form of `TrackOperation` — the plane / join
@@ -1550,6 +1593,139 @@ impl StereoMode {
     /// answer without matching on the specific packing.
     pub fn is_stereo(&self) -> bool {
         !matches!(self, StereoMode::Mono)
+    }
+}
+
+/// `ProjectionType` (RFC 9559 §5.1.4.1.28.42, Table 18): the projection used
+/// to render the video track's frames. `Rectangular` is the default and
+/// covers ordinary flat video; the other three values describe spherical /
+/// VR-video projections that pair with the [`Projection::private`] payload
+/// (which mirrors the corresponding ISOBMFF box, §5.1.4.1.28.43).
+///
+/// §27.15 leaves the "Matroska Projection Types" registry open for future
+/// additions, so any value outside Table 18 passes through the
+/// [`ProjectionType::Other`] variant rather than being dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProjectionType {
+    /// `0` — rectangular (flat) projection. Spec default; per §5.1.4.1.28.43
+    /// `ProjectionPrivate` MUST NOT be present when this type is in effect.
+    #[default]
+    Rectangular,
+    /// `1` — equirectangular spherical projection. `ProjectionPrivate` MUST
+    /// be present and mirrors the ISOBMFF "equi" box body.
+    Equirectangular,
+    /// `2` — cubemap projection. `ProjectionPrivate` MUST be present and
+    /// mirrors the ISOBMFF "cbmp" box body.
+    Cubemap,
+    /// `3` — mesh projection. `ProjectionPrivate` MUST be present and
+    /// mirrors the ISOBMFF "mshp" box body.
+    Mesh,
+    /// Any value not registered in §5.1.4.1.28.42 Table 18. §27.15 leaves
+    /// the registry open for future additions; surfaced rather than dropped
+    /// so callers can log it.
+    Other(u64),
+}
+
+impl ProjectionType {
+    /// Map a raw `ProjectionType` integer onto the enum, preserving values
+    /// outside §5.1.4.1.28.42 Table 18 via [`ProjectionType::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::PROJECTION_TYPE_RECTANGULAR => ProjectionType::Rectangular,
+            ids::PROJECTION_TYPE_EQUIRECTANGULAR => ProjectionType::Equirectangular,
+            ids::PROJECTION_TYPE_CUBEMAP => ProjectionType::Cubemap,
+            ids::PROJECTION_TYPE_MESH => ProjectionType::Mesh,
+            other => ProjectionType::Other(other),
+        }
+    }
+
+    /// `true` for any projection that isn't ordinary flat rectangular video.
+    /// Convenience for callers that only need a yes/no "is this a spherical
+    /// / VR track?" answer without matching on the specific projection.
+    pub fn is_spherical(&self) -> bool {
+        !matches!(self, ProjectionType::Rectangular)
+    }
+}
+
+/// A video track's `Projection` master (RFC 9559 §5.1.4.1.28.41 plus the
+/// `ProjectionType` / `ProjectionPrivate` / `ProjectionPose{Yaw,Pitch,Roll}`
+/// sub-elements §5.1.4.1.28.42..46).
+///
+/// Surfaced per stream via [`MkvDemuxer::video_projection`]. The pose triple
+/// is in degrees; per §5.1.4.1.28.44..46 the yaw/roll are in [-180, 180] and
+/// the pitch is in [-90, 90], and all three default to `0.0`. The
+/// `private` payload is the verbatim ISOBMFF box body that pairs with the
+/// projection type (`equi` / `cbmp` / `mshp`); the demuxer never parses or
+/// validates it — that's a renderer concern. `private` is `None` when the
+/// `ProjectionPrivate` element is absent (which is the only legal state when
+/// `projection_type == Rectangular`, per the §5.1.4.1.28.43 "MUST NOT be
+/// present" clause).
+///
+/// Spec defaults are materialised on the typed surface so an empty
+/// `Projection` master (one with only the mandatory `ProjectionType` =
+/// `Rectangular` plus pose-zero defaults) decodes as a fully-typed identity
+/// projection. The §5.1.4.1.28.46 worked example
+/// `<Projection><ProjectionPoseRoll>90</ProjectionPoseRoll></Projection>`
+/// — used to signal a 90° counter-clockwise rotation — round-trips through
+/// the typed surface with `projection_type == Rectangular`, `pose_roll ==
+/// 90.0`, and the other pose components at their zero defaults.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Projection {
+    projection_type: ProjectionType,
+    private: Option<Vec<u8>>,
+    pose_yaw: f64,
+    pose_pitch: f64,
+    pose_roll: f64,
+}
+
+impl Projection {
+    /// `ProjectionType` (RFC 9559 §5.1.4.1.28.42) — the projection used for
+    /// the track. Spec default `0` ([`ProjectionType::Rectangular`]) is
+    /// materialised when the file's `Projection` master carried no explicit
+    /// `ProjectionType` child.
+    pub fn projection_type(&self) -> ProjectionType {
+        self.projection_type
+    }
+
+    /// `ProjectionPrivate` (RFC 9559 §5.1.4.1.28.43): the verbatim ISOBMFF
+    /// box body (without size/FourCC framing but with the FullBox version
+    /// and flag fields) that pairs with [`Projection::projection_type`].
+    /// `None` when the element is absent — the only legal state when the
+    /// projection type is `Rectangular` (the spec MUSTs it out for that
+    /// case). Returned by reference so callers don't copy multi-kilobyte
+    /// mesh-box payloads they only want to read.
+    pub fn private(&self) -> Option<&[u8]> {
+        self.private.as_deref()
+    }
+
+    /// `ProjectionPoseYaw` (RFC 9559 §5.1.4.1.28.44): clockwise rotation
+    /// around the up vector, in degrees. Spec range `[-180.0, 180.0]`,
+    /// default `0.0`. Applied before pitch and roll.
+    pub fn pose_yaw(&self) -> f64 {
+        self.pose_yaw
+    }
+
+    /// `ProjectionPosePitch` (RFC 9559 §5.1.4.1.28.45): counter-clockwise
+    /// rotation around the right vector, in degrees. Spec range
+    /// `[-90.0, 90.0]`, default `0.0`. Applied after yaw and before roll.
+    pub fn pose_pitch(&self) -> f64 {
+        self.pose_pitch
+    }
+
+    /// `ProjectionPoseRoll` (RFC 9559 §5.1.4.1.28.46): counter-clockwise
+    /// rotation around the forward vector, in degrees. Spec range
+    /// `[-180.0, 180.0]`, default `0.0`. Applied after both yaw and pitch.
+    /// Used by the §5.1.4.1.28.46 worked example (`90` ⇒ "present with a
+    /// 90-degree counter-clockwise rotation").
+    pub fn pose_roll(&self) -> f64 {
+        self.pose_roll
+    }
+
+    /// `true` when any pose component is non-zero (i.e. the projection
+    /// includes a rotation). Convenience for callers that only need a
+    /// yes/no "does this track want to be rotated?" answer.
+    pub fn is_rotated(&self) -> bool {
+        self.pose_yaw != 0.0 || self.pose_pitch != 0.0 || self.pose_roll != 0.0
     }
 }
 
@@ -3495,6 +3671,21 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                 parse_colour(r, body_end, &mut c)?;
                 t.colour_raw = Some(c);
             }
+            ids::PROJECTION => {
+                let body_end = r.stream_position()? + e.size;
+                // Spec defaults — `ProjectionType` defaults to 0 (rectangular)
+                // per §5.1.4.1.28.42; the three pose floats default to
+                // 0x0p+0 per §5.1.4.1.28.44..46. `parse_projection` overrides
+                // only the children the file actually carries, so an empty
+                // `Projection` master surfaces an identity rectangular
+                // projection.
+                let mut p = RawProjection {
+                    projection_type_raw: ids::PROJECTION_TYPE_RECTANGULAR,
+                    ..Default::default()
+                };
+                parse_projection(r, body_end, &mut p)?;
+                t.projection_raw = Some(p);
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -3593,6 +3784,25 @@ fn parse_mastering_metadata(
             }
             ids::LUMINANCE_MAX => m.luminance_max = Some(read_float(r, e.size as usize)?),
             ids::LUMINANCE_MIN => m.luminance_min = Some(read_float(r, e.size as usize)?),
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `Video > Projection` master (RFC 9559 §5.1.4.1.28.41). `p` is
+/// pre-populated by `parse_video` with the spec defaults for every child
+/// that has one — this routine overrides only the children the file actually
+/// carries. Unknown elements are skipped (forward-compat).
+fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::PROJECTION_TYPE => p.projection_type_raw = read_uint(r, e.size as usize)?,
+            ids::PROJECTION_PRIVATE => p.private = Some(read_bytes(r, e.size as usize)?),
+            ids::PROJECTION_POSE_YAW => p.pose_yaw = read_float(r, e.size as usize)?,
+            ids::PROJECTION_POSE_PITCH => p.pose_pitch = read_float(r, e.size as usize)?,
+            ids::PROJECTION_POSE_ROLL => p.pose_roll = read_float(r, e.size as usize)?,
             _ => skip(r, e.size)?,
         }
     }
@@ -3699,6 +3909,12 @@ pub struct MkvDemuxer {
     /// for a `Video` master with no explicit child. See
     /// [`MkvDemuxer::video_stereo_mode`].
     video_stereo_modes: Vec<Option<StereoMode>>,
+    /// Per-stream `Projection` (RFC 9559 §5.1.4.1.28.41) — the spherical /
+    /// VR-video projection plus the yaw / pitch / roll pose triple —
+    /// indexed by stream index. `None` for non-video tracks and for video
+    /// tracks whose `Video` master carried no `Projection` child. See
+    /// [`MkvDemuxer::video_projection`].
+    video_projections: Vec<Option<Projection>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -4136,6 +4352,44 @@ impl MkvDemuxer {
     /// semantics.
     pub fn video_stereo_modes(&self) -> &[Option<StereoMode>] {
         &self.video_stereo_modes
+    }
+
+    /// `Projection` (RFC 9559 §5.1.4.1.28.41) for the stream at
+    /// `stream_index`, or `None` when the track is not a video track / its
+    /// `Video` master carried no `Projection` child.
+    ///
+    /// The returned [`Projection`] folds `ProjectionType` (§5.1.4.1.28.42 —
+    /// `Rectangular` / `Equirectangular` / `Cubemap` / `Mesh` /
+    /// `Other(u64)` for values registered after RFC 9559, §27.15),
+    /// `ProjectionPrivate` (§5.1.4.1.28.43 — the verbatim ISOBMFF box body),
+    /// and the three pose floats (§5.1.4.1.28.44..46) into a single typed
+    /// record. Spec defaults are materialised on the typed surface: an empty
+    /// `Projection` master decodes as a fully-typed identity projection
+    /// (rectangular + zero pose), distinguishable from `None` (which means
+    /// "no `Projection` master at all" — the common case for ordinary 2D
+    /// video).
+    ///
+    /// The pose triple is in degrees; the spec ranges are
+    /// `[-180.0, 180.0]` for yaw and roll and `[-90.0, 90.0]` for pitch.
+    /// The §5.1.4.1.28.46 worked example
+    /// `<Projection><ProjectionPoseRoll>90</ProjectionPoseRoll></Projection>`
+    /// round-trips with `projection_type == Rectangular`, `pose_roll == 90.0`,
+    /// and the other components at `0.0`.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_projection(&self, stream_index: u32) -> Option<&Projection> {
+        self.video_projections
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+    }
+
+    /// All per-stream `Projection`s (RFC 9559 §5.1.4.1.28.41), indexed by
+    /// stream index. The slice has one entry per stream — `None` for
+    /// non-video tracks and for video tracks whose `Video` master carried no
+    /// `Projection` child. See [`MkvDemuxer::video_projection`] for the
+    /// semantics.
+    pub fn video_projections(&self) -> &[Option<Projection>] {
+        &self.video_projections
     }
 
     /// Apply a `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) after a

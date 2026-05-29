@@ -247,6 +247,30 @@ the unified `oxideav` aggregator to wire decoding automatically.
   TrackCombinePlanes`, §5.1.4.1.30.1) is independent and surfaces
   through `track_operation`; a single track MAY carry both. A convenience
   `StereoMode::is_stereo()` returns `true` for any non-`Mono` packing.
+- **`Video > Projection` typed decode** (RFC 9559 §5.1.4.1.28.41,
+  including §5.1.4.1.28.42..§5.1.4.1.28.46):
+  `MkvDemuxer::video_projection(stream_index)` (and the per-stream
+  `video_projections()` slice) folds the `Projection` master's children
+  into a single typed `Projection`. `ProjectionType` surfaces as a typed
+  enum (`Rectangular` / `Equirectangular` / `Cubemap` / `Mesh` /
+  `Other(u64)` for values registered after RFC 9559 — §27.15 leaves the
+  registry open). `ProjectionPrivate` (the verbatim ISOBMFF box body —
+  `equi` / `cbmp` / `mshp` — that pairs with the projection type)
+  surfaces verbatim as `Option<&[u8]>` and is never parsed or validated
+  by the container; that's a renderer concern. The yaw / pitch / roll
+  pose triple (degrees, ranges `±180 / ±90 / ±180` per §5.1.4.1.28.44..46)
+  surfaces as three `f64`s with the spec default `0.0` materialised. An
+  empty `Projection` master decodes as a fully-typed identity projection
+  (rectangular + zero pose), distinguishable from `None` (which means
+  "no `Projection` master at all" — the common case for ordinary 2D
+  video). The §5.1.4.1.28.46 worked example
+  `<Projection><ProjectionPoseRoll>90</ProjectionPoseRoll></Projection>`
+  (signalling a 90° counter-clockwise rotation) round-trips with
+  `projection_type == Rectangular`, `pose_roll == 90.0`, and the other
+  pose components at their defaults. Convenience helpers
+  `ProjectionType::is_spherical()` and `Projection::is_rotated()` provide
+  the headline yes/no answers. Non-video tracks (and video tracks with no
+  `Projection` child) return `None`.
 - **`Video > FlagInterlaced` + `FieldOrder` typed decode** (RFC 9559
   §5.1.4.1.28.1 + §5.1.4.1.28.2):
   `MkvDemuxer::video_interlacing(stream_index)` (and the per-stream
@@ -371,10 +395,13 @@ so the demuxer never hides an unrecognised track.
   (§5.1.4.1.28.8..§5.1.4.1.28.14) surfaces through `video_geometry`; and
   the full `Colour` master (§5.1.4.1.28.16) — including HDR metadata
   (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — surfaces through
-  `video_colour` (see above); and `StereoMode` (§5.1.4.1.28.3) surfaces
-  through `video_stereo_mode`. `AlphaMode`, `AspectRatioType` (reclaimed
-  Appendix-A element), `UncompressedFourCC` and the `Projection` master
-  (§5.1.4.1.28.41) are still skipped on the demux side. None of the
+  `video_colour` (see above); `StereoMode` (§5.1.4.1.28.3) surfaces
+  through `video_stereo_mode`; and the `Projection` master
+  (§5.1.4.1.28.41) — including `ProjectionType`, the verbatim
+  ISOBMFF-mirrored `ProjectionPrivate` payload, and the yaw / pitch /
+  roll pose triple — surfaces through `video_projection`. `AlphaMode`,
+  `AspectRatioType` (reclaimed Appendix-A element) and
+  `UncompressedFourCC` are still skipped on the demux side. None of the
   `Video` sub-elements above the PixelWidth/PixelHeight pair are written
   on the mux side.
 

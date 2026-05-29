@@ -292,6 +292,25 @@ pub const FIELD_ORDER_BFF: u64 = 6;
 pub const FIELD_ORDER_TFF_INTERLEAVED: u64 = 9;
 pub const FIELD_ORDER_BFF_INTERLEAVED: u64 = 14;
 
+// Video > Projection master (RFC 9559 §5.1.4.1.28.41..§5.1.4.1.28.46): the
+// per-track spherical-/VR-video projection description plus a yaw/pitch/roll
+// rotation triple. The pose floats are stream-copy (§8) and bounded to the
+// ±180 / ±90 / ±180 degree ranges in §5.1.4.1.28.44..46.
+pub const PROJECTION: u32 = 0x7670;
+pub const PROJECTION_TYPE: u32 = 0x7671;
+pub const PROJECTION_PRIVATE: u32 = 0x7672;
+pub const PROJECTION_POSE_YAW: u32 = 0x7673;
+pub const PROJECTION_POSE_PITCH: u32 = 0x7674;
+pub const PROJECTION_POSE_ROLL: u32 = 0x7675;
+
+// ProjectionType values (RFC 9559 §5.1.4.1.28.42, Table 18). §27.15 leaves the
+// registry open for future additions; values outside the four registered
+// labels pass through the typed enum's `Other(u64)` variant.
+pub const PROJECTION_TYPE_RECTANGULAR: u64 = 0;
+pub const PROJECTION_TYPE_EQUIRECTANGULAR: u64 = 1;
+pub const PROJECTION_TYPE_CUBEMAP: u64 = 2;
+pub const PROJECTION_TYPE_MESH: u64 = 3;
+
 // StereoMode values (RFC 9559 §5.1.4.1.28.3, Table 5). All 0..=14 values the
 // spec defines are listed; §27.7 leaves the registry open for future
 // additions, so values outside this set pass through the typed enum's
