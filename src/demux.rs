@@ -472,6 +472,35 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         })
         .collect();
 
+    // Per-stream `AlphaMode` (RFC 9559 §5.1.4.1.28.4), indexed by stream
+    // index. `None` for tracks with no `Video` master; the spec default `0`
+    // ([`AlphaMode::None`]) is materialised inside `parse_video` so an empty
+    // `Video` master decodes as `Some(AlphaMode::None)`.
+    let video_alpha_modes: Vec<Option<AlphaMode>> = tracks
+        .iter()
+        .map(|t| t.alpha_mode_raw.map(AlphaMode::from_raw))
+        .collect();
+
+    // Per-stream `AspectRatioType` (RFC 9559 Appendix A.24 "Reclaimed"),
+    // indexed by stream index. `None` whenever the file did not carry the
+    // element — the reclaimed appendix specifies no default, so absence is
+    // never synthesised.
+    let video_aspect_ratio_types: Vec<Option<u64>> =
+        tracks.iter().map(|t| t.aspect_ratio_type_raw).collect();
+
+    // Per-stream `UncompressedFourCC` (RFC 9559 §5.1.4.1.28.15), indexed by
+    // stream index. `None` whenever the file did not carry the element
+    // (§5.1.4.1.28.15 Table 11 makes it mandatory only when
+    // `CodecID == "V_UNCOMPRESSED"` and there is no spec default).
+    let video_uncompressed_fourccs: Vec<Option<UncompressedFourCC>> = tracks
+        .iter()
+        .map(|t| {
+            t.uncompressed_fourcc_raw
+                .as_ref()
+                .map(|raw| UncompressedFourCC { bytes: raw.clone() })
+        })
+        .collect();
+
     let video_geometries: Vec<Option<VideoGeometry>> = tracks
         .iter()
         .map(|t| {
@@ -572,6 +601,9 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_colours,
         video_stereo_modes,
         video_projections,
+        video_alpha_modes,
+        video_aspect_ratio_types,
+        video_uncompressed_fourccs,
     })
 }
 
@@ -743,6 +775,23 @@ struct TrackEntry {
     /// pose-components `0.0`) so the typed surface can materialise an
     /// identity projection uniformly.
     projection_raw: Option<RawProjection>,
+    /// Raw `AlphaMode` (RFC 9559 §5.1.4.1.28.4) captured during the `Video`
+    /// walk. `None` when the track has no `Video` master; otherwise the
+    /// spec default `0` is materialised so an empty `Video` master surfaces
+    /// `Some(AlphaMode::None)` on the typed side.
+    alpha_mode_raw: Option<u64>,
+    /// Raw `AspectRatioType` (RFC 9559 Appendix A.24, id `0x54B3` — reclaimed)
+    /// captured during the `Video` walk. `None` when the track has no `Video`
+    /// master or the element was absent — the reclaimed appendix specifies
+    /// no default, so absence does not materialise a synthetic value.
+    aspect_ratio_type_raw: Option<u64>,
+    /// Raw `UncompressedFourCC` (RFC 9559 §5.1.4.1.28.15) captured during the
+    /// `Video` walk. `None` when the track has no `Video` master or the
+    /// element was absent. The spec marks the field as a fixed-length 4-byte
+    /// binary — a non-4-byte payload is preserved verbatim so callers can
+    /// inspect the malformed file; the typed surface's `fourcc()` accessor
+    /// returns `None` whenever the byte length isn't exactly 4.
+    uncompressed_fourcc_raw: Option<Vec<u8>>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -1726,6 +1775,108 @@ impl Projection {
     /// yes/no "does this track want to be rotated?" answer.
     pub fn is_rotated(&self) -> bool {
         self.pose_yaw != 0.0 || self.pose_pitch != 0.0 || self.pose_roll != 0.0
+    }
+}
+
+/// `AlphaMode` (RFC 9559 §5.1.4.1.28.4, Table 6): whether the track carries
+/// out-of-band alpha-channel data inside `BlockAdditional` elements with
+/// `BlockAddID=1`. Surfaced per stream via [`MkvDemuxer::video_alpha_mode`].
+///
+/// The spec only enumerates two values (`0` none, `1` present); values
+/// outside the registered set are forwarded via [`AlphaMode::Other`] —
+/// §27.8 leaves the "Matroska Alpha Modes" registry open for future
+/// additions. The §5.1.4.1.28.4 default `0` is materialised on the typed
+/// surface so an empty `Video` master decodes as `Some(AlphaMode::None)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AlphaMode {
+    /// `0` — no alpha-channel data. Spec default; either the
+    /// `BlockAdditional` element with `BlockAddID=1` is absent, or it
+    /// SHOULD NOT be treated as alpha data (§5.1.4.1.28.4 Table 6).
+    #[default]
+    None,
+    /// `1` — the `BlockAdditional` element with `BlockAddID=1` carries
+    /// alpha-channel data, decoded as the codec mapping for `CodecID`
+    /// requires. The WebM alpha-channel extension uses this with
+    /// `BlockAddID=1` carrying a parallel VP8/VP9 frame's alpha plane.
+    Present,
+    /// Any other value — preserved for forward-compatibility with the
+    /// "Matroska Alpha Modes" registry (§27.8). The spec also notes that
+    /// values other than `0` and `1` "SHOULD NOT be used, as the behavior
+    /// of known implementations is different".
+    Other(u64),
+}
+
+impl AlphaMode {
+    /// Map a raw `AlphaMode` integer onto the enum, preserving unrecognised
+    /// values via [`AlphaMode::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::ALPHA_MODE_NONE => AlphaMode::None,
+            ids::ALPHA_MODE_PRESENT => AlphaMode::Present,
+            other => AlphaMode::Other(other),
+        }
+    }
+
+    /// `true` when the track is signalling alpha-channel data (i.e. the
+    /// value is exactly [`AlphaMode::Present`]). Convenience for callers
+    /// that want the headline yes/no answer; values outside the registered
+    /// set are treated as "no" because the spec leaves their semantics
+    /// implementation-defined.
+    pub fn has_alpha(&self) -> bool {
+        matches!(self, AlphaMode::Present)
+    }
+}
+
+/// `UncompressedFourCC` (RFC 9559 §5.1.4.1.28.15): the 4-byte FourCC that
+/// identifies the uncompressed pixel layout used by the track. The spec
+/// makes the element mandatory only when `CodecID = "V_UNCOMPRESSED"`
+/// (§5.1.4.1.28.15 Table 11) and explicitly notes that there is "neither a
+/// definitive list of FourCC values nor an official registry" — so we
+/// surface the raw bytes plus a UTF-8 lossy 4-character preview and let the
+/// caller compare against whichever FourCC set they care about.
+///
+/// The spec also pins the on-disk byte length to exactly 4 (the EBML
+/// schema's `length:` field). A non-4-byte payload is preserved verbatim
+/// so a caller debugging a malformed file can still see what the writer
+/// emitted; the [`Self::fourcc`] and [`Self::as_str`] accessors return
+/// `None` whenever [`Self::as_bytes`] isn't exactly 4 bytes long.
+///
+/// Surfaced per stream via [`MkvDemuxer::video_uncompressed_fourcc`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UncompressedFourCC {
+    bytes: Vec<u8>,
+}
+
+impl UncompressedFourCC {
+    /// The raw on-disk bytes verbatim. For a well-formed file the length is
+    /// exactly 4; for malformed input the original payload length is
+    /// preserved so callers can log the deviation.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The four-byte FourCC as a `[u8; 4]`, or `None` when the on-disk
+    /// payload wasn't exactly 4 bytes long. Convenience for callers that
+    /// want to match against canonical `*b"YUY2"`-style byte patterns.
+    pub fn fourcc(&self) -> Option<[u8; 4]> {
+        if self.bytes.len() == 4 {
+            Some([self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]])
+        } else {
+            None
+        }
+    }
+
+    /// The four-byte FourCC as a UTF-8 lossy string preview. Returns `None`
+    /// when the on-disk payload wasn't exactly 4 bytes long. The lossy
+    /// conversion replaces any byte that isn't valid ASCII / UTF-8 with the
+    /// Unicode replacement character — a FourCC of `b"YUY2"` becomes
+    /// `"YUY2"`; an exotic 4-byte payload still returns a non-empty string.
+    pub fn as_str(&self) -> Option<String> {
+        if self.bytes.len() == 4 {
+            Some(String::from_utf8_lossy(&self.bytes).into_owned())
+        } else {
+            None
+        }
     }
 }
 
@@ -3636,6 +3787,8 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     // StereoMode (§5.1.4.1.28.3, default 0 = mono). A `Video` master with
     // no explicit `StereoMode` decodes to `Mono` on the typed surface.
     let mut stereo_mode: u64 = ids::STEREO_MODE_MONO;
+    // AlphaMode (§5.1.4.1.28.4, default 0 = none).
+    let mut alpha_mode: u64 = ids::ALPHA_MODE_NONE;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -3644,6 +3797,18 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::FLAG_INTERLACED => flag_interlaced = read_uint(r, e.size as usize)?,
             ids::FIELD_ORDER => field_order = read_uint(r, e.size as usize)?,
             ids::STEREO_MODE => stereo_mode = read_uint(r, e.size as usize)?,
+            ids::ALPHA_MODE => alpha_mode = read_uint(r, e.size as usize)?,
+            ids::ASPECT_RATIO_TYPE => {
+                // Reclaimed Appendix A.24 element — no spec default; surface only
+                // when the file actually carries it.
+                t.aspect_ratio_type_raw = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::UNCOMPRESSED_FOURCC => {
+                // 4-byte binary FourCC (§5.1.4.1.28.15). Preserve verbatim;
+                // the typed `fourcc()` accessor rejects payloads whose length
+                // isn't exactly 4.
+                t.uncompressed_fourcc_raw = Some(read_bytes(r, e.size as usize)?)
+            }
             ids::PIXEL_CROP_TOP => crop_top = read_uint(r, e.size as usize)?,
             ids::PIXEL_CROP_BOTTOM => crop_bottom = read_uint(r, e.size as usize)?,
             ids::PIXEL_CROP_LEFT => crop_left = read_uint(r, e.size as usize)?,
@@ -3700,6 +3865,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
         display_unit,
     ));
     t.stereo_mode_raw = Some(stereo_mode);
+    t.alpha_mode_raw = Some(alpha_mode);
     Ok(())
 }
 
@@ -3915,6 +4081,23 @@ pub struct MkvDemuxer {
     /// tracks whose `Video` master carried no `Projection` child. See
     /// [`MkvDemuxer::video_projection`].
     video_projections: Vec<Option<Projection>>,
+    /// Per-stream `AlphaMode` (RFC 9559 §5.1.4.1.28.4) — whether the track
+    /// carries WebM-style alpha data in a `BlockAdditional` (`BlockAddID=1`).
+    /// `None` for non-video tracks and for video tracks whose `TrackEntry`
+    /// carried no `Video` master; the spec default `0` ([`AlphaMode::None`])
+    /// is materialised for a `Video` master with no explicit child. See
+    /// [`MkvDemuxer::video_alpha_mode`].
+    video_alpha_modes: Vec<Option<AlphaMode>>,
+    /// Per-stream `AspectRatioType` (RFC 9559 Appendix A.24, reclaimed),
+    /// indexed by stream index. `None` when the file did not carry the
+    /// element — the reclaimed appendix specifies no default. See
+    /// [`MkvDemuxer::video_aspect_ratio_type`].
+    video_aspect_ratio_types: Vec<Option<u64>>,
+    /// Per-stream `UncompressedFourCC` (RFC 9559 §5.1.4.1.28.15) — the
+    /// 4-byte FourCC identifying the uncompressed pixel layout, only
+    /// meaningful when `CodecID == "V_UNCOMPRESSED"`. `None` when the
+    /// element was absent. See [`MkvDemuxer::video_uncompressed_fourcc`].
+    video_uncompressed_fourccs: Vec<Option<UncompressedFourCC>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -4390,6 +4573,87 @@ impl MkvDemuxer {
     /// semantics.
     pub fn video_projections(&self) -> &[Option<Projection>] {
         &self.video_projections
+    }
+
+    /// `AlphaMode` (RFC 9559 §5.1.4.1.28.4) for the stream at
+    /// `stream_index`, or `None` when the track is not a video track / its
+    /// `TrackEntry` carried no `Video` master.
+    ///
+    /// The §5.1.4.1.28.4 default `0` ([`AlphaMode::None`]) is materialised:
+    /// a `Video` master with no explicit `AlphaMode` decodes as
+    /// `Some(AlphaMode::None)`, distinguishable from `None` (which means
+    /// "no `Video` master at all"). Values outside Table 6 surface via
+    /// [`AlphaMode::Other`] — §27.8 leaves the registry open for future
+    /// additions, and the spec also notes that values other than `0`/`1`
+    /// "SHOULD NOT be used" because implementations differ.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_alpha_mode(&self, stream_index: u32) -> Option<AlphaMode> {
+        self.video_alpha_modes
+            .get(stream_index as usize)
+            .and_then(|v| *v)
+    }
+
+    /// All per-stream `AlphaMode`s (RFC 9559 §5.1.4.1.28.4), indexed by
+    /// stream index. The slice has one entry per stream — `None` for
+    /// non-video tracks and for video tracks whose `TrackEntry` carried no
+    /// `Video` master. See [`MkvDemuxer::video_alpha_mode`] for the
+    /// semantics.
+    pub fn video_alpha_modes(&self) -> &[Option<AlphaMode>] {
+        &self.video_alpha_modes
+    }
+
+    /// `AspectRatioType` (RFC 9559 Appendix A.24, reclaimed) for the stream
+    /// at `stream_index`, or `None` when the file did not carry the
+    /// element.
+    ///
+    /// The element is exposed as the raw `u64` rather than a typed enum:
+    /// the reclaimed appendix says only "Specifies the possible
+    /// modifications to the aspect ratio" and enumerates no values, so
+    /// synthesising labels would be guesswork outside the spec. Returns
+    /// `None` whenever the file did not carry the element (there is no
+    /// spec default — the appendix does not specify one).
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_aspect_ratio_type(&self, stream_index: u32) -> Option<u64> {
+        self.video_aspect_ratio_types
+            .get(stream_index as usize)
+            .and_then(|v| *v)
+    }
+
+    /// All per-stream `AspectRatioType`s (RFC 9559 Appendix A.24), indexed
+    /// by stream index. The slice has one entry per stream — `None` when
+    /// the file did not carry the element. See
+    /// [`MkvDemuxer::video_aspect_ratio_type`] for the semantics.
+    pub fn video_aspect_ratio_types(&self) -> &[Option<u64>] {
+        &self.video_aspect_ratio_types
+    }
+
+    /// `UncompressedFourCC` (RFC 9559 §5.1.4.1.28.15) for the stream at
+    /// `stream_index`, or `None` when the file did not carry the element.
+    ///
+    /// The spec makes the element mandatory only when
+    /// `CodecID == "V_UNCOMPRESSED"`; for any other codec the element is
+    /// optional and most files omit it, in which case this returns `None`.
+    /// The on-disk byte length is pinned to 4 by the schema; a malformed
+    /// non-4-byte payload is preserved verbatim on the returned
+    /// [`UncompressedFourCC`] so callers can debug the deviation, while
+    /// [`UncompressedFourCC::fourcc`] / [`UncompressedFourCC::as_str`]
+    /// return `None` for that case.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_uncompressed_fourcc(&self, stream_index: u32) -> Option<&UncompressedFourCC> {
+        self.video_uncompressed_fourccs
+            .get(stream_index as usize)
+            .and_then(|v| v.as_ref())
+    }
+
+    /// All per-stream `UncompressedFourCC`s (RFC 9559 §5.1.4.1.28.15),
+    /// indexed by stream index. The slice has one entry per stream —
+    /// `None` when the file did not carry the element. See
+    /// [`MkvDemuxer::video_uncompressed_fourcc`] for the semantics.
+    pub fn video_uncompressed_fourccs(&self) -> &[Option<UncompressedFourCC>] {
+        &self.video_uncompressed_fourccs
     }
 
     /// Apply a `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) after a

@@ -271,6 +271,42 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `ProjectionType::is_spherical()` and `Projection::is_rotated()` provide
   the headline yes/no answers. Non-video tracks (and video tracks with no
   `Projection` child) return `None`.
+- **`Video > AlphaMode` typed decode** (RFC 9559 §5.1.4.1.28.4):
+  `MkvDemuxer::video_alpha_mode(stream_index) -> Option<AlphaMode>`
+  (and the per-stream `video_alpha_modes()` slice) folds the per-track
+  WebM-alpha hint into a typed enum (`None` / `Present` / `Other(u64)`
+  for values registered after RFC 9559 — §27.8 leaves the registry
+  open). The §5.1.4.1.28.4 default `0` (`None`) is materialised: a
+  `Video` master with no explicit `AlphaMode` decodes as
+  `Some(AlphaMode::None)`, distinguishable from `None` (which means "no
+  `Video` master at all"). `AlphaMode::Present` (value `1`) signals
+  that the track's `BlockAdditional` element with `BlockAddID=1` carries
+  alpha-channel data per the codec mapping for `CodecID` (the WebM
+  VP8/VP9 alpha extension is the canonical user). A convenience
+  `AlphaMode::has_alpha()` returns `true` exactly for the `Present`
+  variant — values outside Table 6 are conservatively treated as "no
+  alpha" because the spec leaves their semantics implementation-defined.
+- **`Video > AspectRatioType` typed decode** (RFC 9559 Appendix A.24,
+  reclaimed): `MkvDemuxer::video_aspect_ratio_type(stream_index) ->
+  Option<u64>` (and the per-stream `video_aspect_ratio_types()` slice)
+  surfaces the raw `u64` value rather than synthesising an enum — the
+  reclaimed appendix says only "Specifies the possible modifications to
+  the aspect ratio" and enumerates no values. Returns `None` whenever
+  the file did not carry the element (the appendix specifies no
+  default, so absence is *not* materialised).
+- **`Video > UncompressedFourCC` typed decode** (RFC 9559
+  §5.1.4.1.28.15): `MkvDemuxer::video_uncompressed_fourcc(stream_index)
+  -> Option<&UncompressedFourCC>` (and the per-stream
+  `video_uncompressed_fourccs()` slice) surfaces the 4-byte FourCC that
+  identifies the uncompressed pixel layout. Spec-mandatory only when
+  `CodecID == "V_UNCOMPRESSED"` (Table 11); the typed surface carries
+  the verbatim on-disk bytes via `as_bytes()`, plus convenience
+  `fourcc() -> Option<[u8; 4]>` and `as_str() -> Option<String>` (UTF-8
+  lossy) accessors that return `None` whenever the on-disk payload
+  isn't exactly 4 bytes. A malformed non-4-byte payload is preserved
+  verbatim rather than being dropped, so callers debugging a malformed
+  file can still see what the writer emitted. Absence on any track is
+  legal — the spec specifies no default — and returns `None`.
 - **`Video > FlagInterlaced` + `FieldOrder` typed decode** (RFC 9559
   §5.1.4.1.28.1 + §5.1.4.1.28.2):
   `MkvDemuxer::video_interlacing(stream_index)` (and the per-stream
@@ -387,23 +423,26 @@ so the demuxer never hides an unrecognised track.
   reported encoding chain itself. zlib/bzlib/lzo1x decompression and
   decryption are out of container scope; `ContentEncodings` is never written
   on the mux side.
-- `Video` sub-element coverage is partial: `PixelWidth` / `PixelHeight`
-  (§5.1.4.1.28.6 / §5.1.4.1.28.7) feed the `StreamInfo` dimensions;
-  `FlagInterlaced` / `FieldOrder` (§5.1.4.1.28.1 / §5.1.4.1.28.2) surface
-  through `video_interlacing`; the `PixelCrop{Top,Bottom,Left,Right}` +
-  `DisplayWidth` / `DisplayHeight` / `DisplayUnit` quartet
-  (§5.1.4.1.28.8..§5.1.4.1.28.14) surfaces through `video_geometry`; and
+- `Video` sub-element coverage is now complete on the demux side:
+  `PixelWidth` / `PixelHeight` (§5.1.4.1.28.6 / §5.1.4.1.28.7) feed the
+  `StreamInfo` dimensions; `FlagInterlaced` / `FieldOrder`
+  (§5.1.4.1.28.1 / §5.1.4.1.28.2) surface through `video_interlacing`;
+  the `PixelCrop{Top,Bottom,Left,Right}` + `DisplayWidth` /
+  `DisplayHeight` / `DisplayUnit` quartet
+  (§5.1.4.1.28.8..§5.1.4.1.28.14) surfaces through `video_geometry`;
   the full `Colour` master (§5.1.4.1.28.16) — including HDR metadata
   (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — surfaces through
-  `video_colour` (see above); `StereoMode` (§5.1.4.1.28.3) surfaces
-  through `video_stereo_mode`; and the `Projection` master
-  (§5.1.4.1.28.41) — including `ProjectionType`, the verbatim
-  ISOBMFF-mirrored `ProjectionPrivate` payload, and the yaw / pitch /
-  roll pose triple — surfaces through `video_projection`. `AlphaMode`,
-  `AspectRatioType` (reclaimed Appendix-A element) and
-  `UncompressedFourCC` are still skipped on the demux side. None of the
-  `Video` sub-elements above the PixelWidth/PixelHeight pair are written
-  on the mux side.
+  `video_colour`; `StereoMode` (§5.1.4.1.28.3) surfaces through
+  `video_stereo_mode`; the `Projection` master (§5.1.4.1.28.41) —
+  including `ProjectionType`, the verbatim ISOBMFF-mirrored
+  `ProjectionPrivate` payload, and the yaw / pitch / roll pose triple —
+  surfaces through `video_projection`; `AlphaMode` (§5.1.4.1.28.4)
+  surfaces through `video_alpha_mode`; the reclaimed Appendix-A
+  `AspectRatioType` element surfaces through
+  `video_aspect_ratio_type`; and `UncompressedFourCC`
+  (§5.1.4.1.28.15) surfaces through `video_uncompressed_fourcc`. None
+  of the `Video` sub-elements above the PixelWidth/PixelHeight pair are
+  written on the mux side.
 
 ## Robustness
 

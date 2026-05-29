@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- demux: **typed decode for the three remaining `Video` sub-elements**:
+  `AlphaMode` (RFC 9559 §5.1.4.1.28.4), `AspectRatioType` (Appendix
+  A.24, reclaimed), and `UncompressedFourCC` (§5.1.4.1.28.15). New
+  accessors `MkvDemuxer::video_alpha_mode(stream_index) ->
+  Option<AlphaMode>`, `video_aspect_ratio_type(stream_index) ->
+  Option<u64>` and `video_uncompressed_fourcc(stream_index) ->
+  Option<&UncompressedFourCC>` (plus matching slice accessors). The
+  spec default `0` (`AlphaMode::None`) is materialised so an empty
+  `Video` master decodes as `Some(AlphaMode::None)`, distinguishable
+  from `None` (no `Video` master at all); values outside Table 6 pass
+  through `AlphaMode::Other(u64)` per the §27.8 open registry, and a
+  convenience `AlphaMode::has_alpha()` returns `true` exactly for
+  `Present`. `AspectRatioType` is exposed as the raw `u64` (the
+  reclaimed appendix enumerates no values) and has no spec default —
+  `None` on absence. `UncompressedFourCC` exposes the verbatim on-disk
+  bytes via `as_bytes()` plus `fourcc() -> Option<[u8; 4]>` and
+  `as_str() -> Option<String>` (UTF-8 lossy) accessors that return
+  `None` whenever the on-disk payload isn't exactly 4 bytes; a
+  malformed non-4-byte payload is preserved verbatim so a caller
+  debugging a writer issue can still see what was emitted. Pinned by
+  12 new `tests/video_alpha_aspect_fourcc.rs` cases covering AlphaMode
+  present / default-none / other-passthrough / audio-track-returns-none;
+  AspectRatioType present / absent / audio-track; UncompressedFourCC
+  present / absent / malformed-length-preserved / audio-track; and a
+  combined "three video elements together" round-trip. With this
+  change every `Video` sub-element registered under RFC 9559 plus
+  Appendix A.24 now surfaces on the demuxer's typed side.
+
 - demux: **typed `Video > Projection` decode** (RFC 9559 §5.1.4.1.28.41,
   including §5.1.4.1.28.42..§5.1.4.1.28.46). New
   `MkvDemuxer::video_projection(stream_index) -> Option<&Projection>`

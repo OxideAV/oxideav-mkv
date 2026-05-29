@@ -117,6 +117,28 @@ pub const AES_SETTINGS_CIPHER_MODE: u32 = 0x47E8;
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
 
+// AlphaMode (RFC 9559 §5.1.4.1.28.4): signals that a track's BlockAdditional
+// element with `BlockAddID=1` carries alpha-channel data — used by VP8 / VP9
+// alpha-bearing variants in WebM. Spec default `0` (no alpha) per
+// §5.1.4.1.28.4; Table 6 only enumerates `0` and `1`. §27.8 leaves the
+// "Matroska Alpha Modes" registry open for future additions.
+pub const ALPHA_MODE: u32 = 0x53C0;
+pub const ALPHA_MODE_NONE: u64 = 0;
+pub const ALPHA_MODE_PRESENT: u64 = 1;
+
+// AspectRatioType (RFC 9559 Appendix A.24, "Reclaimed"): a uinteger that
+// "specifies the possible modifications to the aspect ratio". The reclaimed
+// appendix lists no enumerated values, so the typed surface returns the raw
+// integer rather than synthesising an enum.
+pub const ASPECT_RATIO_TYPE: u32 = 0x54B3;
+
+// UncompressedFourCC (RFC 9559 §5.1.4.1.28.15): a fixed 4-byte FourCC that
+// identifies the uncompressed pixel layout — only meaningful when
+// `CodecID = "V_UNCOMPRESSED"` (§5.1.4.1.28.15 Table 11). The spec mentions
+// no registry; the typed surface exposes the raw 4 bytes plus a UTF-8 lossy
+// FourCC string.
+pub const UNCOMPRESSED_FOURCC: u32 = 0x2EB524;
+
 // Video geometry quartet (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14).
 // PixelCrop* (default 0) carve the visible window out of the encoded
 // PixelWidth × PixelHeight buffer. DisplayWidth / DisplayHeight describe
