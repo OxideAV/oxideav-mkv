@@ -375,11 +375,24 @@ impl MkvMuxer {
     /// This matches how DVD-derived chapters are typically expressed:
     /// each program-chain cell has a start PTM but no explicit end
     /// (it's implicit from the next chapter's start, or end-of-program).
+    /// The same shape works for Blu-ray MPLS `PlayListMark` entries —
+    /// each mark carries a `mark_time_stamp` (90 kHz PTS) and the muxer
+    /// just needs the nanosecond-converted start. Suggested converter:
+    ///
+    /// ```text
+    /// // BD PTS is 90 kHz; ns is exact (no FP), no overflow up to ~5×10^15 ticks.
+    /// fn bd_pts90k_to_ns(pts_90k: u64) -> u64 {
+    ///     pts_90k * 100_000 / 9
+    /// }
+    /// ```
     ///
     /// Surface model: a `Chapters → EditionEntry → ChapterAtom →
-    /// ChapterDisplay` master per RFC 9559 §5.1.7. Use
-    /// [`MkvMuxer::add_chapter_full`] for multilingual displays or
-    /// explicit `ChapCountry` tagging.
+    /// ChapterDisplay` master per RFC 9559 §5.1.7. The `ChapterTimeStart`
+    /// / `ChapterTimeEnd` payload units are nanoseconds and are
+    /// **independent of the segment's `TimecodeScale`** (the spec pins
+    /// them to ns regardless), so what you pass here is what lands on
+    /// disk. Use [`MkvMuxer::add_chapter_full`] for multilingual
+    /// displays or explicit `ChapCountry` tagging.
     pub fn add_chapter(
         &mut self,
         start_time_ns: u64,

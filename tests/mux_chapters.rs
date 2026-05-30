@@ -322,6 +322,91 @@ fn seek_head_chapters_entry_is_voided_when_no_chapters() {
     );
 }
 
+/// Walk into a Chapters element and pull out the first ChapterAtom's
+/// `(ChapterTimeStart, ChapterTimeEnd)` payloads (both as raw uint
+/// values). Used by the on-disk-units regression test to make sure
+/// the muxer treats `MkvChapter::time_start_ns` as literal
+/// nanoseconds rather than e.g. milliseconds or some scaled
+/// timecode.
+fn first_atom_times(bytes: &[u8]) -> (u64, Option<u64>) {
+    let (chapters_abs, _seg_start) =
+        find_top_level(bytes, ids::CHAPTERS).expect("Chapters element");
+    let mut cur = Cursor::new(bytes);
+    cur.seek(SeekFrom::Start(chapters_abs)).unwrap();
+    let ch = read_element_header(&mut cur).unwrap();
+    assert_eq!(ch.id, ids::CHAPTERS);
+    let ch_end = cur.stream_position().unwrap() + ch.size;
+    // Walk Chapters → EditionEntry → ChapterAtom → {time_start, time_end}.
+    while cur.stream_position().unwrap() < ch_end {
+        let ee = read_element_header(&mut cur).unwrap();
+        let ee_end = cur.stream_position().unwrap() + ee.size;
+        if ee.id != ids::EDITION_ENTRY {
+            cur.seek(SeekFrom::Start(ee_end)).unwrap();
+            continue;
+        }
+        while cur.stream_position().unwrap() < ee_end {
+            let child = read_element_header(&mut cur).unwrap();
+            let child_end = cur.stream_position().unwrap() + child.size;
+            if child.id != ids::CHAPTER_ATOM {
+                cur.seek(SeekFrom::Start(child_end)).unwrap();
+                continue;
+            }
+            let mut start: Option<u64> = None;
+            let mut end: Option<u64> = None;
+            while cur.stream_position().unwrap() < child_end {
+                let sub = read_element_header(&mut cur).unwrap();
+                let sub_end = cur.stream_position().unwrap() + sub.size;
+                match sub.id {
+                    ids::CHAPTER_TIME_START => {
+                        start = Some(read_uint(&mut cur, sub.size as usize).unwrap());
+                    }
+                    ids::CHAPTER_TIME_END => {
+                        end = Some(read_uint(&mut cur, sub.size as usize).unwrap());
+                    }
+                    _ => {
+                        cur.seek(SeekFrom::Start(sub_end)).unwrap();
+                    }
+                }
+            }
+            return (start.expect("ChapterTimeStart required"), end);
+        }
+    }
+    panic!("no ChapterAtom found inside Chapters element");
+}
+
+/// Regression guard: `MkvMuxer::add_chapter` accepts nanoseconds and
+/// writes them straight into `ChapterTimeStart` / `ChapterTimeEnd`,
+/// which are spec-defined as nanoseconds independent of
+/// `TimecodeScale` (RFC 9559 §5.1.7.2). If anyone later misreads the
+/// docstring and tries to "scale" the value into TimecodeScale ticks,
+/// this test catches it.
+#[test]
+fn chapter_times_are_written_as_literal_nanoseconds() {
+    // 3 600 050 000 000 ns = 1 h 0 min 0.05 s — picked so any
+    // accidental ms-rescale (÷1 000 000) would land at the easily-
+    // recognisable value 3 600 050 instead. 90 kHz PTS would land at
+    // 324 004 500 (off by ~4 orders of magnitude).
+    let start_ns: u64 = 3_600_050_000_000;
+    let end_ns: u64 = 7_200_100_000_000;
+    let chapters = vec![MkvChapter {
+        time_start_ns: start_ns,
+        time_end_ns: Some(end_ns),
+        display: vec![ChapterDisplay {
+            title: "NsLiteral".into(),
+            language: "eng".into(),
+            country: None,
+        }],
+    }];
+    let bytes = mux_with_chapters_collect(&chapters);
+    let (start, end) = first_atom_times(&bytes);
+    assert_eq!(start, start_ns, "ChapterTimeStart must be literal ns");
+    assert_eq!(
+        end,
+        Some(end_ns),
+        "ChapterTimeEnd must be literal ns (no TimecodeScale rescale)"
+    );
+}
+
 /// Walk the SeekHead at the head of the Segment and pull out
 /// `(target_id, position)` pairs. Void entries inside the SeekHead are
 /// skipped so the caller can assert on the live Seek set.
