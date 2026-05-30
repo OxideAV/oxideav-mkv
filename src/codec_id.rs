@@ -48,6 +48,17 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "A_MPEG/L3" => "mp3",
         "A_AC3" => "ac3",
         "A_EAC3" => "eac3",
+        // DTS family — Matroska maps every DTS variant (Core, DTS-HD HRA,
+        // DTS-HD MA, DTS:X) onto a single `A_DTS` CodecID. The bitstream
+        // syntex itself distinguishes them; the container only carries the
+        // wire bytes. See <https://www.matroska.org/technical/codec_specs.html>.
+        // Blu-ray ships DTS-HD MA / HRA tracks via this CodecID with no
+        // extradata required for passthrough.
+        "A_DTS" => "dts",
+        // Dolby TrueHD (BD primary lossless audio). Same passthrough model
+        // as DTS: container carries the raw TrueHD frames, decoder picks
+        // up the substream metadata from the bitstream.
+        "A_TRUEHD" => "truehd",
         "V_VP8" => "vp8",
         "V_VP9" => "vp9",
         "V_AV1" => "av1",
@@ -118,6 +129,13 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "mp3" => "A_MPEG/L3",
         "ac3" => "A_AC3",
         "eac3" => "A_EAC3",
+        // DTS family — see notes on `A_DTS` in `from_matroska`. The Matroska
+        // CodecID does not distinguish DTS-HD MA / HRA / Core: callers carry
+        // those distinctions in the bitstream itself.
+        "dts" => "A_DTS",
+        // Dolby TrueHD — BD's primary lossless audio. Passthrough only;
+        // muxer never re-encodes.
+        "truehd" => "A_TRUEHD",
         "vp8" => "V_VP8",
         "vp9" => "V_VP9",
         "av1" => "V_AV1",
@@ -138,4 +156,73 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "kate" => "S_KATE",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: round-trip a Matroska CodecID through
+    /// [`from_matroska`] → [`to_matroska`] and assert the result is
+    /// byte-identical to the original. Codec_private is empty (only
+    /// `V_MS/VFW/FOURCC` consults it).
+    fn assert_round_trip(matroska_id: &str) {
+        let cid = from_matroska(matroska_id, &[]);
+        let back = to_matroska(&cid).unwrap_or_else(|| {
+            panic!(
+                "no inverse mapping for {matroska_id} → oxideav id {}",
+                cid.as_str()
+            )
+        });
+        assert_eq!(
+            back,
+            matroska_id,
+            "round-trip mismatch: {matroska_id} → {} → {back}",
+            cid.as_str()
+        );
+    }
+
+    /// Every Blu-ray-relevant Matroska CodecID must round-trip cleanly
+    /// through the bi-directional table. Adding a new BD CodecID
+    /// requires an entry in [`from_matroska`], a matching entry in
+    /// [`to_matroska`], and a line here.
+    #[test]
+    fn bd_codec_ids_round_trip() {
+        // Video.
+        assert_round_trip("V_MPEG4/ISO/AVC");
+        assert_round_trip("V_MPEGH/ISO/HEVC");
+        // Audio.
+        assert_round_trip("A_AC3");
+        assert_round_trip("A_EAC3");
+        assert_round_trip("A_DTS");
+        assert_round_trip("A_TRUEHD");
+        assert_round_trip("A_PCM/INT/BIG");
+        // Subtitle.
+        assert_round_trip("S_HDMV/PGS");
+        assert_round_trip("S_HDMV/TEXTST");
+    }
+
+    /// `A_DTS` and `A_TRUEHD` were added for BD passthrough. Locked
+    /// down so the oxideav-internal codec ids match the rest of the
+    /// project's naming convention (lowercase, FFmpeg-style short
+    /// names).
+    #[test]
+    fn dts_and_truehd_map_to_expected_oxideav_ids() {
+        assert_eq!(from_matroska("A_DTS", &[]).as_str(), "dts");
+        assert_eq!(from_matroska("A_TRUEHD", &[]).as_str(), "truehd");
+        assert_eq!(to_matroska(&CodecId::new("dts")), Some("A_DTS"));
+        assert_eq!(to_matroska(&CodecId::new("truehd")), Some("A_TRUEHD"));
+    }
+
+    /// BD audio is big-endian LPCM (BD-ROM Part 3 §5.4). Make sure
+    /// the muxer maps the existing `pcm_s16be` id through to
+    /// `A_PCM/INT/BIG` and not the more common little-endian flavour.
+    #[test]
+    fn bd_lpcm_maps_to_big_endian_pcm() {
+        assert_eq!(
+            to_matroska(&CodecId::new("pcm_s16be")),
+            Some("A_PCM/INT/BIG")
+        );
+        assert_eq!(from_matroska("A_PCM/INT/BIG", &[]).as_str(), "pcm_s16be");
+    }
 }
