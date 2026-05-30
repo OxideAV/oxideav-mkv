@@ -325,6 +325,14 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             params.width = Some(t.width as u32);
             params.height = Some(t.height as u32);
         }
+        // RFC 9559 §5.1.4.1.2.1: surface the per-track Language when
+        // the file carried one. We deliberately do NOT synthesise the
+        // spec default "eng" here — callers iterating streams keep the
+        // "absent" signal so re-muxing doesn't add a Language element
+        // that wasn't in the source.
+        if let Some(lang) = t.language.clone() {
+            params.language = Some(lang);
+        }
         streams.push(StreamInfo {
             index: idx,
             time_base,
@@ -794,6 +802,12 @@ struct TrackEntry {
     /// inspect the malformed file; the typed surface's `fourcc()` accessor
     /// returns `None` whenever the byte length isn't exactly 4.
     uncompressed_fourcc_raw: Option<Vec<u8>>,
+    /// `Language` (RFC 9559 §5.1.4.1.2.1) — ISO 639-2/T three-letter
+    /// tag for the track's primary language. `None` when the element
+    /// was absent from the file; the spec default `"eng"` is *not*
+    /// materialised here so the typed surface can distinguish
+    /// "container said English" from "container said nothing".
+    language: Option<String>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -3521,6 +3535,7 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             ids::TRACK_TYPE => t.track_type = read_uint(r, e.size as usize)?,
             ids::CODEC_ID => t.codec_id_string = read_string(r, e.size as usize)?,
             ids::CODEC_PRIVATE => t.codec_private = read_bytes(r, e.size as usize)?,
+            ids::LANGUAGE => t.language = Some(read_string(r, e.size as usize)?),
             ids::AUDIO => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_audio(r, body_end, t)?;

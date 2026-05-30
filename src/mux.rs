@@ -550,6 +550,13 @@ impl Muxer for MkvMuxer {
                 1
             };
             write_uint_element(&mut t, ids::FLAG_LACING, flag_lacing);
+            // RFC 9559 §5.1.4.1.2.1 (Language): per-track ISO 639-2/T
+            // tag. Spec default is `"eng"`, so we only emit the element
+            // when the caller supplied an explicit value — parsers fall
+            // back to the default when the element is omitted.
+            if let Some(lang) = s.params.language.as_deref() {
+                write_string_element(&mut t, ids::LANGUAGE, lang);
+            }
             if let Some(name) = codec_id::to_matroska(&s.params.codec_id) {
                 write_string_element(&mut t, ids::CODEC_ID, name);
             } else {
