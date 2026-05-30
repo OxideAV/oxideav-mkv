@@ -13,6 +13,7 @@
 //! guidelines](https://www.webmproject.org/docs/container/): only VP8,
 //! VP9, AV1 for video and Vorbis, Opus for audio.
 
+pub mod avc;
 pub mod codec_id;
 pub mod demux;
 pub mod ebml;
