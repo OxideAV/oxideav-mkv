@@ -359,6 +359,21 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `write_header`; the muxer emits a single `EditionEntry` between
   Tracks and the first Cluster and patches the SeekHead `Chapters`
   slot to point at it (slot is voided if no chapters were queued).
+- `Attachments` (RFC 9559 §5.1.6): `MkvMuxer::add_attachment(MkvAttachment
+  { filename, mime_type, data, uid, description })` queues one
+  `AttachedFile`. Attachments must be added before `write_header`; the
+  muxer emits the `Attachments` master right after `Chapters` (or
+  directly after `Tracks` when no chapters are queued) and patches the
+  SeekHead `Attachments` slot to point at it (slot is voided if no
+  attachments were queued). Field handling matches the demux side
+  field-for-field so an end-to-end demux→mux pipeline preserves
+  attachments: `FileName` (§5.1.6.1.2) + `FileMediaType` (§5.1.6.1.3)
+  are mandatory and rejected up front when empty; `FileUID` (§5.1.6.1.5,
+  `range: not 0`) auto-derives from the 1-based attachment index when
+  the caller passes `None`, and an explicit `Some(0)` is rejected;
+  `FileDescription` (§5.1.6.1.1) is omitted on disk when `None` or
+  empty. `MkvAttachment::new(filename, mime_type, data)` is a
+  convenience constructor mirroring the demux-side typed surface.
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.
@@ -415,10 +430,8 @@ so the demuxer never hides an unrecognised track.
   not yet checksummed, and a `Cluster` declared with the unknown-size VINT
   produces no status (RFC 8794 §11.3.1 needs a bounded body). CRC-32 is
   never written on the mux side.
-- Attachments are never written on the mux side — the demuxer surfaces
-  `AttachedFile` entries via the typed `MkvDemuxer::attachments`
-  accessor and on-demand `MkvDemuxer::attachment_data` payload reader
-  (see above), but the muxer has no `add_attachment` API yet.
+- ContentSignature (RFC 9559 §A.33 reclaimed `0x47E3`) is parsed by neither
+  side. The element is reserved for a future per-segment signature scheme.
 - `TrackOperation` is decoded and surfaced (left/right-eye plane combining,
   block joining) but the demuxer does not yet *apply* it — virtual tracks
   are reported alongside their source tracks rather than being synthesised

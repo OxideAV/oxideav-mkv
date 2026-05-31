@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- mux: write-side `Attachments` (RFC 9559 §5.1.6) via `MkvMuxer::add_attachment` + `MkvAttachment`. `AttachedFile` children written in demux parse order (`FileDescription`/`FileName`/`FileMediaType`/`FileData`/`FileUID`); `FileUID` auto-derives from the 1-based attachment index when caller passes `None`, and explicit `Some(0)` is rejected per spec `range: not 0`. SeekHead extended to 5 entries (Info/Tracks/Chapters/Attachments/Cues); the new Attachments slot is either patched to the real element offset or voided when no attachments were queued.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.7...v0.0.8) - 2026-05-29
 
 ### Other

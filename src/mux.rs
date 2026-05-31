@@ -179,6 +179,16 @@ pub struct MkvMuxer {
     /// `Chapters` SeekHead entry is patched at the same time. Empty list
     /// → no `Chapters` element written and the SeekHead slot is voided.
     chapters: Vec<MkvChapter>,
+    /// Attached files queued via [`MkvMuxer::add_attachment`]. Materialised
+    /// into an `Attachments` master right after `Chapters` (or right after
+    /// `Tracks` if no chapters were queued) in [`MkvMuxer::write_header`];
+    /// the `Attachments` SeekHead entry is patched at the same time. Empty
+    /// list → no `Attachments` element written and the SeekHead slot is
+    /// voided. Honours RFC 9559 §5.1.6 element ordering: the
+    /// `Attachments` master sits among the other Top-Level masters
+    /// before the first `Cluster`, so the demuxer's single-pass header
+    /// walk picks it up without late-segment rescanning.
+    attachments: Vec<MkvAttachment>,
     /// Opt-in block lacing mode (RFC 9559 §10.3). Default is
     /// [`LacingMode::None`] which preserves the legacy
     /// one-SimpleBlock-per-packet behaviour. Anything else causes
@@ -277,6 +287,74 @@ impl ChapterDisplay {
     }
 }
 
+/// One `AttachedFile` (RFC 9559 §5.1.6) queued for the muxer to emit.
+///
+/// Round-trips through `Attachments → AttachedFile → {FileName,
+/// FileMediaType, FileData, FileUID, FileDescription}` per RFC 9559
+/// §5.1.6.1. Mirrors the demux-side [`crate::demux::Attachment`] surface
+/// so a demux-then-mux pipeline can read an `Attachment` out and feed an
+/// `MkvAttachment` back in without losing any fields.
+///
+/// Field handling per the spec:
+///
+/// * `filename` — `FileName` (§5.1.6.1.2), mandatory per the spec
+///   (`minOccurs / maxOccurs: 1 / 1`). Always written, even when empty
+///   (the spec does not provide a default).
+/// * `mime_type` — `FileMediaType` (§5.1.6.1.3), mandatory. RFC 6838
+///   media-type string (e.g. `"image/jpeg"`, `"application/x-truetype-
+///   font"`). Always written.
+/// * `data` — `FileData` (§5.1.6.1.4), mandatory binary payload. Written
+///   verbatim. A zero-length payload is legal per the spec but unusual.
+/// * `uid` — `FileUID` (§5.1.6.1.5), mandatory uinteger with `range: not
+///   0`. When `None` the muxer auto-derives a stable non-zero UID from
+///   the 1-based attachment index (so `Tags.Targets.TagAttachmentUID`
+///   references can resolve); when `Some(0)` the muxer rejects the call
+///   per the spec's `range: not 0` constraint.
+/// * `description` — `FileDescription` (§5.1.6.1.1), optional. Written
+///   only when `Some(non_empty)`; an empty `Some("")` is treated as
+///   `None` to avoid emitting an empty UTF-8 element.
+///
+/// The on-disk order matches the demux side's parse order for clean
+/// round-tripping under the typed [`crate::demux::Attachment`] accessor.
+#[derive(Clone, Debug, Default)]
+pub struct MkvAttachment {
+    /// `FileName` (RFC 9559 §5.1.6.1.2). Mandatory on disk.
+    pub filename: String,
+    /// `FileMediaType` (RFC 9559 §5.1.6.1.3). RFC 6838 media-type
+    /// string. Mandatory on disk.
+    pub mime_type: String,
+    /// `FileData` (RFC 9559 §5.1.6.1.4). The verbatim file payload —
+    /// font bytes, cover-art image, etc. Mandatory on disk.
+    pub data: Vec<u8>,
+    /// `FileUID` (RFC 9559 §5.1.6.1.5). `range: not 0`. `None` → muxer
+    /// auto-derives a stable non-zero UID from the attachment's 1-based
+    /// index.
+    pub uid: Option<u64>,
+    /// `FileDescription` (RFC 9559 §5.1.6.1.1). Optional human-readable
+    /// note. `None` (or `Some("")`) → element omitted on disk.
+    pub description: Option<String>,
+}
+
+impl MkvAttachment {
+    /// Convenience constructor mirroring [`MkvMuxer::add_chapter`]'s
+    /// shape: only the three mandatory on-disk fields. UID is
+    /// auto-derived from the 1-based attachment index; description is
+    /// omitted.
+    pub fn new(
+        filename: impl Into<String>,
+        mime_type: impl Into<String>,
+        data: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            filename: filename.into(),
+            mime_type: mime_type.into(),
+            data: data.into(),
+            uid: None,
+            description: None,
+        }
+    }
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -330,6 +408,7 @@ impl MkvMuxer {
             trailer_written: false,
             doc_type,
             chapters: Vec::new(),
+            attachments: Vec::new(),
             lacing_mode: LacingMode::None,
             lace_pending: vec![LaceBuffer::default(); n],
         })
@@ -439,6 +518,60 @@ impl MkvMuxer {
         &self.chapters
     }
 
+    /// Queue an attached file (RFC 9559 §5.1.6 `AttachedFile`). Must be
+    /// called before [`Muxer::write_header`]; returns [`Error::other`]
+    /// otherwise — the `Attachments` master is emitted up front so the
+    /// demuxer's single-pass header walk catches it.
+    ///
+    /// Spec validation applied at queue time, not at write time, so the
+    /// caller sees the error attached to the offending call:
+    ///
+    /// * `attachment.filename` must be non-empty (`FileName` is
+    ///   `minOccurs / maxOccurs: 1 / 1` per §5.1.6.1.2 and has no
+    ///   default — an empty value would write a zero-length string the
+    ///   demuxer would surface as the empty string, breaking
+    ///   `tag:attachment:N:<name>` scope lookups).
+    /// * `attachment.mime_type` must be non-empty for the same reason
+    ///   (§5.1.6.1.3, mandatory, no default; RFC 6838 media-type string).
+    /// * `attachment.uid == Some(0)` is rejected per `range: not 0`
+    ///   (§5.1.6.1.5). `None` triggers the muxer's auto-derivation from
+    ///   the 1-based attachment index, which is always non-zero.
+    ///
+    /// The attachment is appended to the queue in arrival order; the
+    /// 1-based index the demuxer surfaces (the `N` in
+    /// `attachment:N:filename`) follows arrival order too.
+    pub fn add_attachment(&mut self, attachment: MkvAttachment) -> Result<()> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: add_attachment called after write_header",
+            ));
+        }
+        if attachment.filename.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: attachment FileName is mandatory (RFC 9559 §5.1.6.1.2, minOccurs=1)",
+            ));
+        }
+        if attachment.mime_type.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: attachment FileMediaType is mandatory (RFC 9559 §5.1.6.1.3, minOccurs=1)",
+            ));
+        }
+        if attachment.uid == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: attachment FileUID range: not 0 (RFC 9559 §5.1.6.1.5)",
+            ));
+        }
+        self.attachments.push(attachment);
+        Ok(())
+    }
+
+    /// Read-only view of the queued attachment list. Mirrors
+    /// [`MkvMuxer::chapters`] for tests / upstream callers that want to
+    /// confirm the list before sealing the header.
+    pub fn attachments(&self) -> &[MkvAttachment] {
+        &self.attachments
+    }
+
     /// Construct a plain Matroska muxer. Thin wrapper around the boxed
     /// [`open`] factory for callers that want a concrete type back (e.g. to
     /// introspect its state in tests).
@@ -487,15 +620,15 @@ impl Muxer for MkvMuxer {
         // cluster positions are stored as byte offsets from this point.
         let segment_data_start_in_buf = all.len() as u64;
 
-        // SeekHead with four Seek entries (Info, Tracks, Chapters, Cues).
-        // Each Seek is written at a fixed width (SeekID 4 bytes,
-        // SeekPosition 8 bytes) so we know exactly where to patch in the
-        // real positions later. Info and Tracks SeekPositions are filled
-        // in below before the buffer is flushed; Chapters is filled in
-        // immediately after the Tracks emit (or voided if no chapters
-        // were queued); Cues stays as a placeholder zero and gets patched
-        // in `write_trailer` (or rewritten as a Void element if no Cues
-        // was actually emitted).
+        // SeekHead with five Seek entries (Info, Tracks, Chapters,
+        // Attachments, Cues). Each Seek is written at a fixed width (SeekID
+        // 4 bytes, SeekPosition 8 bytes) so we know exactly where to patch
+        // in the real positions later. Info and Tracks SeekPositions are
+        // filled in below before the buffer is flushed; Chapters and
+        // Attachments are filled in immediately after the Tracks emit (or
+        // voided if no chapters / attachments were queued); Cues stays as a
+        // placeholder zero and gets patched in `write_trailer` (or rewritten
+        // as a Void element if no Cues was actually emitted).
         let seek_head_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
         let seek_head_bytes = build_initial_seek_head();
         let seek_head_start_in_buf = all.len();
@@ -508,7 +641,8 @@ impl Muxer for MkvMuxer {
         let info_seek_entry_in_buf = seek_head_start_in_buf + SEEK_HEAD_HEADER_LEN;
         let tracks_seek_entry_in_buf = info_seek_entry_in_buf + SEEK_ENTRY_LEN;
         let chapters_seek_entry_in_buf = tracks_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        let cues_seek_entry_in_buf = chapters_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        let attachments_seek_entry_in_buf = chapters_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        let cues_seek_entry_in_buf = attachments_seek_entry_in_buf + SEEK_ENTRY_LEN;
         // Sanity: SeekHead occupies a known total size; the next element
         // starts immediately after.
         debug_assert_eq!(seek_head_bytes.len(), SEEK_HEAD_TOTAL_LEN);
@@ -623,6 +757,23 @@ impl Muxer for MkvMuxer {
             Some(chapters_offset_in_buf)
         };
 
+        // Attachments (optional). Same shape as Chapters: emit the
+        // `Attachments` master sandwiched between Chapters and the first
+        // Cluster when `add_attachment` was called before `write_header`.
+        // RFC 9559 §5.1.6 lets the master appear anywhere in the Segment;
+        // sitting it here keeps the demuxer's pre-Cluster header walk
+        // single-pass. If no attachments were queued, the SeekHead
+        // Attachments slot stays at its placeholder zero and gets voided
+        // below.
+        let attachments_offset_opt: Option<u64> = if self.attachments.is_empty() {
+            None
+        } else {
+            let attachments_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
+            let attachments_bytes = build_attachments_element(&self.attachments);
+            all.extend_from_slice(&attachments_bytes);
+            Some(attachments_offset_in_buf)
+        };
+
         // Patch the Info / Tracks SeekPositions in the SeekHead now that we
         // know where each element landed inside `all`. Cues stays as zero
         // and is patched in `write_trailer`.
@@ -648,6 +799,20 @@ impl Muxer for MkvMuxer {
                 // zero that resolves to the SeekHead itself.
                 let void = void_seek_entry();
                 all[chapters_seek_entry_in_buf..chapters_seek_entry_in_buf + SEEK_ENTRY_LEN]
+                    .copy_from_slice(&void);
+            }
+        }
+        match attachments_offset_opt {
+            Some(off) => write_u64_be_at(
+                &mut all,
+                attachments_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                off,
+            ),
+            None => {
+                // No Attachments element emitted — same void treatment as
+                // the Chapters slot above.
+                let void = void_seek_entry();
+                all[attachments_seek_entry_in_buf..attachments_seek_entry_in_buf + SEEK_ENTRY_LEN]
                     .copy_from_slice(&void);
             }
         }
@@ -1342,12 +1507,13 @@ fn write_master_element(buf: &mut Vec<u8>, id: u32, body: &[u8]) {
 // front, so they're patched directly into the buffer before we flush.
 
 /// Number of bytes consumed by the SeekHead header (id + size VINT) before
-/// the first Seek child. `4 + 1 = 5` for our 84-byte body (4 × 21).
+/// the first Seek child. `4 + 1 = 5` for the 105-byte body (5 × 21).
 const SEEK_HEAD_HEADER_LEN: usize = 5;
 /// Number of Seek entries the SeekHead reserves: Info, Tracks, Chapters,
-/// Cues. Chapters and Cues are voided in `write_header` /
-/// `write_trailer` respectively when those elements turn out to be empty.
-const SEEK_HEAD_ENTRY_COUNT: usize = 4;
+/// Attachments, Cues. Chapters / Attachments / Cues are voided in
+/// `write_header` / `write_trailer` respectively when those elements
+/// turn out to be empty.
+const SEEK_HEAD_ENTRY_COUNT: usize = 5;
 /// Total size of the SeekHead element on disk: header + N × 21-byte
 /// Seek entries.
 const SEEK_HEAD_TOTAL_LEN: usize = SEEK_HEAD_HEADER_LEN + SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN;
@@ -1364,14 +1530,16 @@ const SEEK_ENTRY_LEN: usize = 21;
 const SEEK_POS_PAYLOAD_OFFSET: usize = 13;
 
 /// Build the initial SeekHead with placeholder positions for Info,
-/// Tracks, Chapters, and Cues. The caller patches in the real positions
-/// via `write_u64_be_at` once each element's offset is known (or rewrites
-/// the slot as a Void if the element ends up not being emitted).
+/// Tracks, Chapters, Attachments, and Cues. The caller patches in the
+/// real positions via `write_u64_be_at` once each element's offset is
+/// known (or rewrites the slot as a Void if the element ends up not
+/// being emitted).
 fn build_initial_seek_head() -> Vec<u8> {
     let mut body = Vec::with_capacity(SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN);
     body.extend_from_slice(&seek_entry(ids::INFO, 0));
     body.extend_from_slice(&seek_entry(ids::TRACKS, 0));
     body.extend_from_slice(&seek_entry(ids::CHAPTERS, 0));
+    body.extend_from_slice(&seek_entry(ids::ATTACHMENTS, 0));
     body.extend_from_slice(&seek_entry(ids::CUES, 0));
     debug_assert_eq!(body.len(), SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN);
     let mut out = Vec::with_capacity(SEEK_HEAD_TOTAL_LEN);
@@ -1488,5 +1656,60 @@ fn build_chapter_atom(uid: u64, ch: &MkvChapter) -> Vec<u8> {
         }
         write_master_element(&mut body, ids::CHAPTER_DISPLAY, &display_body);
     }
+    body
+}
+
+// --- Attachments ----------------------------------------------------------
+//
+// One `Attachments` master per file, containing one `AttachedFile` per
+// queued entry, in arrival order. Per RFC 9559 §5.1.6.1 the on-disk
+// child set is:
+//
+//   Attachments (0x1941A469)
+//     AttachedFile (0x61A7) × N
+//       FileDescription (0x467E)   — optional UTF-8, §5.1.6.1.1
+//       FileName        (0x466E)   — UTF-8, mandatory, §5.1.6.1.2
+//       FileMediaType   (0x4660)   — string (RFC 6838), mandatory, §5.1.6.1.3
+//       FileData        (0x465C)   — binary, mandatory, §5.1.6.1.4
+//       FileUID         (0x46AE)   — uinteger, mandatory, range: not 0, §5.1.6.1.5
+//
+// We emit children in the demux side's parse order so the typed
+// `Attachment` round-trips field-for-field.
+
+/// Build the bytes of a complete `Attachments` master element from the
+/// queued attachment list. Caller appends the returned slice into the
+/// muxer's outgoing buffer.
+fn build_attachments_element(attachments: &[MkvAttachment]) -> Vec<u8> {
+    let mut attachments_body = Vec::new();
+    for (i, att) in attachments.iter().enumerate() {
+        let index = i as u64 + 1;
+        let file_body = build_attached_file(index, att);
+        write_master_element(&mut attachments_body, ids::ATTACHED_FILE, &file_body);
+    }
+    let mut out = Vec::with_capacity(attachments_body.len() + 8);
+    write_master_element(&mut out, ids::ATTACHMENTS, &attachments_body);
+    out
+}
+
+/// Body of one `AttachedFile` master (the caller wraps it in
+/// `ids::ATTACHED_FILE`). Field order matches the demux side's parse
+/// order so a typed [`crate::demux::Attachment`] round-trips through an
+/// `MkvAttachment` without losing or reordering fields.
+fn build_attached_file(index: u64, att: &MkvAttachment) -> Vec<u8> {
+    let mut body = Vec::new();
+    if let Some(desc) = att.description.as_deref() {
+        if !desc.is_empty() {
+            write_string_element(&mut body, ids::FILE_DESCRIPTION, desc);
+        }
+    }
+    write_string_element(&mut body, ids::FILE_NAME, &att.filename);
+    write_string_element(&mut body, ids::FILE_MIME_TYPE, &att.mime_type);
+    write_bytes_element(&mut body, ids::FILE_DATA, &att.data);
+    // Mandatory `range: not 0` UID — auto-derive from the 1-based
+    // attachment index when the caller passed `None`. The index is
+    // always >= 1, so the resulting UID is always non-zero. The queue
+    // method `add_attachment` rejects an explicit `Some(0)` up front.
+    let uid = att.uid.unwrap_or(index);
+    write_uint_element(&mut body, ids::FILE_UID, uid);
     body
 }
