@@ -202,7 +202,15 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     if cues.is_empty() {
         if let Some(first_cluster) = first_cluster_offset {
             let resume_pos = input.stream_position()?;
-            if scan_cues_from(&mut *input, first_cluster, segment_data_end, &mut cues).is_err() {
+            if scan_cues_from(
+                &mut *input,
+                first_cluster,
+                segment_data_end,
+                &mut cues,
+                &mut crc_status,
+            )
+            .is_err()
+            {
                 cues.clear();
             }
             // Restore reader position to the first cluster for next_packet().
@@ -3424,6 +3432,7 @@ fn scan_cues_from(
     start: u64,
     end: u64,
     out: &mut Vec<CueEntry>,
+    crc_status: &mut Vec<CrcStatus>,
 ) -> Result<()> {
     r.seek(SeekFrom::Start(start))?;
     while r.stream_position()? < end {
@@ -3439,6 +3448,19 @@ fn scan_cues_from(
             if body_end > end {
                 r.seek(SeekFrom::Start(pos))?;
                 return Ok(());
+            }
+            // Validate a leading CRC-32 child on the late-Cues path too
+            // (RFC 9559 §6.2 — Cues SHOULD carry CRC-32 like every other
+            // Top-Level master, and the muxer we ship does). The helper
+            // rewinds the reader to `body_start` before returning, so
+            // `parse_cues` proceeds unaffected — and if the leading child
+            // happens to be a `CRC-32` rather than a `CuePoint`,
+            // `parse_cues` skips it the same way the early-Cues path
+            // does, since it tolerates unknown ids inside Cues.
+            if e.size != VINT_UNKNOWN_SIZE {
+                if let Some(s) = validate_top_level_crc(r, ids::CUES, body_start, body_end)? {
+                    crc_status.push(s);
+                }
             }
             parse_cues(r, body_end, out)?;
             return Ok(());

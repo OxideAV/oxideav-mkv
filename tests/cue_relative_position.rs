@@ -377,6 +377,13 @@ fn extract_cue_positions(bytes: &[u8]) -> Vec<(u64, Option<u64>)> {
     let mut found = Vec::new();
     while r.position() < cues_end {
         let cp = read_element_header(&mut r).expect("cue point");
+        // Skip a leading `CRC-32` child (RFC 8794 §11.3.1, RFC 9559 §6.2)
+        // when present — the muxer puts one at the head of every
+        // Top-Level master, and it's not a CuePoint.
+        if cp.id == ids::CRC32 {
+            r.seek(SeekFrom::Current(cp.size as i64)).unwrap();
+            continue;
+        }
         assert_eq!(cp.id, ids::CUE_POINT);
         let cp_end = r.position() + cp.size;
         while r.position() < cp_end {

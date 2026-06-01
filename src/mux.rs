@@ -31,7 +31,7 @@ use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
-use crate::ebml::{write_element_id, write_vint, VINT_UNKNOWN_SIZE};
+use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
 
 /// Cluster every ~5 seconds (in MKV ms timecode units).
@@ -654,7 +654,7 @@ impl Muxer for MkvMuxer {
         write_uint_element(&mut info_body, ids::TIMECODE_SCALE, 1_000_000); // 1 ms
         write_string_element(&mut info_body, ids::MUXING_APP, "oxideav");
         write_string_element(&mut info_body, ids::WRITING_APP, "oxideav");
-        write_master_element(&mut all, ids::INFO, &info_body);
+        write_master_element_with_crc(&mut all, ids::INFO, &info_body);
 
         // Tracks element.
         let tracks_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
@@ -738,7 +738,7 @@ impl Muxer for MkvMuxer {
             }
             write_master_element(&mut tracks_body, ids::TRACK_ENTRY, &t);
         }
-        write_master_element(&mut all, ids::TRACKS, &tracks_body);
+        write_master_element_with_crc(&mut all, ids::TRACKS, &tracks_body);
 
         // Chapters (optional). If `add_chapter` calls were made before
         // `write_header`, materialise them now as a single EditionEntry
@@ -1060,8 +1060,8 @@ impl MkvMuxer {
             }
             write_master_element(&mut body, ids::CUE_POINT, &cp);
         }
-        let mut out = Vec::with_capacity(body.len() + 8);
-        write_master_element(&mut out, ids::CUES, &body);
+        let mut out = Vec::with_capacity(body.len() + 8 + CRC32_CHILD_LEN);
+        write_master_element_with_crc(&mut out, ids::CUES, &body);
         let cues_abs = self.output.stream_position().unwrap_or(0);
         self.output.write_all(&out)?;
         Ok(Some(cues_abs.saturating_sub(self.segment_data_start)))
@@ -1496,6 +1496,46 @@ fn write_master_element(buf: &mut Vec<u8>, id: u32, body: &[u8]) {
     buf.extend_from_slice(body);
 }
 
+/// Size of a serialised `CRC-32` child element on disk: 1-byte id
+/// `0xBF` + 1-byte size VINT `0x84` (payload-length 4) + 4-byte
+/// little-endian value = 6 bytes total. Constant because RFC 8794
+/// §11.3.1 fixes the `CRC-32` element to exactly 4 payload bytes and
+/// its id encodes in one byte.
+const CRC32_CHILD_LEN: usize = 6;
+
+/// Serialise a `CRC-32` element (RFC 8794 §11.3.1) whose 4-byte
+/// payload is the IEEE CRC-32 of `data`, stored little-endian. The
+/// returned buffer is always `CRC32_CHILD_LEN` bytes long: id `0xBF`
+/// + size VINT `0x84` + four payload bytes.
+fn build_crc32_child(data: &[u8]) -> [u8; CRC32_CHILD_LEN] {
+    let crc = crc32_ieee(data);
+    let bytes = crc.to_le_bytes();
+    [
+        ids::CRC32 as u8, // 0xBF
+        0x84,             // VINT for payload size 4 (marker | 4)
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+    ]
+}
+
+/// Write a master element with a leading `CRC-32` child computed
+/// over `body` (RFC 9559 §6.2: "all Top-Level Elements of an EBML
+/// Document SHOULD include a CRC-32 element as their first Child
+/// Element"). The on-disk shape is
+/// `id | size(crc_child + body) | CRC-32 child | body` so the demuxer
+/// validates the CRC over `body` exactly, matching the demuxer's
+/// existing `validate_top_level_crc` peel-off-leading-CRC rule.
+fn write_master_element_with_crc(buf: &mut Vec<u8>, id: u32, body: &[u8]) {
+    let crc = build_crc32_child(body);
+    let inner_len = CRC32_CHILD_LEN + body.len();
+    buf.extend_from_slice(&write_element_id(id));
+    buf.extend_from_slice(&write_vint(inner_len as u64, 0));
+    buf.extend_from_slice(&crc);
+    buf.extend_from_slice(body);
+}
+
 // --- SeekHead helpers -----------------------------------------------------
 //
 // We emit a fixed-size SeekHead at the very start of the Segment payload so
@@ -1633,8 +1673,8 @@ fn build_chapters_element(chapters: &[MkvChapter]) -> Vec<u8> {
     }
     let mut chapters_body = Vec::new();
     write_master_element(&mut chapters_body, ids::EDITION_ENTRY, &edition_body);
-    let mut out = Vec::with_capacity(chapters_body.len() + 8);
-    write_master_element(&mut out, ids::CHAPTERS, &chapters_body);
+    let mut out = Vec::with_capacity(chapters_body.len() + 8 + CRC32_CHILD_LEN);
+    write_master_element_with_crc(&mut out, ids::CHAPTERS, &chapters_body);
     out
 }
 
@@ -1686,8 +1726,8 @@ fn build_attachments_element(attachments: &[MkvAttachment]) -> Vec<u8> {
         let file_body = build_attached_file(index, att);
         write_master_element(&mut attachments_body, ids::ATTACHED_FILE, &file_body);
     }
-    let mut out = Vec::with_capacity(attachments_body.len() + 8);
-    write_master_element(&mut out, ids::ATTACHMENTS, &attachments_body);
+    let mut out = Vec::with_capacity(attachments_body.len() + 8 + CRC32_CHILD_LEN);
+    write_master_element_with_crc(&mut out, ids::ATTACHMENTS, &attachments_body);
     out
 }
 

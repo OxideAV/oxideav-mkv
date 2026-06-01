@@ -144,12 +144,18 @@ the unified `oxideav` aggregator to wire decoding automatically.
   checks land lazily on the first `next_packet` / `seek_to` that opens
   each Cluster (the element id on a Cluster status is `ids::CLUSTER`),
   with a body-offset dedup so a back-then-forward seek revisiting the
-  same Cluster never produces two statuses for it. A Cluster declared
-  with the unknown-size VINT can't be CRC-checked (the spec requires a
-  bounded body) and produces no status. Validation is informational — a
-  mismatch does **not** abort the open (RFC 8794 §12: a reader MAY
-  ignore the data); strict callers reject any non-valid status. Elements
-  with no `CRC-32` child produce no status (omission is spec-legal).
+  same Cluster never produces two statuses for it. The late best-effort
+  Cues rescan (the path the demuxer uses when `Cues` sits after the
+  final `Cluster` — the common single-pass-mux layout, and the one our
+  own muxer emits) also validates a leading `CRC-32` on the rediscovered
+  `Cues` element and pushes its status, so a Cues CRC mismatch surfaces
+  regardless of whether the `Cues` was placed before or after Clusters.
+  A Cluster declared with the unknown-size VINT can't be CRC-checked
+  (the spec requires a bounded body) and produces no status. Validation
+  is informational — a mismatch does **not** abort the open (RFC 8794
+  §12: a reader MAY ignore the data); strict callers reject any non-
+  valid status. Elements with no `CRC-32` child produce no status
+  (omission is spec-legal).
 - **`TrackOperation` typed decode** (RFC 9559 §5.1.4.1.30): a *virtual*
   track assembled from other tracks. `MkvDemuxer::track_operation(stream_index)`
   (and the per-stream `track_operations()` slice) returns a typed
@@ -377,6 +383,20 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.
+- **CRC-32 on Top-Level masters** (RFC 8794 §11.3.1, RFC 9559 §6.2):
+  the muxer prepends a 6-byte `CRC-32` child (id `0xBF`, fixed size 4,
+  little-endian IEEE CRC-32 of the rest of the element's data) to every
+  Top-Level master it buffers end-to-end before flushing — `Info`,
+  `Tracks`, `Cues`, plus `Chapters` and `Attachments` when those are
+  queued. RFC 9559 §6.2 says "all Top-Level Elements of an EBML Document
+  SHOULD include a CRC-32 element as their first Child Element," and the
+  in-tree demuxer's `validate_top_level_crc` peel-off-leading-CRC rule
+  verifies every emitted master round-trips to a matching stored /
+  computed pair. `SeekHead` is deliberately not CRC'd — its Cues entry
+  is patched in `write_trailer`, which would invalidate any CRC computed
+  up front. `Cluster` is not CRC'd because the muxer streams Clusters
+  with the unknown-size VINT and RFC 8794 §11.3.1 requires a bounded
+  body for CRC.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -427,9 +447,17 @@ so the demuxer never hides an unrecognised track.
 - CRC-32 validation covers Top-Level master elements parsed up front and
   every `Cluster` the demuxer opens through `next_packet` / `seek_to`; the
   late best-effort Cues rescan (when Cues sit after the final Cluster) is
-  not yet checksummed, and a `Cluster` declared with the unknown-size VINT
-  produces no status (RFC 8794 §11.3.1 needs a bounded body). CRC-32 is
-  never written on the mux side.
+  now checksummed too — a leading `CRC-32` child on the late-Cues `Cues`
+  element validates and surfaces through `crc_status()` exactly the same
+  way the up-front masters do. A `Cluster` declared with the unknown-size
+  VINT still produces no status (RFC 8794 §11.3.1 needs a bounded body).
+  The muxer writes a leading `CRC-32` child on every Top-Level master it
+  buffers end-to-end before flushing — `Info`, `Tracks`, `Cues`, plus
+  `Chapters` and `Attachments` when those are queued. `SeekHead` and
+  `Cluster` are deliberately not CRC'd on the mux side: the `SeekHead`
+  Cues entry is patched in `write_trailer` (which would invalidate any
+  CRC computed up front), and `Cluster` is streamed with the unknown-size
+  VINT (RFC 8794 §11.3.1's bounded-body requirement).
 - ContentSignature (RFC 9559 §A.33 reclaimed `0x47E3`) is parsed by neither
   side. The element is reserved for a future per-segment signature scheme.
 - `TrackOperation` is decoded and surfaced (left/right-eye plane combining,
