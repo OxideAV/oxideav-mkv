@@ -31,6 +31,7 @@ use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
+use crate::demux::{FieldOrder, FlagInterlaced};
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
 
@@ -205,6 +206,16 @@ pub struct MkvMuxer {
     /// the keyframe flag of the first packet (the SimpleBlock KEY
     /// bit applies to the whole Block).
     lace_pending: Vec<LaceBuffer>,
+    /// Per-stream `Video > FlagInterlaced` + `FieldOrder` hint queued via
+    /// [`MkvMuxer::set_video_interlacing`] (RFC 9559 §5.1.4.1.28.1 +
+    /// §5.1.4.1.28.2). Materialised inside each video track's `Video`
+    /// master at `write_header` time, alongside `PixelWidth` /
+    /// `PixelHeight`. `None` (the default) means the muxer omits both
+    /// elements for that stream, so the demuxer materialises the spec
+    /// defaults (FlagInterlaced=0, FieldOrder=2). The slice is sized to
+    /// `streams.len()`; non-video tracks must stay `None` (validated at
+    /// `set_video_interlacing` time).
+    video_interlacings: Vec<Option<VideoInterlacingMux>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -355,6 +366,19 @@ impl MkvAttachment {
     }
 }
 
+/// Internal record of a per-track `Video > FlagInterlaced` +
+/// `FieldOrder` muxer hint. Queued by [`MkvMuxer::set_video_interlacing`]
+/// and materialised inside the track's `Video` master at `write_header`
+/// time. `field_order` is `None` unless `flag == FlagInterlaced::Interlaced`
+/// — RFC 9559 §5.1.4.1.28.2 mandates "If FlagInterlaced is not set to 1,
+/// this element MUST be ignored", so a non-interlaced track never carries
+/// an explicit `FieldOrder` on disk under our writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VideoInterlacingMux {
+    flag: FlagInterlaced,
+    field_order: Option<FieldOrder>,
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -411,6 +435,7 @@ impl MkvMuxer {
             attachments: Vec::new(),
             lacing_mode: LacingMode::None,
             lace_pending: vec![LaceBuffer::default(); n],
+            video_interlacings: vec![None; n],
         })
     }
 
@@ -444,6 +469,95 @@ impl MkvMuxer {
     /// (no-lacing) state. Useful for tests + diagnostics.
     pub fn block_lacing_mode(&self) -> LacingMode {
         self.lacing_mode
+    }
+
+    /// Set the per-track `Video > FlagInterlaced` (RFC 9559 §5.1.4.1.28.1)
+    /// and optional `FieldOrder` (§5.1.4.1.28.2) for one stream. Must be
+    /// called before [`Muxer::write_header`]; returns [`Error::other`]
+    /// otherwise — both elements live in the `Video` master inside
+    /// `Tracks`, which is written exactly once at header time.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range
+    ///   indices return [`Error::invalid`].
+    /// * The target stream's [`MediaType`] must be
+    ///   [`MediaType::Video`]. Non-video tracks have no `Video` master,
+    ///   so the `FlagInterlaced` / `FieldOrder` elements have no on-disk
+    ///   home for them and the call is rejected.
+    /// * If `flag` is anything other than [`FlagInterlaced::Interlaced`],
+    ///   `field_order` MUST be `None`. §5.1.4.1.28.2 mandates "If
+    ///   FlagInterlaced is not set to 1, this element MUST be ignored",
+    ///   so the muxer refuses to write a `FieldOrder` element that would
+    ///   be a no-op on every conforming reader. An interlaced track MAY
+    ///   pass `None`; the demuxer materialises the §5.1.4.1.28.2 default
+    ///   `2` (undetermined) in that case.
+    ///
+    /// `FlagInterlaced::Other(v)` and `FieldOrder::Other(v)` round-trip
+    /// their wrapped values verbatim, so a caller copying values from
+    /// another file's `MkvDemuxer::video_interlacing(...)` (including
+    /// forward-compatibility values registered after RFC 9559) gets a
+    /// byte-faithful copy.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value. Calling it on a stream that already has
+    /// `FlagInterlaced::Undetermined` + `field_order: None` is
+    /// functionally a no-op (matches the on-disk omission default).
+    ///
+    /// Returns a mutable reference back so calls can chain
+    /// builder-style if the caller has a `&mut MkvMuxer`.
+    pub fn set_video_interlacing(
+        &mut self,
+        stream_index: usize,
+        flag: FlagInterlaced,
+        field_order: Option<FieldOrder>,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_interlacing called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_interlacing stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_interlacing on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        // §5.1.4.1.28.2: "If FlagInterlaced is not set to 1, this element
+        // MUST be ignored". Writing FieldOrder on a non-Interlaced track
+        // would either be ignored by readers (best case) or trip
+        // §5.1.4.1.28.2 conformance checkers; reject the call so the
+        // caller sees the spec violation up front.
+        if field_order.is_some() && flag != FlagInterlaced::Interlaced {
+            return Err(Error::invalid(
+                "MKV muxer: FieldOrder requires FlagInterlaced::Interlaced per RFC 9559 §5.1.4.1.28.2",
+            ));
+        }
+        self.video_interlacings[stream_index] = Some(VideoInterlacingMux { flag, field_order });
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream interlacing hint
+    /// installed via [`MkvMuxer::set_video_interlacing`]. Returns
+    /// `None` for any stream that didn't have the API called (the
+    /// muxer will omit both `FlagInterlaced` and `FieldOrder` from
+    /// the on-disk `Video` master, and the demuxer materialises the
+    /// §5.1.4.1.28.1 / §5.1.4.1.28.2 spec defaults). Mostly useful
+    /// for tests; production callers typically just configure and
+    /// then call `write_header`.
+    pub fn video_interlacing(
+        &self,
+        stream_index: usize,
+    ) -> Option<(FlagInterlaced, Option<FieldOrder>)> {
+        self.video_interlacings
+            .get(stream_index)?
+            .map(|m| (m.flag, m.field_order))
     }
 
     /// Queue a chapter atom with one English-language `ChapterDisplay`
@@ -728,6 +842,27 @@ impl Muxer for MkvMuxer {
             }
             if s.params.media_type == MediaType::Video {
                 let mut video = Vec::new();
+                // Per RFC 9559 §5.1.4.1.28 the on-disk child order is not
+                // semantically meaningful, but writing fields in the same
+                // order a demuxer typically encounters them (FlagInterlaced
+                // / FieldOrder before PixelWidth/PixelHeight per the IANA
+                // numerical-id ordering, then geometry, then the masters)
+                // keeps the byte layout close to what mkvmerge produces and
+                // keeps diff-friendly fixtures small.
+                if let Some(vi) = self.video_interlacings[i] {
+                    // FlagInterlaced (§5.1.4.1.28.1) — only emitted when
+                    // the caller explicitly opted in. Omitting it lets the
+                    // demuxer materialise the default `0` (undetermined).
+                    write_uint_element(&mut video, ids::FLAG_INTERLACED, vi.flag.to_raw());
+                    // FieldOrder (§5.1.4.1.28.2) — written only when the
+                    // caller paired it with FlagInterlaced::Interlaced.
+                    // set_video_interlacing rejects FieldOrder paired with
+                    // any other flag, so this branch is only taken on
+                    // genuinely-interlaced tracks.
+                    if let Some(fo) = vi.field_order {
+                        write_uint_element(&mut video, ids::FIELD_ORDER, fo.to_raw());
+                    }
+                }
                 if let Some(w) = s.params.width {
                     write_uint_element(&mut video, ids::PIXEL_WIDTH, w as u64);
                 }

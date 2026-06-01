@@ -1532,6 +1532,19 @@ impl FlagInterlaced {
             other => FlagInterlaced::Other(other),
         }
     }
+
+    /// Inverse of [`FlagInterlaced::from_raw`]: convert the typed enum back
+    /// to its on-disk `FlagInterlaced` value (RFC 9559 §5.1.4.1.28.1,
+    /// Table 3). [`FlagInterlaced::Other`] round-trips its wrapped value
+    /// verbatim. Used by the muxer's `Video > FlagInterlaced` write path.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            FlagInterlaced::Undetermined => ids::FLAG_INTERLACED_UNDETERMINED,
+            FlagInterlaced::Interlaced => ids::FLAG_INTERLACED_INTERLACED,
+            FlagInterlaced::Progressive => ids::FLAG_INTERLACED_PROGRESSIVE,
+            FlagInterlaced::Other(v) => v,
+        }
+    }
 }
 
 /// `FieldOrder` (RFC 9559 §5.1.4.1.28.2, Table 4): the field ordering of an
@@ -1574,6 +1587,22 @@ impl FieldOrder {
             ids::FIELD_ORDER_TFF_INTERLEAVED => FieldOrder::TffInterleaved,
             ids::FIELD_ORDER_BFF_INTERLEAVED => FieldOrder::BffInterleaved,
             other => FieldOrder::Other(other),
+        }
+    }
+
+    /// Inverse of [`FieldOrder::from_raw`]: convert the typed enum back to
+    /// its on-disk `FieldOrder` value (RFC 9559 §5.1.4.1.28.2, Table 4).
+    /// [`FieldOrder::Other`] round-trips its wrapped value verbatim. Used
+    /// by the muxer's `Video > FieldOrder` write path.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            FieldOrder::Progressive => ids::FIELD_ORDER_PROGRESSIVE,
+            FieldOrder::Tff => ids::FIELD_ORDER_TFF,
+            FieldOrder::Undetermined => ids::FIELD_ORDER_UNDETERMINED,
+            FieldOrder::Bff => ids::FIELD_ORDER_BFF,
+            FieldOrder::TffInterleaved => ids::FIELD_ORDER_TFF_INTERLEAVED,
+            FieldOrder::BffInterleaved => ids::FIELD_ORDER_BFF_INTERLEAVED,
+            FieldOrder::Other(v) => v,
         }
     }
 }

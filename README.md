@@ -397,6 +397,24 @@ the unified `oxideav` aggregator to wire decoding automatically.
   up front. `Cluster` is not CRC'd because the muxer streams Clusters
   with the unknown-size VINT and RFC 8794 §11.3.1 requires a bounded
   body for CRC.
+- **`Video > FlagInterlaced` + `FieldOrder` on write** (RFC 9559
+  §5.1.4.1.28.1 + §5.1.4.1.28.2): `MkvMuxer::set_video_interlacing(
+  stream_index, FlagInterlaced, Option<FieldOrder>)` queues a per-track
+  interlacing hint that lands inside the track's `Video` master at
+  `write_header` time, alongside the existing `PixelWidth` /
+  `PixelHeight`. The demux-side `FlagInterlaced` / `FieldOrder` enums
+  gained `to_raw()` inverses so every Table 3 / Table 4 value
+  round-trips, including the `Other(u64)` forward-compat variant on
+  both. Spec rules enforced at queue time: the call rejects
+  post-`write_header` use, out-of-range `stream_index`, non-video
+  tracks, and `FieldOrder` paired with anything other than
+  `FlagInterlaced::Interlaced` (the §5.1.4.1.28.2 "If FlagInterlaced is
+  not set to 1, this element MUST be ignored" rule applied
+  symmetrically on write). Omitting the call leaves both elements
+  off-disk so the demuxer materialises the §5.1.4.1.28.1 default `0` /
+  §5.1.4.1.28.2 default `2` (Undetermined). Pairs symmetrically with
+  the existing `MkvDemuxer::video_interlacing` typed accessor — a
+  mux→demux pipeline preserves the interlacing pair bit-exactly.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -490,9 +508,13 @@ so the demuxer never hides an unrecognised track.
   surfaces through `video_alpha_mode`; the reclaimed Appendix-A
   `AspectRatioType` element surfaces through
   `video_aspect_ratio_type`; and `UncompressedFourCC`
-  (§5.1.4.1.28.15) surfaces through `video_uncompressed_fourcc`. None
-  of the `Video` sub-elements above the PixelWidth/PixelHeight pair are
-  written on the mux side.
+  (§5.1.4.1.28.15) surfaces through `video_uncompressed_fourcc`. On the
+  mux side, `PixelWidth` / `PixelHeight` plus the new opt-in
+  `FlagInterlaced` / `FieldOrder` pair (`MkvMuxer::set_video_interlacing`,
+  §5.1.4.1.28.1 + §5.1.4.1.28.2) are written; the remaining `Video`
+  sub-elements (StereoMode, AlphaMode, geometry quartet, Colour /
+  MasteringMetadata, Projection, AspectRatioType, UncompressedFourCC)
+  are not yet written.
 
 ## Robustness
 
