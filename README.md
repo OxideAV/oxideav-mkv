@@ -415,6 +415,27 @@ the unified `oxideav` aggregator to wire decoding automatically.
   §5.1.4.1.28.2 default `2` (Undetermined). Pairs symmetrically with
   the existing `MkvDemuxer::video_interlacing` typed accessor — a
   mux→demux pipeline preserves the interlacing pair bit-exactly.
+- **`Video > StereoMode` + `AlphaMode` on write** (RFC 9559
+  §5.1.4.1.28.3 + §5.1.4.1.28.4):
+  `MkvMuxer::set_video_stereo_mode(stream_index, StereoMode)` and
+  `MkvMuxer::set_video_alpha_mode(stream_index, AlphaMode)` queue
+  per-track hints that land inside the track's `Video` master at
+  `write_header` time. The demux-side `StereoMode` and `AlphaMode`
+  enums gained `to_raw()` inverses so every Table 5 / Table 6 value
+  round-trips, including the `Other(u64)` forward-compat variant on
+  both (§27.7 / §27.8 leave the "Matroska Stereo Modes" / "Matroska
+  Alpha Modes" registries open). Spec rules enforced at queue time:
+  both setters reject post-`write_header` use, out-of-range
+  `stream_index`, and calls on non-video tracks. The two settings are
+  independent — setting one does not affect the other. Omitting the
+  call leaves the element off-disk so the demuxer materialises the
+  §5.1.4.1.28.3 default `0` (`Mono`) / §5.1.4.1.28.4 default `0`
+  (`None`). Calling `set_video_stereo_mode(_, StereoMode::Mono)` /
+  `set_video_alpha_mode(_, AlphaMode::None)` explicitly still writes
+  the element on disk — that is the way for a producer to override a
+  downstream tool that might infer something else. Pairs symmetrically
+  with the existing `MkvDemuxer::video_stereo_mode` /
+  `MkvDemuxer::video_alpha_mode` typed accessors.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -509,12 +530,14 @@ so the demuxer never hides an unrecognised track.
   `AspectRatioType` element surfaces through
   `video_aspect_ratio_type`; and `UncompressedFourCC`
   (§5.1.4.1.28.15) surfaces through `video_uncompressed_fourcc`. On the
-  mux side, `PixelWidth` / `PixelHeight` plus the new opt-in
-  `FlagInterlaced` / `FieldOrder` pair (`MkvMuxer::set_video_interlacing`,
-  §5.1.4.1.28.1 + §5.1.4.1.28.2) are written; the remaining `Video`
-  sub-elements (StereoMode, AlphaMode, geometry quartet, Colour /
-  MasteringMetadata, Projection, AspectRatioType, UncompressedFourCC)
-  are not yet written.
+  mux side, `PixelWidth` / `PixelHeight`, the `FlagInterlaced` /
+  `FieldOrder` pair (`MkvMuxer::set_video_interlacing`,
+  §5.1.4.1.28.1 + §5.1.4.1.28.2), and the `StereoMode` / `AlphaMode`
+  pair (`MkvMuxer::set_video_stereo_mode` /
+  `MkvMuxer::set_video_alpha_mode`, §5.1.4.1.28.3 + §5.1.4.1.28.4) are
+  written; the remaining `Video` sub-elements (geometry quartet,
+  Colour / MasteringMetadata, Projection, AspectRatioType,
+  UncompressedFourCC) are not yet written.
 
 ## Robustness
 

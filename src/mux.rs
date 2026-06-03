@@ -31,7 +31,7 @@ use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
-use crate::demux::{FieldOrder, FlagInterlaced};
+use crate::demux::{AlphaMode, FieldOrder, FlagInterlaced, StereoMode};
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
 
@@ -216,6 +216,24 @@ pub struct MkvMuxer {
     /// `streams.len()`; non-video tracks must stay `None` (validated at
     /// `set_video_interlacing` time).
     video_interlacings: Vec<Option<VideoInterlacingMux>>,
+    /// Per-stream `Video > StereoMode` hint queued via
+    /// [`MkvMuxer::set_video_stereo_mode`] (RFC 9559 §5.1.4.1.28.3).
+    /// Materialised inside each video track's `Video` master at
+    /// `write_header` time. `None` (the default) means the muxer omits
+    /// the element entirely, so the demuxer materialises the spec
+    /// default `0` ([`StereoMode::Mono`]). The slice is sized to
+    /// `streams.len()`; non-video tracks must stay `None` (validated
+    /// at `set_video_stereo_mode` time).
+    video_stereo_modes: Vec<Option<StereoMode>>,
+    /// Per-stream `Video > AlphaMode` hint queued via
+    /// [`MkvMuxer::set_video_alpha_mode`] (RFC 9559 §5.1.4.1.28.4).
+    /// Materialised inside each video track's `Video` master at
+    /// `write_header` time. `None` (the default) means the muxer omits
+    /// the element entirely, so the demuxer materialises the spec
+    /// default `0` ([`AlphaMode::None`]). The slice is sized to
+    /// `streams.len()`; non-video tracks must stay `None` (validated
+    /// at `set_video_alpha_mode` time).
+    video_alpha_modes: Vec<Option<AlphaMode>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -436,6 +454,8 @@ impl MkvMuxer {
             lacing_mode: LacingMode::None,
             lace_pending: vec![LaceBuffer::default(); n],
             video_interlacings: vec![None; n],
+            video_stereo_modes: vec![None; n],
+            video_alpha_modes: vec![None; n],
         })
     }
 
@@ -558,6 +578,128 @@ impl MkvMuxer {
         self.video_interlacings
             .get(stream_index)?
             .map(|m| (m.flag, m.field_order))
+    }
+
+    /// Set the per-track `Video > StereoMode` (RFC 9559 §5.1.4.1.28.3) for
+    /// one stream. Must be called before [`Muxer::write_header`]; returns
+    /// [`Error::other`] otherwise — the element lives in the `Video` master
+    /// inside `Tracks`, which is written exactly once at header time.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range
+    ///   indices return [`Error::invalid`].
+    /// * The target stream's [`MediaType`] must be [`MediaType::Video`].
+    ///   Non-video tracks have no `Video` master, so the element has no
+    ///   on-disk home and the call is rejected.
+    ///
+    /// [`StereoMode::Other(v)`] round-trips its wrapped value verbatim, so
+    /// a caller copying a value from another file's
+    /// `MkvDemuxer::video_stereo_mode(...)` (including forward-compat values
+    /// registered in §27.7 after RFC 9559) gets a byte-faithful copy.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value. Calling it with [`StereoMode::Mono`] (the
+    /// spec default per §5.1.4.1.28.3) still writes the element on disk —
+    /// that is the explicit way to override a downstream tool that might
+    /// otherwise infer something else. Omitting the call entirely is
+    /// functionally a no-op (matches the on-disk omission default).
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_video_stereo_mode(
+        &mut self,
+        stream_index: usize,
+        mode: StereoMode,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_stereo_mode called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_stereo_mode stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_stereo_mode on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        self.video_stereo_modes[stream_index] = Some(mode);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `StereoMode` hint
+    /// installed via [`MkvMuxer::set_video_stereo_mode`]. Returns `None`
+    /// for any stream that didn't have the API called (the muxer will
+    /// omit `StereoMode` from the on-disk `Video` master, and the demuxer
+    /// materialises the §5.1.4.1.28.3 spec default `0` mono). Mostly
+    /// useful for tests; production callers typically just configure and
+    /// then call `write_header`.
+    pub fn video_stereo_mode(&self, stream_index: usize) -> Option<StereoMode> {
+        *self.video_stereo_modes.get(stream_index)?
+    }
+
+    /// Set the per-track `Video > AlphaMode` (RFC 9559 §5.1.4.1.28.4) for
+    /// one stream. Must be called before [`Muxer::write_header`]; returns
+    /// [`Error::other`] otherwise — the element lives in the `Video` master
+    /// inside `Tracks`, which is written exactly once at header time.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range
+    ///   indices return [`Error::invalid`].
+    /// * The target stream's [`MediaType`] must be [`MediaType::Video`].
+    ///   Non-video tracks have no `Video` master and the call is rejected.
+    ///
+    /// Note that §5.1.4.1.28.4 itself warns that values outside `0` / `1`
+    /// "SHOULD NOT be used, as the behavior of known implementations is
+    /// different". [`AlphaMode::Other(v)`] is still accepted (and round-trips
+    /// verbatim) for forward-compatibility with the §27.8 registry — the
+    /// caller is responsible for knowing whether the consuming decoder
+    /// understands the value.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value.
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_video_alpha_mode(
+        &mut self,
+        stream_index: usize,
+        mode: AlphaMode,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_alpha_mode called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_alpha_mode stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_alpha_mode on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        self.video_alpha_modes[stream_index] = Some(mode);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `AlphaMode` hint
+    /// installed via [`MkvMuxer::set_video_alpha_mode`]. Returns `None`
+    /// for any stream that didn't have the API called (the muxer will
+    /// omit `AlphaMode` from the on-disk `Video` master, and the demuxer
+    /// materialises the §5.1.4.1.28.4 spec default `0` none). Mostly
+    /// useful for tests.
+    pub fn video_alpha_mode(&self, stream_index: usize) -> Option<AlphaMode> {
+        *self.video_alpha_modes.get(stream_index)?
     }
 
     /// Queue a chapter atom with one English-language `ChapterDisplay`
@@ -862,6 +1004,18 @@ impl Muxer for MkvMuxer {
                     if let Some(fo) = vi.field_order {
                         write_uint_element(&mut video, ids::FIELD_ORDER, fo.to_raw());
                     }
+                }
+                // StereoMode (§5.1.4.1.28.3) — written only when the caller
+                // explicitly opted in via `set_video_stereo_mode`. Omitting
+                // it lets the demuxer materialise the spec default `0` mono.
+                if let Some(sm) = self.video_stereo_modes[i] {
+                    write_uint_element(&mut video, ids::STEREO_MODE, sm.to_raw());
+                }
+                // AlphaMode (§5.1.4.1.28.4) — written only when the caller
+                // explicitly opted in via `set_video_alpha_mode`. Omitting
+                // it lets the demuxer materialise the spec default `0` none.
+                if let Some(am) = self.video_alpha_modes[i] {
+                    write_uint_element(&mut video, ids::ALPHA_MODE, am.to_raw());
                 }
                 if let Some(w) = s.params.width {
                     write_uint_element(&mut video, ids::PIXEL_WIDTH, w as u64);

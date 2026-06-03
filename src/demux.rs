@@ -1696,6 +1696,35 @@ impl StereoMode {
     pub fn is_stereo(&self) -> bool {
         !matches!(self, StereoMode::Mono)
     }
+
+    /// Inverse of [`StereoMode::from_raw`]: convert the typed enum back to its
+    /// on-disk `StereoMode` value (RFC 9559 §5.1.4.1.28.3, Table 5).
+    /// [`StereoMode::Other`] round-trips its wrapped value verbatim. Used by
+    /// the muxer's `Video > StereoMode` write path.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            StereoMode::Mono => ids::STEREO_MODE_MONO,
+            StereoMode::SideBySideLeftFirst => ids::STEREO_MODE_SIDE_BY_SIDE_LEFT_FIRST,
+            StereoMode::TopBottomRightFirst => ids::STEREO_MODE_TOP_BOTTOM_RIGHT_FIRST,
+            StereoMode::TopBottomLeftFirst => ids::STEREO_MODE_TOP_BOTTOM_LEFT_FIRST,
+            StereoMode::CheckboardRightFirst => ids::STEREO_MODE_CHECKBOARD_RIGHT_FIRST,
+            StereoMode::CheckboardLeftFirst => ids::STEREO_MODE_CHECKBOARD_LEFT_FIRST,
+            StereoMode::RowInterleavedRightFirst => ids::STEREO_MODE_ROW_INTERLEAVED_RIGHT_FIRST,
+            StereoMode::RowInterleavedLeftFirst => ids::STEREO_MODE_ROW_INTERLEAVED_LEFT_FIRST,
+            StereoMode::ColumnInterleavedRightFirst => {
+                ids::STEREO_MODE_COLUMN_INTERLEAVED_RIGHT_FIRST
+            }
+            StereoMode::ColumnInterleavedLeftFirst => {
+                ids::STEREO_MODE_COLUMN_INTERLEAVED_LEFT_FIRST
+            }
+            StereoMode::AnaglyphCyanRed => ids::STEREO_MODE_ANAGLYPH_CYAN_RED,
+            StereoMode::SideBySideRightFirst => ids::STEREO_MODE_SIDE_BY_SIDE_RIGHT_FIRST,
+            StereoMode::AnaglyphGreenMagenta => ids::STEREO_MODE_ANAGLYPH_GREEN_MAGENTA,
+            StereoMode::BothEyesLacedLeftFirst => ids::STEREO_MODE_BOTH_EYES_LACED_LEFT_FIRST,
+            StereoMode::BothEyesLacedRightFirst => ids::STEREO_MODE_BOTH_EYES_LACED_RIGHT_FIRST,
+            StereoMode::Other(v) => v,
+        }
+    }
 }
 
 /// `ProjectionType` (RFC 9559 §5.1.4.1.28.42, Table 18): the projection used
@@ -1877,6 +1906,18 @@ impl AlphaMode {
     /// implementation-defined.
     pub fn has_alpha(&self) -> bool {
         matches!(self, AlphaMode::Present)
+    }
+
+    /// Inverse of [`AlphaMode::from_raw`]: convert the typed enum back to its
+    /// on-disk `AlphaMode` value (RFC 9559 §5.1.4.1.28.4, Table 6).
+    /// [`AlphaMode::Other`] round-trips its wrapped value verbatim. Used by
+    /// the muxer's `Video > AlphaMode` write path.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            AlphaMode::None => ids::ALPHA_MODE_NONE,
+            AlphaMode::Present => ids::ALPHA_MODE_PRESENT,
+            AlphaMode::Other(v) => v,
+        }
     }
 }
 
