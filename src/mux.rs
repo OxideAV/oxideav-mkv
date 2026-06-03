@@ -31,7 +31,7 @@ use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
-use crate::demux::{AlphaMode, FieldOrder, FlagInterlaced, StereoMode};
+use crate::demux::{AlphaMode, DisplayUnit, FieldOrder, FlagInterlaced, StereoMode};
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
 
@@ -234,6 +234,18 @@ pub struct MkvMuxer {
     /// `streams.len()`; non-video tracks must stay `None` (validated
     /// at `set_video_alpha_mode` time).
     video_alpha_modes: Vec<Option<AlphaMode>>,
+    /// Per-stream `Video > PixelCrop{Top,Bottom,Left,Right}` +
+    /// `DisplayWidth` / `DisplayHeight` / `DisplayUnit` hint queued via
+    /// [`MkvMuxer::set_video_geometry`] (RFC 9559
+    /// §5.1.4.1.28.8..§5.1.4.1.28.14). Materialised inside each video
+    /// track's `Video` master at `write_header` time, alongside
+    /// `PixelWidth` / `PixelHeight`. `None` (the default) means the
+    /// muxer omits all seven geometry elements for that stream, so the
+    /// demuxer materialises the spec defaults (zero crops, derived
+    /// display dimensions, `DisplayUnit::Pixels`). The slice is sized
+    /// to `streams.len()`; non-video tracks must stay `None` (validated
+    /// at `set_video_geometry` time).
+    video_geometries: Vec<Option<MkvVideoGeometry>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -397,6 +409,87 @@ struct VideoInterlacingMux {
     field_order: Option<FieldOrder>,
 }
 
+/// Per-track `Video > PixelCrop{Top,Bottom,Left,Right}` (RFC 9559
+/// §5.1.4.1.28.8..§5.1.4.1.28.11) plus `DisplayWidth` (§5.1.4.1.28.12) /
+/// `DisplayHeight` (§5.1.4.1.28.13) / `DisplayUnit` (§5.1.4.1.28.14) muxer
+/// hint. Queued by [`MkvMuxer::set_video_geometry`] and materialised inside
+/// the track's `Video` master at `write_header` time, alongside `PixelWidth`
+/// / `PixelHeight`.
+///
+/// Field handling per the spec:
+///
+/// * `crop_top`, `crop_bottom`, `crop_left`, `crop_right` —
+///   `PixelCrop{Top,Bottom,Left,Right}`. The spec ranges them at
+///   `0` default and the muxer writes the explicit element only for
+///   non-zero values; a zero crop is left off-disk so the demuxer
+///   materialises the §5.1.4.1.28.8..11 default `0`.
+/// * `display_width`, `display_height` — `DisplayWidth` / `DisplayHeight`.
+///   `range: not 0` per §5.1.4.1.28.12 / .13. `None` skips the element;
+///   `Some(0)` is rejected at queue time. The demuxer materialises the
+///   spec-derived default (`PixelWidth - PixelCropLeft - PixelCropRight`,
+///   resp.) only when `display_unit == Pixels`.
+/// * `display_unit` — `DisplayUnit` (Table 10). The default is
+///   [`DisplayUnit::Pixels`] (`0`); the muxer omits the element when set
+///   to `Pixels` so the file stays minimal, and writes it explicitly for
+///   every other variant (including [`DisplayUnit::Other`] for §27.9
+///   forward-compat values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MkvVideoGeometry {
+    /// `PixelCropTop` (RFC 9559 §5.1.4.1.28.9). Spec default `0`.
+    pub crop_top: u64,
+    /// `PixelCropBottom` (RFC 9559 §5.1.4.1.28.8). Spec default `0`.
+    pub crop_bottom: u64,
+    /// `PixelCropLeft` (RFC 9559 §5.1.4.1.28.10). Spec default `0`.
+    pub crop_left: u64,
+    /// `PixelCropRight` (RFC 9559 §5.1.4.1.28.11). Spec default `0`.
+    pub crop_right: u64,
+    /// `DisplayWidth` (RFC 9559 §5.1.4.1.28.12). `range: not 0`; `None`
+    /// skips the element on disk.
+    pub display_width: Option<u64>,
+    /// `DisplayHeight` (RFC 9559 §5.1.4.1.28.13). `range: not 0`; `None`
+    /// skips the element on disk.
+    pub display_height: Option<u64>,
+    /// `DisplayUnit` (RFC 9559 §5.1.4.1.28.14, Table 10). Spec default
+    /// `0` ([`DisplayUnit::Pixels`]); the muxer omits the element when set
+    /// to `Pixels` and writes it explicitly otherwise.
+    pub display_unit: DisplayUnit,
+}
+
+impl MkvVideoGeometry {
+    /// Convenience constructor for the pillar-box / letterbox case worked
+    /// in RFC 9559 §11.1: equal left+right or top+bottom crops, no
+    /// display-size override, default `Pixels` unit. The four cropped
+    /// edges hide encoded padding; the demuxer derives `DisplayWidth` /
+    /// `DisplayHeight` from `PixelWidth - crops`.
+    pub fn cropped(top: u64, bottom: u64, left: u64, right: u64) -> Self {
+        Self {
+            crop_top: top,
+            crop_bottom: bottom,
+            crop_left: left,
+            crop_right: right,
+            display_width: None,
+            display_height: None,
+            display_unit: DisplayUnit::Pixels,
+        }
+    }
+
+    /// Convenience constructor for an aspect-ratio override: no crops,
+    /// `DisplayUnit::DisplayAspectRatio` and the `(num, den)` ratio
+    /// encoded into `DisplayWidth` / `DisplayHeight` per RFC 9559
+    /// §5.1.4.1.28.14 (Table 10 value `3`).
+    pub fn aspect_ratio(num: u64, den: u64) -> Self {
+        Self {
+            crop_top: 0,
+            crop_bottom: 0,
+            crop_left: 0,
+            crop_right: 0,
+            display_width: Some(num),
+            display_height: Some(den),
+            display_unit: DisplayUnit::DisplayAspectRatio,
+        }
+    }
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -456,6 +549,7 @@ impl MkvMuxer {
             video_interlacings: vec![None; n],
             video_stereo_modes: vec![None; n],
             video_alpha_modes: vec![None; n],
+            video_geometries: vec![None; n],
         })
     }
 
@@ -700,6 +794,98 @@ impl MkvMuxer {
     /// useful for tests.
     pub fn video_alpha_mode(&self, stream_index: usize) -> Option<AlphaMode> {
         *self.video_alpha_modes.get(stream_index)?
+    }
+
+    /// Set the per-track `Video > PixelCrop{Top,Bottom,Left,Right}` +
+    /// `DisplayWidth` / `DisplayHeight` / `DisplayUnit` geometry quartet
+    /// (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14) for one stream. Must be
+    /// called before [`Muxer::write_header`]; returns [`Error::other`]
+    /// otherwise — every targeted element lives in the `Video` master
+    /// inside `Tracks`, which is written exactly once at header time.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range
+    ///   indices return [`Error::invalid`].
+    /// * The target stream's [`MediaType`] must be [`MediaType::Video`].
+    ///   Non-video tracks have no `Video` master, so the elements have no
+    ///   on-disk home and the call is rejected.
+    /// * `display_width == Some(0)` and `display_height == Some(0)` are
+    ///   rejected. RFC 9559 §5.1.4.1.28.12 / .13 explicitly pins both
+    ///   elements at `range: not 0`. Use `None` to leave the element off
+    ///   disk instead.
+    ///
+    /// Element omission rules at write time:
+    ///
+    /// * A zero crop on any of the four axes is left off-disk so the
+    ///   demuxer materialises the §5.1.4.1.28.8..11 default `0`. A
+    ///   non-zero crop is always written explicitly.
+    /// * `display_width` / `display_height` are written when `Some`,
+    ///   skipped when `None`. When skipped + `display_unit == Pixels`,
+    ///   the demuxer derives the value from `PixelWidth - crop_left -
+    ///   crop_right` (resp. height). Skipped + non-Pixels: the demuxer
+    ///   returns `None` (the spec mandates "there is no default value").
+    /// * `display_unit` is written when not [`DisplayUnit::Pixels`].
+    ///   Setting it to `Pixels` (the spec default) is treated as "omit
+    ///   the element" so a downstream re-mux of a file that did not
+    ///   carry an explicit `DisplayUnit` stays byte-faithful to the
+    ///   common case. [`DisplayUnit::Other(v)`] round-trips its wrapped
+    ///   value verbatim for §27.9 forward-compat.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value. Calling it with a zero-everything
+    /// [`MkvVideoGeometry::default()`] is functionally a no-op (matches
+    /// the on-disk omission default).
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_video_geometry(
+        &mut self,
+        stream_index: usize,
+        geometry: MkvVideoGeometry,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_geometry called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_geometry stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_geometry on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        // §5.1.4.1.28.12 / .13: DisplayWidth / DisplayHeight are pinned at
+        // `range: not 0`. Reject Some(0) so a caller who meant "omit"
+        // hears about the spec violation up front rather than producing a
+        // file conforming readers will refuse to load.
+        if matches!(geometry.display_width, Some(0)) {
+            return Err(Error::invalid(
+                "MKV muxer: set_video_geometry display_width == Some(0) violates RFC 9559 §5.1.4.1.28.12 (range: not 0). Use None to omit the element.",
+            ));
+        }
+        if matches!(geometry.display_height, Some(0)) {
+            return Err(Error::invalid(
+                "MKV muxer: set_video_geometry display_height == Some(0) violates RFC 9559 §5.1.4.1.28.13 (range: not 0). Use None to omit the element.",
+            ));
+        }
+        self.video_geometries[stream_index] = Some(geometry);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream geometry hint
+    /// installed via [`MkvMuxer::set_video_geometry`]. Returns `None`
+    /// for any stream that didn't have the API called (the muxer will
+    /// omit all seven geometry elements from the on-disk `Video` master,
+    /// and the demuxer materialises the §5.1.4.1.28.8..14 spec defaults).
+    /// Mostly useful for tests.
+    pub fn video_geometry(&self, stream_index: usize) -> Option<MkvVideoGeometry> {
+        *self.video_geometries.get(stream_index)?
     }
 
     /// Queue a chapter atom with one English-language `ChapterDisplay`
@@ -1022,6 +1208,35 @@ impl Muxer for MkvMuxer {
                 }
                 if let Some(h) = s.params.height {
                     write_uint_element(&mut video, ids::PIXEL_HEIGHT, h as u64);
+                }
+                // PixelCrop{Top,Bottom,Left,Right} (§5.1.4.1.28.8..11) +
+                // DisplayWidth (§.12) / DisplayHeight (§.13) / DisplayUnit
+                // (§.14). Per-element omission rules per the docstring on
+                // `set_video_geometry`: zero crops stay off-disk (spec
+                // default `0`), `display_*` written when `Some`,
+                // `DisplayUnit::Pixels` (the spec default) stays off-disk.
+                if let Some(g) = self.video_geometries[i] {
+                    if g.crop_top != 0 {
+                        write_uint_element(&mut video, ids::PIXEL_CROP_TOP, g.crop_top);
+                    }
+                    if g.crop_bottom != 0 {
+                        write_uint_element(&mut video, ids::PIXEL_CROP_BOTTOM, g.crop_bottom);
+                    }
+                    if g.crop_left != 0 {
+                        write_uint_element(&mut video, ids::PIXEL_CROP_LEFT, g.crop_left);
+                    }
+                    if g.crop_right != 0 {
+                        write_uint_element(&mut video, ids::PIXEL_CROP_RIGHT, g.crop_right);
+                    }
+                    if let Some(dw) = g.display_width {
+                        write_uint_element(&mut video, ids::DISPLAY_WIDTH, dw);
+                    }
+                    if let Some(dh) = g.display_height {
+                        write_uint_element(&mut video, ids::DISPLAY_HEIGHT, dh);
+                    }
+                    if g.display_unit != DisplayUnit::Pixels {
+                        write_uint_element(&mut video, ids::DISPLAY_UNIT, g.display_unit.to_raw());
+                    }
                 }
                 write_master_element(&mut t, ids::VIDEO, &video);
             }

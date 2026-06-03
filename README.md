@@ -415,6 +415,34 @@ the unified `oxideav` aggregator to wire decoding automatically.
   §5.1.4.1.28.2 default `2` (Undetermined). Pairs symmetrically with
   the existing `MkvDemuxer::video_interlacing` typed accessor — a
   mux→demux pipeline preserves the interlacing pair bit-exactly.
+- **`Video` geometry quartet on write** (RFC 9559
+  §5.1.4.1.28.8..§5.1.4.1.28.14):
+  `MkvMuxer::set_video_geometry(stream_index, MkvVideoGeometry)` queues a
+  per-track hint that lands inside the track's `Video` master at
+  `write_header` time, alongside `PixelWidth` / `PixelHeight`. The hint
+  carries `PixelCrop{Top,Bottom,Left,Right}` (§5.1.4.1.28.8..11),
+  `DisplayWidth` / `DisplayHeight` (§5.1.4.1.28.12 / .13), and
+  `DisplayUnit` (§5.1.4.1.28.14). The demux-side `DisplayUnit` enum
+  gained a `to_raw()` inverse so every Table 10 value round-trips,
+  including the `Other(u64)` forward-compat variant (§27.9 leaves the
+  "Matroska Display Units" registry open). Per-element omission rules:
+  zero crops stay off-disk (spec default `0`); `DisplayWidth` /
+  `DisplayHeight` are written when `Some` and skipped when `None`;
+  `DisplayUnit` is written explicitly only for non-`Pixels` values
+  (omitting it lets the demuxer materialise the §5.1.4.1.28.14 spec
+  default). Spec rules enforced at queue time: rejects post-`write_header`
+  use, out-of-range `stream_index`, calls on non-video tracks, and
+  `Some(0)` on either `display_width` / `display_height` per the
+  §5.1.4.1.28.12 / .13 `range: not 0` pin. Convenience constructors
+  `MkvVideoGeometry::cropped(top, bottom, left, right)` (RFC 9559 §11.1
+  pillar-box / letterbox shape, no display-size override, `Pixels` unit)
+  and `MkvVideoGeometry::aspect_ratio(num, den)`
+  (`DisplayUnit::DisplayAspectRatio` + the ratio encoded as
+  `DisplayWidth` / `DisplayHeight`) cover the two common shapes. Pairs
+  symmetrically with the existing `MkvDemuxer::video_geometry` typed
+  accessor — a mux→demux pipeline preserves the quartet bit-exactly,
+  including the §5.1.4.1.28.12 / .13 derived-default behaviour when
+  display dimensions were omitted on write and `DisplayUnit == Pixels`.
 - **`Video > StereoMode` + `AlphaMode` on write** (RFC 9559
   §5.1.4.1.28.3 + §5.1.4.1.28.4):
   `MkvMuxer::set_video_stereo_mode(stream_index, StereoMode)` and
@@ -532,12 +560,15 @@ so the demuxer never hides an unrecognised track.
   (§5.1.4.1.28.15) surfaces through `video_uncompressed_fourcc`. On the
   mux side, `PixelWidth` / `PixelHeight`, the `FlagInterlaced` /
   `FieldOrder` pair (`MkvMuxer::set_video_interlacing`,
-  §5.1.4.1.28.1 + §5.1.4.1.28.2), and the `StereoMode` / `AlphaMode`
+  §5.1.4.1.28.1 + §5.1.4.1.28.2), the `StereoMode` / `AlphaMode`
   pair (`MkvMuxer::set_video_stereo_mode` /
-  `MkvMuxer::set_video_alpha_mode`, §5.1.4.1.28.3 + §5.1.4.1.28.4) are
-  written; the remaining `Video` sub-elements (geometry quartet,
-  Colour / MasteringMetadata, Projection, AspectRatioType,
-  UncompressedFourCC) are not yet written.
+  `MkvMuxer::set_video_alpha_mode`, §5.1.4.1.28.3 + §5.1.4.1.28.4), and
+  the `PixelCrop{Top,Bottom,Left,Right}` + `DisplayWidth` /
+  `DisplayHeight` / `DisplayUnit` quartet
+  (`MkvMuxer::set_video_geometry`, §5.1.4.1.28.8..§5.1.4.1.28.14) are
+  written; the remaining `Video` sub-elements (Colour /
+  MasteringMetadata, Projection, AspectRatioType, UncompressedFourCC)
+  are not yet written.
 
 ## Robustness
 

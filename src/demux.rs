@@ -2094,6 +2094,22 @@ impl DisplayUnit {
             other => DisplayUnit::Other(other),
         }
     }
+
+    /// Inverse of [`DisplayUnit::from_raw`]: return the raw integer this
+    /// variant maps to. Used by the muxer to write `DisplayUnit` (RFC 9559
+    /// §5.1.4.1.28.14, Table 10) verbatim, including the [`DisplayUnit::Other`]
+    /// forward-compat variant for values registered after RFC 9559 in the
+    /// "Matroska Display Units" registry (§27.9).
+    pub fn to_raw(self) -> u64 {
+        match self {
+            DisplayUnit::Pixels => ids::DISPLAY_UNIT_PIXELS,
+            DisplayUnit::Centimeters => ids::DISPLAY_UNIT_CENTIMETERS,
+            DisplayUnit::Inches => ids::DISPLAY_UNIT_INCHES,
+            DisplayUnit::DisplayAspectRatio => ids::DISPLAY_UNIT_DAR,
+            DisplayUnit::Unknown => ids::DISPLAY_UNIT_UNKNOWN,
+            DisplayUnit::Other(v) => v,
+        }
+    }
 }
 
 /// A video track's `Colour` master (RFC 9559 §5.1.4.1.28.16): the
