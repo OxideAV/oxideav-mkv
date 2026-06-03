@@ -464,6 +464,24 @@ the unified `oxideav` aggregator to wire decoding automatically.
   downstream tool that might infer something else. Pairs symmetrically
   with the existing `MkvDemuxer::video_stereo_mode` /
   `MkvDemuxer::video_alpha_mode` typed accessors.
+- **`Video > UncompressedFourCC` on write** (RFC 9559 §5.1.4.1.28.15):
+  `MkvMuxer::set_video_uncompressed_fourcc(stream_index, [u8; 4])`
+  queues a per-track FourCC hint that lands inside the track's
+  `Video` master at `write_header` time (id `0x2EB524`, `binary`
+  type, schema-fixed `length: 4`). The setter takes a `[u8; 4]` array
+  directly, so the schema's fixed length is enforced at the type
+  system; every byte (including high bytes and `0x00`) is written
+  verbatim — the element is `binary`, not `string`, and the muxer
+  never interprets the payload as text. Spec rules enforced at queue
+  time: the setter rejects post-`write_header` use, out-of-range
+  `stream_index`, and calls on non-video tracks. Omitting the call
+  leaves the element off-disk so the demuxer's
+  `MkvDemuxer::video_uncompressed_fourcc` surfaces `None` —
+  §5.1.4.1.28.15 defines no default, and Table 11's `minOccurs=1`
+  only fires for `CodecID == "V_UNCOMPRESSED"`, which the muxer does
+  not presently emit. Pairs symmetrically with the existing
+  `MkvDemuxer::video_uncompressed_fourcc` typed accessor — a
+  mux→demux pipeline preserves the four-byte FourCC bit-exactly.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -562,13 +580,15 @@ so the demuxer never hides an unrecognised track.
   `FieldOrder` pair (`MkvMuxer::set_video_interlacing`,
   §5.1.4.1.28.1 + §5.1.4.1.28.2), the `StereoMode` / `AlphaMode`
   pair (`MkvMuxer::set_video_stereo_mode` /
-  `MkvMuxer::set_video_alpha_mode`, §5.1.4.1.28.3 + §5.1.4.1.28.4), and
+  `MkvMuxer::set_video_alpha_mode`, §5.1.4.1.28.3 + §5.1.4.1.28.4),
   the `PixelCrop{Top,Bottom,Left,Right}` + `DisplayWidth` /
   `DisplayHeight` / `DisplayUnit` quartet
-  (`MkvMuxer::set_video_geometry`, §5.1.4.1.28.8..§5.1.4.1.28.14) are
+  (`MkvMuxer::set_video_geometry`, §5.1.4.1.28.8..§5.1.4.1.28.14),
+  and `UncompressedFourCC`
+  (`MkvMuxer::set_video_uncompressed_fourcc`, §5.1.4.1.28.15) are
   written; the remaining `Video` sub-elements (Colour /
-  MasteringMetadata, Projection, AspectRatioType, UncompressedFourCC)
-  are not yet written.
+  MasteringMetadata, Projection, AspectRatioType) are not yet
+  written.
 
 ## Robustness
 

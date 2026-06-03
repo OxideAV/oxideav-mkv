@@ -246,6 +246,18 @@ pub struct MkvMuxer {
     /// to `streams.len()`; non-video tracks must stay `None` (validated
     /// at `set_video_geometry` time).
     video_geometries: Vec<Option<MkvVideoGeometry>>,
+    /// Per-stream `Video > UncompressedFourCC` hint queued via
+    /// [`MkvMuxer::set_video_uncompressed_fourcc`] (RFC 9559
+    /// §5.1.4.1.28.15). Materialised inside each video track's `Video`
+    /// master at `write_header` time as a 4-byte `binary` element
+    /// (id `0x2EB524`, fixed `length: 4`). `None` (the default) means
+    /// the muxer omits the element for that stream — legal for any
+    /// track whose `CodecID` is not `V_UNCOMPRESSED`, since
+    /// §5.1.4.1.28.15 Table 11 only pins `minOccurs=1` for that one
+    /// codec id. The slice is sized to `streams.len()`; non-video
+    /// tracks must stay `None` (validated at
+    /// `set_video_uncompressed_fourcc` time).
+    video_uncompressed_fourccs: Vec<Option<[u8; 4]>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -550,6 +562,7 @@ impl MkvMuxer {
             video_stereo_modes: vec![None; n],
             video_alpha_modes: vec![None; n],
             video_geometries: vec![None; n],
+            video_uncompressed_fourccs: vec![None; n],
         })
     }
 
@@ -886,6 +899,76 @@ impl MkvMuxer {
     /// Mostly useful for tests.
     pub fn video_geometry(&self, stream_index: usize) -> Option<MkvVideoGeometry> {
         *self.video_geometries.get(stream_index)?
+    }
+
+    /// Set the per-track `Video > UncompressedFourCC` (RFC 9559
+    /// §5.1.4.1.28.15) for one stream. Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise —
+    /// the element lives in the `Video` master inside `Tracks`, which is
+    /// written exactly once at header time.
+    ///
+    /// `fourcc` is a four-byte FourCC identifying the uncompressed pixel
+    /// layout used by the track's frames (e.g. `*b"YUY2"`, `*b"BGRA"`).
+    /// The spec defines neither a definitive list of values nor an
+    /// official registry — the caller is responsible for picking a
+    /// FourCC the consuming decoder understands. The on-disk element
+    /// length is pinned to exactly 4 bytes per §5.1.4.1.28.15's
+    /// `length: 4` schema field; the muxer enforces this by taking a
+    /// `[u8; 4]` array directly.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range
+    ///   indices return [`Error::invalid`].
+    /// * The target stream's [`MediaType`] must be [`MediaType::Video`].
+    ///   Non-video tracks have no `Video` master and the call is rejected.
+    ///
+    /// Omitting the call leaves the element off-disk so the demuxer
+    /// surfaces `None` for that stream's
+    /// `MkvDemuxer::video_uncompressed_fourcc`. Per §5.1.4.1.28.15
+    /// Table 11 the element is only spec-mandatory when `CodecID ==
+    /// "V_UNCOMPRESSED"`, and the muxer does not currently emit that
+    /// codec id, so the omission case stays spec-conformant for every
+    /// codec the muxer presently supports.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins).
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_video_uncompressed_fourcc(
+        &mut self,
+        stream_index: usize,
+        fourcc: [u8; 4],
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_uncompressed_fourcc called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_uncompressed_fourcc stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_uncompressed_fourcc on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        self.video_uncompressed_fourccs[stream_index] = Some(fourcc);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `UncompressedFourCC`
+    /// hint installed via [`MkvMuxer::set_video_uncompressed_fourcc`].
+    /// Returns `None` for any stream that didn't have the API called
+    /// (the muxer omits the element from the on-disk `Video` master,
+    /// and the demuxer surfaces `None` as well). Mostly useful for
+    /// tests.
+    pub fn video_uncompressed_fourcc(&self, stream_index: usize) -> Option<[u8; 4]> {
+        *self.video_uncompressed_fourccs.get(stream_index)?
     }
 
     /// Queue a chapter atom with one English-language `ChapterDisplay`
@@ -1237,6 +1320,18 @@ impl Muxer for MkvMuxer {
                     if g.display_unit != DisplayUnit::Pixels {
                         write_uint_element(&mut video, ids::DISPLAY_UNIT, g.display_unit.to_raw());
                     }
+                }
+                // UncompressedFourCC (§5.1.4.1.28.15) — written only when
+                // the caller explicitly opted in via
+                // `set_video_uncompressed_fourcc`. Omitting it keeps the
+                // element off-disk so the demuxer surfaces `None` for the
+                // stream's `video_uncompressed_fourcc` (the spec defines
+                // no default — Table 11 only pins `minOccurs=1` for
+                // `CodecID == "V_UNCOMPRESSED"`). The element is `binary`
+                // with a fixed `length: 4`, so the 4-byte payload is
+                // written verbatim.
+                if let Some(fourcc) = self.video_uncompressed_fourccs[i] {
+                    write_bytes_element(&mut video, ids::UNCOMPRESSED_FOURCC, &fourcc);
                 }
                 write_master_element(&mut t, ids::VIDEO, &video);
             }
