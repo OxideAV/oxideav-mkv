@@ -2289,6 +2289,32 @@ impl MatrixCoefficients {
             other => Self::Other(other),
         }
     }
+
+    /// Inverse of [`MatrixCoefficients::from_raw`]: return the raw integer
+    /// this variant maps to. Used by the muxer to write `MatrixCoefficients`
+    /// (RFC 9559 §5.1.4.1.28.17, Table 12) verbatim, including the
+    /// [`MatrixCoefficients::Other`] forward-compat variant for values
+    /// registered after RFC 9559 in §27.13.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            Self::Identity => 0,
+            Self::BT709 => 1,
+            Self::Unspecified => 2,
+            Self::Reserved => 3,
+            Self::UsFcc73682 => 4,
+            Self::BT470Bg => 5,
+            Self::Smpte170M => 6,
+            Self::Smpte240M => 7,
+            Self::YCoCg => 8,
+            Self::BT2020NonConstantLuminance => 9,
+            Self::BT2020ConstantLuminance => 10,
+            Self::SmpteSt2085 => 11,
+            Self::ChromaDerivedNonConstantLuminance => 12,
+            Self::ChromaDerivedConstantLuminance => 13,
+            Self::BT2100 => 14,
+            Self::Other(v) => v,
+        }
+    }
 }
 
 /// `ChromaSitingHorz` (RFC 9559 §5.1.4.1.28.23, Table 13).
@@ -2315,6 +2341,20 @@ impl ChromaSitingHorz {
             other => Self::Other(other),
         }
     }
+
+    /// Inverse of [`ChromaSitingHorz::from_raw`]: return the raw integer this
+    /// variant maps to. Used by the muxer to write `ChromaSitingHorz` (RFC
+    /// 9559 §5.1.4.1.28.23, Table 13) verbatim, including the
+    /// [`ChromaSitingHorz::Other`] forward-compat variant for values
+    /// registered after RFC 9559 in §27.10.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            Self::Unspecified => ids::CHROMA_SITING_UNSPECIFIED,
+            Self::LeftCollocated => ids::CHROMA_SITING_HORZ_LEFT_COLLOCATED,
+            Self::Half => ids::CHROMA_SITING_HALF,
+            Self::Other(v) => v,
+        }
+    }
 }
 
 /// `ChromaSitingVert` (RFC 9559 §5.1.4.1.28.24, Table 14).
@@ -2339,6 +2379,20 @@ impl ChromaSitingVert {
             ids::CHROMA_SITING_VERT_TOP_COLLOCATED => Self::TopCollocated,
             ids::CHROMA_SITING_HALF => Self::Half,
             other => Self::Other(other),
+        }
+    }
+
+    /// Inverse of [`ChromaSitingVert::from_raw`]: return the raw integer this
+    /// variant maps to. Used by the muxer to write `ChromaSitingVert` (RFC
+    /// 9559 §5.1.4.1.28.24, Table 14) verbatim, including the
+    /// [`ChromaSitingVert::Other`] forward-compat variant for values
+    /// registered after RFC 9559 in §27.11.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            Self::Unspecified => ids::CHROMA_SITING_UNSPECIFIED,
+            Self::TopCollocated => ids::CHROMA_SITING_VERT_TOP_COLLOCATED,
+            Self::Half => ids::CHROMA_SITING_HALF,
+            Self::Other(v) => v,
         }
     }
 }
@@ -2369,6 +2423,21 @@ impl ColourRange {
             ids::COLOUR_RANGE_FULL => Self::Full,
             ids::COLOUR_RANGE_DEFINED_BY_MATRIX_AND_TRANSFER => Self::DefinedByMatrixAndTransfer,
             other => Self::Other(other),
+        }
+    }
+
+    /// Inverse of [`ColourRange::from_raw`]: return the raw integer this
+    /// variant maps to. Used by the muxer to write `Range` (RFC 9559
+    /// §5.1.4.1.28.25, Table 15) verbatim, including the
+    /// [`ColourRange::Other`] forward-compat variant for values registered
+    /// after RFC 9559 in §27.12.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            Self::Unspecified => ids::COLOUR_RANGE_UNSPECIFIED,
+            Self::Broadcast => ids::COLOUR_RANGE_BROADCAST,
+            Self::Full => ids::COLOUR_RANGE_FULL,
+            Self::DefinedByMatrixAndTransfer => ids::COLOUR_RANGE_DEFINED_BY_MATRIX_AND_TRANSFER,
+            Self::Other(v) => v,
         }
     }
 }
@@ -2425,6 +2494,36 @@ impl TransferCharacteristics {
             other => Self::Other(other),
         }
     }
+
+    /// Inverse of [`TransferCharacteristics::from_raw`]: return the raw
+    /// integer this variant maps to. Used by the muxer to write
+    /// `TransferCharacteristics` (RFC 9559 §5.1.4.1.28.26, Table 16)
+    /// verbatim, including the [`TransferCharacteristics::Other`]
+    /// forward-compat variant for values registered after RFC 9559.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            Self::Reserved0 => 0,
+            Self::BT709 => 1,
+            Self::Unspecified => 2,
+            Self::Reserved3 => 3,
+            Self::Gamma22BT470M => 4,
+            Self::Gamma28BT470Bg => 5,
+            Self::Smpte170M => 6,
+            Self::Smpte240M => 7,
+            Self::Linear => 8,
+            Self::Log => 9,
+            Self::LogSqrt => 10,
+            Self::Iec61966_2_4 => 11,
+            Self::BT1361ExtendedColourGamut => 12,
+            Self::Iec61966_2_1 => 13,
+            Self::BT2020TenBit => 14,
+            Self::BT2020TwelveBit => 15,
+            Self::BT2100Pq => 16,
+            Self::SmpteSt428_1 => 17,
+            Self::AribStdB67Hlg => 18,
+            Self::Other(v) => v,
+        }
+    }
 }
 
 /// `Primaries` (RFC 9559 §5.1.4.1.28.27, Table 17) — the colour primaries
@@ -2467,6 +2566,32 @@ impl Primaries {
             12 => Self::SmpteEg432_2,
             22 => Self::EbuTech3213EJedecP22Phosphors,
             other => Self::Other(other),
+        }
+    }
+
+    /// Inverse of [`Primaries::from_raw`]: return the raw integer this
+    /// variant maps to. Used by the muxer to write `Primaries` (RFC 9559
+    /// §5.1.4.1.28.27, Table 17) verbatim, including the
+    /// [`Primaries::Other`] forward-compat variant for values registered
+    /// after RFC 9559. Note the table's gap between `12` and `22` —
+    /// `EbuTech3213EJedecP22Phosphors` maps back to `22`, not `13`.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            Self::Reserved0 => 0,
+            Self::BT709 => 1,
+            Self::Unspecified => 2,
+            Self::Reserved3 => 3,
+            Self::BT470M => 4,
+            Self::BT470Bg => 5,
+            Self::BT601_525Smpte170M => 6,
+            Self::Smpte240M => 7,
+            Self::Film => 8,
+            Self::BT2020 => 9,
+            Self::SmpteSt428_1 => 10,
+            Self::SmpteRp432_2 => 11,
+            Self::SmpteEg432_2 => 12,
+            Self::EbuTech3213EJedecP22Phosphors => 22,
+            Self::Other(v) => v,
         }
     }
 }

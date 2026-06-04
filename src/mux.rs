@@ -31,7 +31,10 @@ use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
-use crate::demux::{AlphaMode, DisplayUnit, FieldOrder, FlagInterlaced, StereoMode};
+use crate::demux::{
+    AlphaMode, ChromaSitingHorz, ChromaSitingVert, ColourRange, DisplayUnit, FieldOrder,
+    FlagInterlaced, MatrixCoefficients, Primaries, StereoMode, TransferCharacteristics,
+};
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
 
@@ -258,6 +261,20 @@ pub struct MkvMuxer {
     /// tracks must stay `None` (validated at
     /// `set_video_uncompressed_fourcc` time).
     video_uncompressed_fourccs: Vec<Option<[u8; 4]>>,
+    /// Per-stream `Video > Colour` master hint queued via
+    /// [`MkvMuxer::set_video_colour`] (RFC 9559 §5.1.4.1.28.16).
+    /// Materialised inside each video track's `Video` master at
+    /// `write_header` time as a `Colour` master carrying the scalar
+    /// children that differ from the §5.1.4.1.28.17..§5.1.4.1.28.27
+    /// spec defaults. `None` (the default) means the muxer omits the
+    /// `Colour` master entirely so the demuxer surfaces `None` from
+    /// `video_colour` for that stream. The slice is sized to
+    /// `streams.len()`; non-video tracks must stay `None` (validated
+    /// at `set_video_colour` time).
+    ///
+    /// `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40) is not yet
+    /// emitted; this round covers the scalar Colour children only.
+    video_colours: Vec<Option<MkvVideoColour>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -502,6 +519,151 @@ impl MkvVideoGeometry {
     }
 }
 
+/// Per-track `Video > Colour` (RFC 9559 §5.1.4.1.28.16) muxer hint, queued
+/// by [`MkvMuxer::set_video_colour`] and materialised inside the track's
+/// `Video` master at `write_header` time, alongside the existing geometry /
+/// interlacing / `UncompressedFourCC` block.
+///
+/// This struct covers the eleven scalar children of the `Colour` master
+/// (§5.1.4.1.28.17..§5.1.4.1.28.29). The `MasteringMetadata` sub-master
+/// (§5.1.4.1.28.30..§5.1.4.1.28.40) is intentionally absent from this
+/// round — HDR mastering metadata is a separate addition.
+///
+/// Field handling per the spec:
+///
+/// * `matrix_coefficients` — `MatrixCoefficients` (Table 12). Spec default
+///   `2` ([`MatrixCoefficients::Unspecified`]); the muxer omits the
+///   element when it equals the default so the file stays minimal.
+/// * `bits_per_channel` — `BitsPerChannel`. Spec default `0`
+///   (*unspecified*); omitted when zero.
+/// * `chroma_subsampling_horz` / `chroma_subsampling_vert` —
+///   `ChromaSubsamplingHorz` / `ChromaSubsamplingVert`. No spec default;
+///   `None` skips the element, `Some(v)` writes it.
+/// * `cb_subsampling_horz` / `cb_subsampling_vert` — `CbSubsamplingHorz`
+///   / `CbSubsamplingVert`. No spec default; `None` skips, `Some(v)`
+///   writes.
+/// * `chroma_siting_horz` / `chroma_siting_vert` — `ChromaSitingHorz`
+///   (Table 13) / `ChromaSitingVert` (Table 14). Spec default `0`
+///   ([`ChromaSitingHorz::Unspecified`] / [`ChromaSitingVert::Unspecified`]);
+///   omitted when equal to the default.
+/// * `range` — `Range` (Table 15). Spec default `0`
+///   ([`ColourRange::Unspecified`]); omitted when equal.
+/// * `transfer_characteristics` — `TransferCharacteristics` (Table 16).
+///   Spec default `2` ([`TransferCharacteristics::Unspecified`]); omitted
+///   when equal.
+/// * `primaries` — `Primaries` (Table 17). Spec default `2`
+///   ([`Primaries::Unspecified`]); omitted when equal.
+/// * `max_cll` / `max_fall` — `MaxCLL` / `MaxFALL`. No spec default;
+///   `None` skips, `Some(v)` writes.
+///
+/// Every enum-typed field accepts the `Other(u64)` forward-compat variant
+/// so a value the demuxer parsed from a §27 open registry can be re-muxed
+/// verbatim.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MkvVideoColour {
+    /// `MatrixCoefficients` (RFC 9559 §5.1.4.1.28.17, Table 12). Default
+    /// [`MatrixCoefficients::Unspecified`].
+    pub matrix_coefficients: MatrixCoefficients,
+    /// `BitsPerChannel` (RFC 9559 §5.1.4.1.28.18). Default `0`
+    /// (*unspecified*).
+    pub bits_per_channel: u64,
+    /// `ChromaSubsamplingHorz` (RFC 9559 §5.1.4.1.28.19). `None` skips
+    /// the element on disk.
+    pub chroma_subsampling_horz: Option<u64>,
+    /// `ChromaSubsamplingVert` (RFC 9559 §5.1.4.1.28.20). `None` skips.
+    pub chroma_subsampling_vert: Option<u64>,
+    /// `CbSubsamplingHorz` (RFC 9559 §5.1.4.1.28.21). `None` skips.
+    pub cb_subsampling_horz: Option<u64>,
+    /// `CbSubsamplingVert` (RFC 9559 §5.1.4.1.28.22). `None` skips.
+    pub cb_subsampling_vert: Option<u64>,
+    /// `ChromaSitingHorz` (RFC 9559 §5.1.4.1.28.23, Table 13). Default
+    /// [`ChromaSitingHorz::Unspecified`].
+    pub chroma_siting_horz: ChromaSitingHorz,
+    /// `ChromaSitingVert` (RFC 9559 §5.1.4.1.28.24, Table 14). Default
+    /// [`ChromaSitingVert::Unspecified`].
+    pub chroma_siting_vert: ChromaSitingVert,
+    /// `Range` (RFC 9559 §5.1.4.1.28.25, Table 15). Default
+    /// [`ColourRange::Unspecified`].
+    pub range: ColourRange,
+    /// `TransferCharacteristics` (RFC 9559 §5.1.4.1.28.26, Table 16).
+    /// Default [`TransferCharacteristics::Unspecified`].
+    pub transfer_characteristics: TransferCharacteristics,
+    /// `Primaries` (RFC 9559 §5.1.4.1.28.27, Table 17). Default
+    /// [`Primaries::Unspecified`].
+    pub primaries: Primaries,
+    /// `MaxCLL` (RFC 9559 §5.1.4.1.28.28). No spec default; `None`
+    /// skips.
+    pub max_cll: Option<u64>,
+    /// `MaxFALL` (RFC 9559 §5.1.4.1.28.29). No spec default; `None`
+    /// skips.
+    pub max_fall: Option<u64>,
+}
+
+impl Default for MkvVideoColour {
+    /// Default Colour hint: every scalar at the §5.1.4.1.28 spec default
+    /// (`MatrixCoefficients` / `TransferCharacteristics` / `Primaries` =
+    /// `2` *unspecified*; `BitsPerChannel` / `ChromaSitingHorz` /
+    /// `ChromaSitingVert` / `Range` = `0` *unspecified*) and every
+    /// `Option<…>` set to `None`. Queueing this default still causes the
+    /// `Colour` master to be emitted — just as an empty master with no
+    /// children — which mirrors how the demuxer parses an empty `Colour`
+    /// master (the typed `VideoColour` surfaces `Some` with every default
+    /// materialised). To omit the `Colour` master entirely, simply do not
+    /// call [`MkvMuxer::set_video_colour`].
+    fn default() -> Self {
+        Self {
+            matrix_coefficients: MatrixCoefficients::Unspecified,
+            bits_per_channel: 0,
+            chroma_subsampling_horz: None,
+            chroma_subsampling_vert: None,
+            cb_subsampling_horz: None,
+            cb_subsampling_vert: None,
+            chroma_siting_horz: ChromaSitingHorz::Unspecified,
+            chroma_siting_vert: ChromaSitingVert::Unspecified,
+            range: ColourRange::Unspecified,
+            transfer_characteristics: TransferCharacteristics::Unspecified,
+            primaries: Primaries::Unspecified,
+            max_cll: None,
+            max_fall: None,
+        }
+    }
+}
+
+impl MkvVideoColour {
+    /// Convenience constructor for the BT.709 SDR shape: matrix `1`,
+    /// transfer `1`, primaries `1`, broadcast range. This is the canonical
+    /// shape for legacy 8-bit HD video (RFC 9559 §5.1.4.1.28.17 / .26 / .27
+    /// Tables 12 / 16 / 17 entry `1`).
+    pub fn bt709() -> Self {
+        Self {
+            matrix_coefficients: MatrixCoefficients::BT709,
+            transfer_characteristics: TransferCharacteristics::BT709,
+            primaries: Primaries::BT709,
+            range: ColourRange::Broadcast,
+            ..Self::default()
+        }
+    }
+
+    /// Convenience constructor for the BT.2020 HDR PQ shape: matrix `9`
+    /// (BT.2020 non-constant luminance), transfer `16` (BT.2100 PQ),
+    /// primaries `9` (BT.2020), full range, 10 bits per channel. This is
+    /// the canonical shape used for HDR10 video — the `MaxCLL` /
+    /// `MaxFALL` and `MasteringMetadata` fields are *not* set here; a
+    /// caller wanting them can override `max_cll` / `max_fall` on the
+    /// returned value (MasteringMetadata is not yet emitted on the write
+    /// side).
+    pub fn bt2020_pq() -> Self {
+        Self {
+            matrix_coefficients: MatrixCoefficients::BT2020NonConstantLuminance,
+            transfer_characteristics: TransferCharacteristics::BT2100Pq,
+            primaries: Primaries::BT2020,
+            range: ColourRange::Full,
+            bits_per_channel: 10,
+            ..Self::default()
+        }
+    }
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -563,6 +725,7 @@ impl MkvMuxer {
             video_alpha_modes: vec![None; n],
             video_geometries: vec![None; n],
             video_uncompressed_fourccs: vec![None; n],
+            video_colours: vec![None; n],
         })
     }
 
@@ -971,6 +1134,77 @@ impl MkvMuxer {
         *self.video_uncompressed_fourccs.get(stream_index)?
     }
 
+    /// Set the per-track `Video > Colour` master (RFC 9559 §5.1.4.1.28.16)
+    /// for one stream. Must be called before [`Muxer::write_header`];
+    /// returns [`Error::other`] otherwise.
+    ///
+    /// The supplied [`MkvVideoColour`] is materialised inside the
+    /// `Video` master at `write_header` time. The muxer applies per-element
+    /// omission rules to keep the file minimal — every scalar child that
+    /// equals its §5.1.4.1.28 spec default is left off-disk so the demuxer
+    /// surfaces the spec-defined default value; every `Option<…>` field
+    /// is only emitted when `Some(v)`. As a result, calling this with
+    /// [`MkvVideoColour::default`] writes an *empty* `Colour` master on
+    /// disk — present-but-childless — which the demuxer parses into a
+    /// `Some(VideoColour)` whose every getter returns the spec default,
+    /// distinguishable from the call-was-omitted case (`None`).
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` is out of range, or the stream
+    ///   at that index is not [`MediaType::Video`] (only video tracks
+    ///   carry a `Video` master per RFC 9559 §5.1.4.1.28).
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins).
+    ///
+    /// Omitting the call entirely keeps the `Colour` master off-disk so
+    /// the demuxer surfaces `None` from
+    /// [`crate::demux::MkvDemuxer::video_colour`] — distinct from "empty
+    /// `Colour` master present" (`Some(VideoColour::default())`).
+    ///
+    /// `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40) is not yet
+    /// emitted on the write side; queueing a colour hint that semantically
+    /// belongs with mastering metadata still works — only the scalar
+    /// children are written.
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_video_colour(
+        &mut self,
+        stream_index: usize,
+        colour: MkvVideoColour,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_colour called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_colour stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_colour on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        self.video_colours[stream_index] = Some(colour);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `Colour` hint
+    /// installed via [`MkvMuxer::set_video_colour`]. Returns `None` for
+    /// any stream that didn't have the API called (the muxer omits the
+    /// `Colour` master from the on-disk `Video` master, and the demuxer
+    /// surfaces `None` as well). Mostly useful for tests.
+    pub fn video_colour(&self, stream_index: usize) -> Option<MkvVideoColour> {
+        *self.video_colours.get(stream_index)?
+    }
+
     /// Queue a chapter atom with one English-language `ChapterDisplay`
     /// carrying `title`. Must be called before [`MkvMuxer::write_header`];
     /// returns [`Error::other`] if the header has already been emitted.
@@ -1332,6 +1566,79 @@ impl Muxer for MkvMuxer {
                 // written verbatim.
                 if let Some(fourcc) = self.video_uncompressed_fourccs[i] {
                     write_bytes_element(&mut video, ids::UNCOMPRESSED_FOURCC, &fourcc);
+                }
+                // Colour master (§5.1.4.1.28.16). Emitted only when the
+                // caller explicitly opted in via `set_video_colour`. Each
+                // scalar child is written only when its value differs
+                // from the §5.1.4.1.28.17..§5.1.4.1.28.27 spec default so
+                // an empty colour hint serialises as an empty Colour
+                // master — the demuxer parses that as
+                // `Some(VideoColour::default())` with every getter
+                // returning the materialised spec default, which is the
+                // round-trip semantics the demux side already
+                // documents. Children are written in numerical-id order
+                // (the order the demuxer also encounters them while
+                // walking 0x55B1..0x55BD) so the layout is diff-friendly.
+                // MasteringMetadata (§5.1.4.1.28.30..§5.1.4.1.28.40) is
+                // not yet emitted on the write side.
+                if let Some(c) = self.video_colours[i] {
+                    let mut colour = Vec::new();
+                    if c.matrix_coefficients != MatrixCoefficients::Unspecified {
+                        write_uint_element(
+                            &mut colour,
+                            ids::MATRIX_COEFFICIENTS,
+                            c.matrix_coefficients.to_raw(),
+                        );
+                    }
+                    if c.bits_per_channel != 0 {
+                        write_uint_element(&mut colour, ids::BITS_PER_CHANNEL, c.bits_per_channel);
+                    }
+                    if let Some(v) = c.chroma_subsampling_horz {
+                        write_uint_element(&mut colour, ids::CHROMA_SUBSAMPLING_HORZ, v);
+                    }
+                    if let Some(v) = c.chroma_subsampling_vert {
+                        write_uint_element(&mut colour, ids::CHROMA_SUBSAMPLING_VERT, v);
+                    }
+                    if let Some(v) = c.cb_subsampling_horz {
+                        write_uint_element(&mut colour, ids::CB_SUBSAMPLING_HORZ, v);
+                    }
+                    if let Some(v) = c.cb_subsampling_vert {
+                        write_uint_element(&mut colour, ids::CB_SUBSAMPLING_VERT, v);
+                    }
+                    if c.chroma_siting_horz != ChromaSitingHorz::Unspecified {
+                        write_uint_element(
+                            &mut colour,
+                            ids::CHROMA_SITING_HORZ,
+                            c.chroma_siting_horz.to_raw(),
+                        );
+                    }
+                    if c.chroma_siting_vert != ChromaSitingVert::Unspecified {
+                        write_uint_element(
+                            &mut colour,
+                            ids::CHROMA_SITING_VERT,
+                            c.chroma_siting_vert.to_raw(),
+                        );
+                    }
+                    if c.range != ColourRange::Unspecified {
+                        write_uint_element(&mut colour, ids::COLOUR_RANGE, c.range.to_raw());
+                    }
+                    if c.transfer_characteristics != TransferCharacteristics::Unspecified {
+                        write_uint_element(
+                            &mut colour,
+                            ids::TRANSFER_CHARACTERISTICS,
+                            c.transfer_characteristics.to_raw(),
+                        );
+                    }
+                    if c.primaries != Primaries::Unspecified {
+                        write_uint_element(&mut colour, ids::PRIMARIES, c.primaries.to_raw());
+                    }
+                    if let Some(v) = c.max_cll {
+                        write_uint_element(&mut colour, ids::MAX_CLL, v);
+                    }
+                    if let Some(v) = c.max_fall {
+                        write_uint_element(&mut colour, ids::MAX_FALL, v);
+                    }
+                    write_master_element(&mut video, ids::COLOUR, &colour);
                 }
                 write_master_element(&mut t, ids::VIDEO, &video);
             }

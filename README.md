@@ -482,6 +482,39 @@ the unified `oxideav` aggregator to wire decoding automatically.
   not presently emit. Pairs symmetrically with the existing
   `MkvDemuxer::video_uncompressed_fourcc` typed accessor — a
   mux→demux pipeline preserves the four-byte FourCC bit-exactly.
+- **`Video > Colour` scalar children on write** (RFC 9559
+  §5.1.4.1.28.16, §5.1.4.1.28.17..§5.1.4.1.28.29):
+  `MkvMuxer::set_video_colour(stream_index, MkvVideoColour)` queues a
+  per-track colour-description hint that lands inside the track's
+  `Video` master at `write_header` time as a `Colour` master (id
+  `0x55B0`) carrying the eleven scalar children: `MatrixCoefficients`
+  / `BitsPerChannel` / `ChromaSubsampling{Horz,Vert}` /
+  `CbSubsampling{Horz,Vert}` / `ChromaSiting{Horz,Vert}` / `Range` /
+  `TransferCharacteristics` / `Primaries` / `MaxCLL` / `MaxFALL`.
+  Convenience constructors `MkvVideoColour::bt709()` (matrix `1` /
+  transfer `1` / primaries `1` / broadcast range — the canonical SDR
+  HD shape) and `MkvVideoColour::bt2020_pq()` (matrix `9` / transfer
+  `16` / primaries `9` / full range / 10 bpc — the canonical HDR10
+  shape) cover the two everyday cases; every field can be overridden
+  on the returned value for one-off departures. Per-element omission
+  rules apply at write time: every scalar that equals its
+  §5.1.4.1.28 spec default is left off-disk so the demuxer
+  materialises the spec default; every `Option<u64>` (the four
+  chroma-subsampling integers + `MaxCLL` / `MaxFALL`) is written
+  when `Some(v)` and skipped when `None`. As a result, queueing
+  `MkvVideoColour::default()` writes an empty 3-byte `Colour` master
+  (id `0x55B0` + size VINT `0x80`), which the demuxer parses into
+  `Some(VideoColour::default())` with every getter returning the
+  materialised spec default — distinguishable on disk from the
+  call-was-omitted case, which keeps the `Colour` master off-disk
+  entirely so the demuxer surfaces `None` from `video_colour`. Spec
+  rules enforced at queue time: the setter rejects post-`write_header`
+  use, out-of-range `stream_index`, and calls on non-video tracks.
+  `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40) is not yet
+  emitted on the write side. Pairs symmetrically with the existing
+  `MkvDemuxer::video_colour` typed accessor — a mux→demux pipeline
+  preserves every scalar child verbatim, including the `Other(u64)`
+  forward-compat variants on each of the six enum-typed children.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -584,11 +617,19 @@ so the demuxer never hides an unrecognised track.
   the `PixelCrop{Top,Bottom,Left,Right}` + `DisplayWidth` /
   `DisplayHeight` / `DisplayUnit` quartet
   (`MkvMuxer::set_video_geometry`, §5.1.4.1.28.8..§5.1.4.1.28.14),
-  and `UncompressedFourCC`
-  (`MkvMuxer::set_video_uncompressed_fourcc`, §5.1.4.1.28.15) are
-  written; the remaining `Video` sub-elements (Colour /
-  MasteringMetadata, Projection, AspectRatioType) are not yet
-  written.
+  `UncompressedFourCC`
+  (`MkvMuxer::set_video_uncompressed_fourcc`, §5.1.4.1.28.15), and the
+  eleven scalar children of the `Colour` master
+  (`MkvMuxer::set_video_colour`, §5.1.4.1.28.16,
+  §5.1.4.1.28.17..§5.1.4.1.28.29 — `MatrixCoefficients`,
+  `BitsPerChannel`, `ChromaSubsampling{Horz,Vert}`,
+  `CbSubsampling{Horz,Vert}`, `ChromaSiting{Horz,Vert}`, `Range`,
+  `TransferCharacteristics`, `Primaries`, `MaxCLL`, `MaxFALL`; the
+  convenience constructors `MkvVideoColour::bt709()` and
+  `MkvVideoColour::bt2020_pq()` cover the SDR HD and HDR10 PQ
+  shapes) are written; the remaining `Video` sub-elements
+  (`Colour > MasteringMetadata`, `Projection`, `AspectRatioType`) are
+  not yet written.
 
 ## Robustness
 
