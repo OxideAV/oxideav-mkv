@@ -404,6 +404,14 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let content_encodings: Vec<Option<ContentEncodings>> =
         tracks.iter().map(|t| t.content_encodings.clone()).collect();
 
+    // Per-stream `BlockAdditionMapping`s (RFC 9559 §5.1.4.1.17), indexed by
+    // stream index. Each entry is one mapping master in on-disk order;
+    // tracks with no `BlockAdditionMapping` child get an empty `Vec`.
+    let block_addition_mappings: Vec<Vec<BlockAdditionMapping>> = tracks
+        .iter()
+        .map(|t| t.block_addition_mappings.clone())
+        .collect();
+
     // Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2),
     // indexed by stream index. `None` for non-video tracks and for video
     // tracks whose `TrackEntry` had no `Video` master; for everything else
@@ -621,6 +629,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_alpha_modes,
         video_aspect_ratio_types,
         video_uncompressed_fourccs,
+        block_addition_mappings,
     })
 }
 
@@ -816,6 +825,13 @@ struct TrackEntry {
     /// materialised here so the typed surface can distinguish
     /// "container said English" from "container said nothing".
     language: Option<String>,
+    /// `BlockAdditionMapping` masters (RFC 9559 §5.1.4.1.17) captured during
+    /// the `TrackEntry` walk, one entry per master in on-disk order. Empty
+    /// when the `TrackEntry` carried no `BlockAdditionMapping` child (the
+    /// common case — the element only appears on tracks that use
+    /// `BlockAdditional` to extend their on-disk format, e.g. WebM alpha
+    /// or HDR dynamic metadata payloads).
+    block_addition_mappings: Vec<BlockAdditionMapping>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -1461,6 +1477,64 @@ pub struct TrackRef {
     /// Resolved 0-indexed stream index, or `None` when no track in the
     /// Segment carries this `TrackUID`.
     pub stream_index: Option<u32>,
+}
+
+/// One `BlockAdditionMapping` master (RFC 9559 §5.1.4.1.17) on a
+/// `TrackEntry`: describes how the per-frame `BlockAdditional` data
+/// (`BlockGroup > BlockAdditions > BlockMore > BlockAdditional`, §5.1.3.5.2.4)
+/// for a given `BlockAddID` value (§5.1.3.5.2.3) is to be interpreted.
+///
+/// A track that uses `BlockAdditional` to carry side-channel payloads
+/// (e.g. WebM alpha at `BlockAddID == 1`, HDR dynamic metadata, ITU-T T.35
+/// frame-level metadata) declares one mapping per non-default
+/// `BlockAddID` value it intends to emit. The mapping itself carries no
+/// payload bytes — it links a `BlockAddID` to a registered
+/// [`addid_type`](Self::addid_type) value plus optional per-track
+/// [`extra_data`](Self::extra_data) the type interpreter consults.
+///
+/// Surfaced per stream via [`MkvDemuxer::block_addition_mappings`].
+/// Multiple mappings per `TrackEntry` are permitted by the spec (no
+/// `maxOccurs` on §5.1.4.1.17) and surface as a `&[BlockAdditionMapping]`
+/// in on-disk order.
+///
+/// Container-level only — the bytes inside `BlockAdditional` are not
+/// surfaced here; this just declares the *shape* of the side channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockAdditionMapping {
+    /// `BlockAddIDValue` (RFC 9559 §5.1.4.1.17.1) — the `BlockAddID`
+    /// (§5.1.3.5.2.3) value this mapping describes. Range is "`>=2`"
+    /// per the spec because `BlockAddID == 1` is reserved for the
+    /// codec-defined default and needs no mapping. `None` when the
+    /// `BlockAdditionMapping` master had no `BlockAddIDValue` child —
+    /// the spec gives the field no default and no minOccurs, so absence
+    /// is preserved verbatim.
+    pub value: Option<u64>,
+    /// `BlockAddIDName` (RFC 9559 §5.1.4.1.17.2) — a human-readable
+    /// label for the mapping. `None` when the element was absent (the
+    /// spec gives the field no default).
+    pub name: Option<String>,
+    /// `BlockAddIDType` (RFC 9559 §5.1.4.1.17.3) — the IANA-registered
+    /// type identifier the `BlockAdditional` payload follows. Spec
+    /// default `0` (codec-defined) is materialised so a `BlockAdditionMapping`
+    /// master with no `BlockAddIDType` child decodes as `0`; the spec's
+    /// usage note then constrains both `BlockAddIDValue` and the
+    /// matching `BlockAddID` to be `1` for that case.
+    pub addid_type: u64,
+    /// `BlockAddIDExtraData` (RFC 9559 §5.1.4.1.17.4) — opaque per-track
+    /// binary state the type interpreter consults to decode
+    /// `BlockAdditional` payloads. `None` when the element was absent
+    /// (the spec gives the field no default).
+    pub extra_data: Option<Vec<u8>>,
+}
+
+impl BlockAdditionMapping {
+    /// True when this mapping points at the codec-defined default
+    /// (`addid_type == 0`). Per RFC 9559 §5.1.4.1.17.3's usage note,
+    /// such a mapping constrains its `BlockAddIDValue` (and the
+    /// matching `BlockAddID`) to `1`.
+    pub fn is_codec_defined(&self) -> bool {
+        self.addid_type == 0
+    }
 }
 
 /// A video track's interlacing settings — `FlagInterlaced` (RFC 9559
@@ -3787,6 +3861,11 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 let body_end = r.stream_position()?.saturating_add(e.size);
                 t.content_encodings = Some(parse_content_encodings(r, body_end)?);
             }
+            ids::BLOCK_ADDITION_MAPPING => {
+                let body_end = r.stream_position()?.saturating_add(e.size);
+                let mapping = parse_block_addition_mapping(r, body_end)?;
+                t.block_addition_mappings.push(mapping);
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -3998,6 +4077,39 @@ fn parse_join_blocks(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperation)
         }
     }
     Ok(())
+}
+
+/// Parse one `BlockAdditionMapping` master (RFC 9559 §5.1.4.1.17) into the
+/// typed [`BlockAdditionMapping`]. `BlockAddIDType` (§5.1.4.1.17.3) has
+/// spec default `0` (codec-defined) which is materialised here so an empty
+/// mapping master decodes to a fully-typed "codec-defined" record;
+/// `BlockAddIDValue` / `BlockAddIDName` / `BlockAddIDExtraData` carry no
+/// defaults (`maxOccurs == 1`, no `default:` clause) so they stay
+/// `Option<…>` and an absent child surfaces as `None`. Unknown children
+/// are skipped — forward-compat with future schema extensions.
+fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockAdditionMapping> {
+    let mut value: Option<u64> = None;
+    let mut name: Option<String> = None;
+    // §5.1.4.1.17.3 default is `0` (codec-defined): "If BlockAddIDType is
+    // 0, the BlockAddIDValue and corresponding BlockAddID values MUST be 1."
+    let mut addid_type: u64 = 0;
+    let mut extra_data: Option<Vec<u8>> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::BLOCK_ADD_ID_VALUE => value = Some(read_uint(r, e.size as usize)?),
+            ids::BLOCK_ADD_ID_NAME => name = Some(read_string(r, e.size as usize)?),
+            ids::BLOCK_ADD_ID_TYPE => addid_type = read_uint(r, e.size as usize)?,
+            ids::BLOCK_ADD_ID_EXTRA_DATA => extra_data = Some(read_bytes(r, e.size as usize)?),
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(BlockAdditionMapping {
+        value,
+        name,
+        addid_type,
+        extra_data,
+    })
 }
 
 fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
@@ -4363,6 +4475,12 @@ pub struct MkvDemuxer {
     /// meaningful when `CodecID == "V_UNCOMPRESSED"`. `None` when the
     /// element was absent. See [`MkvDemuxer::video_uncompressed_fourcc`].
     video_uncompressed_fourccs: Vec<Option<UncompressedFourCC>>,
+    /// Per-stream `BlockAdditionMapping`s (RFC 9559 §5.1.4.1.17), indexed
+    /// by stream index. Empty `Vec` for tracks that carry no
+    /// `BlockAdditionMapping` child (the common case — the element only
+    /// appears on tracks that use `BlockAdditional` to extend their
+    /// on-disk format). See [`MkvDemuxer::block_addition_mappings`].
+    block_addition_mappings: Vec<Vec<BlockAdditionMapping>>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -4661,6 +4779,40 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::track_operation`] for the semantics.
     pub fn track_operations(&self) -> &[Option<TrackOperation>] {
         &self.track_operations
+    }
+
+    /// `BlockAdditionMapping`s (RFC 9559 §5.1.4.1.17) for the stream at
+    /// `stream_index`, in on-disk order. Returns an empty slice when the
+    /// `TrackEntry` carried no `BlockAdditionMapping` child (the common
+    /// case — only tracks that use `BlockAdditional` to extend their
+    /// format declare mappings).
+    ///
+    /// Each [`BlockAdditionMapping`] in the returned slice describes one
+    /// `BlockAddID` value the track is allowed to attach to its
+    /// `BlockGroup > BlockAdditions > BlockMore` payloads. The mapping
+    /// itself carries no payload — the per-frame `BlockAdditional` bytes
+    /// stay in the codec/extension's hands; the container only declares
+    /// the *shape* of the side channel (which `BlockAddID` values are in
+    /// use, what registered [`addid_type`](BlockAdditionMapping::addid_type)
+    /// each follows, any per-track
+    /// [`extra_data`](BlockAdditionMapping::extra_data) the type
+    /// interpreter consults).
+    ///
+    /// Returns an empty slice for an out-of-range `stream_index`.
+    pub fn block_addition_mappings(&self, stream_index: u32) -> &[BlockAdditionMapping] {
+        self.block_addition_mappings
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// All per-stream `BlockAdditionMapping` lists (RFC 9559 §5.1.4.1.17),
+    /// indexed by stream index. The slice has one `Vec` per stream —
+    /// empty when the corresponding `TrackEntry` carried no
+    /// `BlockAdditionMapping` child. See
+    /// [`MkvDemuxer::block_addition_mappings`] for the semantics.
+    pub fn all_block_addition_mappings(&self) -> &[Vec<BlockAdditionMapping>] {
+        &self.block_addition_mappings
     }
 
     /// `ContentEncodings` (RFC 9559 §5.1.4.1.31) for the stream at

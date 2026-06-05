@@ -95,6 +95,23 @@ pub const TRACK_PLANE_TYPE: u32 = 0xE6;
 pub const TRACK_JOIN_BLOCKS: u32 = 0xE9;
 pub const TRACK_JOIN_UID: u32 = 0xED;
 
+// BlockAdditionMapping (RFC 9559 §5.1.4.1.17): a per-TrackEntry container
+// that describes how to interpret BlockAdditional data (carried via the
+// `BlockMore.BlockAddID` field on a `BlockGroup`, §5.1.3.5.2.3). Each
+// mapping is identified by `BlockAddIDValue` (>=2) and tagged with an IANA-
+// registered `BlockAddIDType` (defaults to 0 — codec-defined); the optional
+// `BlockAddIDName` is a human-readable label and `BlockAddIDExtraData` is
+// per-track binary state the type may consult. The element is unbounded —
+// a TrackEntry can carry several mappings, one per (BlockAddIDType,
+// BlockAddIDValue) pair. The container surfaces these *headers*; semantic
+// interpretation of the per-frame `BlockAdditional` bytes lives in the
+// codec / track-format extension that owns each `BlockAddIDType` value.
+pub const BLOCK_ADDITION_MAPPING: u32 = 0x41E4;
+pub const BLOCK_ADD_ID_VALUE: u32 = 0x41F0;
+pub const BLOCK_ADD_ID_NAME: u32 = 0x41A4;
+pub const BLOCK_ADD_ID_TYPE: u32 = 0x41E7;
+pub const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
+
 // ContentEncodings (RFC 9559 §5.1.4.1.31): a per-track ordered list of
 // transformations (compression / encryption) applied to frame data, the
 // CodecPrivate, or both, before the bytes were placed in Blocks. The

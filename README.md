@@ -169,6 +169,27 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `TrackUID` and the matching 0-indexed stream index (`None` for a dangling
   reference, kept rather than dropped). A `TrackPlane` missing its mandatory
   `TrackPlaneUID` and a zero `TrackJoinUID` ("not 0" per spec) are dropped.
+- **`BlockAdditionMapping` typed decode** (RFC 9559 §5.1.4.1.17):
+  `MkvDemuxer::block_addition_mappings(stream_index)` (and the per-stream
+  `all_block_addition_mappings()` slice) returns each
+  `Tracks > TrackEntry > BlockAdditionMapping` master the file carries,
+  in on-disk order, as a typed `BlockAdditionMapping` record exposing
+  `value` (`BlockAddIDValue`, §5.1.4.1.17.1, `Option<u64>` — spec range
+  `>=2`, no default), `name` (`BlockAddIDName`, §5.1.4.1.17.2,
+  `Option<String>`), `addid_type` (`BlockAddIDType`, §5.1.4.1.17.3,
+  `u64` — spec default `0` (codec-defined) materialised), and
+  `extra_data` (`BlockAddIDExtraData`, §5.1.4.1.17.4, `Option<Vec<u8>>`
+  — opaque per-track binary state the type interpreter consults). The
+  helper `is_codec_defined()` reports whether `addid_type == 0` (the
+  §5.1.4.1.17.3 usage-note case in which the matching `BlockAddID` must
+  be `1`). Unknown child elements inside the master are skipped — the
+  spec allows additions to the registry. Tracks with no
+  `BlockAdditionMapping` child surface as an empty slice (the common
+  case — the element only appears on tracks that use `BlockAdditional`
+  to extend their on-disk format). Per-frame `BlockAdditional` payload
+  bytes are *not* surfaced — the typed view declares the *shape* of
+  the side channel; payload semantics stay with the codec / track-format
+  extension that owns each `BlockAddIDType` value.
 - **`ContentEncodings` typed decode** (RFC 9559 §5.1.4.1.31):
   `MkvDemuxer::content_encodings(stream_index)` (and the per-stream
   `all_content_encodings()` slice) returns the track's transformation chain
