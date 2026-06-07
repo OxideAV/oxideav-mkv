@@ -262,7 +262,12 @@ pub struct MkvMuxer {
     /// `set_video_uncompressed_fourcc` time).
     video_uncompressed_fourccs: Vec<Option<[u8; 4]>>,
     /// Per-stream `Video > Colour` master hint queued via
-    /// [`MkvMuxer::set_video_colour`] (RFC 9559 §5.1.4.1.28.16).
+    /// [`MkvMuxer::set_video_colour`] (RFC 9559 §5.1.4.1.28.16). The
+    /// `MasteringMetadata` sub-master
+    /// (§5.1.4.1.28.30..§5.1.4.1.28.40) is emitted whenever the queued
+    /// colour hint's [`MkvVideoColour::mastering_metadata`] slot is
+    /// `Some(_)`; each of its ten chromaticity / luminance children is
+    /// written only when its own `Option<f64>` slot is `Some(v)`.
     /// Materialised inside each video track's `Video` master at
     /// `write_header` time as a `Colour` master carrying the scalar
     /// children that differ from the §5.1.4.1.28.17..§5.1.4.1.28.27
@@ -272,8 +277,6 @@ pub struct MkvMuxer {
     /// `streams.len()`; non-video tracks must stay `None` (validated
     /// at `set_video_colour` time).
     ///
-    /// `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40) is not yet
-    /// emitted; this round covers the scalar Colour children only.
     video_colours: Vec<Option<MkvVideoColour>>,
 }
 
@@ -597,6 +600,95 @@ pub struct MkvVideoColour {
     /// `MaxFALL` (RFC 9559 §5.1.4.1.28.29). No spec default; `None`
     /// skips.
     pub max_fall: Option<u64>,
+    /// `MasteringMetadata` sub-master (RFC 9559 §5.1.4.1.28.30) — the
+    /// SMPTE ST 2086 / CTA-861.3 mastering-display description. `None`
+    /// skips the entire master on disk so the demuxer surfaces `None`
+    /// from [`crate::demux::VideoColour::mastering_metadata`]. `Some(m)`
+    /// emits the master with each child written only when its slot in
+    /// `m` is `Some(v)` — see [`MkvMasteringMetadata`] for the per-
+    /// child semantics.
+    pub mastering_metadata: Option<MkvMasteringMetadata>,
+}
+
+/// `Colour > MasteringMetadata` payload (RFC 9559
+/// §5.1.4.1.28.30..§5.1.4.1.28.40) on the write side: the SMPTE ST 2086
+/// / CTA-861.3 mastering-display description that accompanies HDR
+/// content.
+///
+/// Each child is independently optional — the spec does not require any
+/// of them to appear together. The muxer emits the `MasteringMetadata`
+/// master only when its slot in [`MkvVideoColour::mastering_metadata`]
+/// is `Some`; inside that master, each child element is written only
+/// when its corresponding `Option<f64>` is `Some(v)`. Every chromaticity
+/// or luminance is written as an 8-byte big-endian `f64`, which the
+/// demux side's [`crate::demux::MasteringMetadata`] reads back through
+/// the shared `ebml::read_float` helper (also accepts 4-byte
+/// `f32`-shaped values on read).
+///
+/// `Primary{R,G,B}Chromaticity{X,Y}` and `WhitePointChromaticity{X,Y}`
+/// are CIE-1931 chromaticities in the range `[0.0, 1.0]` per RFC 9559
+/// §5.1.4.1.28.31..§5.1.4.1.28.38. `Luminance{Max,Min}` are in cd/m²
+/// (§5.1.4.1.28.39 / §5.1.4.1.28.40, range `>= 0`). The muxer does
+/// **not** validate range — values outside the spec range still reach
+/// disk verbatim so a caller mirroring a file with out-of-spec values
+/// can preserve them.
+///
+/// Pairs symmetrically with [`crate::demux::MasteringMetadata`]: a
+/// mux→demux round-trip preserves every child verbatim, and a
+/// `MkvMasteringMetadata` with every slot `None` round-trips through
+/// an empty `MasteringMetadata` master on disk that the demuxer parses
+/// into `Some(MasteringMetadata::default())` — distinct from "no
+/// `MasteringMetadata` element present" which leaves the demux-side
+/// accessor `None`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MkvMasteringMetadata {
+    /// `PrimaryRChromaticityX` (RFC 9559 §5.1.4.1.28.31, id `0x55D1`).
+    /// CIE-1931 X coordinate of the mastering display's red primary,
+    /// range `[0.0, 1.0]`.
+    pub primary_r_chromaticity_x: Option<f64>,
+    /// `PrimaryRChromaticityY` (RFC 9559 §5.1.4.1.28.32, id `0x55D2`).
+    pub primary_r_chromaticity_y: Option<f64>,
+    /// `PrimaryGChromaticityX` (RFC 9559 §5.1.4.1.28.33, id `0x55D3`).
+    pub primary_g_chromaticity_x: Option<f64>,
+    /// `PrimaryGChromaticityY` (RFC 9559 §5.1.4.1.28.34, id `0x55D4`).
+    pub primary_g_chromaticity_y: Option<f64>,
+    /// `PrimaryBChromaticityX` (RFC 9559 §5.1.4.1.28.35, id `0x55D5`).
+    pub primary_b_chromaticity_x: Option<f64>,
+    /// `PrimaryBChromaticityY` (RFC 9559 §5.1.4.1.28.36, id `0x55D6`).
+    pub primary_b_chromaticity_y: Option<f64>,
+    /// `WhitePointChromaticityX` (RFC 9559 §5.1.4.1.28.37, id `0x55D7`).
+    pub white_point_chromaticity_x: Option<f64>,
+    /// `WhitePointChromaticityY` (RFC 9559 §5.1.4.1.28.38, id `0x55D8`).
+    pub white_point_chromaticity_y: Option<f64>,
+    /// `LuminanceMax` (RFC 9559 §5.1.4.1.28.39, id `0x55D9`), in cd/m²;
+    /// spec range `>= 0`. Maximum luminance of the mastering display.
+    pub luminance_max: Option<f64>,
+    /// `LuminanceMin` (RFC 9559 §5.1.4.1.28.40, id `0x55DA`), in cd/m²;
+    /// spec range `>= 0`. Minimum luminance of the mastering display.
+    pub luminance_min: Option<f64>,
+}
+
+impl MkvMasteringMetadata {
+    /// Convenience constructor for the BT.2020 primaries + D65 white
+    /// point shape used by the canonical HDR10 mastering display
+    /// (a 1000 cd/m² peak, 0.005 cd/m² floor). Chromaticities follow
+    /// ITU-R BT.2020 Table 2 (red `(0.708, 0.292)`, green
+    /// `(0.170, 0.797)`, blue `(0.131, 0.046)`) and D65 white point
+    /// `(0.3127, 0.3290)`.
+    pub fn bt2020_d65_hdr10() -> Self {
+        Self {
+            primary_r_chromaticity_x: Some(0.708),
+            primary_r_chromaticity_y: Some(0.292),
+            primary_g_chromaticity_x: Some(0.170),
+            primary_g_chromaticity_y: Some(0.797),
+            primary_b_chromaticity_x: Some(0.131),
+            primary_b_chromaticity_y: Some(0.046),
+            white_point_chromaticity_x: Some(0.3127),
+            white_point_chromaticity_y: Some(0.3290),
+            luminance_max: Some(1000.0),
+            luminance_min: Some(0.005),
+        }
+    }
 }
 
 impl Default for MkvVideoColour {
@@ -625,6 +717,7 @@ impl Default for MkvVideoColour {
             primaries: Primaries::Unspecified,
             max_cll: None,
             max_fall: None,
+            mastering_metadata: None,
         }
     }
 }
@@ -648,10 +741,11 @@ impl MkvVideoColour {
     /// (BT.2020 non-constant luminance), transfer `16` (BT.2100 PQ),
     /// primaries `9` (BT.2020), full range, 10 bits per channel. This is
     /// the canonical shape used for HDR10 video — the `MaxCLL` /
-    /// `MaxFALL` and `MasteringMetadata` fields are *not* set here; a
-    /// caller wanting them can override `max_cll` / `max_fall` on the
-    /// returned value (MasteringMetadata is not yet emitted on the write
-    /// side).
+    /// `MaxFALL` and `mastering_metadata` slots are *not* populated
+    /// here; a caller wanting them can override `max_cll` / `max_fall`
+    /// on the returned value, and attach a
+    /// [`MkvMasteringMetadata`] via `mastering_metadata: Some(…)` (e.g.
+    /// [`MkvMasteringMetadata::bt2020_d65_hdr10`]).
     pub fn bt2020_pq() -> Self {
         Self {
             matrix_coefficients: MatrixCoefficients::BT2020NonConstantLuminance,
@@ -1164,10 +1258,14 @@ impl MkvMuxer {
     /// [`crate::demux::MkvDemuxer::video_colour`] — distinct from "empty
     /// `Colour` master present" (`Some(VideoColour::default())`).
     ///
-    /// `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40) is not yet
-    /// emitted on the write side; queueing a colour hint that semantically
-    /// belongs with mastering metadata still works — only the scalar
-    /// children are written.
+    /// `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40) is emitted
+    /// whenever the queued [`MkvVideoColour::mastering_metadata`] slot
+    /// is `Some(_)`. Inside that master, each chromaticity / luminance
+    /// child is written only when its own `Option<f64>` slot is
+    /// `Some(v)`, mirroring the scalar-child omission rules above —
+    /// a [`MkvMasteringMetadata::default`] (all slots `None`) inside
+    /// `Some(_)` round-trips through an empty `MasteringMetadata`
+    /// master on disk.
     ///
     /// Returns a mutable reference back so calls can chain builder-style.
     pub fn set_video_colour(
@@ -1579,8 +1677,19 @@ impl Muxer for MkvMuxer {
                 // documents. Children are written in numerical-id order
                 // (the order the demuxer also encounters them while
                 // walking 0x55B1..0x55BD) so the layout is diff-friendly.
-                // MasteringMetadata (§5.1.4.1.28.30..§5.1.4.1.28.40) is
-                // not yet emitted on the write side.
+                // The `MasteringMetadata` sub-master
+                // (§5.1.4.1.28.30..§5.1.4.1.28.40, id 0x55D0) is emitted
+                // last when the queued hint carries
+                // `mastering_metadata: Some(MkvMasteringMetadata)`; each
+                // of its ten chromaticity / luminance children is
+                // written only when its own Option is `Some(v)`,
+                // mirroring the scalar-child omission rules above. An
+                // explicit `Some(MkvMasteringMetadata::default())`
+                // serialises as an empty MasteringMetadata master that
+                // the demuxer parses into
+                // `Some(MasteringMetadata::default())` — distinct from
+                // the slot-omitted case which keeps the master off-disk
+                // entirely so the demuxer surfaces `None`.
                 if let Some(c) = self.video_colours[i] {
                     let mut colour = Vec::new();
                     if c.matrix_coefficients != MatrixCoefficients::Unspecified {
@@ -1637,6 +1746,45 @@ impl Muxer for MkvMuxer {
                     }
                     if let Some(v) = c.max_fall {
                         write_uint_element(&mut colour, ids::MAX_FALL, v);
+                    }
+                    if let Some(mm) = c.mastering_metadata {
+                        // MasteringMetadata sub-master (RFC 9559
+                        // §5.1.4.1.28.30, id 0x55D0). Children emitted
+                        // in numerical-id order (0x55D1..0x55DA) so the
+                        // on-disk layout matches the order the demuxer
+                        // walks them.
+                        let mut mast = Vec::new();
+                        if let Some(v) = mm.primary_r_chromaticity_x {
+                            write_float_element(&mut mast, ids::PRIMARY_R_CHROMATICITY_X, v);
+                        }
+                        if let Some(v) = mm.primary_r_chromaticity_y {
+                            write_float_element(&mut mast, ids::PRIMARY_R_CHROMATICITY_Y, v);
+                        }
+                        if let Some(v) = mm.primary_g_chromaticity_x {
+                            write_float_element(&mut mast, ids::PRIMARY_G_CHROMATICITY_X, v);
+                        }
+                        if let Some(v) = mm.primary_g_chromaticity_y {
+                            write_float_element(&mut mast, ids::PRIMARY_G_CHROMATICITY_Y, v);
+                        }
+                        if let Some(v) = mm.primary_b_chromaticity_x {
+                            write_float_element(&mut mast, ids::PRIMARY_B_CHROMATICITY_X, v);
+                        }
+                        if let Some(v) = mm.primary_b_chromaticity_y {
+                            write_float_element(&mut mast, ids::PRIMARY_B_CHROMATICITY_Y, v);
+                        }
+                        if let Some(v) = mm.white_point_chromaticity_x {
+                            write_float_element(&mut mast, ids::WHITE_POINT_CHROMATICITY_X, v);
+                        }
+                        if let Some(v) = mm.white_point_chromaticity_y {
+                            write_float_element(&mut mast, ids::WHITE_POINT_CHROMATICITY_Y, v);
+                        }
+                        if let Some(v) = mm.luminance_max {
+                            write_float_element(&mut mast, ids::LUMINANCE_MAX, v);
+                        }
+                        if let Some(v) = mm.luminance_min {
+                            write_float_element(&mut mast, ids::LUMINANCE_MIN, v);
+                        }
+                        write_master_element(&mut colour, ids::MASTERING_METADATA, &mast);
                     }
                     write_master_element(&mut video, ids::COLOUR, &colour);
                 }

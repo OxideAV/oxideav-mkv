@@ -531,11 +531,28 @@ the unified `oxideav` aggregator to wire decoding automatically.
   entirely so the demuxer surfaces `None` from `video_colour`. Spec
   rules enforced at queue time: the setter rejects post-`write_header`
   use, out-of-range `stream_index`, and calls on non-video tracks.
-  `MasteringMetadata` (§5.1.4.1.28.30..§5.1.4.1.28.40) is not yet
-  emitted on the write side. Pairs symmetrically with the existing
-  `MkvDemuxer::video_colour` typed accessor — a mux→demux pipeline
-  preserves every scalar child verbatim, including the `Other(u64)`
-  forward-compat variants on each of the six enum-typed children.
+  The `Colour > MasteringMetadata` sub-master
+  (§5.1.4.1.28.30..§5.1.4.1.28.40, id `0x55D0`) is emitted whenever
+  the queued hint carries `mastering_metadata: Some(MkvMasteringMetadata)`;
+  inside that master each chromaticity / luminance child
+  (`PrimaryRChromaticityX/Y` / `PrimaryGChromaticityX/Y` /
+  `PrimaryBChromaticityX/Y` / `WhitePointChromaticityX/Y` /
+  `LuminanceMax` / `LuminanceMin`, ids `0x55D1`..`0x55DA`) is written
+  as an 8-byte big-endian `f64` only when its own `Option<f64>` slot is
+  `Some(v)` — mirroring the per-child omission rules above. A
+  `Some(MkvMasteringMetadata::default())` (every slot `None`)
+  serialises as an empty 3-byte `MasteringMetadata` master that the
+  demuxer parses into `Some(MasteringMetadata::default())`; setting
+  `mastering_metadata: None` keeps the entire sub-master off-disk so
+  the demuxer surfaces `None` from `mastering_metadata()`. The
+  convenience `MkvMasteringMetadata::bt2020_d65_hdr10()` populates the
+  ten-child set with BT.2020 primaries + D65 white point + 1000 cd/m²
+  peak / 0.005 cd/m² floor — the canonical HDR10 mastering display.
+  Pairs symmetrically with the existing `MkvDemuxer::video_colour`
+  typed accessor — a mux→demux pipeline preserves every scalar child
+  verbatim, including the `Other(u64)` forward-compat variants on each
+  of the six enum-typed children, plus every populated
+  `MasteringMetadata` chromaticity / luminance child.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -639,7 +656,7 @@ so the demuxer never hides an unrecognised track.
   `DisplayHeight` / `DisplayUnit` quartet
   (`MkvMuxer::set_video_geometry`, §5.1.4.1.28.8..§5.1.4.1.28.14),
   `UncompressedFourCC`
-  (`MkvMuxer::set_video_uncompressed_fourcc`, §5.1.4.1.28.15), and the
+  (`MkvMuxer::set_video_uncompressed_fourcc`, §5.1.4.1.28.15), the
   eleven scalar children of the `Colour` master
   (`MkvMuxer::set_video_colour`, §5.1.4.1.28.16,
   §5.1.4.1.28.17..§5.1.4.1.28.29 — `MatrixCoefficients`,
@@ -648,9 +665,14 @@ so the demuxer never hides an unrecognised track.
   `TransferCharacteristics`, `Primaries`, `MaxCLL`, `MaxFALL`; the
   convenience constructors `MkvVideoColour::bt709()` and
   `MkvVideoColour::bt2020_pq()` cover the SDR HD and HDR10 PQ
-  shapes) are written; the remaining `Video` sub-elements
-  (`Colour > MasteringMetadata`, `Projection`, `AspectRatioType`) are
-  not yet written.
+  shapes), and the ten chromaticity / luminance children of the
+  `Colour > MasteringMetadata` sub-master
+  (`MkvVideoColour::mastering_metadata = Some(MkvMasteringMetadata)`,
+  §5.1.4.1.28.30..§5.1.4.1.28.40 — `Primary{R,G,B}Chromaticity{X,Y}`,
+  `WhitePointChromaticity{X,Y}`, `Luminance{Max,Min}`; the convenience
+  constructor `MkvMasteringMetadata::bt2020_d65_hdr10()` covers the
+  canonical HDR10 shape) are written; the remaining `Video`
+  sub-elements (`Projection`, `AspectRatioType`) are not yet written.
 
 ## Robustness
 

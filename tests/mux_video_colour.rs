@@ -649,3 +649,293 @@ fn matrix_coefficients_explicit_bt2020_ncl_round_trip() {
         MatrixCoefficients::BT2020NonConstantLuminance
     );
 }
+
+/// `MkvMasteringMetadata::bt2020_d65_hdr10()` populates all ten
+/// chromaticity / luminance children with the BT.2020 + D65 + 1000
+/// nit / 0.005 nit shape. Round-tripping through the muxer's
+/// `MasteringMetadata` write path lands every one back exactly through
+/// the demuxer's typed accessor (RFC 9559 §5.1.4.1.28.30..§5.1.4.1.28.40).
+#[test]
+fn roundtrip_mastering_metadata_bt2020_d65_hdr10() {
+    use oxideav_mkv::mux::MkvMasteringMetadata;
+    let c = MkvVideoColour {
+        mastering_metadata: Some(MkvMasteringMetadata::bt2020_d65_hdr10()),
+        ..MkvVideoColour::bt2020_pq()
+    };
+    let bytes = mux_video(|mx| {
+        mx.set_video_colour(0, c).unwrap();
+    });
+    let dmx = demux_typed(bytes);
+    let got = dmx.video_colour(0).expect("video_colour surfaced");
+    let m = got
+        .mastering_metadata()
+        .expect("MasteringMetadata surfaced");
+    fn approx(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|v| (v - b).abs() < 1e-9)
+    }
+    assert!(approx(m.primary_r_chromaticity_x(), 0.708));
+    assert!(approx(m.primary_r_chromaticity_y(), 0.292));
+    assert!(approx(m.primary_g_chromaticity_x(), 0.170));
+    assert!(approx(m.primary_g_chromaticity_y(), 0.797));
+    assert!(approx(m.primary_b_chromaticity_x(), 0.131));
+    assert!(approx(m.primary_b_chromaticity_y(), 0.046));
+    assert!(approx(m.white_point_chromaticity_x(), 0.3127));
+    assert!(approx(m.white_point_chromaticity_y(), 0.3290));
+    assert!(approx(m.luminance_max(), 1000.0));
+    assert!(approx(m.luminance_min(), 0.005));
+    // The companion BT.2100 PQ scalar children carried in the same
+    // Colour master must still round-trip alongside the new sub-master.
+    assert_eq!(got.primaries(), Primaries::BT2020);
+    assert_eq!(
+        got.transfer_characteristics(),
+        TransferCharacteristics::BT2100Pq
+    );
+    assert_eq!(got.range(), ColourRange::Full);
+    assert_eq!(got.bits_per_channel(), 10);
+}
+
+/// Sparse `MasteringMetadata`: only `LuminanceMax` and `LuminanceMin`
+/// populated. Every other child stays `None` on disk and surfaces as
+/// `None` on the demux side. Pins the per-child omission rule.
+#[test]
+fn roundtrip_mastering_metadata_sparse_luminance_only() {
+    use oxideav_mkv::mux::MkvMasteringMetadata;
+    let mm = MkvMasteringMetadata {
+        luminance_max: Some(4000.0),
+        luminance_min: Some(0.0001),
+        ..MkvMasteringMetadata::default()
+    };
+    let c = MkvVideoColour {
+        mastering_metadata: Some(mm),
+        ..MkvVideoColour::bt2020_pq()
+    };
+    let bytes = mux_video(|mx| {
+        mx.set_video_colour(0, c).unwrap();
+    });
+    let dmx = demux_typed(bytes);
+    let got = dmx.video_colour(0).expect("video_colour");
+    let m = got
+        .mastering_metadata()
+        .expect("MasteringMetadata surfaced");
+    assert!(m.luminance_max().is_some_and(|v| (v - 4000.0).abs() < 1e-9));
+    assert!(m.luminance_min().is_some_and(|v| (v - 0.0001).abs() < 1e-9));
+    assert!(m.primary_r_chromaticity_x().is_none());
+    assert!(m.primary_r_chromaticity_y().is_none());
+    assert!(m.primary_g_chromaticity_x().is_none());
+    assert!(m.primary_g_chromaticity_y().is_none());
+    assert!(m.primary_b_chromaticity_x().is_none());
+    assert!(m.primary_b_chromaticity_y().is_none());
+    assert!(m.white_point_chromaticity_x().is_none());
+    assert!(m.white_point_chromaticity_y().is_none());
+}
+
+/// `mastering_metadata: None` (the default) keeps the
+/// `MasteringMetadata` sub-master off-disk entirely, so the demuxer's
+/// `mastering_metadata()` accessor surfaces `None` — distinct from the
+/// empty-master case below.
+#[test]
+fn omitted_mastering_metadata_yields_none() {
+    // Use BT.2020 PQ so the Colour master itself still gets written —
+    // the test is specifically about the sub-master being absent
+    // beneath a present Colour master.
+    let c = MkvVideoColour {
+        ..MkvVideoColour::bt2020_pq()
+    };
+    assert!(c.mastering_metadata.is_none());
+    let bytes = mux_video(|mx| {
+        mx.set_video_colour(0, c).unwrap();
+    });
+    let on_disk = bytes.clone();
+    let dmx = demux_typed(bytes);
+    let got = dmx.video_colour(0).expect("Colour master present");
+    assert!(
+        got.mastering_metadata().is_none(),
+        "absent MasteringMetadata sub-master must surface as None"
+    );
+    // And the MasteringMetadata id (0x55D0) must not appear on disk.
+    let needle = [0x55u8, 0xD0];
+    assert!(
+        !on_disk.windows(2).any(|w| w == needle),
+        "MasteringMetadata id (0x55D0) must NOT appear when slot was None"
+    );
+}
+
+/// `Some(MkvMasteringMetadata::default())` with every slot `None`
+/// serialises as an empty `MasteringMetadata` master that the demuxer
+/// parses into `Some(MasteringMetadata::default())` — every getter
+/// returns `None` but the master itself is present. Mirrors the
+/// empty-`Colour`-master semantics for the parent.
+#[test]
+fn empty_mastering_metadata_writes_empty_master() {
+    use oxideav_mkv::mux::MkvMasteringMetadata;
+    let c = MkvVideoColour {
+        mastering_metadata: Some(MkvMasteringMetadata::default()),
+        ..MkvVideoColour::bt2020_pq()
+    };
+    let bytes = mux_video(|mx| {
+        mx.set_video_colour(0, c).unwrap();
+    });
+    let on_disk = bytes.clone();
+    let dmx = demux_typed(bytes);
+    let got = dmx.video_colour(0).expect("Colour master present");
+    let m = got
+        .mastering_metadata()
+        .expect("empty MasteringMetadata master must surface as Some");
+    assert!(m.primary_r_chromaticity_x().is_none());
+    assert!(m.primary_r_chromaticity_y().is_none());
+    assert!(m.primary_g_chromaticity_x().is_none());
+    assert!(m.primary_g_chromaticity_y().is_none());
+    assert!(m.primary_b_chromaticity_x().is_none());
+    assert!(m.primary_b_chromaticity_y().is_none());
+    assert!(m.white_point_chromaticity_x().is_none());
+    assert!(m.white_point_chromaticity_y().is_none());
+    assert!(m.luminance_max().is_none());
+    assert!(m.luminance_min().is_none());
+
+    // On-disk literal walk: the empty MasteringMetadata master is
+    // exactly 3 bytes: id 0x55D0 (two bytes) + size VINT 0x80
+    // (zero-length payload). The same shape the empty-Colour-master
+    // test pins for the parent.
+    let needle = [0x55u8, 0xD0, 0x80];
+    assert!(
+        on_disk.windows(needle.len()).any(|w| w == needle),
+        "empty MasteringMetadata master must be exactly 3 bytes on disk: id 0x55D0 + size VINT 0x80"
+    );
+}
+
+/// Each chromaticity / luminance child round-trips on its own slot,
+/// independently of the others. Twelve assertions confirm the field-id
+/// table (`0x55D1`..`0x55DA`) maps every byte the parser walks back
+/// onto the slot the muxer wrote. Verifies that the muxer is wiring
+/// each `Option<f64>` to its correct element id rather than collapsing
+/// them.
+#[test]
+fn each_mastering_metadata_child_round_trips_independently() {
+    use oxideav_mkv::mux::MkvMasteringMetadata;
+    // Distinct values per slot so any field-id transposition shows up
+    // as the wrong number landing on the wrong getter.
+    let mm = MkvMasteringMetadata {
+        primary_r_chromaticity_x: Some(0.111),
+        primary_r_chromaticity_y: Some(0.222),
+        primary_g_chromaticity_x: Some(0.333),
+        primary_g_chromaticity_y: Some(0.444),
+        primary_b_chromaticity_x: Some(0.555),
+        primary_b_chromaticity_y: Some(0.666),
+        white_point_chromaticity_x: Some(0.777),
+        white_point_chromaticity_y: Some(0.888),
+        luminance_max: Some(123.0),
+        luminance_min: Some(0.5),
+    };
+    let c = MkvVideoColour {
+        mastering_metadata: Some(mm),
+        ..MkvVideoColour::default()
+    };
+    let bytes = mux_video(|mx| {
+        mx.set_video_colour(0, c).unwrap();
+    });
+    let dmx = demux_typed(bytes);
+    let got = dmx.video_colour(0).expect("Colour master present");
+    let m = got
+        .mastering_metadata()
+        .expect("MasteringMetadata surfaced");
+    let approx = |a: Option<f64>, b: f64| a.is_some_and(|v| (v - b).abs() < 1e-9);
+    assert!(approx(m.primary_r_chromaticity_x(), 0.111));
+    assert!(approx(m.primary_r_chromaticity_y(), 0.222));
+    assert!(approx(m.primary_g_chromaticity_x(), 0.333));
+    assert!(approx(m.primary_g_chromaticity_y(), 0.444));
+    assert!(approx(m.primary_b_chromaticity_x(), 0.555));
+    assert!(approx(m.primary_b_chromaticity_y(), 0.666));
+    assert!(approx(m.white_point_chromaticity_x(), 0.777));
+    assert!(approx(m.white_point_chromaticity_y(), 0.888));
+    assert!(approx(m.luminance_max(), 123.0));
+    assert!(approx(m.luminance_min(), 0.5));
+}
+
+/// `MasteringMetadata` round-trips alongside the parent `Colour`
+/// master's scalar children — the new sub-master writer doesn't perturb
+/// the existing `Colour > MaxCLL` / `MaxFALL` integer pair or any
+/// `Other(u64)` enum-typed children either side of it. Pins integration
+/// with the rest of the Colour-write path.
+#[test]
+fn mastering_metadata_does_not_perturb_other_colour_children() {
+    use oxideav_mkv::mux::MkvMasteringMetadata;
+    let c = MkvVideoColour {
+        max_cll: Some(4000),
+        max_fall: Some(800),
+        mastering_metadata: Some(MkvMasteringMetadata::bt2020_d65_hdr10()),
+        ..MkvVideoColour::bt2020_pq()
+    };
+    let bytes = mux_video(|mx| {
+        mx.set_video_colour(0, c).unwrap();
+    });
+    let dmx = demux_typed(bytes);
+    let got = dmx.video_colour(0).expect("Colour master present");
+    // Scalar children still carry their values.
+    assert_eq!(got.max_cll(), Some(4000));
+    assert_eq!(got.max_fall(), Some(800));
+    assert_eq!(got.primaries(), Primaries::BT2020);
+    assert_eq!(
+        got.transfer_characteristics(),
+        TransferCharacteristics::BT2100Pq
+    );
+    assert_eq!(got.range(), ColourRange::Full);
+    // MasteringMetadata still landed.
+    let m = got
+        .mastering_metadata()
+        .expect("MasteringMetadata surfaced");
+    assert!(m.luminance_max().is_some_and(|v| (v - 1000.0).abs() < 1e-9));
+    assert!(m.luminance_min().is_some_and(|v| (v - 0.005).abs() < 1e-9));
+}
+
+/// The muxer's own queued-value accessor returns the populated
+/// `MkvMasteringMetadata` verbatim — useful for tests that want to
+/// confirm the builder applied a hint without re-opening the file.
+#[test]
+fn accessor_returns_queued_mastering_metadata() {
+    use oxideav_mkv::mux::MkvMasteringMetadata;
+    let tmp = tmp_path("acc-mm");
+    let f = std::fs::File::create(&tmp).unwrap();
+    let ws: Box<dyn WriteSeek> = Box::new(f);
+    let mut mx = MkvMuxer::new_matroska(ws, &[video_stream()]).unwrap();
+    let mm = MkvMasteringMetadata::bt2020_d65_hdr10();
+    let c = MkvVideoColour {
+        mastering_metadata: Some(mm),
+        ..MkvVideoColour::bt2020_pq()
+    };
+    mx.set_video_colour(0, c).unwrap();
+    let got = mx.video_colour(0).expect("queued");
+    assert_eq!(got.mastering_metadata, Some(mm));
+    let _ = std::fs::remove_file(&tmp);
+}
+
+/// Out-of-range chromaticity / luminance values reach disk verbatim —
+/// the muxer does not validate the `[0.0, 1.0]` / `>= 0` ranges. A
+/// caller mirroring a producer that emitted out-of-spec values can
+/// preserve them through the round-trip.
+#[test]
+fn mastering_metadata_out_of_range_values_pass_through() {
+    use oxideav_mkv::mux::MkvMasteringMetadata;
+    let mm = MkvMasteringMetadata {
+        // Deliberately outside [0.0, 1.0].
+        primary_r_chromaticity_x: Some(1.5),
+        // Deliberately negative.
+        luminance_min: Some(-1.0),
+        ..MkvMasteringMetadata::default()
+    };
+    let c = MkvVideoColour {
+        mastering_metadata: Some(mm),
+        ..MkvVideoColour::default()
+    };
+    let bytes = mux_video(|mx| {
+        mx.set_video_colour(0, c).unwrap();
+    });
+    let dmx = demux_typed(bytes);
+    let got = dmx.video_colour(0).expect("Colour master present");
+    let m = got
+        .mastering_metadata()
+        .expect("MasteringMetadata surfaced");
+    assert!(m
+        .primary_r_chromaticity_x()
+        .is_some_and(|v| (v - 1.5).abs() < 1e-9));
+    assert!(m.luminance_min().is_some_and(|v| (v + 1.0).abs() < 1e-9));
+}
