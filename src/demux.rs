@@ -630,6 +630,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_aspect_ratio_types,
         video_uncompressed_fourccs,
         block_addition_mappings,
+        cluster_records: Vec::new(),
+        cluster_record_by_offset: std::collections::HashMap::new(),
     })
 }
 
@@ -667,6 +669,51 @@ impl CrcStatus {
     pub fn is_valid(&self) -> bool {
         self.stored == self.computed
     }
+}
+
+/// Per-Cluster typed record (RFC 9559 §5.1.3.2 — `Position`, §5.1.3.3 —
+/// `PrevSize`). Captured as the demuxer first opens each Cluster through
+/// [`Demuxer::next_packet`] or [`Demuxer::seek_to`]; absent fields stay
+/// `None` because both `Position` and `PrevSize` are optional children
+/// (`maxOccurs: 1`, no `minOccurs`).
+///
+/// Surfaced through [`MkvDemuxer::cluster_records`] as the demuxer walks
+/// the Segment, ordered by first-encounter time. A given Cluster is
+/// recorded at most once even when a back-then-forward seek revisits it —
+/// the `body_offset` field is the dedup key.
+///
+/// `Position` is the Segment Position (Section 16) of the Cluster — the
+/// distance from the first octet of the Cluster's id to the byte right
+/// after the Segment's id+size header. It MUST equal `0` in live streams,
+/// where the Cluster's own offset isn't determined ahead of time. The
+/// `body_offset` field is the absolute file offset of the Cluster's body
+/// (the byte right after its id+size header); consumers can subtract the
+/// Cluster's header length from `body_offset - segment_data_start` to
+/// recover the expected `Position` value and verify it against the
+/// recorded one.
+///
+/// `PrevSize` is the size of the previous Cluster element in octets —
+/// useful for backward playback. RFC 9559 §5.1.3.3 doesn't constrain how
+/// "size" is measured (id + size header + data, vs. data only), but in
+/// practice writers report the full element size, matching what a
+/// reverse walker would consume to step back across the previous
+/// Cluster.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClusterRecord {
+    /// Absolute file offset of the Cluster's body (the byte right after
+    /// its id+size header). Stable across re-seeks; used as the dedup
+    /// key when the demuxer revisits the same Cluster.
+    pub body_offset: u64,
+    /// `Position` element value (RFC 9559 §5.1.3.2) if the Cluster
+    /// carried one. `None` when absent — common, since `Position` is
+    /// optional and many writers omit it. A value of `Some(0)` is the
+    /// spec convention for live streams.
+    pub position: Option<u64>,
+    /// `PrevSize` element value (RFC 9559 §5.1.3.3) if the Cluster
+    /// carried one. `None` when absent — common on the very first
+    /// Cluster of a Segment (no previous Cluster to size), and on
+    /// writers that don't bother emitting it.
+    pub prev_size: Option<u64>,
 }
 
 /// Check a Top-Level master element for a leading `CRC-32` child and, if
@@ -4460,8 +4507,14 @@ fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection) -> Re
 enum ClusterState {
     /// Not inside a cluster; the next read must start with a Cluster header.
     Idle,
-    /// Inside a Cluster, reading children. `body_end` is where the cluster ends.
+    /// Inside a Cluster, reading children. `body_end` is where the cluster
+    /// ends. `body_start` is the absolute file offset of the byte right
+    /// after the Cluster's id+size header — used as the dedup key on
+    /// [`MkvDemuxer::cluster_records`] so a `Position` / `PrevSize` child
+    /// seen during the walk attaches to the correct record even when a
+    /// back-then-forward seek re-enters the same Cluster.
     InCluster {
+        body_start: u64,
         body_end: u64,
         cluster_timecode: i64,
     },
@@ -4599,6 +4652,19 @@ pub struct MkvDemuxer {
     /// appears on tracks that use `BlockAdditional` to extend their
     /// on-disk format). See [`MkvDemuxer::block_addition_mappings`].
     block_addition_mappings: Vec<Vec<BlockAdditionMapping>>,
+    /// Per-Cluster typed records (RFC 9559 §5.1.3.2 / §5.1.3.3 —
+    /// `Position` / `PrevSize`), appended in first-encounter order as
+    /// the demuxer opens each Cluster through [`Demuxer::next_packet`]
+    /// or [`Demuxer::seek_to`]. See [`MkvDemuxer::cluster_records`].
+    cluster_records: Vec<ClusterRecord>,
+    /// Reverse index keyed by [`ClusterRecord::body_offset`] —
+    /// position in [`Self::cluster_records`]. Lets the demuxer set
+    /// `Position` / `PrevSize` on the right record when the child
+    /// element is seen mid-walk, and dedups repeat opens (a
+    /// back-then-forward seek revisits the same Cluster — the second
+    /// open finds the record already present and reuses it instead of
+    /// pushing a duplicate row).
+    cluster_record_by_offset: std::collections::HashMap<u64, usize>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -4788,6 +4854,78 @@ impl MkvDemuxer {
     /// order it was first opened by `next_packet` / `seek_to`.
     pub fn crc_status(&self) -> &[CrcStatus] {
         &self.crc_status
+    }
+
+    /// Per-Cluster typed records (RFC 9559 §5.1.3.2 — `Position`,
+    /// §5.1.3.3 — `PrevSize`) appended in first-encounter order as the
+    /// demuxer opens each Cluster through [`Demuxer::next_packet`] /
+    /// [`Demuxer::seek_to`].
+    ///
+    /// Each [`ClusterRecord`] carries the Cluster's absolute body-offset
+    /// (the byte right after its id+size header) along with the optional
+    /// `Position` and `PrevSize` child values when present. A Cluster is
+    /// recorded at most once even when a back-then-forward seek revisits
+    /// it — the `body_offset` field is the dedup key.
+    ///
+    /// `Position` and `PrevSize` are both informational and optional —
+    /// many writers omit them, especially `PrevSize` on the first
+    /// Cluster of a Segment. Consumers walking this slice can:
+    ///
+    /// * Verify a recorded `Position` matches the actual on-disk offset
+    ///   (subtract `segment_data_start` plus the Cluster's header
+    ///   length from `body_offset` to recover the expected value) and
+    ///   reject damaged files where the two disagree;
+    /// * Build a reverse walker on top of `PrevSize` that steps back
+    ///   across the previous Cluster without re-scanning the Segment
+    ///   from the SeekHead / Cues;
+    /// * Detect a live stream by seeing `Some(0)` `Position` values
+    ///   (the §5.1.3.2 spec convention for streams with no known
+    ///   Cluster offsets ahead of time).
+    ///
+    /// Returned in the order the Clusters were first opened. The slice
+    /// grows as more Clusters are walked, so callers that want the full
+    /// per-Cluster record set should drain the file via `next_packet`
+    /// (or seek to every Cluster of interest) first.
+    pub fn cluster_records(&self) -> &[ClusterRecord] {
+        &self.cluster_records
+    }
+
+    /// Register a Cluster at `body_start` on the typed-record list if
+    /// not already present. Idempotent across re-seeks — a back-then-
+    /// forward seek that revisits the same Cluster reuses the existing
+    /// row instead of pushing a duplicate.
+    fn register_cluster_record(&mut self, body_start: u64) {
+        if self.cluster_record_by_offset.contains_key(&body_start) {
+            return;
+        }
+        let idx = self.cluster_records.len();
+        self.cluster_records.push(ClusterRecord {
+            body_offset: body_start,
+            position: None,
+            prev_size: None,
+        });
+        self.cluster_record_by_offset.insert(body_start, idx);
+    }
+
+    /// Attach a `Position` value (RFC 9559 §5.1.3.2) to the Cluster
+    /// record keyed by `body_start`. No-op when the record is missing —
+    /// the on-disk element ordering guarantees the record was pushed
+    /// when the Cluster's id+size header was parsed, so this only
+    /// happens if a malformed file emits `Position` outside a Cluster
+    /// the demuxer recognised.
+    fn set_cluster_position(&mut self, body_start: u64, v: u64) {
+        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
+            self.cluster_records[idx].position = Some(v);
+        }
+    }
+
+    /// Attach a `PrevSize` value (RFC 9559 §5.1.3.3) to the Cluster
+    /// record keyed by `body_start`. No-op when the record is missing —
+    /// see [`Self::set_cluster_position`] for the why.
+    fn set_cluster_prev_size(&mut self, body_start: u64, v: u64) {
+        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
+            self.cluster_records[idx].prev_size = Some(v);
+        }
     }
 
     /// Typed `Chapters\EditionEntry` tree (RFC 9559 §5.1.7) parsed from
@@ -5288,9 +5426,17 @@ impl MkvDemuxer {
         }
         // `pos` now equals `target` (or `target` was 0 and we never
         // entered the loop). Seek to the target and install the
-        // InCluster state.
+        // InCluster state. The `Position` / `PrevSize` children (RFC
+        // 9559 §5.1.3.2 / §5.1.3.3) are SHOULD-be-near-the-start —
+        // typically right after the `Timestamp` — so the Cue-driven
+        // skip past `target` may step over them; we still register
+        // the record so a subsequent direct walk that re-enters this
+        // Cluster (e.g. on a back-then-forward seek) can populate the
+        // fields without creating a duplicate row.
         self.input.seek(SeekFrom::Start(target))?;
+        self.register_cluster_record(body_start);
         self.cluster_state = ClusterState::InCluster {
+            body_start,
             body_end,
             cluster_timecode,
         };
@@ -5375,7 +5521,9 @@ impl MkvDemuxer {
                         // helper rewinds the reader to `body_start` so the
                         // child-element walk below sees the same bytes.
                         self.validate_cluster_crc(body_start, body_end, is_unknown_size)?;
+                        self.register_cluster_record(body_start);
                         self.cluster_state = ClusterState::InCluster {
+                            body_start,
                             body_end,
                             cluster_timecode: 0,
                         };
@@ -5394,6 +5542,7 @@ impl MkvDemuxer {
                 }
             }
             ClusterState::InCluster {
+                body_start,
                 body_end,
                 cluster_timecode,
             } => {
@@ -5413,6 +5562,24 @@ impl MkvDemuxer {
                         {
                             *cluster_timecode = v;
                         }
+                    }
+                    ids::POSITION => {
+                        // RFC 9559 §5.1.3.2 — the Segment Position of this
+                        // Cluster (Section 16). `0` in live streams. Captured
+                        // onto the typed record so consumers can verify it
+                        // matches the actual on-disk offset (`body_start -
+                        // segment_data_start - cluster_header_len`) or use
+                        // it as a damaged-stream resync hint.
+                        let v = read_uint(&mut *self.input, e.size as usize)?;
+                        self.set_cluster_position(body_start, v);
+                    }
+                    ids::PREV_SIZE => {
+                        // RFC 9559 §5.1.3.3 — size of the previous Cluster
+                        // in octets. Useful for backward playing — captured
+                        // so a reverse-walker built on top of the demuxer
+                        // can jump back without re-scanning the Segment.
+                        let v = read_uint(&mut *self.input, e.size as usize)?;
+                        self.set_cluster_prev_size(body_start, v);
                     }
                     ids::SIMPLE_BLOCK => {
                         let bytes = read_bytes(&mut *self.input, e.size as usize)?;

@@ -245,6 +245,8 @@ pub const BIT_DEPTH: u32 = 0x6264;
 
 // Cluster.
 pub const TIMECODE: u32 = 0xE7;
+pub const POSITION: u32 = 0xA7;
+pub const PREV_SIZE: u32 = 0xAB;
 pub const SIMPLE_BLOCK: u32 = 0xA3;
 pub const BLOCK_GROUP: u32 = 0xA0;
 pub const BLOCK: u32 = 0xA1;

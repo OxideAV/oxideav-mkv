@@ -101,6 +101,28 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `EPISODE` labels); the file's own `TargetType` informational string
   stays on the existing `Targets::target_type` field — the typed level
   helper doesn't overwrite it.
+- **Typed per-Cluster `Position` / `PrevSize` records** (RFC 9559
+  §5.1.3.2 / §5.1.3.3): `MkvDemuxer::cluster_records() ->
+  &[ClusterRecord]` surfaces each Cluster's optional `Position`
+  (id `0xA7`, `uinteger`) and `PrevSize` (id `0xAB`, `uinteger`)
+  children as they're walked. Records are appended in first-encounter
+  order through `next_packet` / `seek_to`, with `body_offset` (the
+  absolute file offset of the byte right after the Cluster's id+size
+  header) as the dedup key — a back-then-forward seek that revisits
+  the same Cluster doesn't push a duplicate row. Both typed fields
+  are `Option<u64>`: `None` when the on-disk child was absent (common
+  for `PrevSize` on the first Cluster of a Segment, and for both
+  fields when a writer omitted them entirely), `Some(v)` when present.
+  The `Some(0)` `Position` case is the §5.1.3.2 spec convention for
+  live streams (Cluster offset not determined ahead of time) and is
+  distinct from `None`. Consumers can verify a recorded `Position`
+  matches the actual on-disk offset by subtracting `segment_data_start`
+  + the Cluster's header length from `body_offset` (the §16
+  Segment-Position definition), build a reverse walker on top of
+  `PrevSize` without re-scanning the SeekHead, or detect a live stream
+  by seeing `Some(0)` `Position` values. The slice grows incrementally
+  as the demuxer walks the Segment — callers wanting the full
+  per-Cluster set should drain the file via `next_packet` first.
 - **Typed `Attachments` accessor** (RFC 9559 §5.1.6):
   `MkvDemuxer::attachments() -> &[Attachment]` returns one
   [`Attachment`] per `AttachedFile` parsed from the Segment, in document
