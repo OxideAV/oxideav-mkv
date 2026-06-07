@@ -78,6 +78,29 @@ the unified `oxideav` aggregator to wire decoding automatically.
   and binary `TagBinary` payloads (e.g. embedded cover-art bytes).
   Tags with only dangling non-zero UIDs are filtered out per
   §5.1.8.1.1.3..§5.1.8.1.1.6; mixed Targets keep their resolvable UIDs.
+- **`Targets::target_level()` typed hierarchy** (RFC 9559 §5.1.8.1.1.1,
+  Table 33): `Targets::target_level() -> Option<TargetLevel>` resolves
+  the raw `target_type_value` integer into the typed `TargetLevel`
+  enum (`Shot=10` / `Subtrack=20` / `Track=30` / `Part=40` /
+  `Album=50` / `Edition=60` / `Collection=70`, plus `Other(u64)` for
+  values registered under the §27.13 "Matroska Tags Target Types"
+  registry after RFC 9559). The enum derives `Ord` in spec-containment
+  order so a player can walk the album → track → subtrack hierarchy
+  without re-comparing raw integers — the §5.1.8.1.1.1 usage note
+  ("Higher values MUST correspond to a logical level that contains
+  the lower logical level TargetTypeValue values") falls straight out
+  of `Ord`. `Other(_)` sorts after every named level so a future entry
+  doesn't break the comparison rule for the named ones. Returns `None`
+  when the `TargetTypeValue` element was absent on disk —
+  distinguishable from `Some(TargetLevel::Album)` (the spec default
+  `50` materialised by a writer). Inverse `TargetLevel::to_raw()`
+  round-trips every named variant + the `Other(u64)` forward-compat
+  passthrough. Companion `TargetLevel::canonical_label()` returns the
+  leftmost / most common Table 33 label for the level (e.g. `ALBUM`
+  for value `50`, not the alternate `OPERA` / `CONCERT` / `MOVIE` /
+  `EPISODE` labels); the file's own `TargetType` informational string
+  stays on the existing `Targets::target_type` field — the typed level
+  helper doesn't overwrite it.
 - **Typed `Attachments` accessor** (RFC 9559 §5.1.6):
   `MkvDemuxer::attachments() -> &[Attachment]` returns one
   [`Attachment`] per `AttachedFile` parsed from the Segment, in document

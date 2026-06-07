@@ -1322,6 +1322,124 @@ pub struct Targets {
     pub uids: Vec<TargetUid>,
 }
 
+impl Targets {
+    /// Resolve [`Targets::target_type_value`] (RFC 9559 §5.1.8.1.1.1) into
+    /// the typed [`TargetLevel`] hierarchy (Table 33 — `COLLECTION` ⊇
+    /// `EDITION` ⊇ `ALBUM` ⊇ `PART` ⊇ `TRACK` ⊇ `SUBTRACK` ⊇ `SHOT`).
+    ///
+    /// Returns `None` when the `TargetTypeValue` element was absent from
+    /// the file — distinguishable from `Some(TargetLevel::Album)` (which
+    /// would be the spec default `50` materialised by the writer). The
+    /// `TargetType` informational string (§5.1.8.1.1.2) is *not* consulted
+    /// here: the spec lets a single `TargetTypeValue` row carry several
+    /// equivalent `TargetType` labels (e.g. `ALBUM` / `OPERA` / `CONCERT`
+    /// / `MOVIE` / `EPISODE` all map to value `50`), so the integer is the
+    /// canonical hierarchy key and the string is purely a display hint.
+    /// Forward-compat values registered after RFC 9559 (§27.13 leaves the
+    /// "Matroska Tags Target Types" registry open) surface as
+    /// [`TargetLevel::Other`] rather than being clamped or dropped.
+    pub fn target_level(&self) -> Option<TargetLevel> {
+        self.target_type_value.map(TargetLevel::from_raw)
+    }
+}
+
+/// Hierarchical level a [`Tag`] applies to (RFC 9559 §5.1.8.1.1.1,
+/// Table 33). Variants correspond to the `TargetTypeValue` rows whose
+/// "lower hierarchical level" comparison rule (§5.1.8.1.1.1 usage notes:
+/// "The TargetTypeValue values are meant to be compared. Higher values
+/// MUST correspond to a logical level that contains the lower logical
+/// level TargetTypeValue values.") underpins how a player walks an
+/// album → track → subtrack hierarchy.
+///
+/// The variant ordering matches the spec ordering (`Shot` < `Subtrack` <
+/// `Track` < `Part` < `Album` < `Edition` < `Collection`), so deriving
+/// `Ord` mirrors the §5.1.8.1.1.1 containment semantics. Forward-compat
+/// values registered after RFC 9559 (§27.13 leaves the registry open)
+/// surface as [`TargetLevel::Other`], which sorts after every named
+/// level so an unrecognised value doesn't break the comparison rule for
+/// the named ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TargetLevel {
+    /// `10` — `SHOT`. The lowest hierarchy found in music or movies.
+    Shot,
+    /// `20` — `SUBTRACK` / `MOVEMENT` / `SCENE`. Parts of a track for
+    /// audio, such as a movement or scene in a movie.
+    Subtrack,
+    /// `30` — `TRACK` / `SONG` / `CHAPTER`. The common parts of an album
+    /// or movie.
+    Track,
+    /// `40` — `PART` / `SESSION`. When an album or episode has different
+    /// logical parts.
+    Part,
+    /// `50` — `ALBUM` / `OPERA` / `CONCERT` / `MOVIE` / `EPISODE`. The
+    /// spec default for `TargetTypeValue`; the most common grouping
+    /// level of music and video (e.g. an episode for TV series).
+    Album,
+    /// `60` — `EDITION` / `ISSUE` / `VOLUME` / `OPUS` / `SEASON` /
+    /// `SEQUEL`. A list of lower levels grouped together.
+    Edition,
+    /// `70` — `COLLECTION`. The highest hierarchical level that tags
+    /// can describe.
+    Collection,
+    /// A value registered after RFC 9559 under the "Matroska Tags
+    /// Target Types" registry (§27.13). Carries the raw integer so the
+    /// caller can compare across rounds without losing data.
+    Other(u64),
+}
+
+impl TargetLevel {
+    /// Map a raw `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1) onto the
+    /// hierarchy enum, preserving unrecognised values via
+    /// [`TargetLevel::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            10 => TargetLevel::Shot,
+            20 => TargetLevel::Subtrack,
+            30 => TargetLevel::Track,
+            40 => TargetLevel::Part,
+            50 => TargetLevel::Album,
+            60 => TargetLevel::Edition,
+            70 => TargetLevel::Collection,
+            other => TargetLevel::Other(other),
+        }
+    }
+
+    /// Inverse of [`TargetLevel::from_raw`] — round-trip an enum value
+    /// back to its `TargetTypeValue` integer. Useful for re-mux paths
+    /// that want to write the level back out.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            TargetLevel::Shot => 10,
+            TargetLevel::Subtrack => 20,
+            TargetLevel::Track => 30,
+            TargetLevel::Part => 40,
+            TargetLevel::Album => 50,
+            TargetLevel::Edition => 60,
+            TargetLevel::Collection => 70,
+            TargetLevel::Other(v) => v,
+        }
+    }
+
+    /// Canonical (first) `TargetType` informational label for the level
+    /// (RFC 9559 §5.1.8.1.1.1, Table 33). When several labels share a
+    /// `TargetTypeValue` row (e.g. value `50` covers `ALBUM` / `OPERA`
+    /// / `CONCERT` / `MOVIE` / `EPISODE`) the leftmost / most common
+    /// label is returned. `None` for [`TargetLevel::Other`] — the spec
+    /// gives no canonical label for a forward-compat registry entry.
+    pub fn canonical_label(self) -> Option<&'static str> {
+        match self {
+            TargetLevel::Shot => Some("SHOT"),
+            TargetLevel::Subtrack => Some("SUBTRACK"),
+            TargetLevel::Track => Some("TRACK"),
+            TargetLevel::Part => Some("PART"),
+            TargetLevel::Album => Some("ALBUM"),
+            TargetLevel::Edition => Some("EDITION"),
+            TargetLevel::Collection => Some("COLLECTION"),
+            TargetLevel::Other(_) => None,
+        }
+    }
+}
+
 /// One resolved entry in [`Targets::uids`]. The `_uid` field preserves
 /// the on-disk UID so consumers that want to cross-reference (e.g. emit
 /// the same tag back into a re-mux) can do so without re-reading the

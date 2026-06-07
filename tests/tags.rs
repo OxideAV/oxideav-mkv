@@ -24,7 +24,7 @@
 use std::io::Cursor;
 
 use oxideav_core::{Demuxer, ReadSeek};
-use oxideav_mkv::demux::{SimpleTagValue, TargetUid};
+use oxideav_mkv::demux::{SimpleTagValue, TargetLevel, TargetUid};
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -886,4 +886,193 @@ fn typed_tags_empty_targets_master_means_global() {
     assert!(t.targets.uids.is_empty());
     assert_eq!(t.targets.target_type, None);
     assert_eq!(t.targets.target_type_value, None);
+}
+
+// ---------------------------------------------------------------------------
+// TargetLevel typed surface (RFC 9559 §5.1.8.1.1.1, Table 33).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn target_level_from_to_raw_round_trip_named_levels() {
+    // Every Table 33 row round-trips bit-exactly through the enum.
+    for (raw, level, label) in [
+        (10u64, TargetLevel::Shot, "SHOT"),
+        (20, TargetLevel::Subtrack, "SUBTRACK"),
+        (30, TargetLevel::Track, "TRACK"),
+        (40, TargetLevel::Part, "PART"),
+        (50, TargetLevel::Album, "ALBUM"),
+        (60, TargetLevel::Edition, "EDITION"),
+        (70, TargetLevel::Collection, "COLLECTION"),
+    ] {
+        assert_eq!(TargetLevel::from_raw(raw), level, "from_raw({raw})");
+        assert_eq!(level.to_raw(), raw, "to_raw({label})");
+        assert_eq!(level.canonical_label(), Some(label));
+    }
+}
+
+#[test]
+fn target_level_other_preserves_forward_compat_values() {
+    // RFC 9559 §27.13 leaves the "Matroska Tags Target Types" registry open
+    // — unrecognised values surface as TargetLevel::Other(raw) rather than
+    // being clamped or dropped, and round-trip through to_raw() losslessly.
+    // Spec range for TargetTypeValue is "not 0 (1..u64::MAX)" per §5.1.8.1.1.1.
+    for raw in [1u64, 25, 55, 80, 90, 100, 1_000, u64::MAX] {
+        let lv = TargetLevel::from_raw(raw);
+        assert_eq!(lv, TargetLevel::Other(raw), "from_raw({raw})");
+        assert_eq!(lv.to_raw(), raw, "to_raw round-trip for {raw}");
+        assert_eq!(lv.canonical_label(), None, "Other({raw}) has no label");
+    }
+}
+
+#[test]
+fn target_level_ordering_matches_spec_containment() {
+    // RFC 9559 §5.1.8.1.1.1: "Higher values MUST correspond to a logical
+    // level that contains the lower logical level TargetTypeValue values."
+    // Our Ord derives mirrors that — Shot < Subtrack < Track < Part <
+    // Album < Edition < Collection. A player walking the hierarchy can
+    // rely on this without re-comparing the raw integers.
+    assert!(TargetLevel::Shot < TargetLevel::Subtrack);
+    assert!(TargetLevel::Subtrack < TargetLevel::Track);
+    assert!(TargetLevel::Track < TargetLevel::Part);
+    assert!(TargetLevel::Part < TargetLevel::Album);
+    assert!(TargetLevel::Album < TargetLevel::Edition);
+    assert!(TargetLevel::Edition < TargetLevel::Collection);
+
+    // Forward-compat values sort after every named level — an unrecognised
+    // entry doesn't break the comparison rule for the named ones.
+    assert!(TargetLevel::Collection < TargetLevel::Other(1));
+    assert!(TargetLevel::Other(1) < TargetLevel::Other(2));
+}
+
+#[test]
+fn targets_target_level_resolves_value_to_typed_enum() {
+    // A Tag with TargetTypeValue=30 (TRACK) and a single resolved
+    // TagTrackUID — Targets::target_level() returns Some(TargetLevel::Track).
+    let tags_body = tag_with_raw(
+        Some(30),
+        Some("TRACK"),
+        &[0xA1], // resolves to stream index 0
+        &[],
+        &[],
+        &[],
+        &[simple_tag_full("TITLE", Ok("Side 1"), None, None, None)],
+    );
+    let bytes = build_mkv_with_custom_tags(tags_body);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx =
+        oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+    let tags = dmx.tags();
+    assert_eq!(tags.len(), 1);
+    let t = &tags[0];
+    assert_eq!(t.targets.target_type_value, Some(30));
+    assert_eq!(t.targets.target_level(), Some(TargetLevel::Track));
+    // The TargetType informational string is *not* required to determine
+    // the level — the integer is the canonical hierarchy key.
+    assert_eq!(t.targets.target_type.as_deref(), Some("TRACK"));
+    assert_eq!(
+        t.targets.uids,
+        vec![TargetUid::Track {
+            stream_index: 0,
+            track_uid: 0xA1,
+        }]
+    );
+}
+
+#[test]
+fn targets_target_level_is_none_when_element_absent() {
+    // No TargetTypeValue on disk → Targets::target_level() is None,
+    // distinct from Some(TargetLevel::Album) (the spec default 50 a
+    // writer could have materialised explicitly).
+    let tags_body = tag_with_raw(
+        None, // no TargetTypeValue
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[simple_tag_full("COMMENT", Ok("global"), None, None, None)],
+    );
+    let bytes = build_mkv_with_custom_tags(tags_body);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx =
+        oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+    let tags = dmx.tags();
+    assert_eq!(tags.len(), 1);
+    let t = &tags[0];
+    assert_eq!(t.targets.target_type_value, None);
+    assert_eq!(t.targets.target_level(), None);
+}
+
+#[test]
+fn targets_target_level_surfaces_forward_compat_value() {
+    // Future TargetTypeValue (e.g. 25 — not in Table 33 today, but
+    // §27.13 leaves the registry open) surfaces as TargetLevel::Other(25)
+    // rather than being dropped or clamped.
+    let tags_body = tag_with_raw(
+        Some(25),
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[simple_tag_full(
+            "EXPERIMENTAL",
+            Ok("payload"),
+            None,
+            None,
+            None,
+        )],
+    );
+    let bytes = build_mkv_with_custom_tags(tags_body);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx =
+        oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+    let tags = dmx.tags();
+    assert_eq!(tags.len(), 1);
+    let t = &tags[0];
+    assert_eq!(t.targets.target_type_value, Some(25));
+    assert_eq!(t.targets.target_level(), Some(TargetLevel::Other(25)));
+    assert_eq!(t.targets.target_level().unwrap().canonical_label(), None);
+}
+
+#[test]
+fn targets_target_level_default_50_materialised_when_explicit() {
+    // Writer explicitly emits TargetTypeValue=50 (the spec default) —
+    // target_level() returns Some(TargetLevel::Album), distinguishable
+    // from None (= element absent).
+    let tags_body = tag_with_raw(
+        Some(50),
+        Some("MOVIE"), // one of several Table 33 labels at value 50
+        &[],
+        &[],
+        &[],
+        &[],
+        &[simple_tag_full(
+            "TITLE",
+            Ok("Sample Film"),
+            None,
+            None,
+            None,
+        )],
+    );
+    let bytes = build_mkv_with_custom_tags(tags_body);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx =
+        oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+    let tags = dmx.tags();
+    assert_eq!(tags.len(), 1);
+    let t = &tags[0];
+    assert_eq!(t.targets.target_type_value, Some(50));
+    assert_eq!(t.targets.target_level(), Some(TargetLevel::Album));
+    // The canonical label is ALBUM even though the file carried MOVIE —
+    // both share row 50 in Table 33, and `canonical_label` returns the
+    // leftmost (most common) label for the level.
+    assert_eq!(
+        t.targets.target_level().unwrap().canonical_label(),
+        Some("ALBUM")
+    );
+    // The file's own TargetType string is preserved verbatim on the
+    // existing `target_type` field — the typed level helper doesn't
+    // overwrite it.
+    assert_eq!(t.targets.target_type.as_deref(), Some("MOVIE"));
 }
