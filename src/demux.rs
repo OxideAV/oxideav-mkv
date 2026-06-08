@@ -412,6 +412,32 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         .map(|t| t.block_addition_mappings.clone())
         .collect();
 
+    // Per-stream `TrackAudienceFlags` (RFC 9559 §5.1.4.1.6..§5.1.4.1.11),
+    // indexed by stream index. The spec defaults are materialised here, on
+    // the typed builder, so the raw `audience_flags_raw` tuple on
+    // `TrackEntry` stays a pure on-disk projection: `FlagForced`
+    // (§5.1.4.1.6) defaults to `0` (false) when the on-disk element was
+    // absent, while the five `minver: 4` flags carry no spec default and
+    // stay `None` on absence — `Some(false)` exclusively means "the writer
+    // emitted an explicit 0." Every track surfaces a record (not
+    // `Option<...>`) since the audience-flag elements live on `TrackEntry`
+    // directly with `minOccurs: 1` for `FlagForced`; tracks with no
+    // children fold to `TrackAudienceFlags::default()`.
+    let track_audience_flags: Vec<TrackAudienceFlags> = tracks
+        .iter()
+        .map(|t| {
+            let raw = t.audience_flags_raw;
+            TrackAudienceFlags {
+                forced: raw.forced.map(audience_flag_to_bool).unwrap_or(false),
+                hearing_impaired: raw.hearing_impaired.map(audience_flag_to_bool),
+                visual_impaired: raw.visual_impaired.map(audience_flag_to_bool),
+                text_descriptions: raw.text_descriptions.map(audience_flag_to_bool),
+                original: raw.original.map(audience_flag_to_bool),
+                commentary: raw.commentary.map(audience_flag_to_bool),
+            }
+        })
+        .collect();
+
     // Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2),
     // indexed by stream index. `None` for non-video tracks and for video
     // tracks whose `TrackEntry` had no `Video` master; for everything else
@@ -630,6 +656,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_aspect_ratio_types,
         video_uncompressed_fourccs,
         block_addition_mappings,
+        track_audience_flags,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
     })
@@ -879,6 +906,30 @@ struct TrackEntry {
     /// `BlockAdditional` to extend their on-disk format, e.g. WebM alpha
     /// or HDR dynamic metadata payloads).
     block_addition_mappings: Vec<BlockAdditionMapping>,
+    /// Raw audience-flag uintegers captured from the `TrackEntry` walk
+    /// (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). Each is `None` when the on-disk
+    /// element was absent. `FlagForced` (§5.1.4.1.6) is the only one with
+    /// a spec default (0); the typed surface materialises that default
+    /// uniformly when building [`TrackAudienceFlags`]. The other five
+    /// (`minver: 4`) carry no spec default, so absence stays observable as
+    /// `None` on the typed surface.
+    audience_flags_raw: RawAudienceFlags,
+}
+
+/// Parser-private staging form for the six per-track audience flags
+/// (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). `None` means "no on-disk element";
+/// `Some(v)` carries the raw uinteger payload the writer emitted.
+/// Spec defaults are *not* materialised here — they're folded in on the
+/// typed [`TrackAudienceFlags`] builder so the staging record stays a
+/// pure on-disk projection.
+#[derive(Clone, Copy, Debug, Default)]
+struct RawAudienceFlags {
+    forced: Option<u64>,
+    hearing_impaired: Option<u64>,
+    visual_impaired: Option<u64>,
+    text_descriptions: Option<u64>,
+    original: Option<u64>,
+    commentary: Option<u64>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -1700,6 +1751,139 @@ impl BlockAdditionMapping {
     pub fn is_codec_defined(&self) -> bool {
         self.addid_type == 0
     }
+}
+
+/// The six per-track "audience" flags from RFC 9559 §5.1.4.1.6..§5.1.4.1.11.
+///
+/// Each flag is a 0-or-1 hint about how a player should present the track
+/// to a particular kind of viewer:
+///
+/// * [`forced`](Self::forced) (§5.1.4.1.6): subtitle track eligible for
+///   automatic selection by the player when it matches the user's language
+///   preference, even if the user normally disables subtitles — used for
+///   foreign-language translations of audio or burnt-in on-screen text.
+/// * [`hearing_impaired`](Self::hearing_impaired) (§5.1.4.1.7): the track
+///   is suitable for users with hearing impairments (e.g. SDH subtitles).
+/// * [`visual_impaired`](Self::visual_impaired) (§5.1.4.1.8): the track is
+///   suitable for users with visual impairments (e.g. audio description).
+/// * [`text_descriptions`](Self::text_descriptions) (§5.1.4.1.9): the track
+///   carries textual descriptions of video content.
+/// * [`original`](Self::original) (§5.1.4.1.10): the track is in the
+///   content's original language (vs a dub).
+/// * [`commentary`](Self::commentary) (§5.1.4.1.11): the track contains
+///   commentary (director's commentary, etc.).
+///
+/// **Defaults**: only `FlagForced` carries a spec default (`0`); the other
+/// five elements (`minver: 4`) carry no spec default. The typed surface
+/// reflects that asymmetry: [`forced`](Self::forced) is a bare `bool` (the
+/// default `0` is always materialised, so an empty `TrackEntry` decodes
+/// `forced == false`), while the other five are `Option<bool>` — `None`
+/// when the on-disk element was absent, `Some(true)` / `Some(false)` when
+/// the writer set it explicitly. The §5.1.4.1.7..§5.1.4.1.11 wording
+/// ("Set to 1 *if and only if* …") makes a writer's *explicit* `0` a
+/// stronger signal than absence, so collapsing absence to `false` would
+/// throw away information.
+///
+/// **Spec scope**: §5.1.4.1.6 mentions `FlagForced` "applies only to
+/// subtitles" — but the spec carries the element on every `TrackEntry`
+/// with `minOccurs: 1`, so the typed surface returns a record for every
+/// track (audio / video / subtitle / button / control) and trusts the
+/// caller to apply it only where meaningful.
+///
+/// Surfaced per stream via [`MkvDemuxer::track_audience_flags`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrackAudienceFlags {
+    forced: bool,
+    hearing_impaired: Option<bool>,
+    visual_impaired: Option<bool>,
+    text_descriptions: Option<bool>,
+    original: Option<bool>,
+    commentary: Option<bool>,
+}
+
+impl TrackAudienceFlags {
+    /// `FlagForced` (RFC 9559 §5.1.4.1.6). `true` exactly when the track
+    /// is a forced subtitle eligible for automatic selection. The spec
+    /// default `0` is materialised, so a `TrackEntry` with no `FlagForced`
+    /// child decodes `false`.
+    pub fn forced(&self) -> bool {
+        self.forced
+    }
+
+    /// `FlagHearingImpaired` (RFC 9559 §5.1.4.1.7). `Some(true)` exactly
+    /// when the writer explicitly marked the track as SDH-style suitable
+    /// for hearing-impaired users; `Some(false)` when the writer
+    /// explicitly cleared the flag; `None` when the element was absent
+    /// from disk (the spec gives no default).
+    pub fn hearing_impaired(&self) -> Option<bool> {
+        self.hearing_impaired
+    }
+
+    /// `FlagVisualImpaired` (RFC 9559 §5.1.4.1.8). `Some(true)` exactly
+    /// when the writer explicitly marked the track as suitable for
+    /// visually-impaired users (e.g. an audio-description track);
+    /// `Some(false)` / `None` follow the same convention as
+    /// [`hearing_impaired`](Self::hearing_impaired).
+    pub fn visual_impaired(&self) -> Option<bool> {
+        self.visual_impaired
+    }
+
+    /// `FlagTextDescriptions` (RFC 9559 §5.1.4.1.9). `Some(true)` when
+    /// the writer marked the track as carrying textual descriptions of
+    /// video content; `Some(false)` / `None` per the same convention.
+    pub fn text_descriptions(&self) -> Option<bool> {
+        self.text_descriptions
+    }
+
+    /// `FlagOriginal` (RFC 9559 §5.1.4.1.10). `Some(true)` when the
+    /// writer marked the track as carrying the content's original
+    /// language; `Some(false)` for a dubbed track explicitly cleared by
+    /// the writer; `None` when the element was absent.
+    pub fn original(&self) -> Option<bool> {
+        self.original
+    }
+
+    /// `FlagCommentary` (RFC 9559 §5.1.4.1.11). `Some(true)` when the
+    /// writer marked the track as a commentary track; `Some(false)` /
+    /// `None` per the same convention.
+    pub fn commentary(&self) -> Option<bool> {
+        self.commentary
+    }
+
+    /// `true` exactly when no flag distinguishes the track from a default
+    /// presentation: `forced` is `false`, and the §minver-4 flags are
+    /// either absent (`None`) or explicitly cleared (`Some(false)`). A
+    /// quick filter for "is this a vanilla content track."
+    pub fn is_default_presentation(&self) -> bool {
+        !self.forced
+            && !matches!(self.hearing_impaired, Some(true))
+            && !matches!(self.visual_impaired, Some(true))
+            && !matches!(self.text_descriptions, Some(true))
+            && !matches!(self.original, Some(true))
+            && !matches!(self.commentary, Some(true))
+    }
+
+    /// `true` when any §5.1.4.1.7..§5.1.4.1.11 accessibility flag is
+    /// explicitly set — the track caters to a viewer with hearing or
+    /// visual impairment, or carries textual descriptions of video
+    /// content. Useful for an "accessibility track" filter that ignores
+    /// the spec's silence-vs-explicit-zero distinction.
+    pub fn is_accessibility(&self) -> bool {
+        matches!(self.hearing_impaired, Some(true))
+            || matches!(self.visual_impaired, Some(true))
+            || matches!(self.text_descriptions, Some(true))
+    }
+}
+
+/// Translate a raw audience-flag uinteger into a `bool` per the
+/// §5.1.4.1.6..§5.1.4.1.11 "range: 0-1" rule. Values outside `{0,1}` are
+/// conservatively folded to `true` — a writer who emitted a non-zero
+/// payload almost certainly intended the flag to be set, and dropping the
+/// signal back to `false` would silently mask malformed input. The typed
+/// surface never reports the raw integer, so the choice is internal.
+#[inline]
+fn audience_flag_to_bool(v: u64) -> bool {
+    v != 0
 }
 
 /// A video track's interlacing settings — `FlagInterlaced` (RFC 9559
@@ -4031,6 +4215,28 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 let mapping = parse_block_addition_mapping(r, body_end)?;
                 t.block_addition_mappings.push(mapping);
             }
+            // Audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). All six are
+            // 0-or-1 uintegers; absence is captured as `None` so the typed
+            // surface can distinguish "no element on disk" from "the writer
+            // explicitly set 0". The `FlagForced` (§5.1.4.1.6) default of `0`
+            // is materialised later, on the typed builder, so the raw record
+            // stays a pure on-disk projection.
+            ids::FLAG_FORCED => t.audience_flags_raw.forced = Some(read_uint(r, e.size as usize)?),
+            ids::FLAG_HEARING_IMPAIRED => {
+                t.audience_flags_raw.hearing_impaired = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::FLAG_VISUAL_IMPAIRED => {
+                t.audience_flags_raw.visual_impaired = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::FLAG_TEXT_DESCRIPTIONS => {
+                t.audience_flags_raw.text_descriptions = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::FLAG_ORIGINAL => {
+                t.audience_flags_raw.original = Some(read_uint(r, e.size as usize)?)
+            }
+            ids::FLAG_COMMENTARY => {
+                t.audience_flags_raw.commentary = Some(read_uint(r, e.size as usize)?)
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -4652,6 +4858,13 @@ pub struct MkvDemuxer {
     /// appears on tracks that use `BlockAdditional` to extend their
     /// on-disk format). See [`MkvDemuxer::block_addition_mappings`].
     block_addition_mappings: Vec<Vec<BlockAdditionMapping>>,
+    /// Per-stream [`TrackAudienceFlags`] (RFC 9559 §5.1.4.1.6..§5.1.4.1.11),
+    /// indexed by stream index. Every track surfaces a record — `FlagForced`
+    /// has a spec default of `0` and the §minver-4 flags carry no default
+    /// (absence shows as `None` on the typed surface, observable through
+    /// [`TrackAudienceFlags::hearing_impaired`] et al.). See
+    /// [`MkvDemuxer::track_audience_flags`].
+    track_audience_flags: Vec<TrackAudienceFlags>,
     /// Per-Cluster typed records (RFC 9559 §5.1.3.2 / §5.1.3.3 —
     /// `Position` / `PrevSize`), appended in first-encounter order as
     /// the demuxer opens each Cluster through [`Demuxer::next_packet`]
@@ -5069,6 +5282,43 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::block_addition_mappings`] for the semantics.
     pub fn all_block_addition_mappings(&self) -> &[Vec<BlockAdditionMapping>] {
         &self.block_addition_mappings
+    }
+
+    /// [`TrackAudienceFlags`] (RFC 9559 §5.1.4.1.6..§5.1.4.1.11) for the
+    /// stream at `stream_index`.
+    ///
+    /// The returned record folds the six per-track audience flags —
+    /// `FlagForced` (§5.1.4.1.6), `FlagHearingImpaired` (§5.1.4.1.7),
+    /// `FlagVisualImpaired` (§5.1.4.1.8), `FlagTextDescriptions`
+    /// (§5.1.4.1.9), `FlagOriginal` (§5.1.4.1.10),
+    /// `FlagCommentary` (§5.1.4.1.11) — into one typed surface. Spec
+    /// defaults are materialised asymmetrically: `FlagForced`'s default
+    /// `0` always lands ([`TrackAudienceFlags::forced`] is a bare `bool`),
+    /// while the `minver: 4` flags carry no spec default and stay
+    /// `Option<bool>` so callers can distinguish "writer was silent" from
+    /// "writer explicitly cleared the flag" (the §5.1.4.1.7..§5.1.4.1.11
+    /// "Set to 1 if and only if …" wording makes that distinction load-
+    /// bearing).
+    ///
+    /// Every track surfaces a record — including audio / video / button
+    /// tracks where `FlagForced`'s "applies only to subtitles" note makes
+    /// the flag semantically irrelevant. The spec puts the elements on
+    /// `TrackEntry` itself with `minOccurs: 1` for `FlagForced`, so the
+    /// typed surface mirrors that universality and trusts the caller to
+    /// apply each flag only where it makes sense for the track's
+    /// `TrackType` / `CodecID`.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn track_audience_flags(&self, stream_index: u32) -> Option<&TrackAudienceFlags> {
+        self.track_audience_flags.get(stream_index as usize)
+    }
+
+    /// All per-stream [`TrackAudienceFlags`] (RFC 9559
+    /// §5.1.4.1.6..§5.1.4.1.11), indexed by stream index. The slice has
+    /// one entry per stream. See [`MkvDemuxer::track_audience_flags`] for
+    /// the semantics.
+    pub fn all_track_audience_flags(&self) -> &[TrackAudienceFlags] {
+        &self.track_audience_flags
     }
 
     /// `ContentEncodings` (RFC 9559 §5.1.4.1.31) for the stream at

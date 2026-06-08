@@ -72,6 +72,19 @@ pub const TRACK_TYPE: u32 = 0x83;
 pub const FLAG_ENABLED: u32 = 0xB9;
 pub const FLAG_DEFAULT: u32 = 0x88;
 pub const FLAG_LACING: u32 = 0x9C;
+
+// TrackEntry "audience" flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). Each is a
+// 0-or-1 uinteger that hints at how the track should be presented to a
+// particular kind of user — subtitle-forced-display, hearing/visual
+// impairment accessibility, text-only-descriptions, originality vs dubbing,
+// commentary. Only `FlagForced` (§5.1.4.1.6) has a spec default (0); the
+// other five (`minver: 4`) carry no spec default and surface as `Option`.
+pub const FLAG_FORCED: u32 = 0x55AA;
+pub const FLAG_HEARING_IMPAIRED: u32 = 0x55AB;
+pub const FLAG_VISUAL_IMPAIRED: u32 = 0x55AC;
+pub const FLAG_TEXT_DESCRIPTIONS: u32 = 0x55AD;
+pub const FLAG_ORIGINAL: u32 = 0x55AE;
+pub const FLAG_COMMENTARY: u32 = 0x55AF;
 pub const NAME: u32 = 0x536E;
 pub const LANGUAGE: u32 = 0x22B59C;
 pub const CODEC_ID: u32 = 0x86;

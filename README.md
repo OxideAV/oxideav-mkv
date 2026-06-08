@@ -101,6 +101,28 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `EPISODE` labels); the file's own `TargetType` informational string
   stays on the existing `Targets::target_type` field — the typed level
   helper doesn't overwrite it.
+- **Typed `TrackAudienceFlags` accessor** (RFC 9559 §5.1.4.1.6..§5.1.4.1.11):
+  `MkvDemuxer::track_audience_flags(stream_index) -> Option<&TrackAudienceFlags>`
+  (and the per-stream `all_track_audience_flags()` slice) folds the six
+  per-`TrackEntry` audience hints — `FlagForced` (id `0x55AA`),
+  `FlagHearingImpaired` (id `0x55AB`), `FlagVisualImpaired` (id `0x55AC`),
+  `FlagTextDescriptions` (id `0x55AD`), `FlagOriginal` (id `0x55AE`),
+  `FlagCommentary` (id `0x55AF`) — into one typed record per stream. Spec
+  defaults are materialised asymmetrically: `forced()` returns a bare `bool`
+  with the §5.1.4.1.6 default `0` always reflected (a `TrackEntry` with no
+  `FlagForced` child decodes `false`); the five `minver: 4` flags carry no
+  spec default and surface as `Option<bool>` so callers can distinguish
+  "writer was silent" (`None`) from "writer explicitly cleared the flag"
+  (`Some(false)`) — the §5.1.4.1.7..§5.1.4.1.11 wording ("Set to 1 *if and
+  only if* …") makes that distinction load-bearing. Convenience predicates
+  `is_default_presentation()` (no flag is `Some(true)`) and
+  `is_accessibility()` (any of `hearing_impaired` / `visual_impaired` /
+  `text_descriptions` is `Some(true)`) cover the common filter cases. Every
+  track surfaces a record — `FlagForced`'s spec wording "applies only to
+  subtitles" does not suppress the surface on audio / video tracks because
+  the spec puts the elements on `TrackEntry` itself with `minOccurs: 1` for
+  `FlagForced`; the typed surface trusts the caller to apply each flag
+  where it makes sense for the track's `TrackType` / `CodecID`.
 - **Typed per-Cluster `Position` / `PrevSize` records** (RFC 9559
   §5.1.3.2 / §5.1.3.3): `MkvDemuxer::cluster_records() ->
   &[ClusterRecord]` surfaces each Cluster's optional `Position`
