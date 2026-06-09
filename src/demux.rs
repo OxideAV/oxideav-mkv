@@ -438,6 +438,29 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         })
         .collect();
 
+    // Per-stream `TrackAudio` (RFC 9559 §5.1.4.1.29.1..§5.1.4.1.29.4),
+    // indexed by stream index. The §5.1.4.1.29.1 / §5.1.4.1.29.3 spec
+    // defaults (SamplingFrequency = 0x1.f4p+12 / 8000.0, Channels = 1) are
+    // materialised here on the typed surface so an `Audio` master with no
+    // explicit children still surfaces a meaningful record.
+    // `OutputSamplingFrequency` (§5.1.4.1.29.2) keeps its `Option` so
+    // [`TrackAudio::output_sampling_frequency_explicit`] preserves the
+    // on-disk presence; the typed [`TrackAudio::output_sampling_frequency`]
+    // accessor folds the Table 19 derived default. `BitDepth`
+    // (§5.1.4.1.29.4) has no spec default and stays `Option<u64>` on the
+    // typed surface. Tracks with no `Audio` master surface `None`.
+    let track_audio: Vec<Option<TrackAudio>> = tracks
+        .iter()
+        .map(|t| {
+            t.audio_raw.map(|raw| TrackAudio {
+                sampling_frequency: raw.sampling_frequency.unwrap_or(8000.0),
+                output_sampling_frequency_explicit: raw.output_sampling_frequency,
+                channels: raw.channels.unwrap_or(1),
+                bit_depth: raw.bit_depth,
+            })
+        })
+        .collect();
+
     // Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2),
     // indexed by stream index. `None` for non-video tracks and for video
     // tracks whose `TrackEntry` had no `Video` master; for everything else
@@ -657,6 +680,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_uncompressed_fourccs,
         block_addition_mappings,
         track_audience_flags,
+        track_audio,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
     })
@@ -914,6 +938,16 @@ struct TrackEntry {
     /// (`minver: 4`) carry no spec default, so absence stays observable as
     /// `None` on the typed surface.
     audience_flags_raw: RawAudienceFlags,
+    /// Raw `Audio` sub-master payload (RFC 9559 §5.1.4.1.29) captured during
+    /// the `TrackEntry` walk. `None` when the `TrackEntry` had no `Audio`
+    /// master at all (the normal case for video / subtitle / button tracks).
+    /// When present, each child's on-disk presence is preserved as an
+    /// `Option` so the typed surface can distinguish "writer was silent" —
+    /// in which case the spec defaults (`SamplingFrequency` `0x1.f4p+12` =
+    /// 8000.0, `Channels` 1, `OutputSamplingFrequency` derived from
+    /// `SamplingFrequency`, no default for `BitDepth`) — from "writer
+    /// emitted the element."
+    audio_raw: Option<RawTrackAudio>,
 }
 
 /// Parser-private staging form for the six per-track audience flags
@@ -930,6 +964,21 @@ struct RawAudienceFlags {
     text_descriptions: Option<u64>,
     original: Option<u64>,
     commentary: Option<u64>,
+}
+
+/// Parser-private staging form for the `Audio` sub-master (RFC 9559
+/// §5.1.4.1.29.1..§5.1.4.1.29.4). Each `Option` preserves the on-disk
+/// presence so the typed [`TrackAudio`] builder can fold the spec defaults
+/// asymmetrically — `SamplingFrequency` and `Channels` materialise their
+/// defaults uniformly (mandatory `minOccurs: 1` children), while
+/// `OutputSamplingFrequency` reports its derived default (= `SamplingFrequency`)
+/// when absent without losing the "writer was silent" distinction.
+#[derive(Clone, Copy, Debug, Default)]
+struct RawTrackAudio {
+    sampling_frequency: Option<f64>,
+    output_sampling_frequency: Option<f64>,
+    channels: Option<u64>,
+    bit_depth: Option<u64>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -1884,6 +1933,120 @@ impl TrackAudienceFlags {
 #[inline]
 fn audience_flag_to_bool(v: u64) -> bool {
     v != 0
+}
+
+/// The per-track `Audio` settings from RFC 9559 §5.1.4.1.29.
+///
+/// Every audio track carries an `Audio` master with four children:
+///
+/// * [`sampling_frequency`](Self::sampling_frequency) (§5.1.4.1.29.1): the
+///   on-disk Sampling Frequency in Hz. `minOccurs: 1`, default `0x1.f4p+12`
+///   (8000.0). The typed surface materialises the default uniformly so
+///   every track exposes a non-zero Hz value.
+/// * [`output_sampling_frequency`](Self::output_sampling_frequency)
+///   (§5.1.4.1.29.2): the real output sampling frequency in Hz used for
+///   Spectral Band Replication (SBR). `maxOccurs: 1`, no `minOccurs`, with
+///   a *derived* default — Table 19 says "The default value for
+///   OutputSamplingFrequency of the same TrackEntry is equal to the
+///   SamplingFrequency." The accessor folds that derivation, so a track
+///   that doesn't emit the element still returns a meaningful number.
+///   Pair with
+///   [`output_sampling_frequency_explicit`](Self::output_sampling_frequency_explicit)
+///   when the silence-vs-explicit distinction is load-bearing — e.g. a
+///   re-muxer that doesn't want to materialise an `OutputSamplingFrequency`
+///   element that wasn't on disk.
+/// * [`channels`](Self::channels) (§5.1.4.1.29.3): channel count.
+///   `minOccurs: 1`, default `1`. Mono is the spec's silence-fallback. The
+///   typed surface materialises the default uniformly.
+/// * [`bit_depth`](Self::bit_depth) (§5.1.4.1.29.4): bits per sample,
+///   "mostly used for PCM". `maxOccurs: 1`, no `minOccurs`, no spec
+///   default. The accessor returns `Option<u64>` — `None` exactly when the
+///   writer omitted the element.
+///
+/// **Range checks**. `SamplingFrequency` and `OutputSamplingFrequency` are
+/// ranged "> 0x0p+0" — the typed surface preserves whatever value the
+/// writer emitted (a `0` or negative is observable through the accessor
+/// for diagnostics) but the §5.1.4.1.29.1 default itself is `8000.0`, not
+/// `0.0`. `Channels` is ranged "not 0"; `BitDepth` is ranged "not 0".
+///
+/// **`Audio`-master presence**. The typed accessor surfaces a record only
+/// when the on-disk `TrackEntry` carried an `Audio` master. Video /
+/// subtitle / button tracks (where the `Audio` master is `maxOccurs: 1`
+/// but mandates no `minOccurs` at the `TrackEntry` level) return `None`
+/// from [`MkvDemuxer::track_audio`]. An audio track without an `Audio`
+/// child is technically malformed per the Matroska schema — the typed
+/// surface treats it as a missing master and returns `None` rather than
+/// synthesising a record from the §5.1.4.1.29.1 / .3 defaults.
+///
+/// Surfaced per stream via [`MkvDemuxer::track_audio`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackAudio {
+    sampling_frequency: f64,
+    output_sampling_frequency_explicit: Option<f64>,
+    channels: u64,
+    bit_depth: Option<u64>,
+}
+
+impl TrackAudio {
+    /// `SamplingFrequency` (RFC 9559 §5.1.4.1.29.1), in Hz. The spec
+    /// default `0x1.f4p+12` (= `8000.0`) is materialised, so an `Audio`
+    /// master with no explicit child returns `8000.0` — never `0.0`.
+    pub fn sampling_frequency(&self) -> f64 {
+        self.sampling_frequency
+    }
+
+    /// `OutputSamplingFrequency` (RFC 9559 §5.1.4.1.29.2), in Hz, with
+    /// the §Table 19 derived default applied: when the element was absent
+    /// the accessor returns `sampling_frequency()`. Use
+    /// [`output_sampling_frequency_explicit`](Self::output_sampling_frequency_explicit)
+    /// when the on-disk presence matters.
+    pub fn output_sampling_frequency(&self) -> f64 {
+        self.output_sampling_frequency_explicit
+            .unwrap_or(self.sampling_frequency)
+    }
+
+    /// `OutputSamplingFrequency` (RFC 9559 §5.1.4.1.29.2) as it appeared
+    /// on disk. `Some(v)` when the writer emitted the element explicitly;
+    /// `None` when the writer was silent (the derived default applies on
+    /// the [`output_sampling_frequency`](Self::output_sampling_frequency)
+    /// accessor).
+    pub fn output_sampling_frequency_explicit(&self) -> Option<f64> {
+        self.output_sampling_frequency_explicit
+    }
+
+    /// `Channels` (RFC 9559 §5.1.4.1.29.3). The spec default `1` is
+    /// materialised, so an `Audio` master with no explicit child returns
+    /// `1` (mono).
+    pub fn channels(&self) -> u64 {
+        self.channels
+    }
+
+    /// `BitDepth` (RFC 9559 §5.1.4.1.29.4), in bits per sample. `None`
+    /// when the writer omitted the element — `BitDepth` has no spec
+    /// default. Mostly used by PCM and other linear-sample codecs; lossy
+    /// codecs typically omit it.
+    pub fn bit_depth(&self) -> Option<u64> {
+        self.bit_depth
+    }
+
+    /// `true` exactly when the writer emitted an explicit
+    /// `OutputSamplingFrequency` greater than `SamplingFrequency`. The
+    /// spec describes `OutputSamplingFrequency` as the "Real output
+    /// sampling frequency in Hz that is used for Spectral Band Replication
+    /// (SBR) techniques" (§5.1.4.1.29.2). An SBR-encoded HE-AAC track
+    /// typically halves the core sampling rate and doubles it on output;
+    /// when the writer signals that explicitly, this predicate fires.
+    ///
+    /// Returns `false` when `OutputSamplingFrequency` was absent (the
+    /// derived default equals `SamplingFrequency`, so no SBR doubling is
+    /// signalled) **or** when the explicit value is ≤ the core
+    /// `SamplingFrequency`.
+    pub fn is_sbr(&self) -> bool {
+        match self.output_sampling_frequency_explicit {
+            Some(v) => v > self.sampling_frequency,
+            None => false,
+        }
+    }
 }
 
 /// A video track's interlacing settings — `FlagInterlaced` (RFC 9559
@@ -4484,12 +4647,34 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
 }
 
 fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
+    // Materialise the typed staging record on first call. An `Audio` master
+    // with no children still surfaces a record so the typed builder
+    // ([`build_typed_track_audio`]) can fold the §5.1.4.1.29.1 / .3 defaults
+    // (`SamplingFrequency = 8000.0`, `Channels = 1`); the existing flat
+    // `t.sample_rate` / `t.channels` / `t.bit_depth` legacy fields keep
+    // their previous semantics so non-typed callers don't regress.
+    let raw = t.audio_raw.get_or_insert_with(RawTrackAudio::default);
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::SAMPLING_FREQUENCY => t.sample_rate = read_float(r, e.size as usize)?,
-            ids::CHANNELS => t.channels = read_uint(r, e.size as usize)?,
-            ids::BIT_DEPTH => t.bit_depth = read_uint(r, e.size as usize)?,
+            ids::SAMPLING_FREQUENCY => {
+                let v = read_float(r, e.size as usize)?;
+                raw.sampling_frequency = Some(v);
+                t.sample_rate = v;
+            }
+            ids::OUTPUT_SAMPLING_FREQUENCY => {
+                raw.output_sampling_frequency = Some(read_float(r, e.size as usize)?);
+            }
+            ids::CHANNELS => {
+                let v = read_uint(r, e.size as usize)?;
+                raw.channels = Some(v);
+                t.channels = v;
+            }
+            ids::BIT_DEPTH => {
+                let v = read_uint(r, e.size as usize)?;
+                raw.bit_depth = Some(v);
+                t.bit_depth = v;
+            }
             _ => skip(r, e.size)?,
         }
     }
@@ -4865,6 +5050,13 @@ pub struct MkvDemuxer {
     /// [`TrackAudienceFlags::hearing_impaired`] et al.). See
     /// [`MkvDemuxer::track_audience_flags`].
     track_audience_flags: Vec<TrackAudienceFlags>,
+    /// Per-stream [`TrackAudio`] (RFC 9559 §5.1.4.1.29), indexed by stream
+    /// index. `Some(...)` for tracks whose `TrackEntry` carried an `Audio`
+    /// sub-master (typically every `TrackType::Audio` track); `None`
+    /// otherwise (video / subtitle / button tracks and the pathological
+    /// case of an audio track with no `Audio` master). See
+    /// [`MkvDemuxer::track_audio`].
+    track_audio: Vec<Option<TrackAudio>>,
     /// Per-Cluster typed records (RFC 9559 §5.1.3.2 / §5.1.3.3 —
     /// `Position` / `PrevSize`), appended in first-encounter order as
     /// the demuxer opens each Cluster through [`Demuxer::next_packet`]
@@ -5319,6 +5511,40 @@ impl MkvDemuxer {
     /// the semantics.
     pub fn all_track_audience_flags(&self) -> &[TrackAudienceFlags] {
         &self.track_audience_flags
+    }
+
+    /// [`TrackAudio`] (RFC 9559 §5.1.4.1.29) for the stream at
+    /// `stream_index`, or `None` when the `TrackEntry` carried no `Audio`
+    /// sub-master.
+    ///
+    /// The returned record folds the four `Audio` children into one typed
+    /// surface — [`TrackAudio::sampling_frequency`] (§5.1.4.1.29.1, default
+    /// `8000.0`), [`TrackAudio::output_sampling_frequency`] (§5.1.4.1.29.2,
+    /// Table 19 derived default = `SamplingFrequency`),
+    /// [`TrackAudio::channels`] (§5.1.4.1.29.3, default `1`), and
+    /// [`TrackAudio::bit_depth`] (§5.1.4.1.29.4, no spec default,
+    /// `Option<u64>`). Spec defaults are materialised uniformly so an
+    /// `Audio` master with no explicit children still surfaces meaningful
+    /// numbers; the `output_sampling_frequency_explicit` accessor preserves
+    /// the on-disk presence for re-muxers and SBR-detection callers.
+    ///
+    /// The accessor surfaces a record only when the on-disk `TrackEntry`
+    /// carried an `Audio` master at all — non-audio tracks return `None`
+    /// (a video / subtitle / button track legally omits the master), as
+    /// does a malformed audio track that emitted no `Audio` child.
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn track_audio(&self, stream_index: u32) -> Option<&TrackAudio> {
+        self.track_audio
+            .get(stream_index as usize)
+            .and_then(|o| o.as_ref())
+    }
+
+    /// All per-stream [`TrackAudio`] records (RFC 9559 §5.1.4.1.29),
+    /// indexed by stream index. `None` slots mark tracks that carried no
+    /// `Audio` sub-master (normally non-audio tracks). See
+    /// [`MkvDemuxer::track_audio`] for the per-field semantics.
+    pub fn all_track_audio(&self) -> &[Option<TrackAudio>] {
+        &self.track_audio
     }
 
     /// `ContentEncodings` (RFC 9559 §5.1.4.1.31) for the stream at

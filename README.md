@@ -123,6 +123,31 @@ the unified `oxideav` aggregator to wire decoding automatically.
   the spec puts the elements on `TrackEntry` itself with `minOccurs: 1` for
   `FlagForced`; the typed surface trusts the caller to apply each flag
   where it makes sense for the track's `TrackType` / `CodecID`.
+- **Typed `TrackAudio` accessor** (RFC 9559 §5.1.4.1.29.1..§5.1.4.1.29.4):
+  `MkvDemuxer::track_audio(stream_index) -> Option<&TrackAudio>` (and the
+  per-stream `all_track_audio()` slice) folds the four `Audio` sub-master
+  children — `SamplingFrequency` (id `0xB5`, §5.1.4.1.29.1),
+  `OutputSamplingFrequency` (id `0x78B5`, §5.1.4.1.29.2), `Channels`
+  (id `0x9F`, §5.1.4.1.29.3), `BitDepth` (id `0x6264`, §5.1.4.1.29.4) —
+  into one typed record. Spec defaults are materialised asymmetrically:
+  `sampling_frequency()` returns a bare `f64` with the §5.1.4.1.29.1
+  default `0x1.f4p+12` = `8000.0` always reflected (an `Audio` master with
+  no explicit child still surfaces 8000.0 Hz, never `0.0`); `channels()`
+  returns a bare `u64` with the §5.1.4.1.29.3 default `1` (mono) always
+  reflected; `output_sampling_frequency()` folds Table 19's derived default
+  (= `sampling_frequency()` when the element was absent) but
+  `output_sampling_frequency_explicit()` preserves the on-disk presence as
+  `Option<f64>` so a re-muxer doesn't materialise an element that wasn't
+  in the source. `bit_depth()` stays `Option<u64>` — §5.1.4.1.29.4 defines
+  no default, so absence is observable. Convenience predicate `is_sbr()`
+  returns `true` exactly when the writer emitted an explicit
+  `OutputSamplingFrequency` strictly greater than `SamplingFrequency` (the
+  canonical SBR-doubling signal for HE-AAC and similar tracks). Records
+  surface only for `TrackEntry`s that carried an `Audio` master at all:
+  video / subtitle / button tracks (where the master is `maxOccurs: 1` but
+  carries no `minOccurs` at the `TrackEntry` level) return `None`, as does
+  a malformed audio track that emitted no `Audio` child — the typed
+  surface never synthesises a record from the spec defaults alone.
 - **Typed per-Cluster `Position` / `PrevSize` records** (RFC 9559
   §5.1.3.2 / §5.1.3.3): `MkvDemuxer::cluster_records() ->
   &[ClusterRecord]` surfaces each Cluster's optional `Position`
