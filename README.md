@@ -645,6 +645,32 @@ the unified `oxideav` aggregator to wire decoding automatically.
   verbatim, including the `Other(u64)` forward-compat variants on each
   of the six enum-typed children, plus every populated
   `MasteringMetadata` chromaticity / luminance child.
+- **`Video > Projection` master on write** (RFC 9559 §5.1.4.1.28.41,
+  including §5.1.4.1.28.42..§5.1.4.1.28.46):
+  `MkvMuxer::set_video_projection(stream_index, MkvProjection)` queues a
+  per-track hint that lands inside the track's `Video` master at
+  `write_header` time, after the `Colour` master, as a `Projection`
+  master (id `0x7670`). The demux-side `ProjectionType` enum gained a
+  `to_raw()` inverse so every Table 18 value round-trips, including the
+  `Other(u64)` forward-compat variant (§27.15 leaves the registry open).
+  Per-element omission rules: `ProjectionType` is written only for
+  non-`Rectangular` types (the §5.1.4.1.28.42 default `0` stays off-disk);
+  each `ProjectionPose{Yaw,Pitch,Roll}` child is written as an 8-byte
+  big-endian `f64` only when non-zero (the §5.1.4.1.28.44..46 default
+  `0.0` stays off-disk); `ProjectionPrivate` (the verbatim ISOBMFF box
+  body — `equi` / `cbmp` / `mshp`) is written only when `Some(_)` and is
+  never interpreted by the muxer. Queueing `MkvProjection::default()`
+  writes an empty `Projection` master that the demuxer parses into
+  `Some(Projection::default())`; omitting the call keeps the master
+  off-disk so the demuxer surfaces `None`. Convenience constructors
+  `MkvProjection::equirectangular(private)` (the 360°-VR shape) and
+  `MkvProjection::rotated(roll_degrees)` (the §5.1.4.1.28.46 worked
+  example) cover the two common shapes. Spec rules enforced at queue
+  time: rejects post-`write_header` use, out-of-range `stream_index`, and
+  calls on non-video tracks. Pairs symmetrically with the existing
+  `MkvDemuxer::video_projection` typed accessor — a mux→demux pipeline
+  preserves the projection record (type, pose, and verbatim
+  `ProjectionPrivate` payload) bit-exactly.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -763,8 +789,13 @@ so the demuxer never hides an unrecognised track.
   §5.1.4.1.28.30..§5.1.4.1.28.40 — `Primary{R,G,B}Chromaticity{X,Y}`,
   `WhitePointChromaticity{X,Y}`, `Luminance{Max,Min}`; the convenience
   constructor `MkvMasteringMetadata::bt2020_d65_hdr10()` covers the
-  canonical HDR10 shape) are written; the remaining `Video`
-  sub-elements (`Projection`, `AspectRatioType`) are not yet written.
+  canonical HDR10 shape), and the `Projection` master
+  (`MkvMuxer::set_video_projection`, §5.1.4.1.28.41 — `ProjectionType`,
+  the verbatim `ProjectionPrivate` payload, and the yaw / pitch / roll
+  pose triple; the convenience constructors
+  `MkvProjection::equirectangular()` and `MkvProjection::rotated()` cover
+  the 360°-VR and roll-only shapes) are written; the only remaining
+  `Video` sub-element not yet written is `AspectRatioType`.
 
 ## Robustness
 

@@ -33,7 +33,8 @@ use oxideav_core::{Muxer, WriteSeek};
 use crate::codec_id;
 use crate::demux::{
     AlphaMode, ChromaSitingHorz, ChromaSitingVert, ColourRange, DisplayUnit, FieldOrder,
-    FlagInterlaced, MatrixCoefficients, Primaries, StereoMode, TransferCharacteristics,
+    FlagInterlaced, MatrixCoefficients, Primaries, ProjectionType, StereoMode,
+    TransferCharacteristics,
 };
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
@@ -278,6 +279,18 @@ pub struct MkvMuxer {
     /// at `set_video_colour` time).
     ///
     video_colours: Vec<Option<MkvVideoColour>>,
+    /// Per-stream `Video > Projection` master hint queued via
+    /// [`MkvMuxer::set_video_projection`] (RFC 9559 §5.1.4.1.28.41).
+    /// Materialised inside each video track's `Video` master at
+    /// `write_header` time as a `Projection` master (id `0x7670`), after
+    /// the `Colour` master, carrying the `ProjectionType` /
+    /// `ProjectionPrivate` / `ProjectionPose{Yaw,Pitch,Roll}` children
+    /// that differ from their §5.1.4.1.28.42..46 spec defaults. `None`
+    /// (the default) means the muxer omits the `Projection` master
+    /// entirely so the demuxer surfaces `None` from `video_projection`
+    /// for that stream. The slice is sized to `streams.len()`; non-video
+    /// tracks must stay `None` (validated at `set_video_projection` time).
+    video_projections: Vec<Option<MkvProjection>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -758,6 +771,77 @@ impl MkvVideoColour {
     }
 }
 
+/// Per-track `Video > Projection` write hint (RFC 9559 §5.1.4.1.28.41,
+/// including the §5.1.4.1.28.42..§5.1.4.1.28.46 sub-elements). Queued by
+/// [`MkvMuxer::set_video_projection`] and materialised inside the track's
+/// `Video` master at `write_header` time, after the `Colour` master.
+///
+/// The pose triple is in degrees: per §5.1.4.1.28.44..46 yaw / roll are in
+/// `[-180.0, 180.0]` and pitch is in `[-90.0, 90.0]`, all defaulting to
+/// `0.0`. `private` is the verbatim ISOBMFF box body (`equi` / `cbmp` /
+/// `mshp`) that pairs with a spherical [`ProjectionType`]; it is written
+/// only when `Some(_)` and never interpreted by the muxer. Per
+/// §5.1.4.1.28.43 `ProjectionPrivate` MUST NOT be present for a
+/// `Rectangular` projection — that's a producer concern; the muxer writes
+/// what it's handed.
+///
+/// Per-element omission rules at write time: `ProjectionType` is written
+/// only for non-`Rectangular` types (the §5.1.4.1.28.42 default `0` is
+/// omitted so the demuxer materialises it); each pose component is written
+/// only when non-zero (the §5.1.4.1.28.44..46 default `0.0` is omitted);
+/// `ProjectionPrivate` is written only when `Some(_)`. As a result a
+/// [`MkvProjection::default`] (rectangular, zero pose, no private) queued
+/// via the setter serialises as an *empty* `Projection` master — present
+/// but childless — which the demuxer parses into `Some(Projection)` with
+/// every getter returning the spec default, distinct from the
+/// call-was-omitted case (`None`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MkvProjection {
+    /// `ProjectionType` (RFC 9559 §5.1.4.1.28.42, id `0x7671`). Default
+    /// [`ProjectionType::Rectangular`]; written on disk only for
+    /// non-rectangular projections.
+    pub projection_type: ProjectionType,
+    /// `ProjectionPrivate` (RFC 9559 §5.1.4.1.28.43, id `0x7672`): the
+    /// verbatim ISOBMFF box body for the projection type. Written only
+    /// when `Some(_)`; never interpreted.
+    pub private: Option<Vec<u8>>,
+    /// `ProjectionPoseYaw` (RFC 9559 §5.1.4.1.28.44, id `0x7673`),
+    /// degrees, range `[-180.0, 180.0]`, default `0.0`.
+    pub pose_yaw: f64,
+    /// `ProjectionPosePitch` (RFC 9559 §5.1.4.1.28.45, id `0x7674`),
+    /// degrees, range `[-90.0, 90.0]`, default `0.0`.
+    pub pose_pitch: f64,
+    /// `ProjectionPoseRoll` (RFC 9559 §5.1.4.1.28.46, id `0x7675`),
+    /// degrees, range `[-180.0, 180.0]`, default `0.0`.
+    pub pose_roll: f64,
+}
+
+impl MkvProjection {
+    /// Convenience constructor for the equirectangular spherical
+    /// projection (RFC 9559 §5.1.4.1.28.42 value `1`) — the common 360°
+    /// monoscopic / stereoscopic VR shape — carrying the verbatim
+    /// ISOBMFF `equi` box body in `ProjectionPrivate` and a zero pose.
+    pub fn equirectangular(private: Vec<u8>) -> Self {
+        Self {
+            projection_type: ProjectionType::Equirectangular,
+            private: Some(private),
+            ..Self::default()
+        }
+    }
+
+    /// Convenience constructor for a flat rectangular track that only
+    /// needs a roll rotation — the §5.1.4.1.28.46 worked example
+    /// (`ProjectionPoseRoll = 90` ⇒ a 90° counter-clockwise rotation).
+    /// `roll_degrees` lands in `ProjectionPoseRoll`; yaw / pitch stay at
+    /// their `0.0` defaults and `ProjectionType` stays `Rectangular`.
+    pub fn rotated(roll_degrees: f64) -> Self {
+        Self {
+            pose_roll: roll_degrees,
+            ..Self::default()
+        }
+    }
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -820,6 +904,7 @@ impl MkvMuxer {
             video_geometries: vec![None; n],
             video_uncompressed_fourccs: vec![None; n],
             video_colours: vec![None; n],
+            video_projections: vec![None; n],
         })
     }
 
@@ -1301,6 +1386,81 @@ impl MkvMuxer {
     /// surfaces `None` as well). Mostly useful for tests.
     pub fn video_colour(&self, stream_index: usize) -> Option<MkvVideoColour> {
         *self.video_colours.get(stream_index)?
+    }
+
+    /// Set the per-track `Video > Projection` master (RFC 9559
+    /// §5.1.4.1.28.41, including the §5.1.4.1.28.42..§5.1.4.1.28.46
+    /// sub-elements) for one stream. Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise.
+    ///
+    /// The supplied [`MkvProjection`] is materialised inside the `Video`
+    /// master at `write_header` time as a `Projection` master placed after
+    /// the `Colour` master. The muxer applies per-element omission rules to
+    /// keep the file minimal: `ProjectionType` is written only when it is
+    /// not [`ProjectionType::Rectangular`] (the §5.1.4.1.28.42 default `0`),
+    /// each `ProjectionPose{Yaw,Pitch,Roll}` child is written only when
+    /// non-zero (the §5.1.4.1.28.44..46 default `0.0`), and
+    /// `ProjectionPrivate` is written only when `private` is `Some(_)`. As a
+    /// result, calling this with [`MkvProjection::default`] writes an
+    /// *empty* `Projection` master on disk — present-but-childless — which
+    /// the demuxer parses into a `Some(Projection)` whose every getter
+    /// returns the spec default (rectangular, zero pose, no private),
+    /// distinguishable from the call-was-omitted case (`None`).
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` is out of range, or the stream
+    ///   at that index is not [`MediaType::Video`] (only video tracks
+    ///   carry a `Video` master per RFC 9559 §5.1.4.1.28).
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins).
+    ///
+    /// Omitting the call entirely keeps the `Projection` master off-disk so
+    /// the demuxer surfaces `None` from
+    /// [`crate::demux::MkvDemuxer::video_projection`] — distinct from "empty
+    /// `Projection` master present" (`Some(Projection::default())`).
+    ///
+    /// Pairs symmetrically with the existing
+    /// [`crate::demux::MkvDemuxer::video_projection`] typed accessor — a
+    /// mux→demux pipeline preserves the projection record (type, pose, and
+    /// verbatim `ProjectionPrivate` payload) bit-exactly.
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_video_projection(
+        &mut self,
+        stream_index: usize,
+        projection: MkvProjection,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_projection called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_projection stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_projection on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        self.video_projections[stream_index] = Some(projection);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `Projection` hint
+    /// installed via [`MkvMuxer::set_video_projection`]. Returns `None` for
+    /// any stream that didn't have the API called (the muxer omits the
+    /// `Projection` master from the on-disk `Video` master, and the demuxer
+    /// surfaces `None` as well). Mostly useful for tests.
+    pub fn video_projection(&self, stream_index: usize) -> Option<&MkvProjection> {
+        self.video_projections.get(stream_index)?.as_ref()
     }
 
     /// Queue a chapter atom with one English-language `ChapterDisplay`
@@ -1787,6 +1947,44 @@ impl Muxer for MkvMuxer {
                         write_master_element(&mut colour, ids::MASTERING_METADATA, &mast);
                     }
                     write_master_element(&mut video, ids::COLOUR, &colour);
+                }
+                // Projection master (§5.1.4.1.28.41). Emitted only when the
+                // caller explicitly opted in via `set_video_projection`.
+                // Children are written in numerical-id order (0x7671..0x7675,
+                // the order the demuxer also encounters them) so the on-disk
+                // layout is diff-friendly. Per-element omission rules per the
+                // `set_video_projection` docstring: `ProjectionType` is
+                // written only for non-rectangular types (the §5.1.4.1.28.42
+                // default `0` stays off-disk), each pose component only when
+                // non-zero (the §5.1.4.1.28.44..46 default `0.0` stays
+                // off-disk), and `ProjectionPrivate` only when `Some(_)`. An
+                // explicit `MkvProjection::default()` therefore serialises as
+                // an empty `Projection` master that the demuxer parses into
+                // `Some(Projection::default())` — distinct from the
+                // call-omitted case which keeps the master off-disk so the
+                // demuxer surfaces `None`.
+                if let Some(p) = &self.video_projections[i] {
+                    let mut proj = Vec::new();
+                    if p.projection_type != ProjectionType::Rectangular {
+                        write_uint_element(
+                            &mut proj,
+                            ids::PROJECTION_TYPE,
+                            p.projection_type.to_raw(),
+                        );
+                    }
+                    if let Some(private) = &p.private {
+                        write_bytes_element(&mut proj, ids::PROJECTION_PRIVATE, private);
+                    }
+                    if p.pose_yaw != 0.0 {
+                        write_float_element(&mut proj, ids::PROJECTION_POSE_YAW, p.pose_yaw);
+                    }
+                    if p.pose_pitch != 0.0 {
+                        write_float_element(&mut proj, ids::PROJECTION_POSE_PITCH, p.pose_pitch);
+                    }
+                    if p.pose_roll != 0.0 {
+                        write_float_element(&mut proj, ids::PROJECTION_POSE_ROLL, p.pose_roll);
+                    }
+                    write_master_element(&mut video, ids::PROJECTION, &proj);
                 }
                 write_master_element(&mut t, ids::VIDEO, &video);
             }

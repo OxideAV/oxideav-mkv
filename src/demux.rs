@@ -2362,6 +2362,20 @@ impl ProjectionType {
     pub fn is_spherical(&self) -> bool {
         !matches!(self, ProjectionType::Rectangular)
     }
+
+    /// Inverse of [`ProjectionType::from_raw`]: convert the typed enum back to
+    /// its on-disk `ProjectionType` value (RFC 9559 §5.1.4.1.28.42, Table 18).
+    /// [`ProjectionType::Other`] round-trips its wrapped value verbatim. Used
+    /// by the muxer's `Video > Projection` write path.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            ProjectionType::Rectangular => ids::PROJECTION_TYPE_RECTANGULAR,
+            ProjectionType::Equirectangular => ids::PROJECTION_TYPE_EQUIRECTANGULAR,
+            ProjectionType::Cubemap => ids::PROJECTION_TYPE_CUBEMAP,
+            ProjectionType::Mesh => ids::PROJECTION_TYPE_MESH,
+            ProjectionType::Other(v) => v,
+        }
+    }
 }
 
 /// A video track's `Projection` master (RFC 9559 §5.1.4.1.28.41 plus the
