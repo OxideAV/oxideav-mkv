@@ -671,6 +671,38 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `MkvDemuxer::video_projection` typed accessor — a mux→demux pipeline
   preserves the projection record (type, pose, and verbatim
   `ProjectionPrivate` payload) bit-exactly.
+- **TrackEntry audience flags on write** (RFC 9559
+  §5.1.4.1.6..§5.1.4.1.11):
+  `MkvMuxer::set_track_audience_flags(stream_index, MkvTrackAudienceFlags)`
+  queues a per-track hint whose six `Option<bool>` slots — `forced`
+  (`FlagForced`, id `0x55AA`), `hearing_impaired` (`FlagHearingImpaired`,
+  id `0x55AB`), `visual_impaired` (`FlagVisualImpaired`, id `0x55AC`),
+  `text_descriptions` (`FlagTextDescriptions`, id `0x55AD`), `original`
+  (`FlagOriginal`, id `0x55AE`), `commentary` (`FlagCommentary`, id
+  `0x55AF`) — land directly inside the `TrackEntry` (the elements sit on
+  `TrackEntry` itself, not in a sub-master) at `write_header` time, after
+  `FlagLacing`, in numerical-id order. Per-element omission rule: each
+  `Some(v)` slot writes the element explicitly as `0` / `1`; each `None`
+  slot stays off-disk. For `FlagForced` (the only one with a spec
+  default), omission and `Some(false)` decode identically (`false`) but
+  differ on disk — the explicit write is the way to override a
+  downstream tool. For the five default-less `minver: 4` flags the
+  distinction is semantic: omission decodes as `None` while `Some(false)`
+  round-trips as `Some(false)`, preserving the §5.1.4.1.7..§5.1.4.1.11
+  "set to 1 *if and only if* …" explicit-zero signal. Unlike the
+  `set_video_*` family there is **no track-type restriction** — the spec
+  carries all six elements on every `TrackEntry`, so audio / video /
+  subtitle tracks all accept the call (mirroring the demux side, which
+  surfaces a record for every track). The muxer already pins
+  `DocTypeVersion` to `4`, so emitting the `minver: 4` elements never
+  violates the declared document version. Convenience constructors
+  `MkvTrackAudienceFlags::forced_subtitle()` /
+  `hearing_impaired_track()` / `visual_impaired_track()` /
+  `commentary_track()` cover the common single-flag shapes. Rejects
+  post-`write_header` use and out-of-range `stream_index`. Pairs
+  symmetrically with the existing `MkvDemuxer::track_audience_flags`
+  typed accessor — a mux→demux pipeline preserves every explicit flag,
+  including the `Some(false)`-vs-absent distinction.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status

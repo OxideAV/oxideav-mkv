@@ -291,6 +291,18 @@ pub struct MkvMuxer {
     /// for that stream. The slice is sized to `streams.len()`; non-video
     /// tracks must stay `None` (validated at `set_video_projection` time).
     video_projections: Vec<Option<MkvProjection>>,
+    /// Per-stream audience-flag hints queued via
+    /// [`MkvMuxer::set_track_audience_flags`] (RFC 9559
+    /// §5.1.4.1.6..§5.1.4.1.11). Materialised directly inside each
+    /// `TrackEntry` (the six elements sit on `TrackEntry` itself, not in
+    /// a sub-master) at `write_header` time, right after `FlagLacing`.
+    /// `None` (the default) means the muxer omits all six elements for
+    /// that stream, so the demuxer materialises the §5.1.4.1.6 default
+    /// `0` for `FlagForced` and surfaces `None` for the five
+    /// default-less `minver: 4` flags. Unlike the `Video`-master hints
+    /// above, the slice accepts a value on ANY track type — the spec
+    /// carries the elements on every `TrackEntry`.
+    track_audience_flags: Vec<Option<MkvTrackAudienceFlags>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -842,6 +854,111 @@ impl MkvProjection {
     }
 }
 
+/// Per-track "audience" flags payload (RFC 9559 §5.1.4.1.6..§5.1.4.1.11)
+/// queued by [`MkvMuxer::set_track_audience_flags`] and materialised
+/// directly inside the `TrackEntry` (NOT inside a `Video` / `Audio`
+/// sub-master — the six elements sit on `TrackEntry` itself) at
+/// `write_header` time.
+///
+/// Every field is `Option<bool>` with the same omission rule: `None`
+/// keeps the element off-disk, `Some(v)` writes it explicitly as `0` /
+/// `1`. The on-disk consequences differ per the spec's asymmetric
+/// defaults:
+///
+/// * [`forced`](Self::forced) (`FlagForced`, id `0x55AA`, §5.1.4.1.6)
+///   carries the spec default `0`, so `None` and `Some(false)` are
+///   *observationally* identical to a reader (both decode `false`) but
+///   byte-distinct on disk — `Some(false)` writes the element, the
+///   explicit way for a producer to override a downstream tool that
+///   might infer something else.
+/// * The five `minver: 4` flags — [`hearing_impaired`](Self::hearing_impaired)
+///   (`FlagHearingImpaired`, id `0x55AB`, §5.1.4.1.7),
+///   [`visual_impaired`](Self::visual_impaired) (`FlagVisualImpaired`,
+///   id `0x55AC`, §5.1.4.1.8), [`text_descriptions`](Self::text_descriptions)
+///   (`FlagTextDescriptions`, id `0x55AD`, §5.1.4.1.9),
+///   [`original`](Self::original) (`FlagOriginal`, id `0x55AE`,
+///   §5.1.4.1.10), [`commentary`](Self::commentary) (`FlagCommentary`,
+///   id `0x55AF`, §5.1.4.1.11) — carry **no** spec default, so `None`
+///   vs `Some(false)` is semantically load-bearing: the §5.1.4.1.7..11
+///   wording ("Set to 1 *if and only if* …") makes a writer's explicit
+///   `0` a stronger signal than silence. The demux-side
+///   [`crate::demux::TrackAudienceFlags`] accessor preserves exactly
+///   that distinction (`None` / `Some(false)` / `Some(true)`).
+///
+/// The muxer already pins `DocTypeVersion` to `4`, so emitting the
+/// `minver: 4` elements never violates the declared document version.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MkvTrackAudienceFlags {
+    /// `FlagForced` (§5.1.4.1.6). Applies only to subtitles per the spec
+    /// definition; the muxer still accepts it on any track type because
+    /// the spec carries the element on every `TrackEntry` with
+    /// `minOccurs: 1` — the demux side surfaces it everywhere too.
+    pub forced: Option<bool>,
+    /// `FlagHearingImpaired` (§5.1.4.1.7) — track is suitable for users
+    /// with hearing impairments (e.g. SDH subtitles).
+    pub hearing_impaired: Option<bool>,
+    /// `FlagVisualImpaired` (§5.1.4.1.8) — track is suitable for users
+    /// with visual impairments (e.g. an audio-description track).
+    pub visual_impaired: Option<bool>,
+    /// `FlagTextDescriptions` (§5.1.4.1.9) — track contains textual
+    /// descriptions of video content.
+    pub text_descriptions: Option<bool>,
+    /// `FlagOriginal` (§5.1.4.1.10) — track is in the content's original
+    /// language (vs a dub).
+    pub original: Option<bool>,
+    /// `FlagCommentary` (§5.1.4.1.11) — track contains commentary.
+    pub commentary: Option<bool>,
+}
+
+impl MkvTrackAudienceFlags {
+    /// Convenience constructor for the forced-subtitle shape
+    /// (§5.1.4.1.6): `FlagForced = 1`, everything else off-disk. The
+    /// canonical use is a subtitle track carrying only translations of
+    /// foreign-language audio or on-screen text.
+    pub fn forced_subtitle() -> Self {
+        Self {
+            forced: Some(true),
+            ..Self::default()
+        }
+    }
+
+    /// Convenience constructor for an SDH-style subtitle track
+    /// (§5.1.4.1.7): `FlagHearingImpaired = 1`, everything else
+    /// off-disk.
+    pub fn hearing_impaired_track() -> Self {
+        Self {
+            hearing_impaired: Some(true),
+            ..Self::default()
+        }
+    }
+
+    /// Convenience constructor for an audio-description track
+    /// (§5.1.4.1.8): `FlagVisualImpaired = 1`, everything else off-disk.
+    pub fn visual_impaired_track() -> Self {
+        Self {
+            visual_impaired: Some(true),
+            ..Self::default()
+        }
+    }
+
+    /// Convenience constructor for a commentary track (§5.1.4.1.11):
+    /// `FlagCommentary = 1`, everything else off-disk.
+    pub fn commentary_track() -> Self {
+        Self {
+            commentary: Some(true),
+            ..Self::default()
+        }
+    }
+
+    /// `true` when every slot is `None` — queueing such a record is a
+    /// functional no-op (no element reaches disk), kept legal so a
+    /// caller can pass through a fully-silent source record without
+    /// special-casing.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -905,6 +1022,7 @@ impl MkvMuxer {
             video_uncompressed_fourccs: vec![None; n],
             video_colours: vec![None; n],
             video_projections: vec![None; n],
+            track_audience_flags: vec![None; n],
         })
     }
 
@@ -1463,6 +1581,78 @@ impl MkvMuxer {
         self.video_projections.get(stream_index)?.as_ref()
     }
 
+    /// Set the per-track audience flags (RFC 9559 §5.1.4.1.6..
+    /// §5.1.4.1.11 — `FlagForced` / `FlagHearingImpaired` /
+    /// `FlagVisualImpaired` / `FlagTextDescriptions` / `FlagOriginal` /
+    /// `FlagCommentary`) for one stream. Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise — the
+    /// six elements live directly in the `TrackEntry`, which is written
+    /// exactly once at header time.
+    ///
+    /// Unlike the `set_video_*` family there is **no track-type
+    /// restriction**: the spec carries all six elements on every
+    /// `TrackEntry` (`FlagForced` with `minOccurs: 1`), so audio, video,
+    /// and subtitle tracks all accept the call. §5.1.4.1.6's "applies
+    /// only to subtitles" note describes player semantics, not an
+    /// on-disk placement constraint — mirroring the demux side, which
+    /// surfaces a [`crate::demux::TrackAudienceFlags`] record for every
+    /// track.
+    ///
+    /// Per-element omission rule: each `Some(v)` slot writes the element
+    /// explicitly as `0` / `1`; each `None` slot keeps it off-disk. For
+    /// `FlagForced` (the only one with a spec default), omission and
+    /// `Some(false)` decode identically (`false`) but differ on disk.
+    /// For the five default-less `minver: 4` flags, omission decodes as
+    /// `None` while `Some(false)` decodes as `Some(false)` — the
+    /// explicit-zero "the track is definitely NOT x" signal the
+    /// §5.1.4.1.7..§5.1.4.1.11 "if and only if" wording defines.
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` is out of range.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued record (last-write-wins). Queueing
+    /// [`MkvTrackAudienceFlags::default`] (every slot `None`) is legal
+    /// and functionally a no-op — no element reaches disk.
+    ///
+    /// Pairs symmetrically with the existing
+    /// [`crate::demux::MkvDemuxer::track_audience_flags`] typed accessor
+    /// — a mux→demux pipeline preserves every explicit flag, including
+    /// the `Some(false)`-vs-absent distinction on the `minver: 4` five.
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_track_audience_flags(
+        &mut self,
+        stream_index: usize,
+        flags: MkvTrackAudienceFlags,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_audience_flags called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_audience_flags stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        self.track_audience_flags[stream_index] = Some(flags);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream audience-flag hint
+    /// installed via [`MkvMuxer::set_track_audience_flags`]. Returns
+    /// `None` for any stream that didn't have the API called (the muxer
+    /// omits all six elements, so the demuxer materialises the
+    /// §5.1.4.1.6 default `false` for `forced()` and `None` for the
+    /// five `minver: 4` flags). Mostly useful for tests.
+    pub fn track_audience_flags(&self, stream_index: usize) -> Option<MkvTrackAudienceFlags> {
+        *self.track_audience_flags.get(stream_index)?
+    }
+
     /// Queue a chapter atom with one English-language `ChapterDisplay`
     /// carrying `title`. Must be called before [`MkvMuxer::write_header`];
     /// returns [`Error::other`] if the header has already been emitted.
@@ -1701,6 +1891,35 @@ impl Muxer for MkvMuxer {
                 1
             };
             write_uint_element(&mut t, ids::FLAG_LACING, flag_lacing);
+            // Audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11) — six
+            // TrackEntry-level uinteger elements queued via
+            // `set_track_audience_flags`. Per-element omission rule:
+            // every `Some(v)` slot is written explicitly as 0/1, every
+            // `None` slot stays off-disk (the demuxer materialises the
+            // §5.1.4.1.6 default `0` for FlagForced and surfaces `None`
+            // for the five default-less minver-4 flags). Children land
+            // in numerical-id order (0x55AA..0x55AF), matching the
+            // order the demuxer's TrackEntry walker reports them.
+            if let Some(af) = self.track_audience_flags[i] {
+                if let Some(v) = af.forced {
+                    write_uint_element(&mut t, ids::FLAG_FORCED, v as u64);
+                }
+                if let Some(v) = af.hearing_impaired {
+                    write_uint_element(&mut t, ids::FLAG_HEARING_IMPAIRED, v as u64);
+                }
+                if let Some(v) = af.visual_impaired {
+                    write_uint_element(&mut t, ids::FLAG_VISUAL_IMPAIRED, v as u64);
+                }
+                if let Some(v) = af.text_descriptions {
+                    write_uint_element(&mut t, ids::FLAG_TEXT_DESCRIPTIONS, v as u64);
+                }
+                if let Some(v) = af.original {
+                    write_uint_element(&mut t, ids::FLAG_ORIGINAL, v as u64);
+                }
+                if let Some(v) = af.commentary {
+                    write_uint_element(&mut t, ids::FLAG_COMMENTARY, v as u64);
+                }
+            }
             // RFC 9559 §5.1.4.1.2.1 (Language): per-track ISO 639-2/T
             // tag. Spec default is `"eng"`, so we only emit the element
             // when the caller supplied an explicit value — parsers fall
