@@ -278,10 +278,33 @@ the unified `oxideav` aggregator to wire decoding automatically.
   spec allows additions to the registry. Tracks with no
   `BlockAdditionMapping` child surface as an empty slice (the common
   case — the element only appears on tracks that use `BlockAdditional`
-  to extend their on-disk format). Per-frame `BlockAdditional` payload
-  bytes are *not* surfaced — the typed view declares the *shape* of
-  the side channel; payload semantics stay with the codec / track-format
-  extension that owns each `BlockAddIDType` value.
+  to extend their on-disk format). The typed view declares the *shape*
+  of the side channel; the per-frame `BlockAdditional` payload bytes
+  themselves surface through the per-packet `block_additions()`
+  accessor below, and payload semantics stay with the codec /
+  track-format extension that owns each `BlockAddIDType` value.
+- **Per-Block `BlockAdditions` typed decode** (RFC 9559 §5.1.3.5.2,
+  including §5.1.3.5.2.1..§5.1.3.5.2.3) **+ `MaxBlockAdditionID`**
+  (§5.1.4.1.16): `MkvDemuxer::block_additions() -> &[BlockAddition]`
+  surfaces the side-channel payloads attached to the most recently
+  returned packet — one typed `BlockAddition` per `BlockMore` in
+  on-disk order, each pairing `block_add_id()` (`BlockAddID`,
+  §5.1.3.5.2.3, spec default `1` = codec-defined materialised on
+  omission) with the verbatim `data()` bytes (`BlockAdditional`,
+  §5.1.3.5.2.2, never interpreted by the container — id `1` is e.g.
+  the WebM alpha plane when the track's `AlphaMode` is `Present`; ids
+  `>= 2` are described by the track's `BlockAdditionMapping`). The
+  slice is empty for `SimpleBlock` packets (the element only exists on
+  `BlockGroup`), for `BlockGroup`s without the master (the common
+  case), before the first `next_packet`, and after a seek; every frame
+  de-laced from one laced Block shares the Block's additions (the spec
+  attaches the master to the Block as a whole). Malformed `BlockMore`s
+  are dropped: a missing mandatory `BlockAdditional`, a `BlockAddID`
+  of `0` (range "not 0"), and a duplicate `BlockAddID` (uniqueness
+  MUST — first occurrence kept). The per-track declaration surfaces
+  through `MkvDemuxer::max_block_addition_id(stream_index)` with the
+  §5.1.4.1.16 spec default `0` ("there is no BlockAdditions for this
+  track") materialised on absence.
 - **`ContentEncodings` typed decode** (RFC 9559 §5.1.4.1.31):
   `MkvDemuxer::content_encodings(stream_index)` (and the per-stream
   `all_content_encodings()` slice) returns the track's transformation chain
@@ -703,6 +726,37 @@ the unified `oxideav` aggregator to wire decoding automatically.
   symmetrically with the existing `MkvDemuxer::track_audience_flags`
   typed accessor — a mux→demux pipeline preserves every explicit flag,
   including the `Some(false)`-vs-absent distinction.
+- **Per-Block `BlockAdditions` on write** (RFC 9559 §5.1.3.5.2 +
+  §5.1.4.1.16): `MkvMuxer::write_packet_with_additions(&packet,
+  &[MkvBlockAddition])` emits the packet as a `BlockGroup` (§5.1.3.5)
+  instead of a `SimpleBlock` — `Block` (frame bytes, unlaced; any
+  pending same-track lace is flushed first so Block order is
+  preserved), `BlockAdditions` with one `BlockMore` per addition in
+  slice order (each writing `BlockAdditional` verbatim and `BlockAddID`
+  only when it differs from the §5.1.3.5.2.3 default `1`),
+  `BlockDuration` (§5.1.3.5.3) when the packet carries a duration (a
+  `SimpleBlock` could not have carried it), and `ReferenceBlock`
+  (§5.1.3.5.5) when the packet is not a keyframe (a plain `Block` has
+  no KEY flag bit; keyframe-ness is the element's absence — the
+  relative value points at the track's most recently written Block,
+  falling back to the spec-sanctioned `0` "reference unknown" when
+  there is none). Prerequisite: declare the track's maximum id via
+  `MkvMuxer::set_max_block_addition_id(stream_index, max)` before
+  `write_header` — it lands as the `MaxBlockAdditionID` TrackEntry
+  element, and `write_packet_with_additions` rejects an undeclared
+  stream (§5.1.4.1.16's default `0` means "no BlockAdditions for this
+  track"), a `BlockAddID` of `0` (range "not 0"), an id above the
+  declared maximum, and duplicate ids within one call (§5.1.3.5.2.3
+  uniqueness MUST) — all before any byte is written. An empty
+  additions slice degrades to plain `write_packet` behaviour
+  (`BlockMore` is mandatory inside the master, so an empty
+  `BlockAdditions` would be malformed). The convenience constructor
+  `MkvBlockAddition::codec_defined(data)` covers the `BlockAddID = 1`
+  shape (e.g. WebM alpha — pair with `set_video_alpha_mode`). Pairs
+  symmetrically with the new `MkvDemuxer::block_additions` /
+  `max_block_addition_id` typed accessors — a mux→demux pipeline
+  preserves every addition byte-for-byte, plus the packet's keyframe
+  flag and duration.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status

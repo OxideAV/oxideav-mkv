@@ -303,6 +303,24 @@ pub struct MkvMuxer {
     /// above, the slice accepts a value on ANY track type — the spec
     /// carries the elements on every `TrackEntry`.
     track_audience_flags: Vec<Option<MkvTrackAudienceFlags>>,
+    /// Per-stream `MaxBlockAdditionID` hints queued via
+    /// [`MkvMuxer::set_max_block_addition_id`] (RFC 9559 §5.1.4.1.16).
+    /// `None` (the default) means the muxer omits the element, so the
+    /// demuxer materialises the spec default `0` ("there is no
+    /// BlockAdditions for this track") — and
+    /// [`MkvMuxer::write_packet_with_additions`] rejects the stream.
+    /// `Some(v)` writes the element explicitly, even for `v == 0` (the
+    /// explicit producer-override path, byte-distinct from omission but
+    /// decoding identically).
+    max_block_addition_ids: Vec<Option<u64>>,
+    /// Per-stream timestamp (ms, = track ticks at the muxer's 1 ms
+    /// `TimestampScale`) of the most recently written Block. Used to
+    /// derive the `ReferenceBlock` (RFC 9559 §5.1.3.5.5) relative value
+    /// when a non-keyframe packet is written through the `BlockGroup`
+    /// path — "Historically, Matroska Writers didn't write the actual
+    /// Block(s) that this Block depends on, but they did write some
+    /// Block(s) in the past."
+    last_block_pts_ms: Vec<Option<i64>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -959,6 +977,43 @@ impl MkvTrackAudienceFlags {
     }
 }
 
+/// One per-Block side-channel payload to be written as a
+/// `BlockGroup > BlockAdditions > BlockMore` master (RFC 9559
+/// §5.1.3.5.2.1) by [`MkvMuxer::write_packet_with_additions`].
+///
+/// `id` is the `BlockAddID` (§5.1.3.5.2.3, range "not 0"): `1` means the
+/// `data` bytes are codec-defined (e.g. a WebM alpha plane — pair with
+/// [`MkvMuxer::set_video_alpha_mode`]); any other value should be
+/// described by a `BlockAdditionMapping` on the track. The on-disk
+/// `BlockAddID` element is omitted when `id == 1` (the spec default) and
+/// written explicitly otherwise. `data` is the verbatim
+/// `BlockAdditional` payload (§5.1.3.5.2.2) — never interpreted by the
+/// muxer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MkvBlockAddition {
+    /// `BlockAddID` (RFC 9559 §5.1.3.5.2.3). Must be non-zero and at
+    /// most the track's declared `MaxBlockAdditionID` — validated at
+    /// [`MkvMuxer::write_packet_with_additions`] time.
+    pub id: u64,
+    /// `BlockAdditional` (RFC 9559 §5.1.3.5.2.2) payload bytes, written
+    /// verbatim.
+    pub data: Vec<u8>,
+}
+
+impl MkvBlockAddition {
+    /// Construct an addition with an explicit `BlockAddID`.
+    pub fn new(id: u64, data: Vec<u8>) -> Self {
+        Self { id, data }
+    }
+
+    /// Convenience constructor for the codec-defined channel
+    /// (`BlockAddID == 1`, the §5.1.3.5.2.3 default — e.g. WebM alpha
+    /// data).
+    pub fn codec_defined(data: Vec<u8>) -> Self {
+        Self { id: 1, data }
+    }
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -1023,6 +1078,8 @@ impl MkvMuxer {
             video_colours: vec![None; n],
             video_projections: vec![None; n],
             track_audience_flags: vec![None; n],
+            max_block_addition_ids: vec![None; n],
+            last_block_pts_ms: vec![None; n],
         })
     }
 
@@ -1653,6 +1710,63 @@ impl MkvMuxer {
         *self.track_audience_flags.get(stream_index)?
     }
 
+    /// Declare the track's `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16) —
+    /// the maximum `BlockAddID` (§5.1.3.5.2.3) value any of the track's
+    /// Blocks may carry. Must be called before [`Muxer::write_header`];
+    /// returns [`Error::other`] otherwise — the element lives in the
+    /// `TrackEntry`, which is written exactly once at header time.
+    ///
+    /// Declaring a non-zero value is the prerequisite for
+    /// [`MkvMuxer::write_packet_with_additions`] on the stream: the spec
+    /// default `0` means "there is no BlockAdditions for this track", so
+    /// the muxer refuses to attach additions to an undeclared track
+    /// rather than emit a file whose Blocks contradict its `TrackEntry`.
+    ///
+    /// Omission rule: skipping the call keeps the element off-disk (the
+    /// demuxer materialises the spec default `0`); calling it writes the
+    /// element explicitly — including `set_max_block_addition_id(i, 0)`,
+    /// which decodes identically to absence but is byte-distinct (the
+    /// explicit producer-override path). There is no track-type
+    /// restriction — the spec carries the element on every `TrackEntry`
+    /// with `minOccurs: 1`.
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` is out of range.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins). Returns a mutable
+    /// reference back so calls can chain builder-style.
+    pub fn set_max_block_addition_id(
+        &mut self,
+        stream_index: usize,
+        max: u64,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_max_block_addition_id called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_max_block_addition_id stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        self.max_block_addition_ids[stream_index] = Some(max);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `MaxBlockAdditionID`
+    /// hint installed via [`MkvMuxer::set_max_block_addition_id`].
+    /// Returns `None` for any stream that didn't have the API called
+    /// (the element stays off-disk and the demuxer materialises the
+    /// §5.1.4.1.16 default `0`). Mostly useful for tests.
+    pub fn max_block_addition_id(&self, stream_index: usize) -> Option<u64> {
+        *self.max_block_addition_ids.get(stream_index)?
+    }
+
     /// Queue a chapter atom with one English-language `ChapterDisplay`
     /// carrying `title`. Must be called before [`MkvMuxer::write_header`];
     /// returns [`Error::other`] if the header has already been emitted.
@@ -1919,6 +2033,16 @@ impl Muxer for MkvMuxer {
                 if let Some(v) = af.commentary {
                     write_uint_element(&mut t, ids::FLAG_COMMENTARY, v as u64);
                 }
+            }
+            // MaxBlockAdditionID (RFC 9559 §5.1.4.1.16) queued via
+            // `set_max_block_addition_id`. Omission rule: `None` stays
+            // off-disk (the demuxer materialises the spec default `0` =
+            // "no BlockAdditions for this track"); `Some(v)` writes the
+            // element explicitly, including the byte-distinct explicit
+            // `0`. A non-zero declaration is what unlocks
+            // `write_packet_with_additions` for the stream.
+            if let Some(m) = self.max_block_addition_ids[i] {
+                write_uint_element(&mut t, ids::MAX_BLOCK_ADDITION_ID, m);
             }
             // RFC 9559 §5.1.4.1.2.1 (Language): per-track ISO 639-2/T
             // tag. Spec default is `"eng"`, so we only emit the element
@@ -2300,6 +2424,57 @@ impl Muxer for MkvMuxer {
     }
 
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        self.write_packet_inner(packet, None)
+    }
+
+    fn write_trailer(&mut self) -> Result<()> {
+        if self.trailer_written {
+            return Ok(());
+        }
+        // Flush any in-flight lace buffers before the last Cluster is
+        // sealed by the Cues element — otherwise the buffered frames
+        // would be silently dropped.
+        if self.lacing_mode != LacingMode::None {
+            for i in 0..self.lace_pending.len() {
+                if !self.lace_pending[i].frames.is_empty() {
+                    self.flush_lace(i)?;
+                }
+            }
+        }
+        // Emit a Cues element after the last Cluster. The prior clusters are
+        // left with unknown size (their EBML parser stops when it meets the
+        // top-level Cues element id, which is outside the cluster subtree).
+        let cues_offset_rel = self.write_cues()?;
+        // Patch the Cues entry in the SeekHead. If we did emit Cues, write
+        // its offset (relative to the Segment payload start). If not, replace
+        // the 21-byte Seek slot with a Void so the SeekHead stays self-
+        // consistent — players that pre-walk the SeekHead would otherwise
+        // chase a placeholder zero offset that points at the SeekHead itself.
+        if self.seek_head_written {
+            self.patch_cues_seek_entry(cues_offset_rel)?;
+        }
+        self.output.flush()?;
+        self.trailer_written = true;
+        Ok(())
+    }
+}
+
+impl MkvMuxer {
+    /// Shared body of [`Muxer::write_packet`] and
+    /// [`MkvMuxer::write_packet_with_additions`]. When `additions` is
+    /// `Some`, the packet is emitted as a `BlockGroup` (RFC 9559
+    /// §5.1.3.5) carrying `Block` + `BlockAdditions` (+ `BlockDuration`
+    /// when the packet has a duration, + `ReferenceBlock` when it is not
+    /// a keyframe) instead of the usual `SimpleBlock`; the lacing buffer
+    /// is bypassed for that packet (any pending same-track lace is
+    /// flushed first so Block order is preserved). Validation of the
+    /// additions themselves happens in `write_packet_with_additions`
+    /// before this is called.
+    fn write_packet_inner(
+        &mut self,
+        packet: &Packet,
+        additions: Option<&[MkvBlockAddition]>,
+    ) -> Result<()> {
         if !self.header_written {
             return Err(Error::other("MKV muxer: write_header not called"));
         }
@@ -2340,10 +2515,16 @@ impl Muxer for MkvMuxer {
         // cluster (the Block timestamp is a cluster-relative
         // signed 16-bit offset; spanning clusters would orphan the
         // tail frames' implicit timestamps) and because the
-        // SimpleBlock KEY bit applies to the whole Block.
+        // SimpleBlock KEY bit applies to the whole Block. A packet
+        // carrying BlockAdditions bypasses the lacing buffer entirely
+        // (it becomes its own BlockGroup), so its own track's pending
+        // lace must flush too — otherwise the buffered earlier frames
+        // would land *after* this one in the file.
         if self.lacing_mode != LacingMode::None {
             for other_idx in 0..self.lace_pending.len() {
-                if other_idx != stream_idx && !self.lace_pending[other_idx].frames.is_empty() {
+                if (other_idx != stream_idx || additions.is_some())
+                    && !self.lace_pending[other_idx].frames.is_empty()
+                {
                     self.flush_lace(other_idx)?;
                 }
             }
@@ -2393,9 +2574,11 @@ impl Muxer for MkvMuxer {
                 MediaType::Video => packet.flags.keyframe,
                 _ => true,
             };
-            if indexable && self.lacing_mode == LacingMode::None {
-                // Non-lacing path: the block lands at `pre_block_pos`,
-                // emit the cue now with the correct relative position.
+            if indexable && (self.lacing_mode == LacingMode::None || additions.is_some()) {
+                // Non-lacing path (and the BlockGroup-with-additions
+                // path, which always writes immediately): the block
+                // lands at `pre_block_pos`, emit the cue now with the
+                // correct relative position.
                 self.cues.push(CueRecord {
                     track: track_number,
                     time_ms: pts_ms.max(0) as u64,
@@ -2408,7 +2591,48 @@ impl Muxer for MkvMuxer {
             // actually know where the (possibly laced) block lands.
         }
 
-        if self.lacing_mode == LacingMode::None {
+        if let Some(adds) = additions {
+            // BlockGroup path (RFC 9559 §5.1.3.5): Block + BlockAdditions
+            // (+ BlockDuration when the packet carries a duration,
+            // + ReferenceBlock when it is not a keyframe). A plain Block
+            // has no KEY flag bit — keyframe-ness is signalled by the
+            // *absence* of ReferenceBlock (§5.1.3.5.5: "If the BlockGroup
+            // doesn't have a ReferenceBlock element, then the Block it
+            // contains can be decoded without using any other Block
+            // data").
+            let reference_block = if packet.flags.keyframe {
+                None
+            } else {
+                // §5.1.3.5.5 — a timestamp relative to this Block's, in
+                // track ticks (= ms at our 1 ms TimestampScale), pointing
+                // at a Block this one depends on. We reference the most
+                // recently written Block on the same track; when there is
+                // none, the spec-sanctioned `0` says "cannot be decoded
+                // on its own, but the necessary reference Block(s) is
+                // unknown".
+                Some(
+                    self.last_block_pts_ms[stream_idx]
+                        .map(|prev| prev - pts_ms)
+                        .unwrap_or(0),
+                )
+            };
+            // BlockDuration (§5.1.3.5.3) in track ticks (ms). Only
+            // emitted when the packet carries a non-negative duration —
+            // the element is unsigned.
+            let duration_ms = derived_duration
+                .map(|d| pts_to_ms(d, stream_time_base))
+                .filter(|d| *d >= 0)
+                .map(|d| d as u64);
+            let group = build_block_group(
+                track_number,
+                timecode_offset as i16,
+                &packet.data,
+                adds,
+                duration_ms,
+                reference_block,
+            );
+            self.output.write_all(&group)?;
+        } else if self.lacing_mode == LacingMode::None {
             // Fast path: emit a standalone SimpleBlock with lacing
             // bits = 00 (RFC 9559 §10.3.1). Matches the
             // pre-with_block_lacing behaviour byte-for-byte.
@@ -2423,42 +2647,103 @@ impl Muxer for MkvMuxer {
         } else {
             self.append_to_lace(stream_idx, timecode_offset as i16, packet)?;
         }
+        // Remember this Block's timestamp so a later non-keyframe
+        // BlockGroup on the same track can derive its ReferenceBlock
+        // (§5.1.3.5.5) relative value.
+        self.last_block_pts_ms[stream_idx] = Some(pts_ms);
         Ok(())
     }
 
-    fn write_trailer(&mut self) -> Result<()> {
-        if self.trailer_written {
-            return Ok(());
+    /// Write one packet as a `BlockGroup` (RFC 9559 §5.1.3.5) carrying
+    /// the given `BlockAdditions` (§5.1.3.5.2) side-channel payloads in
+    /// addition to the frame data — the write-side counterpart of
+    /// [`crate::demux::MkvDemuxer::block_additions`].
+    ///
+    /// On-disk shape: `BlockGroup > Block` (the frame bytes, unlaced —
+    /// a packet with additions always bypasses any
+    /// [`MkvMuxer::with_block_lacing`] aggregation and flushes the
+    /// track's pending lace first so Block order is preserved), one
+    /// `BlockMore` per addition in slice order (each writing
+    /// `BlockAdditional` verbatim and `BlockAddID` only when it differs
+    /// from the §5.1.3.5.2.3 default `1`), `BlockDuration` (§5.1.3.5.3)
+    /// when the packet carries a duration, and `ReferenceBlock`
+    /// (§5.1.3.5.5) when the packet is not a keyframe (a plain `Block`
+    /// has no KEY flag bit; keyframe-ness is the *absence* of
+    /// `ReferenceBlock`).
+    ///
+    /// Prerequisite: the stream must have declared a non-zero
+    /// `MaxBlockAdditionID` via [`MkvMuxer::set_max_block_addition_id`]
+    /// before `write_header` — §5.1.4.1.16's default `0` means "there
+    /// is no BlockAdditions for this track", and the muxer refuses to
+    /// emit Blocks that contradict their own `TrackEntry`.
+    ///
+    /// Validation (all before any byte is written):
+    ///
+    /// * `Error::other` — `write_header` not called yet.
+    /// * `Error::invalid` — out-of-range `packet.stream_index`; an
+    ///   addition with `id == 0` (§5.1.3.5.2.3 ranges `BlockAddID` as
+    ///   "not 0"); an addition whose `id` exceeds the declared
+    ///   `MaxBlockAdditionID` (§5.1.4.1.16); two additions sharing an
+    ///   `id` (§5.1.3.5.2.3: "Each BlockAddID value MUST be unique
+    ///   between all BlockMore elements found in a BlockAdditions
+    ///   element"); the stream never declared a `MaxBlockAdditionID`.
+    ///
+    /// An empty `additions` slice degrades to plain
+    /// [`Muxer::write_packet`] behaviour (a `SimpleBlock`, lacing
+    /// eligible) — no empty `BlockAdditions` master is written, since
+    /// `BlockMore` is mandatory inside one (§5.1.3.5.2.1
+    /// `minOccurs: 1`).
+    pub fn write_packet_with_additions(
+        &mut self,
+        packet: &Packet,
+        additions: &[MkvBlockAddition],
+    ) -> Result<()> {
+        if additions.is_empty() {
+            return self.write_packet_inner(packet, None);
         }
-        // Flush any in-flight lace buffers before the last Cluster is
-        // sealed by the Cues element — otherwise the buffered frames
-        // would be silently dropped.
-        if self.lacing_mode != LacingMode::None {
-            for i in 0..self.lace_pending.len() {
-                if !self.lace_pending[i].frames.is_empty() {
-                    self.flush_lace(i)?;
-                }
+        if !self.header_written {
+            return Err(Error::other("MKV muxer: write_header not called"));
+        }
+        let stream_idx = packet.stream_index as usize;
+        if stream_idx >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: unknown stream index {}",
+                stream_idx
+            )));
+        }
+        let declared = self.max_block_addition_ids[stream_idx].unwrap_or(0);
+        if declared == 0 {
+            return Err(Error::invalid(format!(
+                "MKV muxer: stream {stream_idx} has MaxBlockAdditionID 0 — RFC 9559 §5.1.4.1.16 \
+                 means no BlockAdditions for this track; declare a non-zero maximum via \
+                 set_max_block_addition_id before write_header"
+            )));
+        }
+        for (i, a) in additions.iter().enumerate() {
+            if a.id == 0 {
+                return Err(Error::invalid(
+                    "MKV muxer: BlockAddID 0 is out of range — RFC 9559 §5.1.3.5.2.3 ranges the \
+                     element as \"not 0\"",
+                ));
+            }
+            if a.id > declared {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: BlockAddID {} exceeds the track's declared MaxBlockAdditionID {} \
+                     (RFC 9559 §5.1.4.1.16)",
+                    a.id, declared
+                )));
+            }
+            if additions[..i].iter().any(|b| b.id == a.id) {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: duplicate BlockAddID {} — RFC 9559 §5.1.3.5.2.3 requires each \
+                     value to be unique between the BlockMore elements of one BlockAdditions",
+                    a.id
+                )));
             }
         }
-        // Emit a Cues element after the last Cluster. The prior clusters are
-        // left with unknown size (their EBML parser stops when it meets the
-        // top-level Cues element id, which is outside the cluster subtree).
-        let cues_offset_rel = self.write_cues()?;
-        // Patch the Cues entry in the SeekHead. If we did emit Cues, write
-        // its offset (relative to the Segment payload start). If not, replace
-        // the 21-byte Seek slot with a Void so the SeekHead stays self-
-        // consistent — players that pre-walk the SeekHead would otherwise
-        // chase a placeholder zero offset that points at the SeekHead itself.
-        if self.seek_head_written {
-            self.patch_cues_seek_entry(cues_offset_rel)?;
-        }
-        self.output.flush()?;
-        self.trailer_written = true;
-        Ok(())
+        self.write_packet_inner(packet, Some(additions))
     }
-}
 
-impl MkvMuxer {
     fn start_cluster(&mut self, timecode_ms: i64) -> Result<()> {
         // Capture the absolute file offset of the Cluster element header —
         // Cues will store (offset - segment_data_start) as
@@ -2729,6 +3014,66 @@ fn build_simple_block(
     out
 }
 
+/// Build a `BlockGroup` element (RFC 9559 §5.1.3.5) carrying one unlaced
+/// frame plus its `BlockAdditions` (§5.1.3.5.2) side-channel payloads.
+///
+/// Children, in order:
+///
+/// * `Block` (§5.1.3.5.1, §10.2): TrackNumber VINT + signed 16-bit
+///   timestamp + flags byte `0x00` — a plain Block has no KEY flag bit
+///   (keyframe-ness is signalled by the absence of `ReferenceBlock`)
+///   and these frames are never laced — followed by the frame bytes.
+/// * `BlockAdditions` (§5.1.3.5.2): one `BlockMore` per addition in
+///   slice order. Inside each `BlockMore` the children follow the
+///   §5.1.3.5.2.x subsection order — `BlockAdditional` (§5.1.3.5.2.2)
+///   verbatim, then `BlockAddID` (§5.1.3.5.2.3) only when it differs
+///   from the spec default `1` (a mandatory element with a default may
+///   stay off-disk at that default).
+/// * `BlockDuration` (§5.1.3.5.3, uinteger, track ticks) when `Some`.
+/// * `ReferenceBlock` (§5.1.3.5.5, signed integer, track ticks relative
+///   to this Block's timestamp) when `Some` — i.e. for non-keyframes.
+fn build_block_group(
+    track: u64,
+    tc_offset: i16,
+    frame: &[u8],
+    additions: &[MkvBlockAddition],
+    duration_ticks: Option<u64>,
+    reference_block: Option<i64>,
+) -> Vec<u8> {
+    // Block child: same §10.2 header layout as SimpleBlock minus the
+    // keyframe / discardable flag bits, lacing bits 00.
+    let mut block_body = Vec::with_capacity(4 + frame.len());
+    block_body.extend_from_slice(&write_vint(track, 0));
+    block_body.extend_from_slice(&tc_offset.to_be_bytes());
+    block_body.push(0x00);
+    block_body.extend_from_slice(frame);
+
+    let mut group_body = Vec::new();
+    write_bytes_element(&mut group_body, ids::BLOCK, &block_body);
+
+    let mut additions_body = Vec::new();
+    for a in additions {
+        let mut more = Vec::with_capacity(8 + a.data.len());
+        write_bytes_element(&mut more, ids::BLOCK_ADDITIONAL, &a.data);
+        if a.id != 1 {
+            write_uint_element(&mut more, ids::BLOCK_ADD_ID, a.id);
+        }
+        write_master_element(&mut additions_body, ids::BLOCK_MORE, &more);
+    }
+    write_master_element(&mut group_body, ids::BLOCK_ADDITIONS, &additions_body);
+
+    if let Some(d) = duration_ticks {
+        write_uint_element(&mut group_body, ids::BLOCK_DURATION, d);
+    }
+    if let Some(r) = reference_block {
+        write_int_element(&mut group_body, ids::REFERENCE_BLOCK, r);
+    }
+
+    let mut out = Vec::with_capacity(8 + group_body.len());
+    write_master_element(&mut out, ids::BLOCK_GROUP, &group_body);
+    out
+}
+
 /// Append a Xiph-lacing payload to `body` (RFC 9559 §10.3.2):
 /// `n_frames-1` octet, then for every frame except the last the
 /// size as a sum of 255-additive unsigned octets (e.g. 500 →
@@ -2936,6 +3281,27 @@ fn write_uint_element(buf: &mut Vec<u8>, id: u32, value: u64) {
     } else {
         (64 - value.leading_zeros()).div_ceil(8) as usize
     };
+    buf.extend_from_slice(&write_element_id(id));
+    buf.extend_from_slice(&write_vint(n as u64, 0));
+    for i in (0..n).rev() {
+        buf.push(((value >> (i * 8)) & 0xFF) as u8);
+    }
+}
+
+/// Write a signed-integer element (RFC 8794 §7.1: two's complement
+/// notation with the leftmost bit being the sign bit, 0-8 octets).
+/// This writer always picks the minimal octet count that represents
+/// the value — `n` octets cover `-(2^(8n-1)) ..= 2^(8n-1) - 1`.
+fn write_int_element(buf: &mut Vec<u8>, id: u32, value: i64) {
+    let mut n = 1usize;
+    while n < 8 {
+        let min = -(1i64 << (8 * n - 1));
+        let max = (1i64 << (8 * n - 1)) - 1;
+        if value >= min && value <= max {
+            break;
+        }
+        n += 1;
+    }
     buf.extend_from_slice(&write_element_id(id));
     buf.extend_from_slice(&write_vint(n as u64, 0));
     for i in (0..n).rev() {

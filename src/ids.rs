@@ -125,6 +125,12 @@ pub const BLOCK_ADD_ID_NAME: u32 = 0x41A4;
 pub const BLOCK_ADD_ID_TYPE: u32 = 0x41E7;
 pub const BLOCK_ADD_ID_EXTRA_DATA: u32 = 0x41ED;
 
+// MaxBlockAdditionID (RFC 9559 §5.1.4.1.16): per-TrackEntry uinteger
+// declaring the maximum `BlockAddID` (§5.1.3.5.2.3) value any of the
+// track's Blocks may carry. The spec default `0` means "there is no
+// BlockAdditions for this track."
+pub const MAX_BLOCK_ADDITION_ID: u32 = 0x55EE;
+
 // ContentEncodings (RFC 9559 §5.1.4.1.31): a per-track ordered list of
 // transformations (compression / encryption) applied to frame data, the
 // CodecPrivate, or both, before the bytes were placed in Blocks. The
@@ -265,6 +271,19 @@ pub const BLOCK_GROUP: u32 = 0xA0;
 pub const BLOCK: u32 = 0xA1;
 pub const BLOCK_DURATION: u32 = 0x9B;
 pub const REFERENCE_BLOCK: u32 = 0xFB;
+
+// BlockAdditions (RFC 9559 §5.1.3.5.2): per-BlockGroup side channel of
+// additional binary data completing the Block. Each `BlockMore`
+// (§5.1.3.5.2.1) pairs one `BlockAdditional` payload (§5.1.3.5.2.2) with
+// a `BlockAddID` (§5.1.3.5.2.3, uinteger, default `1`, range "not 0")
+// that selects the interpretation: `1` = codec-defined, any other value
+// is described by the matching TrackEntry `BlockAdditionMapping`
+// (§5.1.4.1.17). BlockAddID values MUST be unique between the BlockMore
+// elements of one BlockAdditions master.
+pub const BLOCK_ADDITIONS: u32 = 0x75A1;
+pub const BLOCK_MORE: u32 = 0xA6;
+pub const BLOCK_ADDITIONAL: u32 = 0xA5;
+pub const BLOCK_ADD_ID: u32 = 0xEE;
 
 // Cues (seek index).
 pub const CUE_POINT: u32 = 0xBB;

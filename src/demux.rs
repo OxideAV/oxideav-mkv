@@ -412,6 +412,11 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         .map(|t| t.block_addition_mappings.clone())
         .collect();
 
+    // Per-stream `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16), indexed by
+    // stream index. The spec default `0` ("there is no BlockAdditions for
+    // this track") is already materialised on the raw record.
+    let max_block_addition_ids: Vec<u64> = tracks.iter().map(|t| t.max_block_addition_id).collect();
+
     // Per-stream `TrackAudienceFlags` (RFC 9559 §5.1.4.1.6..§5.1.4.1.11),
     // indexed by stream index. The spec defaults are materialised here, on
     // the typed builder, so the raw `audience_flags_raw` tuple on
@@ -679,6 +684,8 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_aspect_ratio_types,
         video_uncompressed_fourccs,
         block_addition_mappings,
+        max_block_addition_ids,
+        last_block_additions: None,
         track_audience_flags,
         track_audio,
         cluster_records: Vec::new(),
@@ -930,6 +937,12 @@ struct TrackEntry {
     /// `BlockAdditional` to extend their on-disk format, e.g. WebM alpha
     /// or HDR dynamic metadata payloads).
     block_addition_mappings: Vec<BlockAdditionMapping>,
+    /// `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16) — the maximum
+    /// `BlockAddID` value any of the track's Blocks may carry. The spec
+    /// default `0` ("there is no BlockAdditions for this track") is
+    /// materialised here directly, since absence and an explicit `0`
+    /// decode identically.
+    max_block_addition_id: u64,
     /// Raw audience-flag uintegers captured from the `TrackEntry` walk
     /// (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). Each is `None` when the on-disk
     /// element was absent. `FlagForced` (§5.1.4.1.6) is the only one with
@@ -1799,6 +1812,53 @@ impl BlockAdditionMapping {
     /// matching `BlockAddID`) to `1`.
     pub fn is_codec_defined(&self) -> bool {
         self.addid_type == 0
+    }
+}
+
+/// One per-Block side-channel payload from a
+/// `BlockGroup > BlockAdditions > BlockMore` master (RFC 9559
+/// §5.1.3.5.2.1) — the typed pairing of a `BlockAddID` (§5.1.3.5.2.3)
+/// with its `BlockAdditional` bytes (§5.1.3.5.2.2).
+///
+/// `BlockAdditional` data completes the Block's frame data: the
+/// canonical user is WebM alpha-channel data (`BlockAddID == 1` on a
+/// track whose `Video > AlphaMode` is `1` — see
+/// [`MkvDemuxer::video_alpha_mode`]), but HDR dynamic metadata and
+/// similar per-frame extensions ride the same channel under ids `>= 2`
+/// described by the track's `BlockAdditionMapping` masters
+/// (§5.1.4.1.17 — see [`MkvDemuxer::block_addition_mappings`]). The
+/// container surfaces the bytes verbatim; their semantics stay with the
+/// codec / track-format extension that owns the id.
+///
+/// Surfaced per packet via [`MkvDemuxer::block_additions`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockAddition {
+    id: u64,
+    data: Vec<u8>,
+}
+
+impl BlockAddition {
+    /// `BlockAddID` (RFC 9559 §5.1.3.5.2.3) — selects how the payload is
+    /// interpreted. The spec default `1` (codec-defined) is materialised:
+    /// a `BlockMore` with no explicit `BlockAddID` child decodes as `1`.
+    /// Any other value is described by the `BlockAdditionMapping` whose
+    /// `BlockAddIDValue` matches.
+    pub fn block_add_id(&self) -> u64 {
+        self.id
+    }
+
+    /// `BlockAdditional` (RFC 9559 §5.1.3.5.2.2) — the verbatim payload
+    /// bytes, "interpreted by the codec as it wishes (using the
+    /// BlockAddID)". Never parsed or validated by the container.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// True when the payload is codec-defined (`BlockAddID == 1`,
+    /// §5.1.3.5.2.3) — e.g. the WebM alpha plane on a track whose
+    /// `AlphaMode` is `1`.
+    pub fn is_codec_defined(&self) -> bool {
+        self.id == 1
     }
 }
 
@@ -4392,6 +4452,11 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 let mapping = parse_block_addition_mapping(r, body_end)?;
                 t.block_addition_mappings.push(mapping);
             }
+            // RFC 9559 §5.1.4.1.16 — maximum BlockAddID value the track's
+            // Blocks may carry. Default 0 = "no BlockAdditions"; absence
+            // and explicit 0 decode identically, so the raw field holds
+            // the materialised value directly.
+            ids::MAX_BLOCK_ADDITION_ID => t.max_block_addition_id = read_uint(r, e.size as usize)?,
             // Audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). All six are
             // 0-or-1 uintegers; absence is captured as `None` so the typed
             // surface can distinguish "no element on disk" from "the writer
@@ -4658,6 +4723,54 @@ fn parse_block_addition_mapping(r: &mut dyn ReadSeek, end: u64) -> Result<BlockA
         addid_type,
         extra_data,
     })
+}
+
+/// Parse a `BlockAdditions` master (RFC 9559 §5.1.3.5.2) into a list of
+/// typed [`BlockAddition`]s, in on-disk `BlockMore` order.
+///
+/// Per-child handling:
+///
+/// * `BlockAddID` (§5.1.3.5.2.3) defaults to `1` (codec-defined) when the
+///   child is absent — `minOccurs: 1` plus a `default:` clause means an
+///   omitted element is assumed at its default.
+/// * A `BlockMore` with no `BlockAdditional` child is dropped — the
+///   payload is mandatory (§5.1.3.5.2.2, `minOccurs: 1`, no default), so
+///   there is nothing to surface.
+/// * A `BlockAddID` of `0` is dropped — the spec ranges the element as
+///   "not 0".
+/// * A `BlockMore` whose `BlockAddID` repeats an earlier sibling's is
+///   dropped, keeping the first occurrence — §5.1.3.5.2.3's usage note
+///   makes id uniqueness within one `BlockAdditions` a MUST, so a later
+///   duplicate is the invalid one.
+/// * Unknown children are skipped (forward-compat).
+fn parse_block_additions(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<BlockAddition>> {
+    let mut out: Vec<BlockAddition> = Vec::new();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::BLOCK_MORE => {
+                let bm_end = r.stream_position()?.saturating_add(e.size);
+                // §5.1.3.5.2.3 default: BlockAddID = 1 (codec-defined).
+                let mut id: u64 = 1;
+                let mut data: Option<Vec<u8>> = None;
+                while r.stream_position()? < bm_end {
+                    let c = read_element_header(r)?;
+                    match c.id {
+                        ids::BLOCK_ADD_ID => id = read_uint(r, c.size as usize)?,
+                        ids::BLOCK_ADDITIONAL => data = Some(read_bytes(r, c.size as usize)?),
+                        _ => skip(r, c.size)?,
+                    }
+                }
+                if let Some(data) = data {
+                    if id != 0 && !out.iter().any(|a| a.id == id) {
+                        out.push(BlockAddition { id, data });
+                    }
+                }
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(out)
 }
 
 fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
@@ -4943,7 +5056,14 @@ pub struct MkvDemuxer {
     segment_data_start: u64,
     segment_data_end: u64,
     cluster_state: ClusterState,
-    out_queue: std::collections::VecDeque<Packet>,
+    /// De-laced packets waiting to be returned by
+    /// [`Demuxer::next_packet`], each paired with the `BlockAdditions`
+    /// (RFC 9559 §5.1.3.5.2) of the Block it came from — `None` for
+    /// `SimpleBlock` packets (the element only exists on `BlockGroup`)
+    /// and for Blocks that carried no additions. The additions are
+    /// shared via `Arc` because every frame de-laced from one Block
+    /// shares the Block's single `BlockAdditions` master.
+    out_queue: std::collections::VecDeque<(Packet, Option<std::sync::Arc<Vec<BlockAddition>>>)>,
     time_base: TimeBase,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
@@ -5057,6 +5177,15 @@ pub struct MkvDemuxer {
     /// appears on tracks that use `BlockAdditional` to extend their
     /// on-disk format). See [`MkvDemuxer::block_addition_mappings`].
     block_addition_mappings: Vec<Vec<BlockAdditionMapping>>,
+    /// Per-stream `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16), indexed
+    /// by stream index, spec default `0` materialised — see
+    /// [`MkvDemuxer::max_block_addition_id`].
+    max_block_addition_ids: Vec<u64>,
+    /// The `BlockAdditions` attached to the most recently returned
+    /// packet — see [`MkvDemuxer::block_additions`]. `None` when that
+    /// packet's Block carried none (or no packet has been returned yet,
+    /// or a seek invalidated it).
+    last_block_additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
     /// Per-stream [`TrackAudienceFlags`] (RFC 9559 §5.1.4.1.6..§5.1.4.1.11),
     /// indexed by stream index. Every track surfaces a record — `FlagForced`
     /// has a spec default of `0` and the §minver-4 flags carry no default
@@ -5097,7 +5226,11 @@ impl Demuxer for MkvDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            if let Some(p) = self.out_queue.pop_front() {
+            if let Some((p, additions)) = self.out_queue.pop_front() {
+                // Keep the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2)
+                // reachable through `block_additions()` until the next
+                // packet is returned (or a seek invalidates it).
+                self.last_block_additions = additions;
                 return Ok(p);
             }
             self.advance()?;
@@ -5182,8 +5315,11 @@ impl Demuxer for MkvDemuxer {
         let abs = self.segment_data_start + cue_cluster_offset;
         self.input.seek(SeekFrom::Start(abs))?;
         // Reset cluster reader state + any previously queued packets.
+        // The "most recently returned packet" the block-additions
+        // surface refers to is invalidated by the jump too.
         self.cluster_state = ClusterState::Idle;
         self.out_queue.clear();
+        self.last_block_additions = None;
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -5488,6 +5624,46 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::block_addition_mappings`] for the semantics.
     pub fn all_block_addition_mappings(&self) -> &[Vec<BlockAdditionMapping>] {
         &self.block_addition_mappings
+    }
+
+    /// `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16) for the stream at
+    /// `stream_index` — the maximum `BlockAddID` (§5.1.3.5.2.3) value any
+    /// of the track's Blocks may carry. The spec default `0` is
+    /// materialised: a `TrackEntry` with no `MaxBlockAdditionID` child
+    /// decodes as `0`, the spec's "there is no BlockAdditions for this
+    /// track" signal. Returns `None` only for an out-of-range
+    /// `stream_index`.
+    pub fn max_block_addition_id(&self, stream_index: u32) -> Option<u64> {
+        self.max_block_addition_ids
+            .get(stream_index as usize)
+            .copied()
+    }
+
+    /// The [`BlockAddition`]s (RFC 9559 §5.1.3.5.2) attached to the most
+    /// recently returned packet — empty for packets that came from a
+    /// `SimpleBlock` (the element only exists on `BlockGroup`), from a
+    /// `BlockGroup` with no `BlockAdditions` child (the common case), or
+    /// when no packet has been returned yet / the last call was a seek.
+    ///
+    /// Call pattern: `next_packet()` first, then `block_additions()`
+    /// before the next `next_packet()` / `seek_to` call — each returned
+    /// packet replaces the surface. Entries are in on-disk `BlockMore`
+    /// order, each pairing a `BlockAddID` (§5.1.3.5.2.3, default `1` =
+    /// codec-defined) with its verbatim `BlockAdditional` payload
+    /// (§5.1.3.5.2.2). For a laced Block, every de-laced frame reports
+    /// the same additions — the spec attaches the element to the Block
+    /// as a whole, not to individual laced frames.
+    ///
+    /// Interpretation of the bytes is out of container scope: id `1` is
+    /// codec-defined (e.g. the WebM alpha plane when the track's
+    /// [`MkvDemuxer::video_alpha_mode`] is `Present`); ids `>= 2` are
+    /// described by the matching
+    /// [`MkvDemuxer::block_addition_mappings`] entry on the track.
+    pub fn block_additions(&self) -> &[BlockAddition] {
+        self.last_block_additions
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// [`TrackAudienceFlags`] (RFC 9559 §5.1.4.1.6..§5.1.4.1.11) for the
@@ -6105,6 +6281,7 @@ impl MkvDemuxer {
         let mut block_bytes: Option<Vec<u8>> = None;
         let mut duration: Option<i64> = None;
         let mut is_keyframe = true;
+        let mut additions: Option<std::sync::Arc<Vec<BlockAddition>>> = None;
         while self.input.stream_position()? < end {
             let e = read_element_header(&mut *self.input)?;
             match e.id {
@@ -6118,6 +6295,16 @@ impl MkvDemuxer {
                     is_keyframe = false;
                     skip(&mut *self.input, e.size)?;
                 }
+                ids::BLOCK_ADDITIONS => {
+                    // RFC 9559 §5.1.3.5.2 — per-Block side-channel
+                    // payloads, surfaced through `block_additions()`
+                    // alongside the de-laced packets.
+                    let ba_end = self.input.stream_position()?.saturating_add(e.size);
+                    let list = parse_block_additions(&mut *self.input, ba_end)?;
+                    if !list.is_empty() {
+                        additions = Some(std::sync::Arc::new(list));
+                    }
+                }
                 _ => skip(&mut *self.input, e.size)?,
             }
         }
@@ -6125,7 +6312,7 @@ impl MkvDemuxer {
             // For BlockGroup, the lacing flags are in the same place as
             // SimpleBlock (the "keyframe" bit doesn't exist in plain Block —
             // keyframe-ness is inferred from absence of ReferenceBlock).
-            self.queue_block_packets_with(&b, cluster_timecode, is_keyframe, duration)?;
+            self.queue_block_packets_with(&b, cluster_timecode, is_keyframe, duration, additions)?;
         }
         Ok(())
     }
@@ -6139,7 +6326,9 @@ impl MkvDemuxer {
         // SimpleBlock: keyframe bit is bit 7 of flags byte.
         // BlockGroup/Block has the same layout but no keyframe bit.
         // We pass through whatever's set in the flags byte for SimpleBlock.
-        self.queue_block_packets_with(bytes, cluster_timecode, true, None)
+        // A SimpleBlock can never carry BlockAdditions (the element lives
+        // only on BlockGroup, RFC 9559 §5.1.3.5.2).
+        self.queue_block_packets_with(bytes, cluster_timecode, true, None, None)
     }
 
     fn queue_block_packets_with(
@@ -6148,6 +6337,7 @@ impl MkvDemuxer {
         cluster_timecode: i64,
         default_keyframe: bool,
         explicit_duration: Option<i64>,
+        additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
     ) -> Result<()> {
         let mut cur = std::io::Cursor::new(bytes);
         let (track_number, _) = crate::ebml::read_vint(&mut cur, false)?;
@@ -6206,7 +6396,10 @@ impl MkvDemuxer {
             pkt.dts = Some(pts);
             pkt.duration = per_frame;
             pkt.flags.keyframe = keyframe_flag || default_keyframe;
-            self.out_queue.push_back(pkt);
+            // BlockAdditions (RFC 9559 §5.1.3.5.2) attach to the Block as
+            // a whole; every frame de-laced from a laced Block shares the
+            // same additions (the spec gives no per-lace-frame split).
+            self.out_queue.push_back((pkt, additions.clone()));
         }
         Ok(())
     }
