@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.8...v0.0.9) - 2026-06-13
+
+### Other
+
+- write-side Audio master children (RFC 9559 §5.1.4.1.29)
+- Per-Block BlockAdditions typed views, read + write (RFC 9559 §5.1.3.5.2) + MaxBlockAdditionID (§5.1.4.1.16)
+- write-side TrackEntry audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11)
+- write-side Video > Projection master (RFC 9559 §5.1.4.1.28.41)
+- typed TrackAudio accessor (RFC 9559 §5.1.4.1.29.1..§5.1.4.1.29.4)
+- typed TrackAudienceFlags accessor (RFC 9559 §5.1.4.1.6..§5.1.4.1.11)
+- typed per-Cluster Position / PrevSize records (RFC 9559 §5.1.3.2 / §5.1.3.3)
+- typed Targets::target_level() hierarchy resolver (RFC 9559 §5.1.8.1.1.1)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- write Colour > MasteringMetadata sub-master (RFC 9559 §5.1.4.1.28.30..§5.1.4.1.28.40)
+- typed BlockAdditionMapping decode (RFC 9559 §5.1.4.1.17)
+- write Video > Colour scalar children (RFC 9559 §5.1.4.1.28.16, §5.1.4.1.28.17..§5.1.4.1.28.29)
+- write Video > UncompressedFourCC (RFC 9559 §5.1.4.1.28.15)
+- write Video > PixelCrop quartet + Display{Width,Height,Unit} (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14)
+- write Video > StereoMode + AlphaMode (RFC 9559 §5.1.4.1.28.3 + §5.1.4.1.28.4)
+- write Video > FlagInterlaced + FieldOrder (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2)
+- write CRC-32 on every buffered Top-Level master (RFC 9559 §6.2)
+- write-side Attachments (RFC 9559 §5.1.6)
+- emit per-track Language element from CodecParameters::language
+- add Annex-B → AVCC repack helper for V_MPEG4/ISO/AVC passthrough
+
 ### Other
 
 - mux: **write-side `Audio` master children** (RFC 9559 §5.1.4.1.29, including §5.1.4.1.29.1..§5.1.4.1.29.4) via the new `MkvMuxer::set_track_audio(stream_index, MkvTrackAudio)` builder method and the new `MkvTrackAudio` payload struct (mux module). Before this round the muxer derived the per-track `Audio` master (id `0xE1`) solely from `StreamInfo` — `sample_rate` → `SamplingFrequency` (id `0xB5`, §5.1.4.1.29.1), `channels` → `Channels` (id `0x9F`, §5.1.4.1.29.3), sample-format bit width → `BitDepth` (id `0x6264`, §5.1.4.1.29.4) — and had **no** way to emit `OutputSamplingFrequency` (id `0x78B5`, §5.1.4.1.29.2), the Spectral Band Replication (SBR) output rate that the demux-side `MkvDemuxer::track_audio` / `TrackAudio::is_sbr()` accessor already read back. The new setter closes that asymmetry: each of the four `Option` fields, when `Some(v)`, overrides the `StreamInfo`-derived child; when `None`, defers to the `StreamInfo` value (and for `output_sampling_frequency`, simply omits the element since `StreamInfo` has no equivalent). Children that resolve to nothing stay off-disk so the demuxer materialises the §5.1.4.1.29.1 default `8000.0` / §5.1.4.1.29.3 default `1` (mono); `BitDepth` has no spec default so its absence surfaces as `None`. The convenience constructor `MkvTrackAudio::sbr(core_sampling_frequency)` produces the canonical HE-AAC pair (`core`, `2 * core`). Spec range checks enforced at queue time: `SamplingFrequency` / `OutputSamplingFrequency` are ranged `> 0x0p+0` (a `Some(v)` with `v <= 0.0` or non-finite is rejected), `Channels` and `BitDepth` are ranged `not 0` (a `Some(0)` is rejected). Track-type restriction mirrors the demux side, which returns `None` from `track_audio` for non-audio tracks: the setter rejects calls on non-`Audio` streams, plus post-`write_header` use and out-of-range `stream_index`; repeated calls are last-write-wins; the read-back `MkvMuxer::track_audio(stream_index)` accessor returns the queued hint pre-`write_header`. Pairs symmetrically with the existing demux-side `MkvDemuxer::track_audio` typed accessor — a mux→demux round-trip preserves every supplied child bit-exactly, including the `OutputSamplingFrequency` SBR signal. Pinned by 12 new `tests/mux_track_audio.rs` cases: the no-hint StreamInfo-derived round-trip (48 kHz / 2ch / 16-bit, no `OutputSamplingFrequency` on disk, `is_sbr()` false), explicit-hint override of all three StreamInfo children, the SBR round-trip (22050 → 44100, `is_sbr()` firing, channels/bit_depth deferred), the `sbr()` constructor, the `0x78B5` on-disk presence scan (present when set / absent both with no hint and with a hint that left it `None`), the bare-StreamInfo fallback to §5.1.4.1.29.1 / .3 spec defaults, last-write-wins, all four rejection contracts (post-`write_header` → `Error::Other`; out-of-range, non-audio, and each range violation → `Error::InvalidData`), and the pre-`write_header` accessor read-back.
