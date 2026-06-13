@@ -772,6 +772,38 @@ the unified `oxideav` aggregator to wire decoding automatically.
   flushes the lace and starts a new one. Demuxer side already
   handles all three modes — the new write path completes the
   round-trip in-tree.
+- **`Audio` master children on write** (RFC 9559 §5.1.4.1.29,
+  §5.1.4.1.29.1..§5.1.4.1.29.4):
+  `MkvMuxer::set_track_audio(stream_index, MkvTrackAudio)` queues a
+  per-track hint that lands inside the track's `Audio` master (id
+  `0xE1`) at `write_header` time. The muxer already derives a minimal
+  `Audio` master from the stream's `StreamInfo` (`sample_rate` →
+  `SamplingFrequency`, `channels` → `Channels`, sample-format bit width
+  → `BitDepth`); this hint lets a caller override those derived children
+  **and** supply the one child the `StreamInfo`-derived path cannot
+  express: `OutputSamplingFrequency` (id `0x78B5`, §5.1.4.1.29.2), the
+  Spectral Band Replication (SBR) output rate the demux-side
+  `track_audio` / `TrackAudio::is_sbr()` accessor already reads back.
+  Per-field rule: a `Some(v)` overrides the `StreamInfo`-derived child;
+  a `None` defers to the `StreamInfo` value (and for
+  `output_sampling_frequency`, simply omits the element). Children that
+  resolve to nothing stay off-disk so the demuxer materialises the
+  §5.1.4.1.29.1 default `8000.0` / §5.1.4.1.29.3 default `1` (mono);
+  `BitDepth` has no spec default, so its absence surfaces as `None`. The
+  convenience constructor `MkvTrackAudio::sbr(core)` produces the
+  canonical HE-AAC pair (`core`, `2*core`). Spec range checks enforced
+  at queue time: `SamplingFrequency` / `OutputSamplingFrequency` ranged
+  `> 0x0p+0` (a `Some(v)` `<= 0.0` / non-finite is rejected),
+  `Channels` / `BitDepth` ranged `not 0` (a `Some(0)` is rejected).
+  Track-type restriction mirrors the demux side (which returns `None`
+  for non-audio tracks): the setter rejects non-`Audio` streams plus
+  post-`write_header` use and out-of-range `stream_index`; repeated
+  calls are last-write-wins; the read-back
+  `MkvMuxer::track_audio(stream_index)` accessor returns the queued hint
+  pre-`write_header`. Pairs symmetrically with the existing
+  `MkvDemuxer::track_audio` typed accessor — a mux→demux pipeline
+  preserves every supplied child bit-exactly, including the
+  `OutputSamplingFrequency` SBR signal.
 
 ### Codec ID mapping (`codec_id` module)
 

@@ -132,6 +132,80 @@ impl LacingMode {
     }
 }
 
+/// Per-track `Audio` master hint queued via [`MkvMuxer::set_track_audio`]
+/// (RFC 9559 §5.1.4.1.29, including §5.1.4.1.29.1..§5.1.4.1.29.4).
+///
+/// The muxer already derives a minimal `Audio` master from the stream's
+/// [`StreamInfo`] (`sample_rate` → `SamplingFrequency`, `channels` →
+/// `Channels`, `sample_format` bit width → `BitDepth`). This hint lets a
+/// caller override those derived children *and* supply the one child the
+/// `StreamInfo`-derived path cannot express: `OutputSamplingFrequency`
+/// (§5.1.4.1.29.2), the Spectral Band Replication (SBR) output rate used
+/// by HE-AAC and similar tracks.
+///
+/// Every field is `Option`; a `Some(v)` overrides the corresponding
+/// `StreamInfo`-derived child, a `None` leaves the `StreamInfo`-derived
+/// value in place (or, for `output_sampling_frequency`, simply omits the
+/// element since `StreamInfo` has no equivalent).
+///
+/// * `sampling_frequency` — `SamplingFrequency` (§5.1.4.1.29.1), Hz.
+///   Range `> 0x0p+0`. `Some(v)` overrides the `StreamInfo` `sample_rate`;
+///   `None` keeps it. If neither the hint nor `StreamInfo` supplies a
+///   value, the element is omitted and the demuxer materialises the spec
+///   default `8000.0`.
+/// * `output_sampling_frequency` — `OutputSamplingFrequency`
+///   (§5.1.4.1.29.2), Hz. Range `> 0x0p+0`. The SBR signal: set it
+///   strictly greater than `sampling_frequency` to mark SBR doubling
+///   (the demuxer's `is_sbr()` predicate then fires). `None` omits the
+///   element so the demuxer applies the Table 19 derived default
+///   (= `SamplingFrequency`).
+/// * `channels` — `Channels` (§5.1.4.1.29.3). Range `not 0`. `Some(v)`
+///   overrides the `StreamInfo` `channels`; `None` keeps it. If neither
+///   supplies a value, the element is omitted and the demuxer
+///   materialises the spec default `1` (mono).
+/// * `bit_depth` — `BitDepth` (§5.1.4.1.29.4). Range `not 0`. No spec
+///   default. `Some(v)` overrides the `StreamInfo`-derived bit width;
+///   `None` keeps it. If neither supplies a value the element is omitted
+///   and the demuxer surfaces `None`.
+///
+/// Pairs symmetrically with the demux-side
+/// [`crate::demux::MkvDemuxer::track_audio`] /
+/// [`crate::demux::TrackAudio`] typed accessor — a mux→demux pipeline
+/// preserves every supplied child bit-exactly, including the
+/// `OutputSamplingFrequency` SBR signal.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MkvTrackAudio {
+    /// `SamplingFrequency` (RFC 9559 §5.1.4.1.29.1), Hz. `None` defers to
+    /// the stream's `StreamInfo` `sample_rate`.
+    pub sampling_frequency: Option<f64>,
+    /// `OutputSamplingFrequency` (RFC 9559 §5.1.4.1.29.2), Hz — the SBR
+    /// output rate. `None` omits the element (Table 19 derived default
+    /// applies on read).
+    pub output_sampling_frequency: Option<f64>,
+    /// `Channels` (RFC 9559 §5.1.4.1.29.3). `None` defers to the stream's
+    /// `StreamInfo` `channels`.
+    pub channels: Option<u64>,
+    /// `BitDepth` (RFC 9559 §5.1.4.1.29.4), bits per sample. `None` defers
+    /// to the `StreamInfo`-derived bit width (or omits when neither is set).
+    pub bit_depth: Option<u64>,
+}
+
+impl MkvTrackAudio {
+    /// Convenience constructor for the canonical HE-AAC SBR shape:
+    /// a `core` sampling frequency with an explicit
+    /// `OutputSamplingFrequency` of twice that rate (the SBR-doubling
+    /// signal — RFC 9559 §5.1.4.1.29.2). `channels` and `bit_depth` are
+    /// left to the stream's `StreamInfo`.
+    pub fn sbr(core_sampling_frequency: f64) -> Self {
+        MkvTrackAudio {
+            sampling_frequency: Some(core_sampling_frequency),
+            output_sampling_frequency: Some(core_sampling_frequency * 2.0),
+            channels: None,
+            bit_depth: None,
+        }
+    }
+}
+
 pub struct MkvMuxer {
     output: Box<dyn WriteSeek>,
     streams: Vec<StreamInfo>,
@@ -313,6 +387,16 @@ pub struct MkvMuxer {
     /// explicit producer-override path, byte-distinct from omission but
     /// decoding identically).
     max_block_addition_ids: Vec<Option<u64>>,
+    /// Per-stream `Audio` master hints queued via
+    /// [`MkvMuxer::set_track_audio`] (RFC 9559 §5.1.4.1.29). `None` (the
+    /// default) means the muxer derives the `Audio` master's children
+    /// from the stream's `StreamInfo` alone (`sample_rate` /
+    /// `channels` / `sample_format`). `Some(_)` overrides the derived
+    /// children per the hint's `Some` fields and adds the
+    /// `OutputSamplingFrequency` SBR child the `StreamInfo`-derived path
+    /// can't express. The slice is sized to `streams.len()`; non-audio
+    /// tracks must stay `None` (validated at `set_track_audio` time).
+    track_audio: Vec<Option<MkvTrackAudio>>,
     /// Per-stream timestamp (ms, = track ticks at the muxer's 1 ms
     /// `TimestampScale`) of the most recently written Block. Used to
     /// derive the `ReferenceBlock` (RFC 9559 §5.1.3.5.5) relative value
@@ -1079,6 +1163,7 @@ impl MkvMuxer {
             video_projections: vec![None; n],
             track_audience_flags: vec![None; n],
             max_block_addition_ids: vec![None; n],
+            track_audio: vec![None; n],
             last_block_pts_ms: vec![None; n],
         })
     }
@@ -1767,6 +1852,109 @@ impl MkvMuxer {
         *self.max_block_addition_ids.get(stream_index)?
     }
 
+    /// Set the per-track `Audio` master children (RFC 9559 §5.1.4.1.29)
+    /// for one stream. Must be called before [`Muxer::write_header`];
+    /// returns [`Error::other`] otherwise.
+    ///
+    /// The muxer already derives a minimal `Audio` master from the
+    /// stream's [`StreamInfo`] (`sample_rate` → `SamplingFrequency`,
+    /// `channels` → `Channels`, sample-format bit width → `BitDepth`).
+    /// This hint lets a caller override those derived children and — most
+    /// importantly — supply the `OutputSamplingFrequency` child
+    /// (§5.1.4.1.29.2) the `StreamInfo`-derived path cannot express. That
+    /// element is the Spectral Band Replication (SBR) output rate: a
+    /// HE-AAC track typically encodes a half-rate core and signals the
+    /// doubled output rate here, which the demuxer's
+    /// [`crate::demux::TrackAudio::is_sbr`] predicate reads back.
+    ///
+    /// Per-field rule: a `Some(v)` overrides the `StreamInfo`-derived
+    /// child; a `None` defers to the `StreamInfo` value (and for
+    /// `output_sampling_frequency`, simply omits the element, since
+    /// `StreamInfo` has no equivalent). When neither the hint nor
+    /// `StreamInfo` supplies `SamplingFrequency` / `Channels`, those
+    /// elements stay off-disk and the demuxer materialises the
+    /// §5.1.4.1.29.1 default `8000.0` / §5.1.4.1.29.3 default `1`.
+    ///
+    /// Spec range checks enforced at queue time (§5.1.4.1.29):
+    ///
+    /// * `sampling_frequency` / `output_sampling_frequency` are ranged
+    ///   `> 0x0p+0` — a `Some(v)` with `v <= 0.0` (or non-finite) is
+    ///   rejected.
+    /// * `channels` is ranged `not 0` — a `Some(0)` is rejected.
+    /// * `bit_depth` is ranged `not 0` — a `Some(0)` is rejected.
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` is out of range, the stream at
+    ///   that index is not [`MediaType::Audio`] (only audio tracks carry
+    ///   an `Audio` master per RFC 9559 §5.1.4.1.29 — mirroring the demux
+    ///   side, which returns `None` from `track_audio` for non-audio
+    ///   tracks), or any field violates its spec range.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins). Returns a mutable
+    /// reference back so calls can chain builder-style.
+    pub fn set_track_audio(
+        &mut self,
+        stream_index: usize,
+        audio: MkvTrackAudio,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_audio called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_audio stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Audio {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_audio on stream {stream_index} ({}) — only Audio tracks carry an Audio master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        // RFC 9559 §5.1.4.1.29.1 / .2: SamplingFrequency and
+        // OutputSamplingFrequency are ranged "> 0x0p+0".
+        for (name, freq) in [
+            ("sampling_frequency", audio.sampling_frequency),
+            ("output_sampling_frequency", audio.output_sampling_frequency),
+        ] {
+            if let Some(v) = freq {
+                if !(v.is_finite() && v > 0.0) {
+                    return Err(Error::invalid(format!(
+                        "MKV muxer: set_track_audio {name} {v} out of range (must be finite and > 0)"
+                    )));
+                }
+            }
+        }
+        // RFC 9559 §5.1.4.1.29.3 / .4: Channels and BitDepth are ranged
+        // "not 0".
+        if audio.channels == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: set_track_audio channels 0 out of range (must be not 0)".to_string(),
+            ));
+        }
+        if audio.bit_depth == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: set_track_audio bit_depth 0 out of range (must be not 0)".to_string(),
+            ));
+        }
+        self.track_audio[stream_index] = Some(audio);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `Audio` master hint
+    /// installed via [`MkvMuxer::set_track_audio`]. Returns `None` for any
+    /// stream that didn't have the API called (the muxer derives the
+    /// `Audio` master from `StreamInfo` alone). Mostly useful for tests.
+    pub fn track_audio(&self, stream_index: usize) -> Option<MkvTrackAudio> {
+        *self.track_audio.get(stream_index)?
+    }
+
     /// Queue a chapter atom with one English-language `ChapterDisplay`
     /// carrying `title`. Must be called before [`MkvMuxer::write_header`];
     /// returns [`Error::other`] if the header has already been emitted.
@@ -2074,14 +2262,40 @@ impl Muxer for MkvMuxer {
             }
             if s.params.media_type == MediaType::Audio {
                 let mut audio = Vec::new();
-                if let Some(sr) = s.params.sample_rate {
-                    write_float_element(&mut audio, ids::SAMPLING_FREQUENCY, sr as f64);
+                let hint = self.track_audio[i];
+                // RFC 9559 §5.1.4.1.29: each child resolves from the
+                // explicit `set_track_audio` hint first (a `Some` field
+                // overrides) and falls back to the StreamInfo-derived
+                // value. Children that end up unresolved are omitted so
+                // the demuxer materialises the §5.1.4.1.29.1 / .3 spec
+                // defaults (8000.0 Hz / 1 channel) or surfaces `None`
+                // (BitDepth — §5.1.4.1.29.4 has no default).
+                let sampling_frequency = hint
+                    .and_then(|h| h.sampling_frequency)
+                    .or_else(|| s.params.sample_rate.map(|sr| sr as f64));
+                if let Some(sf) = sampling_frequency {
+                    write_float_element(&mut audio, ids::SAMPLING_FREQUENCY, sf);
                 }
-                if let Some(ch) = s.params.channels {
-                    write_uint_element(&mut audio, ids::CHANNELS, ch as u64);
+                // OutputSamplingFrequency (§5.1.4.1.29.2): the SBR output
+                // rate. StreamInfo has no equivalent, so this child only
+                // appears when the hint supplied it. Omission lets the
+                // demuxer apply the Table 19 derived default
+                // (= SamplingFrequency).
+                if let Some(osf) = hint.and_then(|h| h.output_sampling_frequency) {
+                    write_float_element(&mut audio, ids::OUTPUT_SAMPLING_FREQUENCY, osf);
                 }
-                if let Some(fmt) = s.params.sample_format {
-                    let bd = (fmt.bytes_per_sample() * 8) as u64;
+                let channels = hint
+                    .and_then(|h| h.channels)
+                    .or_else(|| s.params.channels.map(|ch| ch as u64));
+                if let Some(ch) = channels {
+                    write_uint_element(&mut audio, ids::CHANNELS, ch);
+                }
+                let bit_depth = hint.and_then(|h| h.bit_depth).or_else(|| {
+                    s.params
+                        .sample_format
+                        .map(|fmt| (fmt.bytes_per_sample() * 8) as u64)
+                });
+                if let Some(bd) = bit_depth {
                     write_uint_element(&mut audio, ids::BIT_DEPTH, bd);
                 }
                 write_master_element(&mut t, ids::AUDIO, &audio);
