@@ -482,6 +482,21 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         })
         .collect();
 
+    // Per-stream `TrackCodecTiming` (RFC 9559 §5.1.4.1.25 + §5.1.4.1.26),
+    // indexed by stream index. A record surfaces for every track (the two
+    // elements sit on `TrackEntry` directly, not in a gating master). Both
+    // carry the spec default `0`, folded in on the typed surface
+    // (`codec_delay` / `seek_pre_roll`); the on-disk presence is preserved
+    // via the `*_explicit` accessors so a re-muxer doesn't materialise an
+    // element the source omitted.
+    let track_codec_timing: Vec<TrackCodecTiming> = tracks
+        .iter()
+        .map(|t| TrackCodecTiming {
+            codec_delay_explicit: t.codec_timing_raw.0,
+            seek_pre_roll_explicit: t.codec_timing_raw.1,
+        })
+        .collect();
+
     // Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2),
     // indexed by stream index. `None` for non-video tracks and for video
     // tracks whose `TrackEntry` had no `Video` master; for everything else
@@ -705,6 +720,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         track_audience_flags,
         track_audio,
         track_timing,
+        track_codec_timing,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
     })
@@ -986,6 +1002,13 @@ struct TrackEntry {
     /// an explicit value. The first two are nanosecond `uinteger`s with a
     /// "not 0" range and no default; the third is a `float` with default `1.0`.
     timing_raw: RawTrackTiming,
+    /// Raw `(CodecDelay, SeekPreRoll)` staging captured during the
+    /// `TrackEntry` walk (RFC 9559 §5.1.4.1.25 / §5.1.4.1.26). Each slot is
+    /// `None` when the on-disk element was absent; the spec default `0` is
+    /// *not* materialised here so the typed [`TrackCodecTiming`] builder can
+    /// distinguish "writer was silent" from an explicit `0`. Both are
+    /// nanosecond (Matroska Tick) `uinteger`s.
+    codec_timing_raw: (Option<u64>, Option<u64>),
 }
 
 /// Parser-private staging form for the three `TrackEntry` timing elements
@@ -2237,6 +2260,82 @@ impl TrackTiming {
         self.default_duration.is_none()
             && self.default_decoded_field_duration.is_none()
             && self.track_timestamp_scale_explicit.is_none()
+    }
+}
+
+/// A track's codec-level timing — `CodecDelay` (RFC 9559 §5.1.4.1.25) paired
+/// with `SeekPreRoll` (§5.1.4.1.26). Both sit directly on `TrackEntry`
+/// (no gating master) and are expressed in Matroska Ticks — i.e. nanoseconds
+/// (§11.1).
+///
+/// `CodecDelay` (`minver: 4`) is the built-in delay for the codec: the number
+/// of codec samples the decoder discards during playback, encoded as a
+/// duration in nanoseconds. Per the spec it "MUST be subtracted from each
+/// frame timestamp in order to get the timestamp that will be actually
+/// played." For an Opus track this is the encoder pre-skip converted to ns;
+/// the muxer side writes exactly that on the `oxideav-opus` path.
+///
+/// `SeekPreRoll` (`minver: 4`) is the duration of data the decoder MUST decode
+/// after a discontinuity (a seek) before the decoded output is valid, again in
+/// nanoseconds. For Opus the conventional value is 80 ms.
+///
+/// Both elements carry the spec default `0` and — unlike the
+/// `DefaultDuration` / `DefaultDecodedFieldDuration` pair — have *no* "not 0"
+/// range, so an explicit on-disk `0` is a legal value distinct from "the
+/// element was absent." The default-materialising accessors
+/// ([`codec_delay`](Self::codec_delay) / [`seek_pre_roll`](Self::seek_pre_roll))
+/// fold the `0` default in; the `*_explicit` accessors preserve the on-disk
+/// presence so a re-muxer can avoid emitting an element the source omitted.
+///
+/// A record surfaces for every track (there is no master to gate it on); a
+/// track that carried neither element decodes as `codec_delay() == 0`,
+/// `seek_pre_roll() == 0`, and [`is_empty`](Self::is_empty) `true`. Surfaced
+/// per stream via [`MkvDemuxer::track_codec_timing`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackCodecTiming {
+    codec_delay_explicit: Option<u64>,
+    seek_pre_roll_explicit: Option<u64>,
+}
+
+impl TrackCodecTiming {
+    /// `CodecDelay` (RFC 9559 §5.1.4.1.25) in nanoseconds, with the spec
+    /// default `0` materialised: a track with no explicit element returns `0`.
+    /// Use [`codec_delay_explicit`](Self::codec_delay_explicit) when the
+    /// on-disk presence matters.
+    pub fn codec_delay(&self) -> u64 {
+        self.codec_delay_explicit.unwrap_or(0)
+    }
+
+    /// `CodecDelay` (RFC 9559 §5.1.4.1.25) as it appeared on disk. `Some(v)`
+    /// when the writer emitted the element (including an explicit `0`); `None`
+    /// when the writer was silent (the `0` default applies on
+    /// [`codec_delay`](Self::codec_delay)).
+    pub fn codec_delay_explicit(&self) -> Option<u64> {
+        self.codec_delay_explicit
+    }
+
+    /// `SeekPreRoll` (RFC 9559 §5.1.4.1.26) in nanoseconds, with the spec
+    /// default `0` materialised: a track with no explicit element returns `0`.
+    /// Use [`seek_pre_roll_explicit`](Self::seek_pre_roll_explicit) when the
+    /// on-disk presence matters.
+    pub fn seek_pre_roll(&self) -> u64 {
+        self.seek_pre_roll_explicit.unwrap_or(0)
+    }
+
+    /// `SeekPreRoll` (RFC 9559 §5.1.4.1.26) as it appeared on disk. `Some(v)`
+    /// when the writer emitted the element (including an explicit `0`); `None`
+    /// when the writer was silent (the `0` default applies on
+    /// [`seek_pre_roll`](Self::seek_pre_roll)).
+    pub fn seek_pre_roll_explicit(&self) -> Option<u64> {
+        self.seek_pre_roll_explicit
+    }
+
+    /// `true` when this track carried neither element — i.e. both `CodecDelay`
+    /// and `SeekPreRoll` were absent on disk. In that state the record carries
+    /// no information beyond the materialised `0` defaults; a track that
+    /// emitted an explicit `0` for either element is *not* empty.
+    pub fn is_empty(&self) -> bool {
+        self.codec_delay_explicit.is_none() && self.seek_pre_roll_explicit.is_none()
     }
 }
 
@@ -4614,6 +4713,18 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                     t.timing_raw.track_timestamp_scale = Some(v);
                 }
             }
+            // Codec timing in Matroska Ticks (= nanoseconds) — `CodecDelay`
+            // (RFC 9559 §5.1.4.1.25) and `SeekPreRoll` (§5.1.4.1.26). Both are
+            // plain `uinteger`s with spec default `0` and *no* "not 0" range,
+            // so an explicit `0` is a legal value distinct from "absent": the
+            // on-disk presence is preserved as `Some(_)` and the default is
+            // materialised on the typed [`TrackCodecTiming`] builder instead.
+            ids::CODEC_DELAY => {
+                t.codec_timing_raw.0 = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::SEEK_PRE_ROLL => {
+                t.codec_timing_raw.1 = Some(read_uint(r, e.size as usize)?);
+            }
             // Audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). All six are
             // 0-or-1 uintegers; absence is captured as `None` so the typed
             // surface can distinguish "no element on disk" from "the writer
@@ -5362,6 +5473,10 @@ pub struct MkvDemuxer {
     /// `DefaultDecodedFieldDuration`, and `TrackTimestampScale` folded
     /// together. See [`MkvDemuxer::track_timing`].
     track_timing: Vec<TrackTiming>,
+    /// Per-stream [`TrackCodecTiming`] (RFC 9559 §5.1.4.1.25 + §5.1.4.1.26),
+    /// indexed by stream index. One record per track — `CodecDelay` and
+    /// `SeekPreRoll` folded together. See [`MkvDemuxer::track_codec_timing`].
+    track_codec_timing: Vec<TrackCodecTiming>,
     /// Per-Cluster typed records (RFC 9559 §5.1.3.2 / §5.1.3.3 —
     /// `Position` / `PrevSize`), appended in first-encounter order as
     /// the demuxer opens each Cluster through [`Demuxer::next_packet`]
@@ -5923,6 +6038,32 @@ impl MkvDemuxer {
     /// track. See [`MkvDemuxer::track_timing`] for the per-field semantics.
     pub fn all_track_timing(&self) -> &[TrackTiming] {
         &self.track_timing
+    }
+
+    /// [`TrackCodecTiming`] (RFC 9559 §5.1.4.1.25 + §5.1.4.1.26) for the stream
+    /// at `stream_index` — the track's `CodecDelay` and `SeekPreRoll` folded
+    /// into one record. Returns `None` only when `stream_index` is out of
+    /// range; every valid track surfaces a record (the elements sit on
+    /// `TrackEntry` directly, so there is no gating master). A track that
+    /// carried neither element surfaces a record with
+    /// [`TrackCodecTiming::codec_delay`] / [`TrackCodecTiming::seek_pre_roll`]
+    /// `0` (the materialised spec defaults) — distinguishable from an explicit
+    /// on-disk `0` via [`TrackCodecTiming::is_empty`] or the `*_explicit`
+    /// accessors.
+    ///
+    /// `CodecDelay` is the encoder's built-in delay in nanoseconds (e.g. Opus
+    /// pre-skip) that the player must subtract from each frame timestamp;
+    /// `SeekPreRoll` is the nanoseconds of audio the decoder must decode after
+    /// a seek before its output is valid.
+    pub fn track_codec_timing(&self, stream_index: u32) -> Option<&TrackCodecTiming> {
+        self.track_codec_timing.get(stream_index as usize)
+    }
+
+    /// All per-stream [`TrackCodecTiming`] records (RFC 9559 §5.1.4.1.25 +
+    /// §5.1.4.1.26), indexed by stream index. One record per track. See
+    /// [`MkvDemuxer::track_codec_timing`] for the per-field semantics.
+    pub fn all_track_codec_timing(&self) -> &[TrackCodecTiming] {
+        &self.track_codec_timing
     }
 
     /// `ContentEncodings` (RFC 9559 §5.1.4.1.31) for the stream at

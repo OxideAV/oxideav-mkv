@@ -166,6 +166,26 @@ the unified `oxideav` aggregator to wire decoding automatically.
   (a non-finite / non-positive payload is dropped, since the spec range is
   `> 0x0p+0`). `TrackTiming::is_empty()` reports the all-absent state — a
   track that carried none of the three elements.
+- **Typed `TrackCodecTiming` accessor** (RFC 9559 §5.1.4.1.25 + §5.1.4.1.26):
+  `MkvDemuxer::track_codec_timing(stream_index) -> Option<&TrackCodecTiming>`
+  (and the per-stream `all_track_codec_timing()` slice) folds the two
+  `TrackEntry`-level codec-timing elements — `CodecDelay` (id `0x56AA`,
+  §5.1.4.1.25) and `SeekPreRoll` (id `0x56BB`, §5.1.4.1.26), both nanosecond
+  (Matroska Tick) `uinteger`s — into one record per track. The elements sit
+  directly on `TrackEntry` (no gating master), so every valid track surfaces a
+  record; `track_codec_timing` returns `None` only for an out-of-range stream
+  index. `codec_delay()` is the encoder's built-in delay (Opus pre-skip) the
+  player MUST subtract from each frame timestamp; `seek_pre_roll()` is the
+  audio the decoder MUST decode after a seek before its output is valid (Opus
+  convention 80 ms). Unlike the `TrackTiming` durations, both elements carry
+  spec default `0` and **no** "not 0" range, so an explicit on-disk `0` is a
+  legal value distinct from "absent": the plain accessors materialise the `0`
+  default while `codec_delay_explicit()` / `seek_pre_roll_explicit()` preserve
+  the on-disk presence (a re-muxer can avoid emitting an element the source
+  omitted). `TrackCodecTiming::is_empty()` reports the both-absent state — a
+  track that emitted an explicit `0` for either element is *not* empty. The
+  mux side already writes both on the Opus path (`CodecDelay` = `OpusHead`
+  pre-skip in ns, `SeekPreRoll` = 80 ms).
 - **Typed per-Cluster `Position` / `PrevSize` records** (RFC 9559
   §5.1.3.2 / §5.1.3.3): `MkvDemuxer::cluster_records() ->
   &[ClusterRecord]` surfaces each Cluster's optional `Position`
