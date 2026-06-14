@@ -618,6 +618,27 @@ the unified `oxideav` aggregator to wire decoding automatically.
   not presently emit. Pairs symmetrically with the existing
   `MkvDemuxer::video_uncompressed_fourcc` typed accessor — a
   mux→demux pipeline preserves the four-byte FourCC bit-exactly.
+- **`Video > AspectRatioType` on write** (RFC 9559 Appendix A.24,
+  reclaimed, id `0x54B3`): `MkvMuxer::set_video_aspect_ratio_type(
+  stream_index, u64)` queues a per-track hint that lands inside the
+  track's `Video` master at `write_header` time as a plain `uinteger`
+  element. The reclaimed appendix documents the element only as
+  "Specifies the possible modifications to the aspect ratio" and
+  enumerates no values and no default, so the setter takes the raw
+  `u64` verbatim — mirroring the demux side, which deliberately
+  surfaces it as a raw `Option<u64>` rather than a synthesised enum.
+  Per-element omission rule: the element is written only when the
+  caller opts in; an explicit `0` is written and round-trips as
+  `Some(0)` (distinct from absence, since the appendix defines no
+  default). Spec rules enforced at queue time: the setter rejects
+  post-`write_header` use, out-of-range `stream_index`, and calls on
+  non-video tracks. Omitting the call leaves the element off-disk so
+  the demuxer's `MkvDemuxer::video_aspect_ratio_type` surfaces `None`.
+  Pairs symmetrically with the existing
+  `MkvDemuxer::video_aspect_ratio_type` typed accessor — a mux→demux
+  pipeline preserves the raw value bit-exactly. This closes the last
+  remaining `Video` sub-element that the demux side read but the mux
+  side could not write.
 - **`Video > Colour` scalar children on write** (RFC 9559
   §5.1.4.1.28.16, §5.1.4.1.28.17..§5.1.4.1.28.29):
   `MkvMuxer::set_video_colour(stream_index, MkvVideoColour)` queues a
@@ -912,8 +933,11 @@ so the demuxer never hides an unrecognised track.
   the verbatim `ProjectionPrivate` payload, and the yaw / pitch / roll
   pose triple; the convenience constructors
   `MkvProjection::equirectangular()` and `MkvProjection::rotated()` cover
-  the 360°-VR and roll-only shapes) are written; the only remaining
-  `Video` sub-element not yet written is `AspectRatioType`.
+  the 360°-VR and roll-only shapes), and the reclaimed Appendix-A
+  `AspectRatioType` element (`MkvMuxer::set_video_aspect_ratio_type`,
+  Appendix A.24, id `0x54B3`) are written. The `Video` sub-element set
+  is now fully symmetric — every element the demux side reads, the mux
+  side can write.
 
 ## Robustness
 

@@ -336,6 +336,16 @@ pub struct MkvMuxer {
     /// tracks must stay `None` (validated at
     /// `set_video_uncompressed_fourcc` time).
     video_uncompressed_fourccs: Vec<Option<[u8; 4]>>,
+    /// Per-stream `Video > AspectRatioType` hint queued via
+    /// [`MkvMuxer::set_video_aspect_ratio_type`] (RFC 9559 Appendix A.24,
+    /// reclaimed, id `0x54B3`). Materialised inside each video track's
+    /// `Video` master at `write_header` time as a `uinteger` element
+    /// carrying the raw value verbatim. `None` (the default) means the
+    /// muxer omits the element for that stream — the reclaimed appendix
+    /// defines no default, so the demuxer surfaces `None` in that case.
+    /// The slice is sized to `streams.len()`; non-video tracks must stay
+    /// `None` (validated at `set_video_aspect_ratio_type` time).
+    video_aspect_ratio_types: Vec<Option<u64>>,
     /// Per-stream `Video > Colour` master hint queued via
     /// [`MkvMuxer::set_video_colour`] (RFC 9559 §5.1.4.1.28.16). The
     /// `MasteringMetadata` sub-master
@@ -1159,6 +1169,7 @@ impl MkvMuxer {
             video_alpha_modes: vec![None; n],
             video_geometries: vec![None; n],
             video_uncompressed_fourccs: vec![None; n],
+            video_aspect_ratio_types: vec![None; n],
             video_colours: vec![None; n],
             video_projections: vec![None; n],
             track_audience_flags: vec![None; n],
@@ -1571,6 +1582,71 @@ impl MkvMuxer {
     /// tests.
     pub fn video_uncompressed_fourcc(&self, stream_index: usize) -> Option<[u8; 4]> {
         *self.video_uncompressed_fourccs.get(stream_index)?
+    }
+
+    /// Set the per-track `Video > AspectRatioType` (RFC 9559 Appendix A.24,
+    /// reclaimed, id `0x54B3`) for one stream. Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise — the
+    /// element lives in the `Video` master inside `Tracks`, which is
+    /// written exactly once at header time.
+    ///
+    /// `value` is the raw `uinteger` written verbatim. The reclaimed
+    /// appendix documents the element only as "Specifies the possible
+    /// modifications to the aspect ratio" and enumerates no values and no
+    /// default — the demux side deliberately surfaces it as a raw
+    /// `Option<u64>` rather than a synthesised enum, and this setter
+    /// mirrors that: the caller owns the meaning of the value.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range
+    ///   indices return [`Error::invalid`].
+    /// * The target stream's [`MediaType`] must be [`MediaType::Video`].
+    ///   Non-video tracks have no `Video` master and the call is rejected.
+    ///
+    /// Omitting the call leaves the element off-disk so the demuxer
+    /// surfaces `None` for that stream's
+    /// `MkvDemuxer::video_aspect_ratio_type` — the appendix defines no
+    /// default, so absence is not materialised on either side.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins).
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_video_aspect_ratio_type(
+        &mut self,
+        stream_index: usize,
+        value: u64,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_aspect_ratio_type called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_aspect_ratio_type stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_aspect_ratio_type on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        self.video_aspect_ratio_types[stream_index] = Some(value);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `AspectRatioType`
+    /// hint installed via [`MkvMuxer::set_video_aspect_ratio_type`].
+    /// Returns `None` for any stream that didn't have the API called
+    /// (the muxer omits the element from the on-disk `Video` master,
+    /// and the demuxer surfaces `None` as well). Mostly useful for
+    /// tests.
+    pub fn video_aspect_ratio_type(&self, stream_index: usize) -> Option<u64> {
+        *self.video_aspect_ratio_types.get(stream_index)?
     }
 
     /// Set the per-track `Video > Colour` master (RFC 9559 §5.1.4.1.28.16)
@@ -2369,6 +2445,16 @@ impl Muxer for MkvMuxer {
                     if g.display_unit != DisplayUnit::Pixels {
                         write_uint_element(&mut video, ids::DISPLAY_UNIT, g.display_unit.to_raw());
                     }
+                }
+                // AspectRatioType (RFC 9559 Appendix A.24, reclaimed,
+                // id 0x54B3) — written only when the caller explicitly
+                // opted in via `set_video_aspect_ratio_type`. Omitting it
+                // keeps the element off-disk so the demuxer surfaces
+                // `None` for the stream's `video_aspect_ratio_type` (the
+                // reclaimed appendix defines no default — absence is not
+                // materialised). Written as a plain `uinteger` verbatim.
+                if let Some(art) = self.video_aspect_ratio_types[i] {
+                    write_uint_element(&mut video, ids::ASPECT_RATIO_TYPE, art);
                 }
                 // UncompressedFourCC (§5.1.4.1.28.15) — written only when
                 // the caller explicitly opted in via
