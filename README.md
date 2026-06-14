@@ -148,6 +148,24 @@ the unified `oxideav` aggregator to wire decoding automatically.
   carries no `minOccurs` at the `TrackEntry` level) return `None`, as does
   a malformed audio track that emitted no `Audio` child — the typed
   surface never synthesises a record from the spec defaults alone.
+- **Typed `TrackTiming` accessor** (RFC 9559 §5.1.4.1.13..§5.1.4.1.15):
+  `MkvDemuxer::track_timing(stream_index) -> Option<&TrackTiming>` (and the
+  per-stream `all_track_timing()` slice) folds the three `TrackEntry`-level
+  timing elements — `DefaultDuration` (id `0x23E383`, §5.1.4.1.13),
+  `DefaultDecodedFieldDuration` (id `0x234E7A`, §5.1.4.1.14), and
+  `TrackTimestampScale` (id `0x23314F`, §5.1.4.1.15) — into one record per
+  track. The elements sit directly on `TrackEntry` (no gating master), so
+  every valid track surfaces a record; `track_timing` returns `None` only
+  for an out-of-range stream index. `default_duration()` is the container's
+  nominal nanoseconds-per-frame source — `TrackTiming::nominal_frame_rate()`
+  derives fps (`1e9 / ns`), so e.g. a `41708333` ns track yields `~23.976`.
+  Both nanosecond durations carry a "not 0" range and no spec default, so
+  they stay `Option<u64>` and a spec-illegal explicit `0` is dropped at parse
+  time. `track_timestamp_scale()` materialises the §5.1.4.1.15 default `1.0`
+  while `track_timestamp_scale_explicit()` preserves the on-disk presence
+  (a non-finite / non-positive payload is dropped, since the spec range is
+  `> 0x0p+0`). `TrackTiming::is_empty()` reports the all-absent state — a
+  track that carried none of the three elements.
 - **Typed per-Cluster `Position` / `PrevSize` records** (RFC 9559
   §5.1.3.2 / §5.1.3.3): `MkvDemuxer::cluster_records() ->
   &[ClusterRecord]` surfaces each Cluster's optional `Position`
@@ -825,6 +843,30 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `MkvDemuxer::track_audio` typed accessor — a mux→demux pipeline
   preserves every supplied child bit-exactly, including the
   `OutputSamplingFrequency` SBR signal.
+- **`TrackEntry` timing trio on write** (RFC 9559
+  §5.1.4.1.13..§5.1.4.1.15): `MkvMuxer::set_track_timing(stream_index,
+  MkvTrackTiming)` queues a per-track hint whose three `Option` slots —
+  `default_duration` (`DefaultDuration`, id `0x23E383`),
+  `default_decoded_field_duration` (`DefaultDecodedFieldDuration`, id
+  `0x234E7A`), and `track_timestamp_scale` (`TrackTimestampScale`, id
+  `0x23314F`) — land directly inside the `TrackEntry` (no gating master) at
+  `write_header` time, after `MaxBlockAdditionID`. Per-field omission rule:
+  each `Some(v)` writes the element explicitly, each `None` stays off-disk
+  (the demuxer surfaces `None` for the two durations and materialises the
+  §5.1.4.1.15 `TrackTimestampScale` default `1.0`). There is no track-type
+  restriction — the spec carries all three on every `TrackEntry`. Spec
+  range checks enforced at queue time: the two durations are ranged `not 0`
+  (a `Some(0)` is rejected) and `TrackTimestampScale` is ranged `> 0x0p+0`
+  (a non-finite / non-positive `Some(v)` is rejected); the setter also
+  rejects post-`write_header` use and out-of-range `stream_index`. The
+  convenience constructor `MkvTrackTiming::from_frame_rate(fps)` rounds
+  `1e9 / fps` to the nanosecond `DefaultDuration` interval (rejecting
+  non-finite / non-positive fps). Repeated calls are last-write-wins; the
+  read-back `MkvMuxer::track_timing(stream_index)` accessor returns the
+  queued hint pre-`write_header`. Pairs symmetrically with the new
+  `MkvDemuxer::track_timing` typed accessor — a mux→demux pipeline
+  preserves every supplied child bit-exactly, including the
+  `DefaultDuration`-derived nominal frame rate.
 
 ### Codec ID mapping (`codec_id` module)
 

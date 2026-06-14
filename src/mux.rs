@@ -206,6 +206,60 @@ impl MkvTrackAudio {
     }
 }
 
+/// A queued `TrackEntry` timing hint (RFC 9559 §5.1.4.1.13..§5.1.4.1.15)
+/// installed via [`MkvMuxer::set_track_timing`]. Each field is `Option`;
+/// a `Some(v)` writes the element explicitly, a `None` leaves it off-disk
+/// so the demuxer surfaces `None` for the two durations and materialises
+/// the §5.1.4.1.15 `TrackTimestampScale` default `1.0`.
+///
+/// Pairs symmetrically with the demux-side
+/// [`crate::demux::MkvDemuxer::track_timing`] / [`crate::demux::TrackTiming`]
+/// typed accessor — a mux→demux pipeline preserves every supplied child
+/// bit-exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MkvTrackTiming {
+    /// `DefaultDuration` (RFC 9559 §5.1.4.1.13), nanoseconds per frame.
+    /// Range `not 0`; no spec default. `None` omits the element.
+    pub default_duration: Option<u64>,
+    /// `DefaultDecodedFieldDuration` (RFC 9559 §5.1.4.1.14), nanoseconds
+    /// between two successive fields at the decoder output. Range `not 0`;
+    /// no spec default. `None` omits the element.
+    pub default_decoded_field_duration: Option<u64>,
+    /// `TrackTimestampScale` (RFC 9559 §5.1.4.1.15), the per-track
+    /// timestamp scale factor. Range `> 0x0p+0`; spec default `1.0`.
+    /// `None` omits the element (the demuxer materialises `1.0`).
+    pub track_timestamp_scale: Option<f64>,
+}
+
+impl MkvTrackTiming {
+    /// Convenience constructor that sets only `DefaultDuration` from a
+    /// nominal frame rate, in frames per second. The nanosecond
+    /// duration is `round(1e9 / fps)`. Returns [`Error::invalid`] when
+    /// `fps` is non-finite, non-positive, or rounds to `0` ns (the spec
+    /// range for `DefaultDuration` is `not 0`).
+    ///
+    /// The other two fields are left `None`. Pairs with the demux-side
+    /// [`crate::demux::TrackTiming::nominal_frame_rate`].
+    pub fn from_frame_rate(fps: f64) -> Result<Self> {
+        if !fps.is_finite() || fps <= 0.0 {
+            return Err(Error::invalid(format!(
+                "MKV muxer: MkvTrackTiming::from_frame_rate fps must be finite and positive (got {fps})"
+            )));
+        }
+        let ns = (1_000_000_000.0_f64 / fps).round();
+        if !(ns.is_finite() && ns >= 1.0) {
+            return Err(Error::invalid(
+                "MKV muxer: MkvTrackTiming::from_frame_rate frame interval rounds to 0 ns",
+            ));
+        }
+        Ok(MkvTrackTiming {
+            default_duration: Some(ns as u64),
+            default_decoded_field_duration: None,
+            track_timestamp_scale: None,
+        })
+    }
+}
+
 pub struct MkvMuxer {
     output: Box<dyn WriteSeek>,
     streams: Vec<StreamInfo>,
@@ -407,6 +461,14 @@ pub struct MkvMuxer {
     /// can't express. The slice is sized to `streams.len()`; non-audio
     /// tracks must stay `None` (validated at `set_track_audio` time).
     track_audio: Vec<Option<MkvTrackAudio>>,
+    /// Per-stream `TrackEntry` timing hints queued via
+    /// [`MkvMuxer::set_track_timing`] (RFC 9559 §5.1.4.1.13..§5.1.4.1.15).
+    /// `None` (the default) means the muxer omits all three elements, so
+    /// the demuxer surfaces `DefaultDuration` / `DefaultDecodedFieldDuration`
+    /// as `None` and materialises the §5.1.4.1.15 `TrackTimestampScale`
+    /// default `1.0`. `Some(_)` writes each populated child explicitly. The
+    /// slice is sized to `streams.len()`.
+    track_timing: Vec<Option<MkvTrackTiming>>,
     /// Per-stream timestamp (ms, = track ticks at the muxer's 1 ms
     /// `TimestampScale`) of the most recently written Block. Used to
     /// derive the `ReferenceBlock` (RFC 9559 §5.1.3.5.5) relative value
@@ -1175,6 +1237,7 @@ impl MkvMuxer {
             track_audience_flags: vec![None; n],
             max_block_addition_ids: vec![None; n],
             track_audio: vec![None; n],
+            track_timing: vec![None; n],
             last_block_pts_ms: vec![None; n],
         })
     }
@@ -2031,6 +2094,83 @@ impl MkvMuxer {
         *self.track_audio.get(stream_index)?
     }
 
+    /// Set the per-track timing elements (RFC 9559 §5.1.4.1.13..§5.1.4.1.15)
+    /// for one stream — `DefaultDuration`, `DefaultDecodedFieldDuration`,
+    /// and `TrackTimestampScale`. Must be called before
+    /// [`Muxer::write_header`]; the elements live in the `TrackEntry`, which
+    /// is written exactly once at header time.
+    ///
+    /// Per-field omission rule: each `Some(v)` writes the element explicitly,
+    /// each `None` stays off-disk. There is **no track-type restriction** —
+    /// the spec carries all three on every `TrackEntry` (though
+    /// `DefaultDuration` and `DefaultDecodedFieldDuration` are mostly used on
+    /// video tracks).
+    ///
+    /// Spec range checks enforced at queue time: `DefaultDuration` and
+    /// `DefaultDecodedFieldDuration` are ranged `not 0` (a `Some(0)` is
+    /// rejected); `TrackTimestampScale` is ranged `> 0x0p+0` (a non-finite
+    /// or non-positive `Some(v)` is rejected).
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` out of range, or a field
+    ///   violates its spec range.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins). Returns a mutable
+    /// reference back so calls can chain builder-style. Pairs symmetrically
+    /// with the demux-side [`crate::demux::MkvDemuxer::track_timing`].
+    pub fn set_track_timing(
+        &mut self,
+        stream_index: usize,
+        timing: MkvTrackTiming,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_timing called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_timing stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        // RFC 9559 §5.1.4.1.13 / .14: DefaultDuration and
+        // DefaultDecodedFieldDuration are ranged "not 0".
+        if timing.default_duration == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: set_track_timing default_duration 0 out of range (must be not 0)"
+                    .to_string(),
+            ));
+        }
+        if timing.default_decoded_field_duration == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: set_track_timing default_decoded_field_duration 0 out of range (must be not 0)"
+                    .to_string(),
+            ));
+        }
+        // RFC 9559 §5.1.4.1.15: TrackTimestampScale is ranged "> 0x0p+0".
+        if let Some(v) = timing.track_timestamp_scale {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: set_track_timing track_timestamp_scale {v} out of range (must be finite and > 0)"
+                )));
+            }
+        }
+        self.track_timing[stream_index] = Some(timing);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream timing hint installed
+    /// via [`MkvMuxer::set_track_timing`]. Returns `None` for any stream
+    /// that didn't have the API called (all three elements stay off-disk).
+    /// Mostly useful for tests.
+    pub fn track_timing(&self, stream_index: usize) -> Option<MkvTrackTiming> {
+        *self.track_timing.get(stream_index)?
+    }
+
     /// Queue a chapter atom with one English-language `ChapterDisplay`
     /// carrying `title`. Must be called before [`MkvMuxer::write_header`];
     /// returns [`Error::other`] if the header has already been emitted.
@@ -2307,6 +2447,23 @@ impl Muxer for MkvMuxer {
             // `write_packet_with_additions` for the stream.
             if let Some(m) = self.max_block_addition_ids[i] {
                 write_uint_element(&mut t, ids::MAX_BLOCK_ADDITION_ID, m);
+            }
+            // Track timing (RFC 9559 §5.1.4.1.13..§5.1.4.1.15) queued via
+            // `set_track_timing`. Per-field omission rule: each `Some(v)` is
+            // written explicitly, each `None` stays off-disk (the demuxer
+            // surfaces `None` for the two durations and materialises the
+            // §5.1.4.1.15 `TrackTimestampScale` default `1.0`). All three sit
+            // directly on `TrackEntry` (no gating master).
+            if let Some(tm) = self.track_timing[i] {
+                if let Some(v) = tm.default_duration {
+                    write_uint_element(&mut t, ids::DEFAULT_DURATION, v);
+                }
+                if let Some(v) = tm.default_decoded_field_duration {
+                    write_uint_element(&mut t, ids::DEFAULT_DECODED_FIELD_DURATION, v);
+                }
+                if let Some(v) = tm.track_timestamp_scale {
+                    write_float_element(&mut t, ids::TRACK_TIMESTAMP_SCALE, v);
+                }
             }
             // RFC 9559 §5.1.4.1.2.1 (Language): per-track ISO 639-2/T
             // tag. Spec default is `"eng"`, so we only emit the element

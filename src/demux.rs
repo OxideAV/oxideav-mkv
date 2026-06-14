@@ -466,6 +466,22 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         })
         .collect();
 
+    // Per-stream `TrackTiming` (RFC 9559 §5.1.4.1.13..§5.1.4.1.15), indexed by
+    // stream index. A record surfaces for every track (the three elements sit
+    // on `TrackEntry` directly, not in a gating master). `DefaultDuration` and
+    // `DefaultDecodedFieldDuration` carry no spec default and stay `Option`;
+    // `TrackTimestampScale`'s `1.0` default is folded in on the typed surface
+    // (`track_timestamp_scale`), with the on-disk presence preserved via
+    // `track_timestamp_scale_explicit`.
+    let track_timing: Vec<TrackTiming> = tracks
+        .iter()
+        .map(|t| TrackTiming {
+            default_duration: t.timing_raw.default_duration,
+            default_decoded_field_duration: t.timing_raw.default_decoded_field_duration,
+            track_timestamp_scale_explicit: t.timing_raw.track_timestamp_scale,
+        })
+        .collect();
+
     // Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2),
     // indexed by stream index. `None` for non-video tracks and for video
     // tracks whose `TrackEntry` had no `Video` master; for everything else
@@ -688,6 +704,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         last_block_additions: None,
         track_audience_flags,
         track_audio,
+        track_timing,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
     })
@@ -961,6 +978,26 @@ struct TrackEntry {
     /// `SamplingFrequency`, no default for `BitDepth`) — from "writer
     /// emitted the element."
     audio_raw: Option<RawTrackAudio>,
+    /// Raw `(DefaultDuration, DefaultDecodedFieldDuration, TrackTimestampScale)`
+    /// staging captured during the `TrackEntry` walk (RFC 9559
+    /// §5.1.4.1.13..§5.1.4.1.15). Each slot is `None` when the on-disk
+    /// element was absent; spec defaults are *not* materialised here so the
+    /// typed [`TrackTiming`] builder can distinguish "writer was silent" from
+    /// an explicit value. The first two are nanosecond `uinteger`s with a
+    /// "not 0" range and no default; the third is a `float` with default `1.0`.
+    timing_raw: RawTrackTiming,
+}
+
+/// Parser-private staging form for the three `TrackEntry` timing elements
+/// (RFC 9559 §5.1.4.1.13..§5.1.4.1.15). Each `Option` preserves the on-disk
+/// presence; the spec default for `TrackTimestampScale` (`1.0`) is folded in
+/// on the typed [`TrackTiming`] builder rather than here, so the staging
+/// record stays a pure on-disk projection.
+#[derive(Clone, Copy, Debug, Default)]
+struct RawTrackTiming {
+    default_duration: Option<u64>,
+    default_decoded_field_duration: Option<u64>,
+    track_timestamp_scale: Option<f64>,
 }
 
 /// Parser-private staging form for the six per-track audience flags
@@ -2106,6 +2143,100 @@ impl TrackAudio {
             Some(v) => v > self.sampling_frequency,
             None => false,
         }
+    }
+}
+
+/// A track's nominal timing — `DefaultDuration` (RFC 9559 §5.1.4.1.13),
+/// `DefaultDecodedFieldDuration` (§5.1.4.1.14), and `TrackTimestampScale`
+/// (§5.1.4.1.15) folded into one typed record.
+///
+/// `DefaultDuration` is "the number of nanoseconds per frame" — one element
+/// put into a (Simple)Block — and is the canonical source for a track's
+/// nominal frame rate when the codec stream does not otherwise carry it.
+/// It has a "not 0" range and no spec default, so it stays `Option<u64>`;
+/// a malformed explicit `0` is dropped at parse time and surfaces as `None`.
+///
+/// `DefaultDecodedFieldDuration` (`minver: 4`) is the period between two
+/// successive *fields* at the output of the decoding process. For an
+/// interlaced sequence it equals that field period; for a progressive
+/// sequence the spec defines it as half the frame period (§9). It likewise
+/// has a "not 0" range and no default.
+///
+/// `TrackTimestampScale` (`maxver: 3`) is the float scale applied to this
+/// track's Block timestamps relative to the other tracks — "mostly used to
+/// adjust video speed when the audio length differs." Its spec default is
+/// `1.0`, which [`track_timestamp_scale`](Self::track_timestamp_scale)
+/// materialises; [`track_timestamp_scale_explicit`](Self::track_timestamp_scale_explicit)
+/// preserves the on-disk presence. The spec notes most reader/writer
+/// implementations ignore any value other than `1.0`, so the typical
+/// on-disk state is "absent" → default `1.0`.
+///
+/// A record surfaces for every track (there is no master to gate it on);
+/// a track that carried none of the three elements decodes as
+/// `default_duration() == None`, `default_decoded_field_duration() == None`,
+/// and `track_timestamp_scale() == 1.0` (the materialised default).
+/// Surfaced per stream via [`MkvDemuxer::track_timing`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackTiming {
+    default_duration: Option<u64>,
+    default_decoded_field_duration: Option<u64>,
+    track_timestamp_scale_explicit: Option<f64>,
+}
+
+impl TrackTiming {
+    /// `DefaultDuration` (RFC 9559 §5.1.4.1.13), in nanoseconds per frame.
+    /// `None` when the writer omitted the element (no spec default) or
+    /// emitted a spec-illegal `0` (dropped at parse time).
+    pub fn default_duration(&self) -> Option<u64> {
+        self.default_duration
+    }
+
+    /// `DefaultDecodedFieldDuration` (RFC 9559 §5.1.4.1.14), in nanoseconds
+    /// between two successive fields at the decoder output. `None` when the
+    /// writer omitted the element (no spec default) or emitted a
+    /// spec-illegal `0`.
+    pub fn default_decoded_field_duration(&self) -> Option<u64> {
+        self.default_decoded_field_duration
+    }
+
+    /// `TrackTimestampScale` (RFC 9559 §5.1.4.1.15) with the spec default
+    /// `1.0` materialised: a track with no explicit element returns `1.0`.
+    /// Use [`track_timestamp_scale_explicit`](Self::track_timestamp_scale_explicit)
+    /// when the on-disk presence matters.
+    pub fn track_timestamp_scale(&self) -> f64 {
+        self.track_timestamp_scale_explicit.unwrap_or(1.0)
+    }
+
+    /// `TrackTimestampScale` (RFC 9559 §5.1.4.1.15) as it appeared on disk.
+    /// `Some(v)` when the writer emitted a finite, positive value (the spec
+    /// range is "> 0x0p+0"); `None` when the writer was silent (the `1.0`
+    /// default applies on [`track_timestamp_scale`](Self::track_timestamp_scale))
+    /// or emitted a non-finite / non-positive value (dropped at parse time).
+    pub fn track_timestamp_scale_explicit(&self) -> Option<f64> {
+        self.track_timestamp_scale_explicit
+    }
+
+    /// The track's nominal frame rate in frames per second, derived from
+    /// `DefaultDuration` (`1e9 / default_duration` since the element is in
+    /// nanoseconds per frame). `None` when `DefaultDuration` is absent — the
+    /// container has no other nominal-rate source, so the caller must fall
+    /// back to the codec stream's own timing. The result is exact for
+    /// integer-ns durations; e.g. a 24000/1001 fps track stored as
+    /// `41708333` ns yields `~23.976`.
+    pub fn nominal_frame_rate(&self) -> Option<f64> {
+        self.default_duration
+            .map(|ns| 1_000_000_000.0_f64 / ns as f64)
+    }
+
+    /// `true` when this track carried none of the three timing elements —
+    /// i.e. `DefaultDuration`, `DefaultDecodedFieldDuration`, and
+    /// `TrackTimestampScale` were all absent on disk. In that state the
+    /// record carries no information beyond the materialised
+    /// `TrackTimestampScale` default of `1.0`.
+    pub fn is_empty(&self) -> bool {
+        self.default_duration.is_none()
+            && self.default_decoded_field_duration.is_none()
+            && self.track_timestamp_scale_explicit.is_none()
     }
 }
 
@@ -4457,6 +4588,32 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             // and explicit 0 decode identically, so the raw field holds
             // the materialised value directly.
             ids::MAX_BLOCK_ADDITION_ID => t.max_block_addition_id = read_uint(r, e.size as usize)?,
+            // Track timing (RFC 9559 §5.1.4.1.13..§5.1.4.1.15). `DefaultDuration`
+            // and `DefaultDecodedFieldDuration` are nanosecond uintegers with a
+            // "not 0" range — a malformed explicit `0` is dropped (treated as
+            // absent) so the typed surface never reports a zero frame interval.
+            // `TrackTimestampScale` is a float with range "> 0x0p+0"; a
+            // non-finite or non-positive value is likewise dropped so it
+            // can't poison the typed scale (which the demuxer otherwise folds
+            // to the spec default `1.0`).
+            ids::DEFAULT_DURATION => {
+                let v = read_uint(r, e.size as usize)?;
+                if v != 0 {
+                    t.timing_raw.default_duration = Some(v);
+                }
+            }
+            ids::DEFAULT_DECODED_FIELD_DURATION => {
+                let v = read_uint(r, e.size as usize)?;
+                if v != 0 {
+                    t.timing_raw.default_decoded_field_duration = Some(v);
+                }
+            }
+            ids::TRACK_TIMESTAMP_SCALE => {
+                let v = read_float(r, e.size as usize)?;
+                if v.is_finite() && v > 0.0 {
+                    t.timing_raw.track_timestamp_scale = Some(v);
+                }
+            }
             // Audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). All six are
             // 0-or-1 uintegers; absence is captured as `None` so the typed
             // surface can distinguish "no element on disk" from "the writer
@@ -5200,6 +5357,11 @@ pub struct MkvDemuxer {
     /// case of an audio track with no `Audio` master). See
     /// [`MkvDemuxer::track_audio`].
     track_audio: Vec<Option<TrackAudio>>,
+    /// Per-stream [`TrackTiming`] (RFC 9559 §5.1.4.1.13..§5.1.4.1.15),
+    /// indexed by stream index. One record per track — `DefaultDuration`,
+    /// `DefaultDecodedFieldDuration`, and `TrackTimestampScale` folded
+    /// together. See [`MkvDemuxer::track_timing`].
+    track_timing: Vec<TrackTiming>,
     /// Per-Cluster typed records (RFC 9559 §5.1.3.2 / §5.1.3.3 —
     /// `Position` / `PrevSize`), appended in first-encounter order as
     /// the demuxer opens each Cluster through [`Demuxer::next_packet`]
@@ -5735,6 +5897,32 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::track_audio`] for the per-field semantics.
     pub fn all_track_audio(&self) -> &[Option<TrackAudio>] {
         &self.track_audio
+    }
+
+    /// [`TrackTiming`] (RFC 9559 §5.1.4.1.13..§5.1.4.1.15) for the stream at
+    /// `stream_index` — the track's `DefaultDuration`,
+    /// `DefaultDecodedFieldDuration`, and `TrackTimestampScale` folded into
+    /// one record. Returns `None` only when `stream_index` is out of range;
+    /// every valid track surfaces a record (the elements sit on `TrackEntry`
+    /// directly, so there is no gating master). A track that carried none of
+    /// the three elements surfaces a record with
+    /// [`TrackTiming::default_duration`] / [`TrackTiming::default_decoded_field_duration`]
+    /// `None` and [`TrackTiming::track_timestamp_scale`] `1.0` (the
+    /// materialised §5.1.4.1.15 default) — distinguishable via
+    /// [`TrackTiming::is_empty`].
+    ///
+    /// `DefaultDuration` is the container's nominal frame interval in
+    /// nanoseconds; [`TrackTiming::nominal_frame_rate`] derives the fps from
+    /// it when present.
+    pub fn track_timing(&self, stream_index: u32) -> Option<&TrackTiming> {
+        self.track_timing.get(stream_index as usize)
+    }
+
+    /// All per-stream [`TrackTiming`] records (RFC 9559
+    /// §5.1.4.1.13..§5.1.4.1.15), indexed by stream index. One record per
+    /// track. See [`MkvDemuxer::track_timing`] for the per-field semantics.
+    pub fn all_track_timing(&self) -> &[TrackTiming] {
+        &self.track_timing
     }
 
     /// `ContentEncodings` (RFC 9559 §5.1.4.1.31) for the stream at

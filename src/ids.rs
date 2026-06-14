@@ -73,6 +73,15 @@ pub const FLAG_ENABLED: u32 = 0xB9;
 pub const FLAG_DEFAULT: u32 = 0x88;
 pub const FLAG_LACING: u32 = 0x9C;
 
+// TrackEntry timing elements (RFC 9559 §5.1.4.1.13..§5.1.4.1.15). The nominal
+// frame interval (`DefaultDuration`), the field-output interval
+// (`DefaultDecodedFieldDuration`), and the per-track timestamp scale factor
+// (`TrackTimestampScale`). The first two are `uinteger` nanoseconds with a
+// "not 0" range and no default; the third is a `float` with default `1.0`.
+pub const DEFAULT_DURATION: u32 = 0x23E383;
+pub const DEFAULT_DECODED_FIELD_DURATION: u32 = 0x234E7A;
+pub const TRACK_TIMESTAMP_SCALE: u32 = 0x23314F;
+
 // TrackEntry "audience" flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11). Each is a
 // 0-or-1 uinteger that hints at how the track should be presented to a
 // particular kind of user — subtitle-forced-display, hearing/visual
