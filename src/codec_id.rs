@@ -204,7 +204,7 @@ mod tests {
 
     /// `A_DTS` and `A_TRUEHD` were added for BD passthrough. Locked
     /// down so the oxideav-internal codec ids match the rest of the
-    /// project's naming convention (lowercase, FFmpeg-style short
+    /// project's naming convention (lowercase, short canonical
     /// names).
     #[test]
     fn dts_and_truehd_map_to_expected_oxideav_ids() {
