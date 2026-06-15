@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.8...v0.0.9) - 2026-06-15
+
+### Other
+
+- typed Cues accessor (RFC 9559 §5.1.5.1)
+- scrub decorative external-implementation references from comments
+- demux TrackCodecTiming — CodecDelay / SeekPreRoll typed accessor (RFC 9559 §5.1.4.1.25..§5.1.4.1.26)
+- TrackEntry timing trio — DefaultDuration / DefaultDecodedFieldDuration / TrackTimestampScale (RFC 9559 §5.1.4.1.13..§5.1.4.1.15)
+- scrub pre-existing decorative impl-attribution from codec_id test comment
+- write-side Video > AspectRatioType (RFC 9559 Appendix A.24)
+- write-side Audio master children (RFC 9559 §5.1.4.1.29)
+- Per-Block BlockAdditions typed views, read + write (RFC 9559 §5.1.3.5.2) + MaxBlockAdditionID (§5.1.4.1.16)
+- write-side TrackEntry audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11)
+- write-side Video > Projection master (RFC 9559 §5.1.4.1.28.41)
+- typed TrackAudio accessor (RFC 9559 §5.1.4.1.29.1..§5.1.4.1.29.4)
+- typed TrackAudienceFlags accessor (RFC 9559 §5.1.4.1.6..§5.1.4.1.11)
+- typed per-Cluster Position / PrevSize records (RFC 9559 §5.1.3.2 / §5.1.3.3)
+- typed Targets::target_level() hierarchy resolver (RFC 9559 §5.1.8.1.1.1)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- write Colour > MasteringMetadata sub-master (RFC 9559 §5.1.4.1.28.30..§5.1.4.1.28.40)
+- typed BlockAdditionMapping decode (RFC 9559 §5.1.4.1.17)
+- write Video > Colour scalar children (RFC 9559 §5.1.4.1.28.16, §5.1.4.1.28.17..§5.1.4.1.28.29)
+- write Video > UncompressedFourCC (RFC 9559 §5.1.4.1.28.15)
+- write Video > PixelCrop quartet + Display{Width,Height,Unit} (RFC 9559 §5.1.4.1.28.8..§5.1.4.1.28.14)
+- write Video > StereoMode + AlphaMode (RFC 9559 §5.1.4.1.28.3 + §5.1.4.1.28.4)
+- write Video > FlagInterlaced + FieldOrder (RFC 9559 §5.1.4.1.28.1 + §5.1.4.1.28.2)
+- write CRC-32 on every buffered Top-Level master (RFC 9559 §6.2)
+- write-side Attachments (RFC 9559 §5.1.6)
+- emit per-track Language element from CodecParameters::language
+- add Annex-B → AVCC repack helper for V_MPEG4/ISO/AVC passthrough
+
 ### Other
 
 - demux: **typed `Cues` accessor** (RFC 9559 §5.1.5.1, including §5.1.5.1.1..§5.1.5.1.2.8 and the reclaimed Appendix A.37..A.39 `CueReference` children). New `MkvDemuxer::cue_points() -> &[CuePoint]` surfaces the full on-disk seek-index tree in document order — the structure the denormalised `seek_to` index (track / time / cluster offset / relative position) collapses. Each `CuePoint` pairs `CueTime` (id `0xB3`, §5.1.5.1.1 — absolute timestamp in Segment Ticks, not microseconds) with one or more `CueTrackPositions` (id `0xB7`, §5.1.5.1.2 — `minOccurs: 1`, no `maxOccurs`, so a single timestamp can index blocks on several tracks). The new typed `CueTrackPositions` record exposes `track` (`CueTrack`, id `0xF7`, §5.1.5.1.2.1), `cluster_position` (`CueClusterPosition`, id `0xF1`, §5.1.5.1.2.2, `Option<u64>`), `relative_position` (`CueRelativePosition`, id `0xF0`, §5.1.5.1.2.3, `Option<u64>`), `duration` (`CueDuration`, id `0xB2`, §5.1.5.1.2.4, `Option<u64>`), `block_number` (`CueBlockNumber`, id `0x5378`, §5.1.5.1.2.5, `Option<u64>`), `codec_state` (`CueCodecState`, id `0xEA`, §5.1.5.1.2.6, `u64` with spec default `0` materialised — `0` meaning "taken from the initial `TrackEntry`"), and `references` (`CueReference`, id `0xDB`, §5.1.5.1.2.7, `Vec<CueReference>`). The new typed `CueReference` record exposes `ref_time` (`CueRefTime`, id `0x96`, §5.1.5.1.2.8) plus the reclaimed-appendix `ref_cluster` (`CueRefCluster`, id `0x97`, A.37), `ref_number` (`CueRefNumber`, id `0x535F`, A.38), and `ref_codec_state` (`CueRefCodecState`, id `0xEB`, A.39), each `Option<u64>` (the reclaimed appendix lists no defaults). The index is populated whether the `Cues` element sits before the first Cluster or after the last (the late best-effort `scan_cues_from` rescan feeds the same typed collector); unknown children inside `CueTrackPositions` are skipped for forward-compat; the denormalised seek path is unchanged. New `ids::CUE_CODEC_STATE` / `CUE_REFERENCE` / `CUE_REF_TIME` / `CUE_REF_CLUSTER` / `CUE_REF_NUMBER` / `CUE_REF_CODEC_STATE` constants plumb the element ids through. Pinned by 12 new `tests/cue_points.rs` cases: the no-Cues empty-slice surface, the spec-minimum mandatory-pair-only CuePoint (every optional child at absence / default), an all-sub-elements round-trip (every documented child including a full `CueReference`), a minimal `CueReference` (only mandatory `CueRefTime`, reclaimed children `None`), multiple `CueReference` rows preserved in document order, multiple `CueTrackPositions` per CuePoint indexing two tracks at one timestamp, multiple CuePoints in document order, the index-at-end (`scan_cues_from`) layout carrying `CueDuration` / `CueBlockNumber`, unknown-child skip inside `CueTrackPositions`, the explicit-`0` `CueCodecState` default case, the typed-view-stable-across-packet-walk contract, and the `CuePoint::default()` / `CueTrackPositions::default()` shape.
