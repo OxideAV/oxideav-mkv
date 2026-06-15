@@ -303,6 +303,12 @@ pub const CUE_CLUSTER_POSITION: u32 = 0xF1;
 pub const CUE_RELATIVE_POSITION: u32 = 0xF0;
 pub const CUE_DURATION: u32 = 0xB2;
 pub const CUE_BLOCK_NUMBER: u32 = 0x5378;
+pub const CUE_CODEC_STATE: u32 = 0xEA;
+pub const CUE_REFERENCE: u32 = 0xDB;
+pub const CUE_REF_TIME: u32 = 0x96;
+pub const CUE_REF_CLUSTER: u32 = 0x97;
+pub const CUE_REF_NUMBER: u32 = 0x535F;
+pub const CUE_REF_CODEC_STATE: u32 = 0xEB;
 
 // Chapters (Segment\Chapters\EditionEntry\ChapterAtom\ChapterDisplay\ChapString).
 pub const EDITION_ENTRY: u32 = 0x45B9;

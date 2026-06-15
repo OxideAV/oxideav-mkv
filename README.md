@@ -260,6 +260,30 @@ the unified `oxideav` aggregator to wire decoding automatically.
   Cluster — finer seek granularity than the legacy "scan from cluster
   start" path, which is preserved as a fallback when the cue has no
   `CueRelativePosition` or the encoded position is out of range.
+- **Typed `Cues` accessor** (RFC 9559 §5.1.5.1, including
+  §5.1.5.1.1..§5.1.5.1.2.8 and the reclaimed Appendix A.37..A.39
+  `CueReference` children): `MkvDemuxer::cue_points() -> &[CuePoint]`
+  surfaces the full on-disk seek-index tree in document order. The
+  `seek_to` path consumes a denormalised, sorted projection internally
+  (track, time, cluster offset, relative position); `cue_points` instead
+  preserves everything that projection collapses, so callers can read
+  per-cue `CueDuration` (§5.1.5.1.2.4) and `CueBlockNumber`
+  (§5.1.5.1.2.5), the `CueCodecState` (§5.1.5.1.2.6, spec default `0`
+  materialised — `0` meaning "taken from the initial `TrackEntry`"), and
+  walk the nested `CueReference` rows (§5.1.5.1.2.7 — each carrying
+  `CueRefTime` plus the reclaimed `CueRefCluster` / `CueRefNumber` /
+  `CueRefCodecState`), or re-mux the `Cues` element sub-element-for-sub-
+  element. Each `CuePoint` pairs an absolute `CueTime` (in Segment Ticks
+  — the file's `TimestampScale`, not microseconds) with one or more
+  `CueTrackPositions` (the spec gives the latter `minOccurs: 1` with no
+  `maxOccurs`, so a single timestamp can index blocks on several tracks).
+  Populated whether `Cues` sits before the first Cluster or after the
+  last (the late best-effort rescan feeds the same typed collector);
+  optional children surface as `Option<u64>` (absent vs present), `0`-but-
+  present and `0`-by-default `CueCodecState` are observationally identical
+  per the spec default. Unknown children inside `CueTrackPositions` are
+  skipped (forward-compat). Returns an empty slice when the file has no
+  `Cues` element.
 - An unknown-size Cluster is terminated cleanly when a sibling Segment-
   child element follows it (no more "Cues silently eaten as payload").
 - **CRC-32 validation** (RFC 8794 §11.3.1, RFC 9559 §6.2): when a Top-Level

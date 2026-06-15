@@ -80,6 +80,12 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut first_cluster_offset: Option<u64> = None;
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut cues: Vec<CueEntry> = Vec::new();
+    // Typed `Cues > CuePoint` tree (RFC 9559 §5.1.5.1), surfaced via
+    // `MkvDemuxer::cue_points` — populated alongside the denormalised
+    // `cues` seek index, preserving the full per-CuePoint sub-element set
+    // (durations, block numbers, codec state, references) the seek path
+    // collapses.
+    let mut cue_points: Vec<CuePoint> = Vec::new();
     // Chapter / attachment / edition UID maps populated during the segment
     // walk, then consulted when we resolve `Tags.Targets` UIDs at the very
     // end. Tags can appear before *or* after Tracks/Chapters/Attachments per
@@ -152,7 +158,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             }
             ids::CUES => {
                 let end = body_end_known.unwrap_or(segment_data_end);
-                parse_cues(&mut *input, end, &mut cues)?;
+                parse_cues(&mut *input, end, &mut cues, &mut cue_points)?;
             }
             ids::CHAPTERS => {
                 let end = body_end_known.unwrap_or(segment_data_end);
@@ -207,11 +213,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                 first_cluster,
                 segment_data_end,
                 &mut cues,
+                &mut cue_points,
                 &mut crc_status,
             )
             .is_err()
             {
                 cues.clear();
+                cue_points.clear();
             }
             // Restore reader position to the first cluster for next_packet().
             input.seek(SeekFrom::Start(resume_pos))?;
@@ -697,6 +705,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         metadata,
         duration_micros,
         cues,
+        cue_points,
         timecode_scale_ns,
         tags: typed_tags,
         editions,
@@ -4458,13 +4467,108 @@ struct CueEntry {
     relative_position: Option<u64>,
 }
 
-fn parse_cues(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<CueEntry>) -> Result<()> {
+/// One `Cues > CuePoint` (RFC 9559 §5.1.5.1) as it appears on disk,
+/// preserving the full seek-index tree the flat seek path
+/// ([`MkvDemuxer::seek_to`]) collapses.
+///
+/// Surfaced through [`MkvDemuxer::cue_points`] in document order. A
+/// `CuePoint` pairs the absolute `CueTime` (§5.1.5.1.1) with one or more
+/// `CueTrackPositions` (§5.1.5.1.2) — the spec marks the latter
+/// `minOccurs: 1` with no `maxOccurs`, so a single seek timestamp can index
+/// blocks on several tracks at once, and each entry is preserved here in
+/// on-disk order.
+///
+/// Timestamps are in Segment Ticks (the file's `TimestampScale`,
+/// §11.1) — the same raw unit the on-disk `CueTime` element carries —
+/// not converted to microseconds, so a re-muxer reproduces the value
+/// bit-exactly. Use the demuxer's `TimestampScale` (1 ms on our own muxer)
+/// to convert.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CuePoint {
+    /// `CueTime` (RFC 9559 §5.1.5.1.1, id `0xB3`) — absolute timestamp of
+    /// the seek point in Segment Ticks. `minOccurs: 1`; defaults to `0`
+    /// only if a malformed file omits it.
+    pub time: u64,
+    /// `CueTrackPositions` (RFC 9559 §5.1.5.1.2, id `0xB7`) entries for this
+    /// seek point, in on-disk order. At least one is required by the spec;
+    /// a malformed `CuePoint` with none surfaces as an empty `Vec`.
+    pub track_positions: Vec<CueTrackPositions>,
+}
+
+/// One `Cues > CuePoint > CueTrackPositions` (RFC 9559 §5.1.5.1.2): the
+/// position of a Block on one track at the parent [`CuePoint`]'s timestamp.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CueTrackPositions {
+    /// `CueTrack` (RFC 9559 §5.1.5.1.2.1, id `0xF7`, `range: not 0`) — the
+    /// track number this position is for.
+    pub track: u64,
+    /// `CueClusterPosition` (RFC 9559 §5.1.5.1.2.2, id `0xF1`) — the Segment
+    /// Position (§16) of the Cluster containing the referenced Block. The
+    /// spec marks it `minOccurs: 1`; `None` only when a malformed cue omits
+    /// it (such an entry is dropped from the flat seek index but preserved
+    /// here verbatim).
+    pub cluster_position: Option<u64>,
+    /// `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3, id `0xF0`, `minver: 4`)
+    /// — the relative byte position inside the Cluster of the referenced
+    /// `SimpleBlock` / `BlockGroup`, `0` being the first possible element
+    /// position. `None` when absent (`maxOccurs: 1`, optional).
+    pub relative_position: Option<u64>,
+    /// `CueDuration` (RFC 9559 §5.1.5.1.2.4, id `0xB2`, `minver: 4`) — the
+    /// duration of the referenced Block in Segment Ticks. `None` when
+    /// absent; per spec, absence means no cue-level duration is available
+    /// (the track's `DefaultDuration` does not apply).
+    pub duration: Option<u64>,
+    /// `CueBlockNumber` (RFC 9559 §5.1.5.1.2.5, id `0x5378`, `range: not 0`)
+    /// — the 1-based number of the Block within the referenced Cluster.
+    /// `None` when absent (`maxOccurs: 1`, optional).
+    pub block_number: Option<u64>,
+    /// `CueCodecState` (RFC 9559 §5.1.5.1.2.6, id `0xEA`, `minver: 2`,
+    /// default `0`) — the Segment Position of the Codec State for this cue;
+    /// `0` (the spec default) means "taken from the initial `TrackEntry`".
+    /// The default `0` is materialised on absence, mirroring how the typed
+    /// surfaces elsewhere treat spec defaults.
+    pub codec_state: u64,
+    /// `CueReference` (RFC 9559 §5.1.5.1.2.7, id `0xDB`, `minver: 2`) — the
+    /// Clusters containing Blocks the referenced Block depends on, in
+    /// on-disk order. Empty when the cue carries none (the common case for
+    /// keyframe cues, which by definition reference nothing).
+    pub references: Vec<CueReference>,
+}
+
+/// One `Cues > CuePoint > CueTrackPositions > CueReference` (RFC 9559
+/// §5.1.5.1.2.7): a reference to a Block the cue's Block depends on.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CueReference {
+    /// `CueRefTime` (RFC 9559 §5.1.5.1.2.8, id `0x96`, `minOccurs: 1`) —
+    /// the timestamp of the referenced Block in Segment Ticks. Defaults to
+    /// `0` only if a malformed reference omits the mandatory element.
+    pub ref_time: u64,
+    /// `CueRefCluster` (RFC 9559 Appendix A.37 reclaimed, id `0x97`) — the
+    /// Segment Position of the Cluster containing the referenced Block.
+    /// `None` when absent.
+    pub ref_cluster: Option<u64>,
+    /// `CueRefNumber` (RFC 9559 Appendix A.38 reclaimed, id `0x535F`) — the
+    /// number of the referenced Block in that Cluster. `None` when absent.
+    pub ref_number: Option<u64>,
+    /// `CueRefCodecState` (RFC 9559 Appendix A.39 reclaimed, id `0xEB`) —
+    /// the Segment Position of the Codec State for the referenced element;
+    /// `0` means "taken from the initial `TrackEntry`". `None` when absent
+    /// (the reclaimed appendix lists no default, so absence is observable).
+    pub ref_codec_state: Option<u64>,
+}
+
+fn parse_cues(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    out: &mut Vec<CueEntry>,
+    typed: &mut Vec<CuePoint>,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::CUE_POINT => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_cue_point(r, body_end, out)?;
+                parse_cue_point(r, body_end, out, typed)?;
             }
             _ => skip(r, e.size)?,
         }
@@ -4472,19 +4576,29 @@ fn parse_cues(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<CueEntry>) -> Result
     Ok(())
 }
 
-fn parse_cue_point(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<CueEntry>) -> Result<()> {
+fn parse_cue_point(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    out: &mut Vec<CueEntry>,
+    typed: &mut Vec<CuePoint>,
+) -> Result<()> {
     let mut time: u64 = 0;
+    let mut point = CuePoint::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::CUE_TIME => time = read_uint(r, e.size as usize)?,
+            ids::CUE_TIME => {
+                time = read_uint(r, e.size as usize)?;
+                point.time = time;
+            }
             ids::CUE_TRACK_POSITIONS => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
-                parse_cue_track_positions(r, body_end, time, out)?;
+                parse_cue_track_positions(r, body_end, time, out, &mut point.track_positions)?;
             }
             _ => skip(r, e.size)?,
         }
     }
+    typed.push(point);
     Ok(())
 }
 
@@ -4493,17 +4607,36 @@ fn parse_cue_track_positions(
     end: u64,
     time: u64,
     out: &mut Vec<CueEntry>,
+    typed: &mut Vec<CueTrackPositions>,
 ) -> Result<()> {
     let mut track: u64 = 0;
     let mut cluster_offset: Option<u64> = None;
     let mut relative_position: Option<u64> = None;
+    let mut tp = CueTrackPositions::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::CUE_TRACK => track = read_uint(r, e.size as usize)?,
-            ids::CUE_CLUSTER_POSITION => cluster_offset = Some(read_uint(r, e.size as usize)?),
+            ids::CUE_TRACK => {
+                track = read_uint(r, e.size as usize)?;
+                tp.track = track;
+            }
+            ids::CUE_CLUSTER_POSITION => {
+                let v = read_uint(r, e.size as usize)?;
+                cluster_offset = Some(v);
+                tp.cluster_position = Some(v);
+            }
             ids::CUE_RELATIVE_POSITION => {
-                relative_position = Some(read_uint(r, e.size as usize)?);
+                let v = read_uint(r, e.size as usize)?;
+                relative_position = Some(v);
+                tp.relative_position = Some(v);
+            }
+            ids::CUE_DURATION => tp.duration = Some(read_uint(r, e.size as usize)?),
+            ids::CUE_BLOCK_NUMBER => tp.block_number = Some(read_uint(r, e.size as usize)?),
+            ids::CUE_CODEC_STATE => tp.codec_state = read_uint(r, e.size as usize)?,
+            ids::CUE_REFERENCE => {
+                let body_end = r.stream_position()?.saturating_add(e.size);
+                let reference = parse_cue_reference(r, body_end)?;
+                tp.references.push(reference);
             }
             _ => skip(r, e.size)?,
         }
@@ -4516,7 +4649,25 @@ fn parse_cue_track_positions(
             relative_position,
         });
     }
+    typed.push(tp);
     Ok(())
+}
+
+fn parse_cue_reference(r: &mut dyn ReadSeek, end: u64) -> Result<CueReference> {
+    let mut reference = CueReference::default();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CUE_REF_TIME => reference.ref_time = read_uint(r, e.size as usize)?,
+            ids::CUE_REF_CLUSTER => reference.ref_cluster = Some(read_uint(r, e.size as usize)?),
+            ids::CUE_REF_NUMBER => reference.ref_number = Some(read_uint(r, e.size as usize)?),
+            ids::CUE_REF_CODEC_STATE => {
+                reference.ref_codec_state = Some(read_uint(r, e.size as usize)?)
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(reference)
 }
 
 /// Best-effort scan of the byte range `[start, end)` looking for a top-level
@@ -4533,6 +4684,7 @@ fn scan_cues_from(
     start: u64,
     end: u64,
     out: &mut Vec<CueEntry>,
+    typed: &mut Vec<CuePoint>,
     crc_status: &mut Vec<CrcStatus>,
 ) -> Result<()> {
     r.seek(SeekFrom::Start(start))?;
@@ -4563,7 +4715,7 @@ fn scan_cues_from(
                     crc_status.push(s);
                 }
             }
-            parse_cues(r, body_end, out)?;
+            parse_cues(r, body_end, out, typed)?;
             return Ok(());
         }
         if e.size == VINT_UNKNOWN_SIZE {
@@ -5339,6 +5491,11 @@ pub struct MkvDemuxer {
     /// no Cues element — `seek_to` returns `Error::Unsupported` in that
     /// case.
     cues: Vec<CueEntry>,
+    /// Typed `Cues > CuePoint` tree (RFC 9559 §5.1.5.1) in document order —
+    /// see [`MkvDemuxer::cue_points`]. Preserves the full per-CuePoint
+    /// sub-element set the denormalised `cues` seek index collapses. Empty
+    /// when the file has no `Cues` element.
+    cue_points: Vec<CuePoint>,
     /// Nanoseconds per Matroska timecode tick (the Segment\Info\TimecodeScale
     /// value, defaulted to 1_000_000 when absent).
     timecode_scale_ns: u64,
@@ -5720,6 +5877,31 @@ impl MkvDemuxer {
     /// (or seek to every Cluster of interest) first.
     pub fn cluster_records(&self) -> &[ClusterRecord] {
         &self.cluster_records
+    }
+
+    /// The typed `Cues > CuePoint` seek index (RFC 9559 §5.1.5.1), in
+    /// document order.
+    ///
+    /// [`Demuxer::seek_to`] consumes a denormalised, sorted projection of
+    /// this index internally; `cue_points` instead surfaces the full
+    /// on-disk tree the seek path collapses, so a caller can:
+    ///
+    /// * read per-cue `CueDuration` (§5.1.5.1.2.4) — e.g. to honour the
+    ///   §22.1 recommendation that subtitle cues carry a duration;
+    /// * read `CueBlockNumber` (§5.1.5.1.2.5) and `CueCodecState`
+    ///   (§5.1.5.1.2.6) for finer-grained or codec-state-aware seeking;
+    /// * walk `CueReference` (§5.1.5.1.2.7) entries to discover the
+    ///   Blocks a referenced Block depends on;
+    /// * re-mux the `Cues` element with every sub-element preserved.
+    ///
+    /// Each [`CuePoint`] pairs an absolute `CueTime` (in Segment Ticks —
+    /// the file's `TimestampScale`, not microseconds) with one or more
+    /// [`CueTrackPositions`]. The index is populated whether the `Cues`
+    /// element sits before the first Cluster or after the last (the late
+    /// best-effort rescan path feeds the same typed collector). Returns an
+    /// empty slice when the file has no `Cues` element.
+    pub fn cue_points(&self) -> &[CuePoint] {
+        &self.cue_points
     }
 
     /// Register a Cluster at `body_start` on the typed-record list if
