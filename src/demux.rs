@@ -1810,6 +1810,20 @@ impl TrackPlaneType {
             other => TrackPlaneType::Other(other),
         }
     }
+
+    /// Inverse of [`TrackPlaneType::from_raw`] — round-trip an enum value
+    /// back to its `TrackPlaneType` integer (RFC 9559 §5.1.4.1.30.4,
+    /// Table 20). Used by the mux side when writing a `TrackPlane`. The
+    /// [`TrackPlaneType::Other`] forward-compat variant passes its wrapped
+    /// value through verbatim.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            TrackPlaneType::LeftEye => ids::TRACK_PLANE_TYPE_LEFT_EYE,
+            TrackPlaneType::RightEye => ids::TRACK_PLANE_TYPE_RIGHT_EYE,
+            TrackPlaneType::Background => ids::TRACK_PLANE_TYPE_BACKGROUND,
+            TrackPlaneType::Other(v) => v,
+        }
+    }
 }
 
 /// A reference to a track from within a [`TrackOperation`], keyed by

@@ -911,6 +911,38 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `MkvDemuxer::track_timing` typed accessor — a mux→demux pipeline
   preserves every supplied child bit-exactly, including the
   `DefaultDuration`-derived nominal frame rate.
+- **`TrackOperation` on write** (RFC 9559 §5.1.4.1.30):
+  `MkvMuxer::set_track_operation(stream_index, MkvTrackOperation)` queues a
+  per-track *virtual-track* recipe that lands as a `TrackOperation` master
+  (id `0xE2`) directly inside the carrying `TrackEntry` (sibling to
+  `Video` / `Audio`) at `write_header` time. `MkvTrackOperation` carries a
+  `combine_planes: Vec<MkvTrackPlane>` (`TrackCombinePlanes`,
+  §5.1.4.1.30.1 — each `MkvTrackPlane` pairs a 0-indexed source
+  `stream_index` with a `TrackPlaneType`, §5.1.4.1.30.4) and a
+  `join_tracks: Vec<usize>` (`TrackJoinBlocks`, §5.1.4.1.30.5). Each
+  plane / join reference's stream index is resolved to the source track's
+  on-disk `TrackUID` at write time — the symmetric inverse of the demux
+  side, which resolves each `TrackPlaneUID` (§5.1.4.1.30.3) /
+  `TrackJoinUID` (§5.1.4.1.30.6) back to a stream index. The demux-side
+  `TrackPlaneType` enum gained a `to_raw()` inverse so every Table 20
+  value (`LeftEye` / `RightEye` / `Background`) round-trips, including the
+  `Other(u64)` forward-compat variant (§27.17 leaves the "Matroska Track
+  Plane Types" registry open). Both operation kinds may coexist on one
+  track. Convenience constructors `MkvTrackOperation::stereo_3d(left,
+  right)` (the canonical left/right-eye 3D recipe) and
+  `MkvTrackOperation::join(streams)` cover the two common shapes. Spec
+  rules enforced at queue time: rejects post-`write_header` use,
+  out-of-range `stream_index`, an empty operation (`TrackCombinePlanes` /
+  `TrackJoinBlocks` exist only to carry references), and any plane / join
+  reference pointing at a non-existent stream (the `TrackPlaneUID` /
+  `TrackJoinUID` "not 0" pins fall out of the stream-index→`TrackUID`
+  mapping). Unlike the `set_video_*` family there is no track-type
+  restriction — the spec carries `TrackOperation` on every `TrackEntry`,
+  so a `TrackJoinBlocks` audio virtual track is accepted. Omitting the
+  call keeps the master off-disk so the demuxer surfaces `None` from
+  `track_operation`. Pairs symmetrically with the existing
+  `MkvDemuxer::track_operation` typed accessor — a mux→demux pipeline
+  preserves every plane (with its type) and every join reference.
 
 ### Codec ID mapping (`codec_id` module)
 
@@ -960,10 +992,11 @@ so the demuxer never hides an unrecognised track.
 - ContentSignature (RFC 9559 §A.33 reclaimed `0x47E3`) is parsed by neither
   side. The element is reserved for a future per-segment signature scheme.
 - `TrackOperation` is decoded and surfaced (left/right-eye plane combining,
-  block joining) but the demuxer does not yet *apply* it — virtual tracks
-  are reported alongside their source tracks rather than being synthesised
-  into a single combined output stream. `TrackOperation` is never written
-  on the mux side.
+  block joining) and now written on the mux side
+  (`MkvMuxer::set_track_operation`, see the Muxer section) but the demuxer
+  does not yet *apply* it — virtual tracks are reported alongside their
+  source tracks rather than being synthesised into a single combined output
+  stream.
 - `ContentEncodings` is decoded and surfaced (compression / encryption
   headers). The demuxer *undoes* a Block-scoped Header-Stripping chain
   (algo 3) on read — packets carry the original frame bytes — but the

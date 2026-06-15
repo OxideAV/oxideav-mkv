@@ -33,7 +33,7 @@ use oxideav_core::{Muxer, WriteSeek};
 use crate::codec_id;
 use crate::demux::{
     AlphaMode, ChromaSitingHorz, ChromaSitingVert, ColourRange, DisplayUnit, FieldOrder,
-    FlagInterlaced, MatrixCoefficients, Primaries, ProjectionType, StereoMode,
+    FlagInterlaced, MatrixCoefficients, Primaries, ProjectionType, StereoMode, TrackPlaneType,
     TransferCharacteristics,
 };
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
@@ -477,6 +477,16 @@ pub struct MkvMuxer {
     /// Block(s) that this Block depends on, but they did write some
     /// Block(s) in the past."
     last_block_pts_ms: Vec<Option<i64>>,
+    /// Per-stream `TrackOperation` hint queued via
+    /// [`MkvMuxer::set_track_operation`] (RFC 9559 §5.1.4.1.30).
+    /// Materialised as a `TrackOperation` master directly inside the
+    /// carrying `TrackEntry` (sibling to `Video` / `Audio`) at
+    /// `write_header` time. `None` (the default) means the muxer omits the
+    /// element for that stream, so the demuxer surfaces `None` from
+    /// `track_operation`. Each plane / join reference's 0-indexed stream
+    /// index is resolved to the source track's `TrackUID` at write time.
+    /// The slice is sized to `streams.len()`.
+    track_operations: Vec<Option<MkvTrackOperation>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -1170,6 +1180,100 @@ impl MkvBlockAddition {
     }
 }
 
+/// A `TrackOperation` (RFC 9559 §5.1.4.1.30) hint queued via
+/// [`MkvMuxer::set_track_operation`]: the recipe that turns the carrying
+/// `TrackEntry` into a *virtual* track assembled from other tracks in the
+/// same Segment.
+///
+/// References to the source tracks are given as 0-indexed **stream
+/// indices** (the same unit [`Muxer::write_packet`] uses), which the muxer
+/// resolves to the corresponding on-disk `TrackUID` at `write_header` time.
+/// This is the symmetric inverse of the demux side, which resolves each
+/// on-disk UID back to a stream index in
+/// [`TrackRef`](crate::demux::TrackRef).
+///
+/// Two independent operation kinds are supported, exactly as the spec
+/// allows them to coexist:
+///
+/// * [`combine_planes`](Self::combine_planes) — `TrackCombinePlanes`
+///   (§5.1.4.1.30.1), the list of video plane tracks (each tagged with a
+///   [`TrackPlaneType`](crate::demux::TrackPlaneType)) merged into one
+///   stereoscopic 3D track.
+/// * [`join_tracks`](Self::join_tracks) — `TrackJoinBlocks`
+///   (§5.1.4.1.30.5), the list of tracks whose Blocks are joined into a
+///   single timeline.
+///
+/// Pairs symmetrically with the existing
+/// [`MkvDemuxer::track_operation`](crate::demux::MkvDemuxer::track_operation)
+/// typed accessor — a mux→demux pipeline preserves every plane (with its
+/// type) and every join reference.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkvTrackOperation {
+    /// `TrackCombinePlanes` planes, in write order. Empty → no
+    /// `TrackCombinePlanes` child is emitted.
+    pub combine_planes: Vec<MkvTrackPlane>,
+    /// `TrackJoinBlocks` source stream indices, in write order. Empty →
+    /// no `TrackJoinBlocks` child is emitted.
+    pub join_tracks: Vec<usize>,
+}
+
+impl MkvTrackOperation {
+    /// Construct an empty operation — add planes / joins via the fields or
+    /// the helpers below.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Convenience constructor for the canonical stereoscopic-3D shape: a
+    /// left-eye plane track and a right-eye plane track combined into this
+    /// virtual track (RFC 9559 §5.1.4.1.30.1, §18.8).
+    pub fn stereo_3d(left_eye: usize, right_eye: usize) -> Self {
+        Self {
+            combine_planes: vec![
+                MkvTrackPlane {
+                    stream_index: left_eye,
+                    plane_type: TrackPlaneType::LeftEye,
+                },
+                MkvTrackPlane {
+                    stream_index: right_eye,
+                    plane_type: TrackPlaneType::RightEye,
+                },
+            ],
+            join_tracks: Vec::new(),
+        }
+    }
+
+    /// Convenience constructor for a `TrackJoinBlocks` virtual track that
+    /// concatenates the Blocks of the given source streams onto one
+    /// timeline (RFC 9559 §5.1.4.1.30.5).
+    pub fn join(streams: Vec<usize>) -> Self {
+        Self {
+            combine_planes: Vec::new(),
+            join_tracks: streams,
+        }
+    }
+
+    /// True when neither a `TrackCombinePlanes` nor a `TrackJoinBlocks`
+    /// child would be written. Such a queue produces an empty
+    /// `TrackOperation` master — legal but inert; the setter rejects it so
+    /// callers don't silently emit a no-op.
+    pub fn is_empty(&self) -> bool {
+        self.combine_planes.is_empty() && self.join_tracks.is_empty()
+    }
+}
+
+/// One `TrackPlane` (RFC 9559 §5.1.4.1.30.2) inside an
+/// [`MkvTrackOperation::combine_planes`] list: a source video track plus
+/// the role it plays in the combined 3D track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MkvTrackPlane {
+    /// 0-indexed stream index of the source plane track, resolved to its
+    /// `TrackPlaneUID` (= the track's `TrackUID`) at `write_header` time.
+    pub stream_index: usize,
+    /// `TrackPlaneType` (RFC 9559 §5.1.4.1.30.4).
+    pub plane_type: TrackPlaneType,
+}
+
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.
 #[derive(Clone, Copy, Debug)]
 struct CueRecord {
@@ -1239,6 +1343,7 @@ impl MkvMuxer {
             track_audio: vec![None; n],
             track_timing: vec![None; n],
             last_block_pts_ms: vec![None; n],
+            track_operations: vec![None; n],
         })
     }
 
@@ -1483,6 +1588,96 @@ impl MkvMuxer {
     /// useful for tests.
     pub fn video_alpha_mode(&self, stream_index: usize) -> Option<AlphaMode> {
         *self.video_alpha_modes.get(stream_index)?
+    }
+
+    /// Set the per-track `TrackOperation` (RFC 9559 §5.1.4.1.30) for one
+    /// stream — the recipe that makes the carrying `TrackEntry` a *virtual*
+    /// track assembled from other tracks (stereoscopic-3D plane combining
+    /// via `TrackCombinePlanes`, §5.1.4.1.30.1, and/or Block joining via
+    /// `TrackJoinBlocks`, §5.1.4.1.30.5). Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise — the
+    /// element lives in `Tracks`, which is written exactly once at header
+    /// time.
+    ///
+    /// References inside the [`MkvTrackOperation`] are 0-indexed stream
+    /// indices (the same unit [`Muxer::write_packet`] uses). The muxer
+    /// resolves each one to the source track's on-disk `TrackUID` at
+    /// `write_header` time — the symmetric inverse of the demux side, which
+    /// resolves each UID back to a stream index.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range
+    ///   indices return [`Error::invalid`].
+    /// * The operation must not be empty (`TrackCombinePlanes` /
+    ///   `TrackJoinBlocks` are masters whose only purpose is to carry
+    ///   references — an empty `TrackOperation` is inert). An
+    ///   [`MkvTrackOperation::is_empty`] queue is rejected.
+    /// * Every `TrackPlaneUID` / `TrackJoinUID` references a track by its
+    ///   `TrackUID`, which the spec pins to "not 0"
+    ///   (§5.1.4.1.30.3 / §5.1.4.1.30.6). Because the muxer derives each
+    ///   `TrackUID` from the 1-based stream index, every referenced
+    ///   `stream_index` must itself point at an existing stream; an
+    ///   out-of-range plane / join reference is rejected. A track MAY
+    ///   reference itself — the spec does not forbid it.
+    ///
+    /// Note that §5.1.4.1.30 marks `TrackOperation` `minver: 3`; the muxer
+    /// pins `DocTypeVersion` to `4`, so emitting it never violates the
+    /// declared document version.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued operation.
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_track_operation(
+        &mut self,
+        stream_index: usize,
+        op: MkvTrackOperation,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_operation called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_operation stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if op.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: set_track_operation given an empty TrackOperation \
+                 (no TrackCombinePlanes planes and no TrackJoinBlocks references)",
+            ));
+        }
+        let n = self.streams.len();
+        for p in &op.combine_planes {
+            if p.stream_index >= n {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: set_track_operation TrackPlane references stream_index {} out of range ({n} streams)",
+                    p.stream_index
+                )));
+            }
+        }
+        for &j in &op.join_tracks {
+            if j >= n {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: set_track_operation TrackJoinBlocks references stream_index {j} out of range ({n} streams)"
+                )));
+            }
+        }
+        self.track_operations[stream_index] = Some(op);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `TrackOperation` hint
+    /// installed via [`MkvMuxer::set_track_operation`]. Returns `None` for
+    /// any stream that didn't have the API called (the muxer omits the
+    /// `TrackOperation` master, and the demuxer surfaces `None` from
+    /// `track_operation`). Mostly useful for tests.
+    pub fn track_operation(&self, stream_index: usize) -> Option<&MkvTrackOperation> {
+        self.track_operations.get(stream_index)?.as_ref()
     }
 
     /// Set the per-track `Video > PixelCrop{Top,Bottom,Left,Right}` +
@@ -2787,6 +2982,55 @@ impl Muxer for MkvMuxer {
                     write_master_element(&mut video, ids::PROJECTION, &proj);
                 }
                 write_master_element(&mut t, ids::VIDEO, &video);
+            }
+            // TrackOperation (RFC 9559 §5.1.4.1.30) — a TrackEntry-level
+            // master (sibling to Video / Audio) describing the virtual
+            // track recipe queued via `set_track_operation`. Emitted only
+            // when the caller opted in; an omitted hint keeps the master
+            // off-disk so the demuxer surfaces `None` from
+            // `track_operation`. The setter has already validated that the
+            // operation is non-empty and that every plane / join
+            // stream_index is in range, so the resolution below cannot
+            // produce a dangling or zero TrackUID.
+            if let Some(op) = &self.track_operations[i] {
+                let mut op_body = Vec::new();
+                // TrackCombinePlanes (§5.1.4.1.30.1): one TrackPlane master
+                // per plane, each carrying the mandatory TrackPlaneUID
+                // (§5.1.4.1.30.3 — the source track's TrackUID, "not 0")
+                // and TrackPlaneType (§5.1.4.1.30.4).
+                if !op.combine_planes.is_empty() {
+                    let mut combine_body = Vec::new();
+                    for p in &op.combine_planes {
+                        let mut plane = Vec::new();
+                        write_uint_element(
+                            &mut plane,
+                            ids::TRACK_PLANE_UID,
+                            self.track_numbers[p.stream_index],
+                        );
+                        write_uint_element(
+                            &mut plane,
+                            ids::TRACK_PLANE_TYPE,
+                            p.plane_type.to_raw(),
+                        );
+                        write_master_element(&mut combine_body, ids::TRACK_PLANE, &plane);
+                    }
+                    write_master_element(&mut op_body, ids::TRACK_COMBINE_PLANES, &combine_body);
+                }
+                // TrackJoinBlocks (§5.1.4.1.30.5): one TrackJoinUID
+                // (§5.1.4.1.30.6 — source track's TrackUID, "not 0") per
+                // joined track.
+                if !op.join_tracks.is_empty() {
+                    let mut join_body = Vec::new();
+                    for &j in &op.join_tracks {
+                        write_uint_element(
+                            &mut join_body,
+                            ids::TRACK_JOIN_UID,
+                            self.track_numbers[j],
+                        );
+                    }
+                    write_master_element(&mut op_body, ids::TRACK_JOIN_BLOCKS, &join_body);
+                }
+                write_master_element(&mut t, ids::TRACK_OPERATION, &op_body);
             }
             write_master_element(&mut tracks_body, ids::TRACK_ENTRY, &t);
         }
