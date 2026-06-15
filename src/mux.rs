@@ -17,9 +17,9 @@
 //! Segment and Cluster use the EBML "unknown size" sentinel so the muxer is
 //! streaming-friendly during packet writes (no seek-back for Segment size).
 //! Cues are emitted at the end of the file — the demuxer supports
-//! end-of-file Cues by scanning past the last cluster, and mpv / ffmpeg /
-//! Chromium accept the same layout. The SeekHead lets players that prefer
-//! up-front index lookup (mpv, Chromium) jump directly to Cues without
+//! end-of-file Cues by scanning past the last cluster, and common players
+//! accept the same layout. The SeekHead lets players that prefer
+//! up-front index lookup jump directly to Cues without
 //! scanning the whole file; the Cues entry's SeekPosition is patched once
 //! the Cues element is actually written (or replaced with a Void if no
 //! packets were muxed). Timestamps are converted to milliseconds using the
@@ -2540,7 +2540,7 @@ impl Muxer for MkvMuxer {
                 // order a demuxer typically encounters them (FlagInterlaced
                 // / FieldOrder before PixelWidth/PixelHeight per the IANA
                 // numerical-id ordering, then geometry, then the masters)
-                // keeps the byte layout close to what mkvmerge produces and
+                // keeps the byte layout close to the conventional muxer output and
                 // keeps diff-friendly fixtures small.
                 if let Some(vi) = self.video_interlacings[i] {
                     // FlagInterlaced (§5.1.4.1.28.1) — only emitted when
@@ -2797,7 +2797,7 @@ impl Muxer for MkvMuxer {
         // master sandwiched between Tracks and the first Cluster. RFC
         // 9559 §5.1.7 lets Chapters appear anywhere in the Segment, but
         // putting it here keeps the demuxer's pre-Cluster header walk
-        // single-pass and matches the order ffmpeg / mkvmerge prefer.
+        // single-pass and matches the conventional single-pass ordering.
         // If no chapters were queued, the SeekHead Chapters slot stays
         // at its placeholder zero and gets voided below.
         let chapters_offset_opt: Option<u64> = if self.chapters.is_empty() {
@@ -3718,8 +3718,8 @@ fn parse_opus_pre_skip(extradata: &[u8]) -> u16 {
 fn encode_codec_private(codec_id: &oxideav_core::CodecId, extradata: &[u8]) -> Vec<u8> {
     match codec_id.as_str() {
         // Matroska's A_FLAC mapping carries the leading "fLaC" magic in
-        // CodecPrivate even though many docs imply it's optional. ffmpeg
-        // expects it; we always prepend it on the muxer side.
+        // CodecPrivate even though many docs imply it's optional. Common
+        // decoders expect it; we always prepend it on the muxer side.
         "flac" => {
             let mut out = Vec::with_capacity(4 + extradata.len());
             out.extend_from_slice(b"fLaC");

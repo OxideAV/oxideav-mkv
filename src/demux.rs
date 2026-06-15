@@ -4521,7 +4521,7 @@ fn parse_cue_track_positions(
 
 /// Best-effort scan of the byte range `[start, end)` looking for a top-level
 /// Cues element whose header we can find intact. Used when the Cues element
-/// appears after the last Cluster in the file (the common ffmpeg layout
+/// appears after the last Cluster in the file (the common single-pass layout
 /// when muxing in a single pass with index-at-end, and also what our own
 /// muxer emits).
 ///

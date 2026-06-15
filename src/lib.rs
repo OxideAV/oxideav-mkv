@@ -88,7 +88,7 @@ fn probe_matroska(p: &oxideav_core::ProbeData) -> u8 {
 /// WebM probe: high score if DocType reads "webm", zero otherwise so a
 /// plain .mkv does not get reported as webm. (A truly ambiguous case —
 /// EBML magic but no readable DocType — falls through to the matroska
-/// entry, which is what ffmpeg/Chromium do.)
+/// entry, which is the conventional fall-through for ambiguous EBML.)
 fn probe_webm(p: &oxideav_core::ProbeData) -> u8 {
     match probe_doctype(p.buf) {
         DocTypeProbe::Webm => SCORE_DOCTYPE_MATCH,

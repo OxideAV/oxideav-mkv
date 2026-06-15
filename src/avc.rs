@@ -31,7 +31,7 @@
 /// 4-byte big-endian length and concatenated. Both buffers are
 /// independently usable — the SPS/PPS NAL units appear **only** in
 /// `config_record` (not duplicated in `packetized`), matching the
-/// shape ffmpeg and mkvmerge produce.
+/// conventional V_MPEG4/ISO/AVC repack shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AvccRepack {
     /// Bytes of `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15
@@ -58,8 +58,7 @@ const NAL_TYPE_PPS: u8 = 8;
 /// SPS and PPS NAL units found in the stream are collected into the
 /// configuration record (one record per unique parameter set, in
 /// first-seen order) and **not** re-emitted into the packetised
-/// output — this matches the shape ffmpeg / mkvmerge produce and is
-/// what `V_MPEG4/ISO/AVC` decoders expect.
+/// output — this matches the conventional shape `V_MPEG4/ISO/AVC` decoders expect.
 ///
 /// `lengthSizeMinusOne` is always `3` (i.e. 4-byte length prefixes)
 /// in the emitted record — the maximum-width choice eliminates any

@@ -543,7 +543,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect format by content probe, not by file extension
 - surface metadata + duration_micros across all containers
 - scaffold decoder — 3 headers + Huffman trees + packet classify
-- RFC 9043 v3 slice layout + CRC-32 parity; ffmpeg→us decodes
+- RFC 9043 v3 slice layout + CRC-32 parity; third-party-muxed → us decodes
 - add lossless video codec — bit-exact self-roundtrip, RFC 9043 v3
 - add rustfmt + clippy gates; release: macOS universal binary
 - add Matroska (MKV) container + Opus crate + proper Ogg header handling
