@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Demuxer: Linked-Segment `Info` metadata (RFC 9559 §5.1.2.1..§5.1.2.8 +
+  Section 17), exposed via `MkvDemuxer::segment_linking()` returning a typed
+  `demux::SegmentLinking`. Parses `SegmentUUID`, `SegmentFilename`,
+  `PrevUUID`/`PrevFilename`, `NextUUID`/`NextFilename`, the unbounded
+  `SegmentFamily` UID list, and the `ChapterTranslate` sub-tree
+  (`ChapterTranslateID` / `ChapterTranslateCodec` / `ChapterTranslateEditionUID`)
+  as `demux::ChapterTranslate`. UID binaries are kept verbatim (off-length
+  values round-trip for inspection); `is_empty()` / `is_hard_linked()`
+  convenience predicates added.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.8...v0.0.9) - 2026-06-15
 
 ### Other

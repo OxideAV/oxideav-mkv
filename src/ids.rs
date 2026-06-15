@@ -41,6 +41,26 @@ pub const WRITING_APP: u32 = 0x5741;
 pub const TITLE: u32 = 0x7BA9;
 pub const DATE_UTC: u32 = 0x4461;
 
+// Linked-Segment Info elements (RFC 9559 §5.1.2.2..§5.1.2.8). These tie a
+// Segment to the other Segments of a Linked Segment (Section 17): the
+// previous / next Segment in a Hard-Linked chain (PrevUUID / NextUUID,
+// 16-byte binary), a human-readable filename for display convenience
+// (SegmentFilename / PrevFilename / NextFilename, utf-8), and the
+// SegmentFamily UID (16-byte binary) all Segments of a Linked Segment
+// share. ChapterTranslate is a master that maps this Segment's
+// SegmentUUID to the internal segment value a Chapter Codec uses, so a
+// file can be remuxed without rewriting its chapter-codec data.
+pub const SEGMENT_FILENAME: u32 = 0x7384;
+pub const PREV_UID: u32 = 0x3CB923;
+pub const PREV_FILENAME: u32 = 0x3C83AB;
+pub const NEXT_UID: u32 = 0x3EB923;
+pub const NEXT_FILENAME: u32 = 0x3E83BB;
+pub const SEGMENT_FAMILY: u32 = 0x4444;
+pub const CHAPTER_TRANSLATE: u32 = 0x6924;
+pub const CHAPTER_TRANSLATE_ID: u32 = 0x69A5;
+pub const CHAPTER_TRANSLATE_CODEC: u32 = 0x69BF;
+pub const CHAPTER_TRANSLATE_EDITION_UID: u32 = 0x69FC;
+
 // Tags (Segment\Tags\Tag\SimpleTag).
 pub const TAG: u32 = 0x7373;
 pub const TARGETS: u32 = 0x63C0;

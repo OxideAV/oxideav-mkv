@@ -707,6 +707,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         cues,
         cue_points,
         timecode_scale_ns,
+        segment_linking: info.linking,
         tags: typed_tags,
         editions,
         attachments,
@@ -739,6 +740,9 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
 struct SegmentInfo {
     timecode_scale: u64,
     duration: f64,
+    /// Linked-Segment Info elements (RFC 9559 §5.1.2.1..§5.1.2.8),
+    /// surfaced via [`MkvDemuxer::segment_linking`].
+    linking: SegmentLinking,
 }
 
 /// Result of validating the `CRC-32` element (RFC 8794 §11.3.1) on one
@@ -814,6 +818,110 @@ pub struct ClusterRecord {
     /// Cluster of a Segment (no previous Cluster to size), and on
     /// writers that don't bother emitting it.
     pub prev_size: Option<u64>,
+}
+
+/// Linked-Segment metadata from a Segment's `Info` element (RFC 9559
+/// §5.1.2.1..§5.1.2.8 + Section 17).
+///
+/// A Linked Segment is a set of Segments that a player treats as one
+/// logical presentation. Two mechanisms exist: *Hard Linking*, where each
+/// Segment names the previous / next Segment by UID ([`prev_uuid`] /
+/// [`next_uuid`], §17.1); and a shared [`families`] UID that groups all
+/// Segments of a Linked Segment regardless of order. The `*_filename`
+/// fields carry display-only filenames — the spec is explicit that the
+/// UIDs, not the filenames, are authoritative for identifying neighbours
+/// (§5.1.2.4, §5.1.2.6).
+///
+/// All fields are absent (`None` / empty) on the common standalone
+/// Segment that participates in no linking. This is a pure container
+/// surface: it records the UIDs and filenames verbatim and performs no
+/// cross-file resolution.
+///
+/// [`prev_uuid`]: SegmentLinking::prev_uuid
+/// [`next_uuid`]: SegmentLinking::next_uuid
+/// [`families`]: SegmentLinking::families
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SegmentLinking {
+    /// `SegmentUUID` (RFC 9559 §5.1.2.1, id `0x73A4`) — the 128-bit UID
+    /// identifying this Segment among others. Verbatim bytes (normally
+    /// exactly 16). `None` when the Segment carried none; REQUIRED only
+    /// when the Segment is part of a Linked Segment.
+    pub segment_uuid: Option<Vec<u8>>,
+    /// `SegmentFilename` (RFC 9559 §5.1.2.2, id `0x7384`) — a filename
+    /// corresponding to this Segment. Display convenience only.
+    pub segment_filename: Option<String>,
+    /// `PrevUUID` (RFC 9559 §5.1.2.3, id `0x3CB923`) — UID of the previous
+    /// Segment in a Hard-Linked chain. `None` on the first Segment of a
+    /// chain (and on standalone Segments). MUST NOT equal
+    /// [`Self::segment_uuid`].
+    pub prev_uuid: Option<Vec<u8>>,
+    /// `PrevFilename` (RFC 9559 §5.1.2.4, id `0x3C83AB`) — display filename
+    /// of the previous Linked Segment. [`Self::prev_uuid`] is authoritative.
+    pub prev_filename: Option<String>,
+    /// `NextUUID` (RFC 9559 §5.1.2.5, id `0x3EB923`) — UID of the next
+    /// Segment in a Hard-Linked chain. `None` on the last Segment of a
+    /// chain (and on standalone Segments). MUST NOT equal
+    /// [`Self::segment_uuid`].
+    pub next_uuid: Option<Vec<u8>>,
+    /// `NextFilename` (RFC 9559 §5.1.2.6, id `0x3E83BB`) — display filename
+    /// of the next Linked Segment. [`Self::next_uuid`] is authoritative.
+    pub next_filename: Option<String>,
+    /// `SegmentFamily` (RFC 9559 §5.1.2.7, id `0x4444`) — UID(s) all
+    /// Segments of a Linked Segment share. The element is unbounded, so a
+    /// Segment may belong to several families; each entry is a 128-bit UID
+    /// (normally 16 bytes). Empty when the Segment declares none.
+    pub families: Vec<Vec<u8>>,
+    /// `ChapterTranslate` (RFC 9559 §5.1.2.8, id `0x6924`) masters, in
+    /// document order. Each maps this Segment's UID to the internal segment
+    /// value a Chapter Codec uses. Empty when the Segment carries none.
+    pub chapter_translates: Vec<ChapterTranslate>,
+}
+
+impl SegmentLinking {
+    /// True when none of the linked-Segment elements were present — the
+    /// common standalone-Segment case. Callers can skip the whole surface
+    /// with a single check.
+    pub fn is_empty(&self) -> bool {
+        self.segment_uuid.is_none()
+            && self.segment_filename.is_none()
+            && self.prev_uuid.is_none()
+            && self.prev_filename.is_none()
+            && self.next_uuid.is_none()
+            && self.next_filename.is_none()
+            && self.families.is_empty()
+            && self.chapter_translates.is_empty()
+    }
+
+    /// True when this Segment is Hard-Linked to a neighbour — it names a
+    /// previous and/or next Segment by UID (RFC 9559 §17.1).
+    pub fn is_hard_linked(&self) -> bool {
+        self.prev_uuid.is_some() || self.next_uuid.is_some()
+    }
+}
+
+/// One `Segment\Info\ChapterTranslate` master (RFC 9559 §5.1.2.8): the
+/// mapping between this Segment and the internal segment value a Chapter
+/// Codec addresses. This lets a file be remuxed (acquiring a new
+/// SegmentUUID) without rewriting the opaque chapter-codec command data —
+/// only the mapping changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChapterTranslate {
+    /// `ChapterTranslateID` (RFC 9559 §5.1.2.8.1, id `0x69A5`,
+    /// `minOccurs: 1`) — the binary value representing this Segment in the
+    /// chapter-codec data. Its format depends on
+    /// [`Self::codec`] (see RFC 9559 §5.1.7.1.4.15). Empty only on a
+    /// malformed master missing the mandatory child.
+    pub id: Vec<u8>,
+    /// `ChapterTranslateCodec` (RFC 9559 §5.1.2.8.2, id `0x69BF`,
+    /// `minOccurs: 1`) — the chapter codec the mapping applies to; the same
+    /// value space as `ChapProcessCodecID` (Table 31: `0` = Matroska
+    /// Script, `1` = DVD-menu).
+    pub codec: u64,
+    /// `ChapterTranslateEditionUID` (RFC 9559 §5.1.2.8.3, id `0x69FC`,
+    /// unbounded) — the chapter editions this mapping applies to. Empty
+    /// means it applies to *all* editions using [`Self::codec`]
+    /// (§5.1.2.8.3).
+    pub edition_uids: Vec<u64>,
 }
 
 /// Check a Top-Level master element for a leading `CRC-32` child and, if
@@ -1156,10 +1264,66 @@ fn parse_info(
                     skip(r, e.size)?;
                 }
             }
+            // Linked-Segment Info (RFC 9559 §5.1.2.1..§5.1.2.8). The three
+            // UID-bearing elements (SegmentUUID / PrevUUID / NextUUID /
+            // SegmentFamily) are 16-byte binaries; we keep them verbatim
+            // rather than forcing them through a fixed-size array so a
+            // malformed off-length value round-trips for inspection instead
+            // of being silently truncated.
+            ids::SEGMENT_UID => {
+                out.linking.segment_uuid = Some(read_bytes(r, e.size as usize)?);
+            }
+            ids::PREV_UID => {
+                out.linking.prev_uuid = Some(read_bytes(r, e.size as usize)?);
+            }
+            ids::NEXT_UID => {
+                out.linking.next_uuid = Some(read_bytes(r, e.size as usize)?);
+            }
+            ids::SEGMENT_FAMILY => {
+                // Unbounded (no maxOccurs): a Segment can belong to several
+                // families. Each is a separate 16-byte UID.
+                out.linking.families.push(read_bytes(r, e.size as usize)?);
+            }
+            ids::SEGMENT_FILENAME => {
+                out.linking.segment_filename = Some(read_string(r, e.size as usize)?);
+            }
+            ids::PREV_FILENAME => {
+                out.linking.prev_filename = Some(read_string(r, e.size as usize)?);
+            }
+            ids::NEXT_FILENAME => {
+                out.linking.next_filename = Some(read_string(r, e.size as usize)?);
+            }
+            ids::CHAPTER_TRANSLATE => {
+                let body_end = r.stream_position()? + e.size;
+                let translate = parse_chapter_translate(r, body_end)?;
+                out.linking.chapter_translates.push(translate);
+            }
             _ => skip(r, e.size)?,
         }
     }
     Ok(())
+}
+
+/// Parse one `Segment\Info\ChapterTranslate` master (RFC 9559 §5.1.2.8).
+/// `ChapterTranslateID` (binary, `minOccurs: 1`) and `ChapterTranslateCodec`
+/// (uinteger, `minOccurs: 1`) are mandatory; `ChapterTranslateEditionUID`
+/// (uinteger, unbounded) is optional and lists the chapter editions the
+/// mapping applies to — an empty list means "all editions using the given
+/// codec" per §5.1.2.8.3.
+fn parse_chapter_translate(r: &mut dyn ReadSeek, end: u64) -> Result<ChapterTranslate> {
+    let mut out = ChapterTranslate::default();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::CHAPTER_TRANSLATE_ID => out.id = read_bytes(r, e.size as usize)?,
+            ids::CHAPTER_TRANSLATE_CODEC => out.codec = read_uint(r, e.size as usize)?,
+            ids::CHAPTER_TRANSLATE_EDITION_UID => {
+                out.edition_uids.push(read_uint(r, e.size as usize)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(out)
 }
 
 /// A `Tags.Tag` element captured during the segment walk, before its
@@ -5513,6 +5677,10 @@ pub struct MkvDemuxer {
     /// Nanoseconds per Matroska timecode tick (the Segment\Info\TimecodeScale
     /// value, defaulted to 1_000_000 when absent).
     timecode_scale_ns: u64,
+    /// Linked-Segment Info metadata (RFC 9559 §5.1.2.1..§5.1.2.8) — see
+    /// [`MkvDemuxer::segment_linking`]. Empty (all-`None`) for the common
+    /// standalone Segment.
+    segment_linking: SegmentLinking,
     /// Typed `Tags\Tag` collection (RFC 9559 §5.1.8.1) — see
     /// [`MkvDemuxer::tags`].
     tags: Vec<Tag>,
@@ -5822,6 +5990,21 @@ impl MkvDemuxer {
     /// dangling non-zero UIDs are dropped per RFC 9559 §5.1.8.1.1.3..6.
     pub fn tags(&self) -> &[Tag] {
         &self.tags
+    }
+
+    /// Linked-Segment Info metadata (RFC 9559 §5.1.2.1..§5.1.2.8 +
+    /// Section 17) parsed from this Segment's `Info` element.
+    ///
+    /// Returns the Segment's own UID, the previous / next Segment UIDs of a
+    /// Hard-Linked chain, the shared SegmentFamily UID(s), the display
+    /// filenames, and any `ChapterTranslate` mappings. For the common
+    /// standalone Segment that participates in no linking,
+    /// [`SegmentLinking::is_empty`] is `true` and every field is absent.
+    ///
+    /// This is a pure container surface: it records the UIDs and filenames
+    /// verbatim and does not resolve or open neighbouring Segment files.
+    pub fn segment_linking(&self) -> &SegmentLinking {
+        &self.segment_linking
     }
 
     /// `CRC-32` validation results for the Top-Level master and

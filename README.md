@@ -247,6 +247,17 @@ the unified `oxideav` aggregator to wire decoding automatically.
   to nested chapters. Returns an empty slice when the file has no
   `Chapters` element.
 - Duration: `Segment\Info\Duration` translated to microseconds.
+- **Linked-Segment `Info` metadata** (RFC 9559 §5.1.2.1..§5.1.2.8 +
+  Section 17) via `MkvDemuxer::segment_linking()` → [`SegmentLinking`]:
+  the Segment's own `SegmentUUID`, the previous / next Segment UIDs of a
+  Hard-Linked chain (`PrevUUID` / `NextUUID`) with their display
+  `*Filename`s, the unbounded `SegmentFamily` UID list, and the
+  `ChapterTranslate` sub-tree ([`ChapterTranslate`]: `ChapterTranslateID`
+  + `ChapterTranslateCodec` + optional `ChapterTranslateEditionUID` list).
+  UID binaries are surfaced verbatim — off-length values round-trip for
+  inspection rather than being truncated. `is_empty()` reports the common
+  standalone Segment; `is_hard_linked()` reports a chain member. Pure
+  container surface: no neighbouring-file resolution.
 - Seek: `seek_to(stream, pts)` uses the Cues index. Handles Cues at
   either end of the Segment, and walks an unknown-size final Cluster to
   find Cues that sit past it.
