@@ -26,7 +26,7 @@ use std::io::Cursor;
 
 use oxideav_core::{Demuxer, ReadSeek};
 use oxideav_mkv::demux::{
-    AesCipherMode, ContentCompAlgo, ContentEncAlgo, ContentEncodingTransform,
+    AesCipherMode, ContentCompAlgo, ContentEncAlgo, ContentEncodingTransform, ContentSigning,
 };
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
@@ -276,10 +276,131 @@ fn aes_encryption_decodes() {
             algo,
             key_id,
             aes_cipher_mode,
+            signing,
         } => {
             assert_eq!(*algo, ContentEncAlgo::Aes);
             assert_eq!(key_id, &key);
             assert_eq!(*aes_cipher_mode, Some(AesCipherMode::Ctr));
+            assert!(signing.is_empty());
+        }
+        other => panic!("expected Encryption, got {other:?}"),
+    }
+}
+
+/// The reclaimed content-signing quartet (RFC 9559 Appendix A.33..A.36) that
+/// lives directly inside `ContentEncryption` is decoded verbatim alongside the
+/// cipher description: `ContentSignature` (`0x47E3`, binary), `ContentSigKeyID`
+/// (`0x47E4`, binary), `ContentSigAlgo` (`0x47E5`, uinteger) and
+/// `ContentSigHashAlgo` (`0x47E6`, uinteger). The appendix names no values and
+/// no defaults, so each surfaces raw and present.
+#[test]
+fn content_signing_quartet_decodes() {
+    let key = [0x10, 0x20];
+    let sig = [0xDE, 0xAD, 0xBE, 0xEF];
+    let sig_key = [0xCA, 0xFE];
+    // Build a ContentEncryption carrying the AES cipher plus the four
+    // signing children directly inside the master.
+    let mut aes = Vec::new();
+    aes.extend_from_slice(&elem_uint(
+        ids::AES_SETTINGS_CIPHER_MODE,
+        ids::AES_CIPHER_MODE_CTR,
+    ));
+    let mut encr = Vec::new();
+    encr.extend_from_slice(&elem_uint(ids::CONTENT_ENC_ALGO, ids::CONTENT_ENC_ALGO_AES));
+    encr.extend_from_slice(&elem_bin(ids::CONTENT_ENC_KEY_ID, &key));
+    encr.extend_from_slice(&elem_master(ids::CONTENT_ENC_AES_SETTINGS, &aes));
+    encr.extend_from_slice(&elem_bin(ids::CONTENT_SIGNATURE, &sig));
+    encr.extend_from_slice(&elem_bin(ids::CONTENT_SIG_KEY_ID, &sig_key));
+    encr.extend_from_slice(&elem_uint(ids::CONTENT_SIG_ALGO, 1));
+    encr.extend_from_slice(&elem_uint(ids::CONTENT_SIG_HASH_ALGO, 2));
+    let mut ce = Vec::new();
+    ce.extend_from_slice(&elem_uint(
+        ids::CONTENT_ENCODING_TYPE,
+        ids::CONTENT_ENCODING_TYPE_ENCRYPTION,
+    ));
+    ce.extend_from_slice(&elem_master(ids::CONTENT_ENCRYPTION, &encr));
+    let enc = elem_master(ids::CONTENT_ENCODING, &ce);
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+    let dmx = open(assemble(&tracks_body));
+
+    match &dmx.content_encodings(0).expect("encodings").encodings[0].transform {
+        ContentEncodingTransform::Encryption {
+            algo,
+            aes_cipher_mode,
+            signing,
+            ..
+        } => {
+            assert_eq!(*algo, ContentEncAlgo::Aes);
+            assert_eq!(*aes_cipher_mode, Some(AesCipherMode::Ctr));
+            assert!(!signing.is_empty());
+            assert_eq!(signing.signature.as_deref(), Some(&sig[..]));
+            assert_eq!(signing.key_id.as_deref(), Some(&sig_key[..]));
+            assert_eq!(signing.algo, Some(1));
+            assert_eq!(signing.hash_algo, Some(2));
+        }
+        other => panic!("expected Encryption, got {other:?}"),
+    }
+}
+
+/// Absence of every signing element leaves `ContentSigning` empty (each field
+/// `None`) — the appendix defines no defaults, so absence is observable and
+/// distinct from a present-but-zero value.
+#[test]
+fn content_signing_absent_stays_none() {
+    let enc = aes_encryption_encoding(0, &[0x01], ids::AES_CIPHER_MODE_CTR);
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+    let dmx = open(assemble(&tracks_body));
+
+    match &dmx.content_encodings(0).expect("encodings").encodings[0].transform {
+        ContentEncodingTransform::Encryption { signing, .. } => {
+            assert!(signing.is_empty());
+            assert_eq!(signing.signature, None);
+            assert_eq!(signing.key_id, None);
+            assert_eq!(signing.algo, None);
+            assert_eq!(signing.hash_algo, None);
+        }
+        other => panic!("expected Encryption, got {other:?}"),
+    }
+    // The default-constructed record is also reported empty.
+    assert!(ContentSigning::default().is_empty());
+}
+
+/// A present-but-zero `ContentSigAlgo` / `ContentSigHashAlgo` round-trips as
+/// `Some(0)` — distinct from absence (`None`), since the appendix defines no
+/// default. Mirrors the reclaimed Appendix-A `AspectRatioType` raw-value rule.
+#[test]
+fn content_signing_zero_distinct_from_absent() {
+    let mut encr = Vec::new();
+    encr.extend_from_slice(&elem_uint(
+        ids::CONTENT_ENC_ALGO,
+        ids::CONTENT_ENC_ALGO_TWOFISH,
+    ));
+    encr.extend_from_slice(&elem_uint(ids::CONTENT_SIG_ALGO, 0));
+    encr.extend_from_slice(&elem_uint(ids::CONTENT_SIG_HASH_ALGO, 0));
+    let mut ce = Vec::new();
+    ce.extend_from_slice(&elem_uint(
+        ids::CONTENT_ENCODING_TYPE,
+        ids::CONTENT_ENCODING_TYPE_ENCRYPTION,
+    ));
+    ce.extend_from_slice(&elem_master(ids::CONTENT_ENCRYPTION, &encr));
+    let enc = elem_master(ids::CONTENT_ENCODING, &ce);
+    let track = video_track(1, 0x1, &elem_master(ids::CONTENT_ENCODINGS, &enc));
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &track));
+    let dmx = open(assemble(&tracks_body));
+
+    match &dmx.content_encodings(0).expect("encodings").encodings[0].transform {
+        ContentEncodingTransform::Encryption { signing, .. } => {
+            assert!(!signing.is_empty(), "a present zero is not 'empty'");
+            assert_eq!(signing.algo, Some(0));
+            assert_eq!(signing.hash_algo, Some(0));
+            assert_eq!(signing.signature, None);
+            assert_eq!(signing.key_id, None);
         }
         other => panic!("expected Encryption, got {other:?}"),
     }
@@ -418,10 +539,12 @@ fn non_aes_encryption_has_no_cipher_mode() {
             algo,
             key_id,
             aes_cipher_mode,
+            signing,
         } => {
             assert_eq!(*algo, ContentEncAlgo::Twofish);
             assert!(key_id.is_empty());
             assert_eq!(*aes_cipher_mode, None);
+            assert!(signing.is_empty());
         }
         other => panic!("expected Encryption, got {other:?}"),
     }

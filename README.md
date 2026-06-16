@@ -389,9 +389,18 @@ the unified `oxideav` aggregator to wire decoding automatically.
   (`ContentCompAlgo` → `Zlib` / `Bzlib` / `Lzo1x` / `HeaderStripping` /
   `Other(u64)`, plus the `ContentCompSettings` stripped bytes) or
   `Encryption` (`ContentEncAlgo` → `None` / `Des` / `TripleDes` / `Twofish`
-  / `Blowfish` / `Aes` / `Other(u64)`, the `ContentEncKeyID`, and the
+  / `Blowfish` / `Aes` / `Other(u64)`, the `ContentEncKeyID`, the
   nested `ContentEncAESSettings` → `AESSettingsCipherMode` as
-  `Ctr` / `Cbc` / `Other(u64)`). The list is pre-sorted into *decode* order
+  `Ctr` / `Cbc` / `Other(u64)`, and the reclaimed content-signing quartet
+  (RFC 9559 Appendix A.33..A.36) as a typed `ContentSigning` record —
+  `ContentSignature` (id `0x47E3`, binary) + `ContentSigKeyID` (`0x47E4`,
+  binary) + `ContentSigAlgo` (`0x47E5`, uinteger) + `ContentSigHashAlgo`
+  (`0x47E6`, uinteger). Each signing field is an `Option` whose `None` means
+  "absent on disk" — the appendix names no values and no defaults, so a
+  present `0` round-trips as `Some(0)` distinct from absence, mirroring the
+  reclaimed Appendix-A `AspectRatioType` raw-value rule;
+  `ContentSigning::is_empty()` reports the all-absent state). The list is
+  pre-sorted into *decode* order
   (highest `ContentEncodingOrder` first, per §5.1.4.1.31.2). Element
   defaults are honoured (order 0, scope 0x1 Block, type 0 compression,
   comp-algo 0 zlib). The headers are surfaced; zlib/bzlib/lzo1x and
@@ -966,8 +975,14 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `ContentEncodingType`-keyed sub-master: `ContentCompression`
   (§5.1.4.1.31.5 — `ContentCompAlgo` + `ContentCompSettings`, the latter
   written only when non-empty) or `ContentEncryption` (§5.1.4.1.31.8 —
-  `ContentEncAlgo`, `ContentEncKeyID` when non-empty, and the nested
-  `ContentEncAESSettings > AESSettingsCipherMode` written only on AES).
+  `ContentEncAlgo`, `ContentEncKeyID` when non-empty, the nested
+  `ContentEncAESSettings > AESSettingsCipherMode` written only on AES, and
+  the reclaimed content-signing quartet (RFC 9559 Appendix A.33..A.36 —
+  `ContentSignature` / `ContentSigKeyID` / `ContentSigAlgo` /
+  `ContentSigHashAlgo`) carried by the demux-side `ContentSigning` record,
+  each of whose four children is written only when its `Option` slot is
+  `Some` so an empty `ContentSigning` adds no bytes and round-trips to
+  `None` on every field).
   The demux-side `ContentCompAlgo` / `ContentEncAlgo` / `AesCipherMode`
   enums gained `to_raw()` inverses so every Table 23 / 24 / 26 value
   round-trips, including each `Other(u64)` forward-compat variant (§27.2 /
@@ -1032,8 +1047,12 @@ so the demuxer never hides an unrecognised track.
   Cues entry is patched in `write_trailer` (which would invalidate any
   CRC computed up front), and `Cluster` is streamed with the unknown-size
   VINT (RFC 8794 §11.3.1's bounded-body requirement).
-- ContentSignature (RFC 9559 §A.33 reclaimed `0x47E3`) is parsed by neither
-  side. The element is reserved for a future per-segment signature scheme.
+- The reclaimed content-signing quartet (RFC 9559 Appendix A.33..A.36 —
+  `ContentSignature` `0x47E3`, `ContentSigKeyID` `0x47E4`, `ContentSigAlgo`
+  `0x47E5`, `ContentSigHashAlgo` `0x47E6`) is now decoded and written on both
+  sides (see the `ContentEncodings` entries below). The container surfaces and
+  round-trips the four values verbatim; it never computes or verifies a
+  signature (out of container scope).
 - `TrackOperation` is decoded and surfaced (left/right-eye plane combining,
   block joining) and now written on the mux side
   (`MkvMuxer::set_track_operation`, see the Muxer section) but the demuxer

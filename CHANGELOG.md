@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: the reclaimed content-signing quartet inside
+  `ContentEncryption` (RFC 9559 Appendix A.33..A.36 — `ContentSignature`
+  `0x47E3`, `ContentSigKeyID` `0x47E4`, `ContentSigAlgo` `0x47E5`,
+  `ContentSigHashAlgo` `0x47E6`). The `demux::ContentEncodingTransform::Encryption`
+  variant gains a `signing: ContentSigning` field surfacing the four elements
+  verbatim — `signature` / `key_id` as `Option<Vec<u8>>`, `algo` / `hash_algo`
+  as `Option<u64>` — where `None` means the element was absent on disk (the
+  appendix defines no values and no defaults, so a present `0` round-trips as
+  `Some(0)` distinct from absence). `ContentSigning::is_empty()` reports the
+  all-absent state. The muxer writes each child only when its `Option` slot is
+  `Some`, so an empty `ContentSigning` adds no bytes and round-trips to `None`
+  on every field. The container is a pure carrier: it never computes or
+  verifies a signature.
 - Muxer: `ContentEncodings` (RFC 9559 §5.1.4.1.31) write path via
   `MkvMuxer::set_track_content_encodings(stream_index, ContentEncodings)`.
   Serialises the per-track compression / encryption chain

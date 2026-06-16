@@ -39,7 +39,7 @@ use oxideav_core::{
 };
 use oxideav_mkv::demux::{
     AesCipherMode, ContentCompAlgo, ContentEncAlgo, ContentEncoding, ContentEncodingScope,
-    ContentEncodingTransform, ContentEncodings,
+    ContentEncodingTransform, ContentEncodings, ContentSigning,
 };
 use oxideav_mkv::mux::MkvMuxer;
 
@@ -124,6 +124,7 @@ fn enc_step(
             algo,
             key_id,
             aes_cipher_mode,
+            signing: ContentSigning::default(),
         },
     }
 }
@@ -207,6 +208,7 @@ fn roundtrip_aes_ctr_encryption() {
             algo,
             key_id: kid,
             aes_cipher_mode,
+            ..
         } => {
             assert_eq!(*algo, ContentEncAlgo::Aes);
             assert_eq!(*kid, key_id);
@@ -232,6 +234,7 @@ fn roundtrip_non_aes_encryption_no_aes_settings() {
             algo,
             key_id,
             aes_cipher_mode,
+            ..
         } => {
             assert_eq!(*algo, ContentEncAlgo::Twofish);
             assert!(key_id.is_empty());
@@ -340,6 +343,81 @@ fn roundtrip_aes_other_cipher_mode() {
         ContentEncodingTransform::Encryption {
             aes_cipher_mode, ..
         } => assert_eq!(*aes_cipher_mode, Some(AesCipherMode::Other(7))),
+        other => panic!("expected encryption, got {other:?}"),
+    }
+}
+
+#[test]
+fn roundtrip_content_signing_quartet() {
+    // The reclaimed content-signing quartet (RFC 9559 Appendix A.33..A.36)
+    // round-trips through the muxer: ContentSignature + ContentSigKeyID
+    // (binary) and ContentSigAlgo + ContentSigHashAlgo (uinteger). Each child
+    // is written only when its Option slot is Some.
+    let sig = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let sig_key = vec![0xCA, 0xFE];
+    let bytes = mux_two_tracks(|mx| {
+        let enc = ContentEncodings {
+            encodings: vec![ContentEncoding {
+                order: 0,
+                scope: ContentEncodingScope(0x1),
+                transform: ContentEncodingTransform::Encryption {
+                    algo: ContentEncAlgo::Aes,
+                    key_id: vec![0x01, 0x02],
+                    aes_cipher_mode: Some(AesCipherMode::Ctr),
+                    signing: ContentSigning {
+                        signature: Some(sig.clone()),
+                        key_id: Some(sig_key.clone()),
+                        algo: Some(1),
+                        hash_algo: Some(2),
+                    },
+                },
+            }],
+        };
+        mx.set_track_content_encodings(0, enc).expect("set");
+    });
+    let dmx = demux_typed(bytes);
+    match &dmx.content_encodings(0).unwrap().encodings[0].transform {
+        ContentEncodingTransform::Encryption { signing, .. } => {
+            assert_eq!(signing.signature.as_deref(), Some(&sig[..]));
+            assert_eq!(signing.key_id.as_deref(), Some(&sig_key[..]));
+            assert_eq!(signing.algo, Some(1));
+            assert_eq!(signing.hash_algo, Some(2));
+        }
+        other => panic!("expected encryption, got {other:?}"),
+    }
+}
+
+#[test]
+fn roundtrip_content_signing_partial() {
+    // Only ContentSigAlgo present (a present zero) — the other three stay
+    // None on read, and the zero is distinct from absence.
+    let bytes = mux_two_tracks(|mx| {
+        let enc = ContentEncodings {
+            encodings: vec![ContentEncoding {
+                order: 0,
+                scope: ContentEncodingScope(0x1),
+                transform: ContentEncodingTransform::Encryption {
+                    algo: ContentEncAlgo::Twofish,
+                    key_id: Vec::new(),
+                    aes_cipher_mode: None,
+                    signing: ContentSigning {
+                        algo: Some(0),
+                        ..ContentSigning::default()
+                    },
+                },
+            }],
+        };
+        mx.set_track_content_encodings(0, enc).expect("set");
+    });
+    let dmx = demux_typed(bytes);
+    match &dmx.content_encodings(0).unwrap().encodings[0].transform {
+        ContentEncodingTransform::Encryption { signing, .. } => {
+            assert!(!signing.is_empty());
+            assert_eq!(signing.algo, Some(0));
+            assert_eq!(signing.signature, None);
+            assert_eq!(signing.key_id, None);
+            assert_eq!(signing.hash_algo, None);
+        }
         other => panic!("expected encryption, got {other:?}"),
     }
 }

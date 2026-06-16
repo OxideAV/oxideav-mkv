@@ -3898,7 +3898,50 @@ pub enum ContentEncodingTransform {
         /// `ContentEncAESSettings` (§5.1.4.1.31.11). Only meaningful when
         /// `algo` is [`ContentEncAlgo::Aes`]; `None` otherwise.
         aes_cipher_mode: Option<AesCipherMode>,
+        /// The reclaimed content-signing quartet that lives directly inside
+        /// `ContentEncryption` (RFC 9559 Appendix A.33..A.36). These describe
+        /// a cryptographic signature over the encrypted contents; the
+        /// container surfaces them verbatim and never verifies a signature.
+        signing: ContentSigning,
     },
+}
+
+/// The reclaimed content-signing quartet inside `ContentEncryption`
+/// (RFC 9559 Appendix A.33..A.36): `ContentSignature` (`0x47E3`),
+/// `ContentSigKeyID` (`0x47E4`), `ContentSigAlgo` (`0x47E5`) and
+/// `ContentSigHashAlgo` (`0x47E6`). The appendix documents each element's
+/// type only and enumerates no values and no defaults, so every field is an
+/// `Option` whose `None` means "the element was absent on disk" — mirroring
+/// the way the reclaimed Appendix-A `AspectRatioType` element surfaces a raw
+/// `Option<u64>` rather than a synthesised enum. The container is a pure
+/// carrier: it never computes, verifies, or interprets a signature.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentSigning {
+    /// `ContentSignature` (Appendix A.33, id `0x47E3`, binary): the
+    /// cryptographic signature of the contents. `None` when absent.
+    pub signature: Option<Vec<u8>>,
+    /// `ContentSigKeyID` (Appendix A.34, id `0x47E4`, binary): the ID of the
+    /// private key the data was signed with. `None` when absent.
+    pub key_id: Option<Vec<u8>>,
+    /// `ContentSigAlgo` (Appendix A.35, id `0x47E5`, uinteger): the algorithm
+    /// used for the signature. Surfaced raw — the appendix names no values.
+    /// `None` when absent.
+    pub algo: Option<u64>,
+    /// `ContentSigHashAlgo` (Appendix A.36, id `0x47E6`, uinteger): the hash
+    /// algorithm used for the signature. Surfaced raw — the appendix names no
+    /// values. `None` when absent.
+    pub hash_algo: Option<u64>,
+}
+
+impl ContentSigning {
+    /// `true` when none of the four signing elements were present on disk —
+    /// the common case (signing is rarely used).
+    pub fn is_empty(&self) -> bool {
+        self.signature.is_none()
+            && self.key_id.is_none()
+            && self.algo.is_none()
+            && self.hash_algo.is_none()
+    }
 }
 
 /// `ContentCompAlgo` (RFC 9559 §5.1.4.1.31.6, Table 23).
@@ -5168,7 +5211,7 @@ fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncod
     let mut scope: u64 = ids::CONTENT_ENCODING_SCOPE_BLOCK; // §5.1.4.1.31.3 default 0x1
     let mut enc_type: u64 = ids::CONTENT_ENCODING_TYPE_COMPRESSION; // §5.1.4.1.31.4 default 0
     let mut comp: Option<(u64, Vec<u8>)> = None;
-    let mut encr: Option<(u64, Vec<u8>, Option<u64>)> = None;
+    let mut encr: Option<(u64, Vec<u8>, Option<u64>, ContentSigning)> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -5187,11 +5230,17 @@ fn parse_content_encoding(r: &mut dyn ReadSeek, end: u64) -> Result<ContentEncod
         }
     }
     let transform = if enc_type == ids::CONTENT_ENCODING_TYPE_ENCRYPTION {
-        let (algo, key_id, mode) = encr.unwrap_or((ids::CONTENT_ENC_ALGO_NONE, Vec::new(), None));
+        let (algo, key_id, mode, signing) = encr.unwrap_or((
+            ids::CONTENT_ENC_ALGO_NONE,
+            Vec::new(),
+            None,
+            ContentSigning::default(),
+        ));
         ContentEncodingTransform::Encryption {
             algo: ContentEncAlgo::from_raw(algo),
             key_id,
             aes_cipher_mode: mode.map(AesCipherMode::from_raw),
+            signing,
         }
     } else {
         // Type 0 (compression) and any unknown type fall through to the
@@ -5226,12 +5275,18 @@ fn parse_content_compression(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec
 }
 
 /// Parse a `ContentEncryption` master (RFC 9559 §5.1.4.1.31.8) into
-/// `(ContentEncAlgo, ContentEncKeyID, AESSettingsCipherMode)`. The cipher
-/// mode is read from the nested `ContentEncAESSettings` master.
-fn parse_content_encryption(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec<u8>, Option<u64>)> {
+/// `(ContentEncAlgo, ContentEncKeyID, AESSettingsCipherMode, ContentSigning)`.
+/// The cipher mode is read from the nested `ContentEncAESSettings` master; the
+/// reclaimed signing quartet (Appendix A.33..A.36) sits directly inside the
+/// `ContentEncryption` master as four direct children.
+fn parse_content_encryption(
+    r: &mut dyn ReadSeek,
+    end: u64,
+) -> Result<(u64, Vec<u8>, Option<u64>, ContentSigning)> {
     let mut algo: u64 = ids::CONTENT_ENC_ALGO_NONE; // §5.1.4.1.31.9 default 0
     let mut key_id: Vec<u8> = Vec::new();
     let mut cipher_mode: Option<u64> = None;
+    let mut signing = ContentSigning::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -5241,10 +5296,17 @@ fn parse_content_encryption(r: &mut dyn ReadSeek, end: u64) -> Result<(u64, Vec<
                 let body_end = r.stream_position()?.saturating_add(e.size);
                 cipher_mode = parse_aes_settings(r, body_end)?;
             }
+            // Reclaimed content-signing quartet (Appendix A.33..A.36). The
+            // appendix defines no defaults, so each element surfaces verbatim
+            // and absence stays `None`.
+            ids::CONTENT_SIGNATURE => signing.signature = Some(read_bytes(r, e.size as usize)?),
+            ids::CONTENT_SIG_KEY_ID => signing.key_id = Some(read_bytes(r, e.size as usize)?),
+            ids::CONTENT_SIG_ALGO => signing.algo = Some(read_uint(r, e.size as usize)?),
+            ids::CONTENT_SIG_HASH_ALGO => signing.hash_algo = Some(read_uint(r, e.size as usize)?),
             _ => skip(r, e.size)?,
         }
     }
-    Ok((algo, key_id, cipher_mode))
+    Ok((algo, key_id, cipher_mode, signing))
 }
 
 /// Parse a `ContentEncAESSettings` master (RFC 9559 §5.1.4.1.31.11) and

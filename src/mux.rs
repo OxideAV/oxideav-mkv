@@ -3231,6 +3231,7 @@ impl Muxer for MkvMuxer {
                             algo,
                             key_id,
                             aes_cipher_mode,
+                            signing,
                         } => {
                             write_uint_element(
                                 &mut ce,
@@ -3253,6 +3254,27 @@ impl Muxer for MkvMuxer {
                                     &mut crypt,
                                     ids::CONTENT_ENC_AES_SETTINGS,
                                     &aes,
+                                );
+                            }
+                            // Reclaimed content-signing quartet (RFC 9559
+                            // Appendix A.33..A.36) — each child written only
+                            // when its `Option` slot is `Some`, so an empty
+                            // `ContentSigning` adds no bytes and round-trips
+                            // to `None` on every field.
+                            if let Some(sig) = &signing.signature {
+                                write_bytes_element(&mut crypt, ids::CONTENT_SIGNATURE, sig);
+                            }
+                            if let Some(sig_key) = &signing.key_id {
+                                write_bytes_element(&mut crypt, ids::CONTENT_SIG_KEY_ID, sig_key);
+                            }
+                            if let Some(sig_algo) = signing.algo {
+                                write_uint_element(&mut crypt, ids::CONTENT_SIG_ALGO, sig_algo);
+                            }
+                            if let Some(sig_hash) = signing.hash_algo {
+                                write_uint_element(
+                                    &mut crypt,
+                                    ids::CONTENT_SIG_HASH_ALGO,
+                                    sig_hash,
                                 );
                             }
                             write_master_element(&mut ce, ids::CONTENT_ENCRYPTION, &crypt);

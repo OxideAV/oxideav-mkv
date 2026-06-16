@@ -179,6 +179,13 @@ pub const CONTENT_ENC_KEY_ID: u32 = 0x47E2;
 pub const CONTENT_ENC_AES_SETTINGS: u32 = 0x47E7;
 pub const AES_SETTINGS_CIPHER_MODE: u32 = 0x47E8;
 
+// Reclaimed content-signing quartet inside ContentEncryption
+// (RFC 9559 Appendix A.33..A.36).
+pub const CONTENT_SIGNATURE: u32 = 0x47E3;
+pub const CONTENT_SIG_KEY_ID: u32 = 0x47E4;
+pub const CONTENT_SIG_ALGO: u32 = 0x47E5;
+pub const CONTENT_SIG_HASH_ALGO: u32 = 0x47E6;
+
 pub const PIXEL_WIDTH: u32 = 0xB0;
 pub const PIXEL_HEIGHT: u32 = 0xBA;
 
