@@ -32,9 +32,9 @@ use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
 use crate::demux::{
-    AlphaMode, ChromaSitingHorz, ChromaSitingVert, ColourRange, DisplayUnit, FieldOrder,
-    FlagInterlaced, MatrixCoefficients, Primaries, ProjectionType, StereoMode, TrackPlaneType,
-    TransferCharacteristics,
+    AlphaMode, ChromaSitingHorz, ChromaSitingVert, ColourRange, ContentEncodingTransform,
+    ContentEncodings, DisplayUnit, FieldOrder, FlagInterlaced, MatrixCoefficients, Primaries,
+    ProjectionType, StereoMode, TrackPlaneType, TransferCharacteristics,
 };
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
@@ -487,6 +487,14 @@ pub struct MkvMuxer {
     /// index is resolved to the source track's `TrackUID` at write time.
     /// The slice is sized to `streams.len()`.
     track_operations: Vec<Option<MkvTrackOperation>>,
+    /// Per-stream `ContentEncodings` hint queued via
+    /// [`MkvMuxer::set_track_content_encodings`] (RFC 9559 §5.1.4.1.31).
+    /// Materialised as a `ContentEncodings` master directly inside the
+    /// carrying `TrackEntry` at `write_header` time. `None` (the default)
+    /// means the muxer omits the element for that stream, so the demuxer
+    /// surfaces `None` from `content_encodings`. The slice is sized to
+    /// `streams.len()`.
+    content_encodings: Vec<Option<ContentEncodings>>,
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -1344,6 +1352,7 @@ impl MkvMuxer {
             track_timing: vec![None; n],
             last_block_pts_ms: vec![None; n],
             track_operations: vec![None; n],
+            content_encodings: vec![None; n],
         })
     }
 
@@ -1678,6 +1687,154 @@ impl MkvMuxer {
     /// `track_operation`). Mostly useful for tests.
     pub fn track_operation(&self, stream_index: usize) -> Option<&MkvTrackOperation> {
         self.track_operations.get(stream_index)?.as_ref()
+    }
+
+    /// Set the per-track `ContentEncodings` (RFC 9559 §5.1.4.1.31) chain —
+    /// the ordered list of compression and/or encryption transformations
+    /// that were applied to the track's frame data and/or `CodecPrivate`
+    /// before the bytes were written into Blocks. Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise (the
+    /// `ContentEncodings` master lives in the `TrackEntry` inside `Tracks`,
+    /// which is written exactly once at header time).
+    ///
+    /// This is the symmetric inverse of the demux-side
+    /// [`MkvDemuxer::content_encodings`](crate::demux::MkvDemuxer::content_encodings)
+    /// accessor: the muxer takes the same
+    /// [`ContentEncodings`](crate::demux::ContentEncodings) record the
+    /// demuxer produces and serialises it back element-for-element, so a
+    /// mux→demux pipeline round-trips the whole chain.
+    ///
+    /// The container is purely a *carrier* here — it does **not** compress
+    /// or encrypt the frame data. The caller is responsible for having
+    /// already transformed the bytes it hands to [`Muxer::write_packet`] to
+    /// match the declared chain (e.g. stripping the `ContentCompSettings`
+    /// prefix for Header Stripping, or encrypting for an `Encryption`
+    /// step). Declaring an encoding the bytes don't actually carry produces
+    /// a file no reader can decode.
+    ///
+    /// Spec rules enforced at queue time (all checked before any byte is
+    /// written, so a rejected call leaves the muxer state untouched):
+    ///
+    /// * `stream_index` must point at an existing stream
+    ///   ([`Error::invalid`] otherwise).
+    /// * At least one [`ContentEncoding`](crate::demux::ContentEncoding)
+    ///   must be present — `ContentEncoding` is `minOccurs: 1` inside the
+    ///   `ContentEncodings` master (§5.1.4.1.31.1), so an empty chain would
+    ///   serialise to a malformed master. An empty chain is rejected; pass
+    ///   no hint at all to leave the element off-disk.
+    /// * Each `ContentEncodingOrder` (§5.1.4.1.31.2) "MUST be unique for
+    ///   each ContentEncoding"; a duplicate order is rejected.
+    /// * Each `ContentEncodingScope` (§5.1.4.1.31.3) is `range: not 0`; a
+    ///   scope of `0` is rejected.
+    /// * For an [`Encryption`](crate::demux::ContentEncodingTransform::Encryption)
+    ///   step, `AESSettingsCipherMode` (§5.1.4.1.31.12) is `range: not 0`,
+    ///   and `ContentEncAESSettings` "MUST NOT be set if ContentEncAlgo is
+    ///   not AES" (Table 25 / Table 27). So a `Some(cipher_mode)` is
+    ///   rejected on any non-AES algorithm, and an `aes_cipher_mode` of
+    ///   `Some(AesCipherMode::Other(0))` is rejected.
+    ///
+    /// Write-time element ordering matches the demux-side parser's
+    /// expectations and the spec paths: the muxer sorts the chain by
+    /// **ascending** `ContentEncodingOrder` on disk (lowest first) — the
+    /// demuxer re-sorts it into descending decode order on read, so either
+    /// on-disk order parses identically; ascending is the conventional
+    /// write order. Each `ContentEncoding` carries `ContentEncodingOrder`,
+    /// `ContentEncodingScope`, `ContentEncodingType` (derived from the
+    /// transform kind), then the matching `ContentCompression` /
+    /// `ContentEncryption` sub-master.
+    ///
+    /// Per-element omission inside each `ContentEncoding` mirrors the
+    /// demux-side defaults so a round-trip is byte-exact for the common
+    /// shapes:
+    ///
+    /// * `ContentEncodingType` is written explicitly (the demux parser
+    ///   keys the transform off it).
+    /// * `ContentCompSettings` (§5.1.4.1.31.7) is written only when
+    ///   non-empty.
+    /// * `ContentEncKeyID` (§5.1.4.1.31.10) is written only when non-empty.
+    /// * `ContentEncAESSettings` (§5.1.4.1.31.11) — and the
+    ///   `AESSettingsCipherMode` inside it — is written only when
+    ///   `aes_cipher_mode` is `Some` (which the validation above pins to
+    ///   AES-only).
+    ///
+    /// The muxer pins `DocTypeVersion` to `4`, so emitting the `minver: 4`
+    /// `ContentEncAESSettings` / `AESSettingsCipherMode` elements never
+    /// violates the declared document version.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued chain. Returns a mutable reference back so calls
+    /// can chain builder-style.
+    pub fn set_track_content_encodings(
+        &mut self,
+        stream_index: usize,
+        encodings: ContentEncodings,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_content_encodings called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_content_encodings stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if encodings.encodings.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: set_track_content_encodings given an empty ContentEncodings \
+                 (ContentEncoding is minOccurs: 1 inside the master, RFC 9559 §5.1.4.1.31.1)",
+            ));
+        }
+        let mut seen_orders: Vec<u64> = Vec::with_capacity(encodings.encodings.len());
+        for e in &encodings.encodings {
+            if seen_orders.contains(&e.order) {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: set_track_content_encodings duplicate ContentEncodingOrder {} \
+                     (RFC 9559 §5.1.4.1.31.2 requires it be unique within the chain)",
+                    e.order
+                )));
+            }
+            seen_orders.push(e.order);
+            if e.scope.0 == 0 {
+                return Err(Error::invalid(
+                    "MKV muxer: set_track_content_encodings ContentEncodingScope 0 out of range \
+                     (RFC 9559 §5.1.4.1.31.3 pins it at 'not 0')"
+                        .to_string(),
+                ));
+            }
+            if let ContentEncodingTransform::Encryption {
+                algo,
+                aes_cipher_mode: Some(mode),
+                ..
+            } = &e.transform
+            {
+                if *algo != crate::demux::ContentEncAlgo::Aes {
+                    return Err(Error::invalid(
+                        "MKV muxer: set_track_content_encodings ContentEncAESSettings set on a \
+                         non-AES ContentEncAlgo (RFC 9559 Table 25 forbids it)"
+                            .to_string(),
+                    ));
+                }
+                if mode.to_raw() == 0 {
+                    return Err(Error::invalid(
+                        "MKV muxer: set_track_content_encodings AESSettingsCipherMode 0 out of \
+                         range (RFC 9559 §5.1.4.1.31.12 pins it at 'not 0')"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        self.content_encodings[stream_index] = Some(encodings);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `ContentEncodings` hint
+    /// installed via [`MkvMuxer::set_track_content_encodings`]. Returns
+    /// `None` for any stream that didn't have the API called. Mostly useful
+    /// for tests.
+    pub fn content_encodings(&self, stream_index: usize) -> Option<&ContentEncodings> {
+        self.content_encodings.get(stream_index)?.as_ref()
     }
 
     /// Set the per-track `Video > PixelCrop{Top,Bottom,Left,Right}` +
@@ -3031,6 +3188,79 @@ impl Muxer for MkvMuxer {
                     write_master_element(&mut op_body, ids::TRACK_JOIN_BLOCKS, &join_body);
                 }
                 write_master_element(&mut t, ids::TRACK_OPERATION, &op_body);
+            }
+            // ContentEncodings (RFC 9559 §5.1.4.1.31) — a TrackEntry-level
+            // master describing the compression / encryption chain queued
+            // via `set_track_content_encodings`. Emitted only when the
+            // caller opted in; an omitted hint keeps the master off-disk so
+            // the demuxer surfaces `None` from `content_encodings`. The
+            // setter has already validated order uniqueness, non-zero
+            // scope, and the AES-only / non-zero cipher-mode rules.
+            if let Some(enc) = &self.content_encodings[i] {
+                let mut encs_body = Vec::new();
+                // Write each ContentEncoding sorted by ascending
+                // ContentEncodingOrder (lowest first). The demuxer re-sorts
+                // into descending decode order on read, so on-disk order is
+                // not load-bearing; ascending is the conventional write
+                // order (§5.1.4.1.31.2 "highest first" is a *decode* rule).
+                let mut chain: Vec<&crate::demux::ContentEncoding> = enc.encodings.iter().collect();
+                chain.sort_by_key(|e| e.order);
+                for e in chain {
+                    let mut ce = Vec::new();
+                    write_uint_element(&mut ce, ids::CONTENT_ENCODING_ORDER, e.order);
+                    write_uint_element(&mut ce, ids::CONTENT_ENCODING_SCOPE, e.scope.0);
+                    match &e.transform {
+                        ContentEncodingTransform::Compression { algo, settings } => {
+                            write_uint_element(
+                                &mut ce,
+                                ids::CONTENT_ENCODING_TYPE,
+                                ids::CONTENT_ENCODING_TYPE_COMPRESSION,
+                            );
+                            let mut comp = Vec::new();
+                            write_uint_element(&mut comp, ids::CONTENT_COMP_ALGO, algo.to_raw());
+                            if !settings.is_empty() {
+                                write_bytes_element(
+                                    &mut comp,
+                                    ids::CONTENT_COMP_SETTINGS,
+                                    settings,
+                                );
+                            }
+                            write_master_element(&mut ce, ids::CONTENT_COMPRESSION, &comp);
+                        }
+                        ContentEncodingTransform::Encryption {
+                            algo,
+                            key_id,
+                            aes_cipher_mode,
+                        } => {
+                            write_uint_element(
+                                &mut ce,
+                                ids::CONTENT_ENCODING_TYPE,
+                                ids::CONTENT_ENCODING_TYPE_ENCRYPTION,
+                            );
+                            let mut crypt = Vec::new();
+                            write_uint_element(&mut crypt, ids::CONTENT_ENC_ALGO, algo.to_raw());
+                            if !key_id.is_empty() {
+                                write_bytes_element(&mut crypt, ids::CONTENT_ENC_KEY_ID, key_id);
+                            }
+                            if let Some(mode) = aes_cipher_mode {
+                                let mut aes = Vec::new();
+                                write_uint_element(
+                                    &mut aes,
+                                    ids::AES_SETTINGS_CIPHER_MODE,
+                                    mode.to_raw(),
+                                );
+                                write_master_element(
+                                    &mut crypt,
+                                    ids::CONTENT_ENC_AES_SETTINGS,
+                                    &aes,
+                                );
+                            }
+                            write_master_element(&mut ce, ids::CONTENT_ENCRYPTION, &crypt);
+                        }
+                    }
+                    write_master_element(&mut encs_body, ids::CONTENT_ENCODING, &ce);
+                }
+                write_master_element(&mut t, ids::CONTENT_ENCODINGS, &encs_body);
             }
             write_master_element(&mut tracks_body, ids::TRACK_ENTRY, &t);
         }

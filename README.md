@@ -954,6 +954,38 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `track_operation`. Pairs symmetrically with the existing
   `MkvDemuxer::track_operation` typed accessor — a mux→demux pipeline
   preserves every plane (with its type) and every join reference.
+- **`ContentEncodings` on write** (RFC 9559 §5.1.4.1.31):
+  `MkvMuxer::set_track_content_encodings(stream_index, ContentEncodings)`
+  queues a per-track transformation chain that lands as a
+  `ContentEncodings` master (id `0x6D80`) directly inside the carrying
+  `TrackEntry` at `write_header` time. The setter takes the **same**
+  demux-side `ContentEncodings` record `MkvDemuxer::content_encodings`
+  produces, so a mux→demux pipeline round-trips the whole chain
+  element-for-element. Each `ContentEncoding` writes `ContentEncodingOrder`
+  (§5.1.4.1.31.2), `ContentEncodingScope` (§5.1.4.1.31.3), and the
+  `ContentEncodingType`-keyed sub-master: `ContentCompression`
+  (§5.1.4.1.31.5 — `ContentCompAlgo` + `ContentCompSettings`, the latter
+  written only when non-empty) or `ContentEncryption` (§5.1.4.1.31.8 —
+  `ContentEncAlgo`, `ContentEncKeyID` when non-empty, and the nested
+  `ContentEncAESSettings > AESSettingsCipherMode` written only on AES).
+  The demux-side `ContentCompAlgo` / `ContentEncAlgo` / `AesCipherMode`
+  enums gained `to_raw()` inverses so every Table 23 / 24 / 26 value
+  round-trips, including each `Other(u64)` forward-compat variant (§27.2 /
+  §27.3 / §27.4 leave the registries open). The container is a pure
+  carrier — it does **not** compress or encrypt the frame bytes; the
+  caller hands `write_packet` payloads already matching the declared
+  chain. Spec rules enforced at queue time (before any byte is written):
+  rejects post-`write_header` use, out-of-range `stream_index`, an empty
+  chain (`ContentEncoding` is `minOccurs: 1`), a duplicate
+  `ContentEncodingOrder` (§5.1.4.1.31.2 "MUST be unique"), a zero
+  `ContentEncodingScope` (§5.1.4.1.31.3 "not 0"), an
+  `AESSettingsCipherMode` paired with a non-AES `ContentEncAlgo` (Table 25
+  forbids it), and a zero `AESSettingsCipherMode` (§5.1.4.1.31.12 "not 0").
+  Chain steps are written ascending by order on disk; the demuxer re-sorts
+  into descending decode order on read, so either layout parses
+  identically. Omitting the call keeps the master off-disk so the demuxer
+  surfaces `None` from `content_encodings`. Pairs symmetrically with the
+  existing `MkvDemuxer::content_encodings` typed accessor.
 
 ### Codec ID mapping (`codec_id` module)
 
@@ -1014,8 +1046,11 @@ so the demuxer never hides an unrecognised track.
   generic compression algorithms (zlib / bzlib / lzo1x) and encryption are
   not reversed: for those a caller that wants raw codec bytes must apply the
   reported encoding chain itself. zlib/bzlib/lzo1x decompression and
-  decryption are out of container scope; `ContentEncodings` is never written
-  on the mux side.
+  decryption are out of container scope. The mux side now *writes* the
+  `ContentEncodings` master (`MkvMuxer::set_track_content_encodings`, see
+  the Muxer section) — it carries the declared chain but does not itself
+  compress or encrypt the frame bytes; the caller supplies already-encoded
+  payloads.
 - `Video` sub-element coverage is now complete on the demux side:
   `PixelWidth` / `PixelHeight` (§5.1.4.1.28.6 / §5.1.4.1.28.7) feed the
   `StreamInfo` dimensions; `FlagInterlaced` / `FieldOrder`

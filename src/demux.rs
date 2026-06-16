@@ -3929,6 +3929,21 @@ impl ContentCompAlgo {
             other => ContentCompAlgo::Other(other),
         }
     }
+
+    /// Inverse of [`ContentCompAlgo::from_raw`]: the raw `ContentCompAlgo`
+    /// integer (RFC 9559 §5.1.4.1.31.6, Table 23) for this variant. Lets the
+    /// muxer round-trip every named algorithm plus the `Other(u64)`
+    /// forward-compat passthrough (the §27.2 "Matroska Compression
+    /// Algorithms" registry stays open).
+    pub fn to_raw(self) -> u64 {
+        match self {
+            ContentCompAlgo::Zlib => ids::CONTENT_COMP_ALGO_ZLIB,
+            ContentCompAlgo::Bzlib => ids::CONTENT_COMP_ALGO_BZLIB,
+            ContentCompAlgo::Lzo1x => ids::CONTENT_COMP_ALGO_LZO1X,
+            ContentCompAlgo::HeaderStripping => ids::CONTENT_COMP_ALGO_HEADER_STRIPPING,
+            ContentCompAlgo::Other(v) => v,
+        }
+    }
 }
 
 /// `ContentEncAlgo` (RFC 9559 §5.1.4.1.31.9, Table 24).
@@ -3964,6 +3979,23 @@ impl ContentEncAlgo {
             other => ContentEncAlgo::Other(other),
         }
     }
+
+    /// Inverse of [`ContentEncAlgo::from_raw`]: the raw `ContentEncAlgo`
+    /// integer (RFC 9559 §5.1.4.1.31.9, Table 24) for this variant. Lets the
+    /// muxer round-trip every named algorithm plus the `Other(u64)`
+    /// forward-compat passthrough (the §27.3 "Matroska Encryption
+    /// Algorithms" registry stays open).
+    pub fn to_raw(self) -> u64 {
+        match self {
+            ContentEncAlgo::None => ids::CONTENT_ENC_ALGO_NONE,
+            ContentEncAlgo::Des => ids::CONTENT_ENC_ALGO_DES,
+            ContentEncAlgo::TripleDes => ids::CONTENT_ENC_ALGO_3DES,
+            ContentEncAlgo::Twofish => ids::CONTENT_ENC_ALGO_TWOFISH,
+            ContentEncAlgo::Blowfish => ids::CONTENT_ENC_ALGO_BLOWFISH,
+            ContentEncAlgo::Aes => ids::CONTENT_ENC_ALGO_AES,
+            ContentEncAlgo::Other(v) => v,
+        }
+    }
 }
 
 /// `AESSettingsCipherMode` (RFC 9559 §5.1.4.1.31.12, Table 26).
@@ -3985,6 +4017,19 @@ impl AesCipherMode {
             ids::AES_CIPHER_MODE_CTR => AesCipherMode::Ctr,
             ids::AES_CIPHER_MODE_CBC => AesCipherMode::Cbc,
             other => AesCipherMode::Other(other),
+        }
+    }
+
+    /// Inverse of [`AesCipherMode::from_raw`]: the raw
+    /// `AESSettingsCipherMode` integer (RFC 9559 §5.1.4.1.31.12, Table 26)
+    /// for this variant. Lets the muxer round-trip both named modes plus the
+    /// `Other(u64)` forward-compat passthrough (the §27.4 "Matroska AES
+    /// Cipher Modes" registry stays open).
+    pub fn to_raw(self) -> u64 {
+        match self {
+            AesCipherMode::Ctr => ids::AES_CIPHER_MODE_CTR,
+            AesCipherMode::Cbc => ids::AES_CIPHER_MODE_CBC,
+            AesCipherMode::Other(v) => v,
         }
     }
 }

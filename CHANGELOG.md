@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: `ContentEncodings` (RFC 9559 §5.1.4.1.31) write path via
+  `MkvMuxer::set_track_content_encodings(stream_index, ContentEncodings)`.
+  Serialises the per-track compression / encryption chain
+  (`ContentEncoding` → `ContentEncodingOrder` / `ContentEncodingScope` /
+  `ContentEncodingType` + `ContentCompression` / `ContentEncryption`
+  sub-masters) as a `ContentEncodings` master inside the `TrackEntry`,
+  taking the same `demux::ContentEncodings` record the demuxer produces
+  for a byte-exact round-trip. Adds `to_raw()` inverses on the
+  `demux::ContentCompAlgo` / `ContentEncAlgo` / `AesCipherMode` enums
+  (Table 23 / 24 / 26, including each `Other(u64)` forward-compat value).
+  Queue-time validation enforces order uniqueness (§5.1.4.1.31.2), non-zero
+  scope (§5.1.4.1.31.3), the AES-only / non-zero `AESSettingsCipherMode`
+  rules (Table 25 / §5.1.4.1.31.12), a non-empty chain, in-range stream
+  index, and pre-`write_header` use. The container carries the declared
+  chain but does not compress or encrypt the frame bytes. Pairs
+  symmetrically with `MkvDemuxer::content_encodings`.
 - Demuxer: Linked-Segment `Info` metadata (RFC 9559 §5.1.2.1..§5.1.2.8 +
   Section 17), exposed via `MkvDemuxer::segment_linking()` returning a typed
   `demux::SegmentLinking`. Parses `SegmentUUID`, `SegmentFilename`,
