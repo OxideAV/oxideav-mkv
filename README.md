@@ -229,6 +229,30 @@ the unified `oxideav` aggregator to wire decoding automatically.
   by seeing `Some(0)` `Position` values. The slice grows incrementally
   as the demuxer walks the Segment — callers wanting the full
   per-Cluster set should drain the file via `next_packet` first.
+- **Typed `SeekHead` accessor** (RFC 9559 §5.1.1, including
+  §5.1.1.1..§5.1.1.1.2): `MkvDemuxer::seek_entries() -> &[SeekEntry]`
+  surfaces the MetaSeek index — the `SeekHead > Seek` rows that point each
+  Top-Level Element to its Segment Position — in document order. The
+  demuxer doesn't *navigate* by the SeekHead (it walks Segment children
+  directly and seeks via `Cues`), so this is a pure inspection / re-mux
+  surface: the one Top-Level master that was CRC-validated but never read
+  back. Each `SeekEntry` pairs a `SeekID` (§5.1.1.1.1, the 4-byte binary
+  EBML ID of the referenced element) with a `SeekPosition` (§5.1.1.1.2, a
+  Segment Position per Section 16 — relative to the first Segment-data
+  byte, *not* an absolute file offset). `seek_id() -> Option<u32>` decodes
+  the big-endian EBML id for the common case (compare against `ids::CUES`
+  / `ids::TRACKS` / …); `seek_id_bytes()` keeps the raw bytes verbatim so
+  a `SeekID` referencing an element this build doesn't recognise still
+  round-trips through a re-mux. A malformed `Seek` missing its mandatory
+  `SeekPosition` (`minOccurs: 1`) is surfaced for inspection with
+  `seek_position() == 0` and `has_position() == false` rather than dropped.
+  Files using the §6.3 two-`SeekHead` layout (`maxOccurs: 2`, the first
+  referencing the second) accumulate both SeekHeads' entries onto the one
+  slice in document order. The in-tree muxer's emitted `SeekHead` (Info /
+  Tracks / Cues) reads back through this accessor with every
+  `SeekPosition + segment_data_start` landing on the matching on-disk
+  element header. Returns an empty slice when the file carries no
+  `SeekHead` (legal — §6.3 only RECOMMENDS it).
 - **Typed `Attachments` accessor** (RFC 9559 §5.1.6):
   `MkvDemuxer::attachments() -> &[Attachment]` returns one
   [`Attachment`] per `AttachedFile` parsed from the Segment, in document

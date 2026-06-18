@@ -110,6 +110,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // bytes on demand via `MkvDemuxer::attachment_data` without paying for
     // them at open time.
     let mut attachments: Vec<Attachment> = Vec::new();
+    // Typed `SeekHead\Seek` index (RFC 9559 §5.1.1), surfaced via
+    // `MkvDemuxer::seek_entries`. The demuxer doesn't navigate by the
+    // SeekHead (it walks Segment children directly and seeks via Cues),
+    // but a caller can inspect or re-mux the MetaSeek index. `maxOccurs:
+    // 2` SeekHeads accumulate their entries onto this one list in
+    // document order.
+    let mut seek_entries: Vec<SeekEntry> = Vec::new();
     // Per-element CRC-32 validation results (RFC 8794 §11.3.1, RFC 9559
     // §6.2). Populated as each Top-Level master with a leading CRC-32
     // child is walked; surfaced via `MkvDemuxer::crc_status`.
@@ -180,6 +187,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
                     &mut attachment_uid_to_index,
                     &mut attachments,
                 )?;
+            }
+            ids::SEEK_HEAD => {
+                let end = body_end_known.unwrap_or(segment_data_end);
+                parse_seek_head(&mut *input, end, &mut seek_entries)?;
             }
             ids::CLUSTER => {
                 if first_cluster_offset.is_none() {
@@ -717,6 +728,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         tags: typed_tags,
         editions,
         attachments,
+        seek_entries,
         crc_status,
         validated_cluster_starts: std::collections::HashSet::new(),
         track_operations,
@@ -825,6 +837,95 @@ pub struct ClusterRecord {
     /// Cluster of a Segment (no previous Cluster to size), and on
     /// writers that don't bother emitting it.
     pub prev_size: Option<u64>,
+}
+
+/// One `SeekHead > Seek` entry (RFC 9559 §5.1.1.1) — the MetaSeek index
+/// row that points a single Top-Level Element to its Segment Position.
+///
+/// The `SeekHead` element (RFC 9559 §5.1.1, also known as MetaSeek) is an
+/// index of Top-Level Element locations within the Segment. A reader can
+/// walk it to jump straight to `Cues` / `Tracks` / `Tags` / `Chapters` /
+/// `Attachments` / a second `SeekHead` without scanning the whole file
+/// (RFC 9559 §4.5, §6.3). The in-tree demuxer does not *need* the
+/// `SeekHead` to navigate — it walks the Segment children directly and
+/// uses the `Cues` index for time seeks — so this is a pure inspection /
+/// re-mux surface, surfaced through [`MkvDemuxer::seek_entries`].
+///
+/// Each `Seek` carries exactly one [`SeekID`] (§5.1.1.1.1, a 4-byte binary
+/// EBML ID of a Top-Level Element) and exactly one [`SeekPosition`]
+/// (§5.1.1.1.2, the Segment Position — Section 16 — of that element). The
+/// raw `SeekID` bytes are surfaced verbatim via [`seek_id_bytes`] because
+/// a writer MAY reference an element this build doesn't recognise; the
+/// decoded [`seek_id`] convenience reads the same bytes as a big-endian
+/// `u32` EBML ID for the common case of a known element.
+///
+/// [`SeekID`]: SeekEntry::seek_id_bytes
+/// [`SeekPosition`]: SeekEntry::seek_position
+/// [`seek_id_bytes`]: SeekEntry::seek_id_bytes
+/// [`seek_id`]: SeekEntry::seek_id
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeekEntry {
+    /// Raw `SeekID` bytes (RFC 9559 §5.1.1.1.1, id `0x53AB`) — the binary
+    /// EBML ID of the referenced Top-Level Element, normally 4 bytes but
+    /// surfaced verbatim (a writer MAY emit a shorter / longer encoding, or
+    /// reference an element this build doesn't recognise).
+    seek_id_bytes: Vec<u8>,
+    /// `SeekPosition` value (RFC 9559 §5.1.1.1.2, id `0x53AC`) — the
+    /// Segment Position (Section 16: byte offset relative to the start of
+    /// the first Segment Data byte) of the referenced element. Add the
+    /// Segment's data-start offset to convert to an absolute file offset.
+    seek_position: u64,
+    /// 1 if the file carried an explicit `SeekPosition` child, 0 otherwise.
+    /// `SeekPosition` is `minOccurs: 1`, so a missing one is malformed; we
+    /// surface the entry anyway (with `seek_position == 0`) for inspection
+    /// rather than dropping it.
+    has_position: bool,
+}
+
+impl SeekEntry {
+    /// Raw `SeekID` bytes (RFC 9559 §5.1.1.1.1) — the binary EBML ID of the
+    /// referenced Top-Level Element, surfaced verbatim. Normally 4 bytes.
+    pub fn seek_id_bytes(&self) -> &[u8] {
+        &self.seek_id_bytes
+    }
+
+    /// The `SeekID` decoded as a big-endian EBML element ID (RFC 9559
+    /// §5.1.1.1.1). Returns `None` when the on-disk `SeekID` payload isn't
+    /// 1..=4 bytes (so the entry can't be a standard 32-bit-class EBML ID)
+    /// — the raw bytes stay available via [`seek_id_bytes`]. Compare against
+    /// [`crate::ids`] constants (e.g. `ids::CUES`, `ids::TRACKS`) to route a
+    /// recognised reference.
+    ///
+    /// [`seek_id_bytes`]: SeekEntry::seek_id_bytes
+    pub fn seek_id(&self) -> Option<u32> {
+        let b = &self.seek_id_bytes;
+        if b.is_empty() || b.len() > 4 {
+            return None;
+        }
+        let mut v = 0u32;
+        for &byte in b {
+            v = (v << 8) | byte as u32;
+        }
+        Some(v)
+    }
+
+    /// `SeekPosition` (RFC 9559 §5.1.1.1.2) — the Segment Position
+    /// (Section 16) of the referenced element: a byte offset relative to
+    /// the first byte of Segment Data, *not* an absolute file offset. Add
+    /// the Segment's data-start to get an absolute offset. A malformed
+    /// entry that omitted the mandatory child surfaces `0` here; use
+    /// [`has_position`] to distinguish.
+    ///
+    /// [`has_position`]: SeekEntry::has_position
+    pub fn seek_position(&self) -> u64 {
+        self.seek_position
+    }
+
+    /// Whether the entry carried an explicit `SeekPosition` child. `false`
+    /// only for a malformed `Seek` missing the `minOccurs: 1` element.
+    pub fn has_position(&self) -> bool {
+        self.has_position
+    }
 }
 
 /// Linked-Segment metadata from a Segment's `Info` element (RFC 9559
@@ -1388,6 +1489,47 @@ fn parse_track_translate(r: &mut dyn ReadSeek, end: u64) -> Result<TrackTranslat
             ids::TRACK_TRANSLATE_CODEC => out.codec = read_uint(r, e.size as usize)?,
             ids::TRACK_TRANSLATE_EDITION_UID => {
                 out.edition_uids.push(read_uint(r, e.size as usize)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(out)
+}
+
+/// Parse a `SeekHead` master (RFC 9559 §5.1.1), appending each `Seek`
+/// child's [`SeekEntry`] to `out`. `maxOccurs: 2` SeekHeads are legal
+/// (the first references the second, §6.3), so entries from a second
+/// SeekHead simply accumulate onto the same list in document order.
+/// Tolerant of unknown children (forward-compat) and of a malformed
+/// `Seek` missing one of its mandatory children — such an entry is
+/// surfaced (with empty `SeekID` bytes and/or `seek_position == 0`)
+/// rather than dropped, so a caller inspecting a damaged file still sees
+/// what the writer emitted.
+fn parse_seek_head(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<SeekEntry>) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::SEEK => {
+                let seek_end = r.stream_position()?.saturating_add(e.size);
+                out.push(parse_seek(r, seek_end)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse a single `SeekHead > Seek` master (RFC 9559 §5.1.1.1) into a
+/// [`SeekEntry`].
+fn parse_seek(r: &mut dyn ReadSeek, end: u64) -> Result<SeekEntry> {
+    let mut out = SeekEntry::default();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::SEEK_ID => out.seek_id_bytes = read_bytes(r, e.size as usize)?,
+            ids::SEEK_POSITION => {
+                out.seek_position = read_uint(r, e.size as usize)?;
+                out.has_position = true;
             }
             _ => skip(r, e.size)?,
         }
@@ -5882,6 +6024,11 @@ pub struct MkvDemuxer {
     /// of its `FileData` payload so [`MkvDemuxer::attachment_data`] can
     /// pull it on demand without paying for it at open time.
     attachments: Vec<Attachment>,
+    /// Typed `SeekHead\Seek` index (RFC 9559 §5.1.1) in document order —
+    /// see [`MkvDemuxer::seek_entries`]. Empty when the file carries no
+    /// `SeekHead` element. Accumulates entries from both SeekHeads when a
+    /// file uses the `maxOccurs: 2` two-SeekHead layout (§6.3).
+    seek_entries: Vec<SeekEntry>,
     /// Per-Top-Level-element `CRC-32` validation results (RFC 8794
     /// §11.3.1) — see [`MkvDemuxer::crc_status`]. Holds both the up-front
     /// statuses captured for `Info` / `Tracks` / `Tags` / `Cues` /
@@ -6291,6 +6438,34 @@ impl MkvDemuxer {
     /// empty slice when the file has no `Cues` element.
     pub fn cue_points(&self) -> &[CuePoint] {
         &self.cue_points
+    }
+
+    /// The typed `SeekHead > Seek` index (RFC 9559 §5.1.1), in document
+    /// order.
+    ///
+    /// The `SeekHead` (a.k.a. MetaSeek, RFC 9559 §4.5 / §6.3) is an index
+    /// of where each Top-Level Element lives in the Segment, letting a
+    /// reader jump straight to `Cues` / `Tracks` / `Tags` / `Chapters` /
+    /// `Attachments` / a second `SeekHead` without scanning the file. This
+    /// demuxer does **not** rely on the `SeekHead` to navigate — it walks
+    /// the Segment children directly and uses the `Cues` element for time
+    /// seeks — so this accessor is a pure inspection / re-mux surface.
+    /// Callers can:
+    ///
+    /// * resolve each [`SeekEntry::seek_id`] against the [`crate::ids`]
+    ///   constants to discover which Top-Level Elements the writer indexed;
+    /// * add [`SeekEntry::seek_position`] (a Segment Position, Section 16)
+    ///   to the Segment data-start to get an absolute file offset;
+    /// * re-mux the `SeekHead` entry-for-entry, preserving even references
+    ///   to elements this build doesn't recognise (the raw `SeekID` bytes
+    ///   survive via [`SeekEntry::seek_id_bytes`]).
+    ///
+    /// When a file uses the §6.3 two-`SeekHead` layout (`maxOccurs: 2`),
+    /// the entries from both SeekHeads accumulate here in document order.
+    /// Returns an empty slice when the file carries no `SeekHead` element
+    /// (legal — its use is only RECOMMENDED, §6.3).
+    pub fn seek_entries(&self) -> &[SeekEntry] {
+        &self.seek_entries
     }
 
     /// Register a Cluster at `body_start` on the typed-record list if

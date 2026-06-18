@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: typed `SeekHead` accessor (RFC 9559 §5.1.1, including
+  §5.1.1.1..§5.1.1.1.2). `MkvDemuxer::seek_entries() -> &[demux::SeekEntry]`
+  surfaces the MetaSeek index — the `SeekHead > Seek` rows that point each
+  Top-Level Element to its Segment Position — in document order. Each
+  `SeekEntry` pairs a `SeekID` (§5.1.1.1.1, the 4-byte binary EBML ID of the
+  referenced element, decoded via `seek_id() -> Option<u32>` and preserved
+  verbatim via `seek_id_bytes()`) with a `SeekPosition` (§5.1.1.1.2, a Segment
+  Position per Section 16, via `seek_position()` + `has_position()`). The
+  demuxer doesn't navigate by the SeekHead — it walks Segment children directly
+  and seeks via `Cues` — so this is a pure inspection / re-mux surface, the one
+  Top-Level master that was CRC-validated but never read back. A malformed
+  `Seek` missing its mandatory `SeekPosition` is surfaced for inspection
+  (`seek_position() == 0`, `has_position() == false`) rather than dropped;
+  a `SeekID` referencing an unrecognised element round-trips verbatim; the §6.3
+  two-`SeekHead` layout (`maxOccurs: 2`) accumulates both SeekHeads' entries
+  onto one slice. The in-tree muxer's emitted SeekHead (Info / Tracks / Cues)
+  reads back through this accessor with every `SeekPosition + segment_data_start`
+  landing on the matching on-disk element header. Returns an empty slice when
+  the file carries no `SeekHead`.
+
 - Demuxer + Muxer: `TrackTranslate` (RFC 9559 §5.1.4.1.27, id `0x6624`) — the
   per-`TrackEntry` chapter-codec track-mapping master, the `TrackEntry`-level
   twin of `Info > ChapterTranslate`. The demuxer surfaces each mapping through
