@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: `TrackTranslate` (RFC 9559 §5.1.4.1.27, id `0x6624`) — the
+  per-`TrackEntry` chapter-codec track-mapping master, the `TrackEntry`-level
+  twin of `Info > ChapterTranslate`. The demuxer surfaces each mapping through
+  `MkvDemuxer::track_translates(stream_index) -> &[demux::TrackTranslate]` (and
+  the per-stream `all_track_translates()` slice) — `track_id`
+  (`TrackTranslateTrackID`, binary, verbatim), `codec` (`TrackTranslateCodec`),
+  and the unbounded `edition_uids` (`TrackTranslateEditionUID`) list, in on-disk
+  order, empty for tracks with no mapping. The muxer writes the masters via
+  `MkvMuxer::set_track_translates(stream_index, Vec<mux::MkvTrackTranslate>)`
+  (convenience constructor `MkvTrackTranslate::new(track_id, codec)`), enforcing
+  the spec rules at queue time (mandatory non-empty `track_id`, "not 0" edition
+  UIDs, pre-`write_header` only, in-range stream). A mux→demux pipeline
+  round-trips every mapping field-for-field.
+
 - Demuxer + Muxer: the reclaimed content-signing quartet inside
   `ContentEncryption` (RFC 9559 Appendix A.33..A.36 — `ContentSignature`
   `0x47E3`, `ContentSigKeyID` `0x47E4`, `ContentSigAlgo` `0x47E5`,

@@ -124,6 +124,24 @@ pub const SEEK_PRE_ROLL: u32 = 0x56BB;
 pub const VIDEO: u32 = 0xE0;
 pub const AUDIO: u32 = 0xE1;
 
+// TrackTranslate (RFC 9559 §5.1.4.1.27): a per-TrackEntry master that maps
+// this track to a track value addressed by a Chapter Codec. A Chapter Codec
+// (e.g. DVD menu, Matroska Script) may need to reference a specific track but
+// does not know how Matroska identifies tracks; this mapping lets a file be
+// remuxed (acquiring new TrackNumbers/TrackUIDs) without rewriting the opaque
+// chapter-codec command data — only the mapping changes. The element is
+// unbounded (a TrackEntry can carry several). `TrackTranslateTrackID`
+// (§5.1.4.1.27.1, binary, minOccurs 1) is the value the chapter codec uses to
+// name this track; its format depends on the ChapProcessCodecID (Table 31,
+// §5.1.7.1.4.15). `TrackTranslateCodec` (§5.1.4.1.27.2, uinteger, minOccurs 1)
+// names that chapter codec. `TrackTranslateEditionUID` (§5.1.4.1.27.3,
+// uinteger, unbounded) lists the chapter editions the mapping applies to — an
+// empty list means "all editions using the given codec."
+pub const TRACK_TRANSLATE: u32 = 0x6624;
+pub const TRACK_TRANSLATE_TRACK_ID: u32 = 0x66A5;
+pub const TRACK_TRANSLATE_CODEC: u32 = 0x66BF;
+pub const TRACK_TRANSLATE_EDITION_UID: u32 = 0x66FC;
+
 // TrackOperation (RFC 9559 §5.1.4.1.30): describes a virtual track built
 // by combining other tracks — either combining video planes into one 3D
 // track (TrackCombinePlanes) or joining several tracks' Blocks into one

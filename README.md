@@ -186,6 +186,27 @@ the unified `oxideav` aggregator to wire decoding automatically.
   track that emitted an explicit `0` for either element is *not* empty. The
   mux side already writes both on the Opus path (`CodecDelay` = `OpusHead`
   pre-skip in ns, `SeekPreRoll` = 80 ms).
+- **Typed `TrackTranslate` accessor** (RFC 9559 §5.1.4.1.27):
+  `MkvDemuxer::track_translates(stream_index) -> &[TrackTranslate]` (and the
+  per-stream `all_track_translates()` slice) returns each
+  `Tracks > TrackEntry > TrackTranslate` master the file carries, in on-disk
+  order. `TrackTranslate` maps a track to the value a Chapter Codec (DVD-menu,
+  Matroska Script) uses to name it, so a file can be remuxed (acquiring new
+  `TrackNumber` / `TrackUID` values) without rewriting the opaque chapter-codec
+  command data — only the mapping changes. It is the `TrackEntry`-level twin of
+  the `Info > ChapterTranslate` (§5.1.2.8) master already surfaced through
+  `segment_linking()`, and is unbounded (a single `TrackEntry` may carry
+  several). Each record exposes `track_id` (`TrackTranslateTrackID`,
+  §5.1.4.1.27.1 — surfaced verbatim, *not* a Matroska `TrackUID`; its format is
+  defined by the chapter codec), `codec` (`TrackTranslateCodec`, §5.1.4.1.27.2 —
+  same value space as `ChapProcessCodecID`, Table 31: `0` = Matroska Script,
+  `1` = DVD-menu), and the unbounded `edition_uids` list
+  (`TrackTranslateEditionUID`, §5.1.4.1.27.3 — an empty list means "all
+  editions using the codec"). A master missing a mandatory child is surfaced
+  verbatim (empty bytes / `0` codec) so callers can inspect a malformed file,
+  mirroring the tolerant `ChapterTranslate` parse. Returns an empty slice for a
+  track with no `TrackTranslate` child (the common case) or an out-of-range
+  `stream_index`.
 - **Typed per-Cluster `Position` / `PrevSize` records** (RFC 9559
   §5.1.3.2 / §5.1.3.3): `MkvDemuxer::cluster_records() ->
   &[ClusterRecord]` surfaces each Cluster's optional `Position`
@@ -963,6 +984,26 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `track_operation`. Pairs symmetrically with the existing
   `MkvDemuxer::track_operation` typed accessor — a mux→demux pipeline
   preserves every plane (with its type) and every join reference.
+- **`TrackTranslate` on write** (RFC 9559 §5.1.4.1.27):
+  `MkvMuxer::set_track_translates(stream_index, Vec<MkvTrackTranslate>)` queues
+  zero or more chapter-codec track-mapping masters that land directly inside the
+  carrying `TrackEntry` (after the `TrackOperation` / `ContentEncodings` masters)
+  at `write_header` time, in slice order. Each `MkvTrackTranslate` carries the
+  mandatory `track_id` (`TrackTranslateTrackID`, binary, written verbatim — its
+  format is defined by the chapter codec, not by Matroska) and `codec`
+  (`TrackTranslateCodec`, Table 31), plus zero or more `edition_uids`
+  (`TrackTranslateEditionUID`, an empty list meaning "all editions using the
+  codec"). Unlike the `set_video_*` family there is **no track-type
+  restriction** — the spec carries `TrackTranslate` on every `TrackEntry`. Spec
+  rules enforced at queue time: rejects post-`write_header` use, out-of-range
+  `stream_index`, an empty `track_id` (`minOccurs: 1`), and a zero
+  `TrackTranslateEditionUID` ("not 0"). Calling with an empty slice clears any
+  previously-queued mappings; repeated calls are last-write-wins. The
+  convenience constructor `MkvTrackTranslate::new(track_id, codec)` covers the
+  all-editions shape. Omitting the call keeps every master off-disk so the
+  demuxer surfaces an empty `track_translates` slice. Pairs symmetrically with
+  the new `MkvDemuxer::track_translates` typed accessor — a mux→demux pipeline
+  round-trips every mapping field-for-field.
 - **`ContentEncodings` on write** (RFC 9559 §5.1.4.1.31):
   `MkvMuxer::set_track_content_encodings(stream_index, ContentEncodings)`
   queues a per-track transformation chain that lands as a

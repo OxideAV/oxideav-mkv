@@ -495,6 +495,48 @@ pub struct MkvMuxer {
     /// surfaces `None` from `content_encodings`. The slice is sized to
     /// `streams.len()`.
     content_encodings: Vec<Option<ContentEncodings>>,
+    /// Per-stream `TrackTranslate` hints queued via
+    /// [`MkvMuxer::set_track_translates`] (RFC 9559 §5.1.4.1.27).
+    /// Materialised as zero or more `TrackTranslate` masters directly inside
+    /// the carrying `TrackEntry` at `write_header` time. The default (an
+    /// empty `Vec`) means the muxer omits the element for that stream, so the
+    /// demuxer surfaces an empty slice from `track_translates`. The slice is
+    /// sized to `streams.len()`.
+    track_translates: Vec<Vec<MkvTrackTranslate>>,
+}
+
+/// One `TrackTranslate` mapping (RFC 9559 §5.1.4.1.27) queued for a track via
+/// [`MkvMuxer::set_track_translates`]. The mux-side mirror of the demux-side
+/// [`TrackTranslate`](crate::demux::TrackTranslate): a mux→demux pipeline
+/// round-trips every field verbatim.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkvTrackTranslate {
+    /// `TrackTranslateTrackID` (§5.1.4.1.27.1, binary, `minOccurs: 1`) — the
+    /// value the chapter codec uses to name this track. Written verbatim; its
+    /// format is defined by the chapter codec (`codec`), not by Matroska. Must
+    /// be non-empty (the spec marks the child mandatory).
+    pub track_id: Vec<u8>,
+    /// `TrackTranslateCodec` (§5.1.4.1.27.2, uinteger, `minOccurs: 1`) — the
+    /// chapter codec the mapping applies to (Table 31: `0` = Matroska Script,
+    /// `1` = DVD-menu).
+    pub codec: u64,
+    /// `TrackTranslateEditionUID` (§5.1.4.1.27.3, uinteger, unbounded) — the
+    /// chapter editions the mapping applies to. An empty list means "all
+    /// editions using `codec`" per the §5.1.4.1.27.3 usage note. Spec ranges
+    /// each value "not 0"; a zero is rejected at queue time.
+    pub edition_uids: Vec<u64>,
+}
+
+impl MkvTrackTranslate {
+    /// Convenience constructor for the common shape: a chapter-codec track-id
+    /// plus its codec, applying to all editions (empty `edition_uids`).
+    pub fn new(track_id: impl Into<Vec<u8>>, codec: u64) -> Self {
+        Self {
+            track_id: track_id.into(),
+            codec,
+            edition_uids: Vec::new(),
+        }
+    }
 }
 
 /// Per-stream packet aggregation buffer used when lacing is on.
@@ -1353,6 +1395,7 @@ impl MkvMuxer {
             last_block_pts_ms: vec![None; n],
             track_operations: vec![None; n],
             content_encodings: vec![None; n],
+            track_translates: vec![Vec::new(); n],
         })
     }
 
@@ -1687,6 +1730,74 @@ impl MkvMuxer {
     /// `track_operation`). Mostly useful for tests.
     pub fn track_operation(&self, stream_index: usize) -> Option<&MkvTrackOperation> {
         self.track_operations.get(stream_index)?.as_ref()
+    }
+
+    /// Queue the per-track `TrackTranslate` masters (RFC 9559 §5.1.4.1.27) for
+    /// a stream — the chapter-codec track-mapping that lets a file be remuxed
+    /// without rewriting opaque chapter-codec data. Each [`MkvTrackTranslate`]
+    /// lands as a `TrackTranslate` master directly inside the carrying
+    /// `TrackEntry` (after the existing `TrackOperation` / `ContentEncodings`
+    /// masters) at `write_header` time, in slice order.
+    ///
+    /// Unlike the `set_video_*` family there is no track-type restriction —
+    /// the spec carries `TrackTranslate` on every `TrackEntry`. Calling with
+    /// an empty slice clears any previously-queued mappings for the stream so
+    /// the muxer emits nothing (the demuxer then surfaces an empty slice from
+    /// `track_translates`); repeated calls are last-write-wins.
+    ///
+    /// Spec rules enforced at queue time (before any byte is written): rejects
+    /// post-`write_header` use, an out-of-range `stream_index`, a mapping with
+    /// an empty `track_id` (`TrackTranslateTrackID` is `minOccurs: 1`), and a
+    /// zero `TrackTranslateEditionUID` (the spec ranges each "not 0").
+    ///
+    /// Pairs symmetrically with
+    /// [`MkvDemuxer::track_translates`](crate::demux::MkvDemuxer::track_translates)
+    /// — a mux→demux pipeline round-trips every mapping field-for-field.
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_track_translates(
+        &mut self,
+        stream_index: usize,
+        translates: Vec<MkvTrackTranslate>,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_translates called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_translates stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        for tt in &translates {
+            if tt.track_id.is_empty() {
+                return Err(Error::invalid(
+                    "MKV muxer: set_track_translates given a TrackTranslate with an empty \
+                     TrackTranslateTrackID (the child is mandatory, minOccurs 1)",
+                ));
+            }
+            if tt.edition_uids.contains(&0) {
+                return Err(Error::invalid(
+                    "MKV muxer: set_track_translates given a zero TrackTranslateEditionUID \
+                     (the spec ranges each value 'not 0')",
+                ));
+            }
+        }
+        self.track_translates[stream_index] = translates;
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `TrackTranslate` hints
+    /// installed via [`MkvMuxer::set_track_translates`]. Returns an empty
+    /// slice for any stream that didn't have the API called. Mostly useful
+    /// for tests.
+    pub fn track_translates(&self, stream_index: usize) -> &[MkvTrackTranslate] {
+        self.track_translates
+            .get(stream_index)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Set the per-track `ContentEncodings` (RFC 9559 §5.1.4.1.31) chain —
@@ -3283,6 +3394,25 @@ impl Muxer for MkvMuxer {
                     write_master_element(&mut encs_body, ids::CONTENT_ENCODING, &ce);
                 }
                 write_master_element(&mut t, ids::CONTENT_ENCODINGS, &encs_body);
+            }
+            // TrackTranslate (RFC 9559 §5.1.4.1.27) — zero or more
+            // chapter-codec track-mapping masters queued via
+            // `set_track_translates`. Each carries the mandatory
+            // `TrackTranslateTrackID` (binary, verbatim) and
+            // `TrackTranslateCodec` (uinteger), plus zero or more optional
+            // `TrackTranslateEditionUID`s. The setter has already validated
+            // that no `track_id` is empty and no edition UID is zero. Emitted
+            // only when the caller opted in; an empty list keeps every master
+            // off-disk so the demuxer surfaces an empty `track_translates`
+            // slice.
+            for tt in &self.track_translates[i] {
+                let mut tt_body = Vec::new();
+                write_bytes_element(&mut tt_body, ids::TRACK_TRANSLATE_TRACK_ID, &tt.track_id);
+                write_uint_element(&mut tt_body, ids::TRACK_TRANSLATE_CODEC, tt.codec);
+                for &uid in &tt.edition_uids {
+                    write_uint_element(&mut tt_body, ids::TRACK_TRANSLATE_EDITION_UID, uid);
+                }
+                write_master_element(&mut t, ids::TRACK_TRANSLATE, &tt_body);
             }
             write_master_element(&mut tracks_body, ids::TRACK_ENTRY, &t);
         }

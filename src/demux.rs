@@ -420,6 +420,12 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         .map(|t| t.block_addition_mappings.clone())
         .collect();
 
+    // Per-stream `TrackTranslate` lists (RFC 9559 §5.1.4.1.27), indexed by
+    // stream index. Empty for tracks with no chapter-codec mapping (the
+    // common case).
+    let track_translates: Vec<Vec<TrackTranslate>> =
+        tracks.iter().map(|t| t.track_translates.clone()).collect();
+
     // Per-stream `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16), indexed by
     // stream index. The spec default `0` ("there is no BlockAdditions for
     // this track") is already materialised on the raw record.
@@ -725,6 +731,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_aspect_ratio_types,
         video_uncompressed_fourccs,
         block_addition_mappings,
+        track_translates,
         max_block_addition_ids,
         last_block_additions: None,
         track_audience_flags,
@@ -924,6 +931,38 @@ pub struct ChapterTranslate {
     pub edition_uids: Vec<u64>,
 }
 
+/// One `Segment\Tracks\TrackEntry\TrackTranslate` master (RFC 9559
+/// §5.1.4.1.27): the mapping between a [`TrackEntry`] and the track value a
+/// Chapter Codec addresses. A Chapter Codec (DVD-menu, Matroska Script) may
+/// need to reference a specific track but does not know how Matroska
+/// identifies tracks; this mapping lets a file be remuxed (acquiring new
+/// `TrackNumber` / `TrackUID` values) without rewriting the opaque
+/// chapter-codec command data — only the mapping changes.
+///
+/// The `TrackEntry`-level twin of [`ChapterTranslate`] (the Segment-level
+/// mapping), surfaced per stream via [`MkvDemuxer::track_translates`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackTranslate {
+    /// `TrackTranslateTrackID` (RFC 9559 §5.1.4.1.27.1, id `0x66A5`,
+    /// `minOccurs: 1`) — the binary value the chapter codec uses to name
+    /// this `TrackEntry`. Its format depends on [`Self::codec`] (the
+    /// `ChapProcessCodecID`, see RFC 9559 §5.1.7.1.4.15) and is **not** a
+    /// Matroska `TrackUID` / `TrackNumber`; the container surfaces it
+    /// verbatim and never interprets it. Empty only on a malformed master
+    /// missing the mandatory child.
+    pub track_id: Vec<u8>,
+    /// `TrackTranslateCodec` (RFC 9559 §5.1.4.1.27.2, id `0x66BF`,
+    /// `minOccurs: 1`) — the chapter codec the mapping applies to; the same
+    /// value space as `ChapProcessCodecID` (Table 31: `0` = Matroska
+    /// Script, `1` = DVD-menu).
+    pub codec: u64,
+    /// `TrackTranslateEditionUID` (RFC 9559 §5.1.4.1.27.3, id `0x66FC`,
+    /// unbounded) — the chapter editions this mapping applies to. Empty
+    /// means it applies to *all* editions found in the Segment using
+    /// [`Self::codec`] (§5.1.4.1.27.3 usage note).
+    pub edition_uids: Vec<u64>,
+}
+
 /// Check a Top-Level master element for a leading `CRC-32` child and, if
 /// present, validate it. `body_start` / `body_end` bracket the element's
 /// data (the bytes after its EBML header). On return the reader is left at
@@ -1087,6 +1126,12 @@ struct TrackEntry {
     /// `BlockAdditional` to extend their on-disk format, e.g. WebM alpha
     /// or HDR dynamic metadata payloads).
     block_addition_mappings: Vec<BlockAdditionMapping>,
+    /// `TrackTranslate` masters (RFC 9559 §5.1.4.1.27) captured during the
+    /// `TrackEntry` walk, one entry per master in on-disk order. Empty when
+    /// the `TrackEntry` carried no `TrackTranslate` child (the common case —
+    /// the element only appears on files whose Chapter Codec addresses
+    /// specific tracks, e.g. DVD-menu chapters).
+    track_translates: Vec<TrackTranslate>,
     /// `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16) — the maximum
     /// `BlockAddID` value any of the track's Blocks may carry. The spec
     /// default `0` ("there is no BlockAdditions for this track") is
@@ -1318,6 +1363,30 @@ fn parse_chapter_translate(r: &mut dyn ReadSeek, end: u64) -> Result<ChapterTran
             ids::CHAPTER_TRANSLATE_ID => out.id = read_bytes(r, e.size as usize)?,
             ids::CHAPTER_TRANSLATE_CODEC => out.codec = read_uint(r, e.size as usize)?,
             ids::CHAPTER_TRANSLATE_EDITION_UID => {
+                out.edition_uids.push(read_uint(r, e.size as usize)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(out)
+}
+
+/// Parse one `Segment\Tracks\TrackEntry\TrackTranslate` master (RFC 9559
+/// §5.1.4.1.27). `TrackTranslateTrackID` (binary, `minOccurs: 1`) and
+/// `TrackTranslateCodec` (uinteger, `minOccurs: 1`) are mandatory;
+/// `TrackTranslateEditionUID` (uinteger, unbounded) is optional and lists the
+/// chapter editions the mapping applies to — an empty list means "all editions
+/// using the given codec" per §5.1.4.1.27.3. The `TrackTranslateTrackID` bytes
+/// are surfaced verbatim; their meaning is defined by the chapter codec, not
+/// the container.
+fn parse_track_translate(r: &mut dyn ReadSeek, end: u64) -> Result<TrackTranslate> {
+    let mut out = TrackTranslate::default();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::TRACK_TRANSLATE_TRACK_ID => out.track_id = read_bytes(r, e.size as usize)?,
+            ids::TRACK_TRANSLATE_CODEC => out.codec = read_uint(r, e.size as usize)?,
+            ids::TRACK_TRANSLATE_EDITION_UID => {
                 out.edition_uids.push(read_uint(r, e.size as usize)?);
             }
             _ => skip(r, e.size)?,
@@ -5100,6 +5169,18 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 let mapping = parse_block_addition_mapping(r, body_end)?;
                 t.block_addition_mappings.push(mapping);
             }
+            // TrackTranslate (RFC 9559 §5.1.4.1.27) — the chapter-codec
+            // track-mapping master. Unbounded, so we push each one in on-disk
+            // order. A master missing its mandatory `TrackTranslateTrackID`
+            // (binary) or `TrackTranslateCodec` (uinteger) is still surfaced
+            // verbatim (empty bytes / `0` codec) so a caller inspecting a
+            // malformed file sees what the writer emitted, mirroring the
+            // tolerant `ChapterTranslate` parse.
+            ids::TRACK_TRANSLATE => {
+                let body_end = r.stream_position()?.saturating_add(e.size);
+                let tt = parse_track_translate(r, body_end)?;
+                t.track_translates.push(tt);
+            }
             // RFC 9559 §5.1.4.1.16 — maximum BlockAddID value the track's
             // Blocks may carry. Default 0 = "no BlockAdditions"; absence
             // and explicit 0 decode identically, so the raw field holds
@@ -5891,6 +5972,10 @@ pub struct MkvDemuxer {
     /// appears on tracks that use `BlockAdditional` to extend their
     /// on-disk format). See [`MkvDemuxer::block_addition_mappings`].
     block_addition_mappings: Vec<Vec<BlockAdditionMapping>>,
+    /// Per-stream `TrackTranslate`s (RFC 9559 §5.1.4.1.27), indexed by stream
+    /// index. Empty `Vec` for tracks with no chapter-codec mapping (the
+    /// common case). See [`MkvDemuxer::track_translates`].
+    track_translates: Vec<Vec<TrackTranslate>>,
     /// Per-stream `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16), indexed
     /// by stream index, spec default `0` materialised — see
     /// [`MkvDemuxer::max_block_addition_id`].
@@ -6387,6 +6472,33 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::block_addition_mappings`] for the semantics.
     pub fn all_block_addition_mappings(&self) -> &[Vec<BlockAdditionMapping>] {
         &self.block_addition_mappings
+    }
+
+    /// The `TrackTranslate` masters (RFC 9559 §5.1.4.1.27) declared on the
+    /// `TrackEntry` for the stream at `stream_index`, in on-disk order.
+    /// Returns an empty slice when the `TrackEntry` carried no
+    /// `TrackTranslate` child (the common case — the element only appears on
+    /// files whose Chapter Codec addresses specific tracks, e.g. DVD-menu
+    /// chapters), or when `stream_index` is out of range.
+    ///
+    /// Each [`TrackTranslate`] maps this track to the value a Chapter Codec
+    /// (`TrackTranslate::codec`) uses to name it (`TrackTranslate::track_id`,
+    /// surfaced verbatim — its format is defined by the chapter codec, **not**
+    /// the Matroska `TrackUID` / `TrackNumber` space). The `TrackEntry`-level
+    /// twin of [`MkvDemuxer::segment_linking`]'s `ChapterTranslate`.
+    pub fn track_translates(&self, stream_index: u32) -> &[TrackTranslate] {
+        self.track_translates
+            .get(stream_index as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// All per-stream `TrackTranslate` lists (RFC 9559 §5.1.4.1.27), indexed
+    /// by stream index. The slice has one `Vec` per stream — empty when the
+    /// corresponding `TrackEntry` carried no `TrackTranslate` child. See
+    /// [`MkvDemuxer::track_translates`].
+    pub fn all_track_translates(&self) -> &[Vec<TrackTranslate>] {
+        &self.track_translates
     }
 
     /// `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16) for the stream at
