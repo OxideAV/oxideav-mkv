@@ -148,6 +148,7 @@ fn chapters_master_carries_valid_crc_when_present() {
             language: "eng".into(),
             country: None,
         }],
+        ..Default::default()
     };
     let bytes = mux_minimal(std::slice::from_ref(&chap), &[]);
     let statuses = collect_crc_statuses(bytes);

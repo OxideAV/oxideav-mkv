@@ -144,6 +144,7 @@ fn chapters_round_trip_through_demuxer() {
                 language: "eng".into(),
                 country: None,
             }],
+            ..Default::default()
         },
         MkvChapter {
             time_start_ns: 1_000_000_000,
@@ -153,6 +154,7 @@ fn chapters_round_trip_through_demuxer() {
                 language: "eng".into(),
                 country: Some("us".into()),
             }],
+            ..Default::default()
         },
         MkvChapter {
             time_start_ns: 2_000_000_000,
@@ -162,6 +164,7 @@ fn chapters_round_trip_through_demuxer() {
                 language: "eng".into(),
                 country: None,
             }],
+            ..Default::default()
         },
     ];
     let bytes = mux_with_chapters_collect(&chapters);
@@ -267,6 +270,7 @@ fn chapters_element_sits_before_first_cluster() {
             language: "eng".into(),
             country: None,
         }],
+        ..Default::default()
     }];
     let bytes = mux_with_chapters_collect(&chapters);
     let (chapters_off, _seg_start) =
@@ -290,6 +294,7 @@ fn seek_head_chapters_entry_points_at_chapters_when_present() {
             language: "eng".into(),
             country: None,
         }],
+        ..Default::default()
     }];
     let bytes = mux_with_chapters_collect(&chapters);
 
@@ -396,6 +401,7 @@ fn chapter_times_are_written_as_literal_nanoseconds() {
             language: "eng".into(),
             country: None,
         }],
+        ..Default::default()
     }];
     let bytes = mux_with_chapters_collect(&chapters);
     let (start, end) = first_atom_times(&bytes);

@@ -582,18 +582,96 @@ const MAX_FRAMES_PER_LACE: usize = 8;
 /// `end_time_ns == None` is permitted — the muxer simply omits
 /// `ChapterTimeEnd`. The demuxer surfaces such an atom without an
 /// `end_ms` metadata key, matching ffprobe behaviour on real files.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MkvChapter {
     /// `ChapterTimeStart`, in nanoseconds.
     pub time_start_ns: u64,
     /// `ChapterTimeEnd`, in nanoseconds. `None` → element omitted.
     pub time_end_ns: Option<u64>,
+    /// `ChapterUID` (RFC 9559 §5.1.7.1.4.1, `range: not 0`). `None` →
+    /// the muxer auto-derives a stable non-zero UID from the atom's
+    /// 1-based index (so `Tags.Targets.TagChapterUID` references can
+    /// resolve). `Some(0)` is rejected at queue time.
+    pub uid: Option<u64>,
+    /// `ChapterStringUID` (RFC 9559 §5.1.7.1.4.2). `None` (or `Some("")`)
+    /// → element omitted.
+    pub string_uid: Option<String>,
+    /// `ChapterFlagHidden` (RFC 9559 §5.1.7.1.4.5, default `0`). Written
+    /// only when `true` (the spec default may stay off-disk).
+    pub hidden: bool,
+    /// `ChapterFlagEnabled` (RFC 9559 §5.1.7.1.4, default `1`). Written
+    /// only when `false` — the default `1` stays off-disk and the demuxer
+    /// materialises it. Defaults to `true` via [`MkvChapter::default`].
+    pub enabled: bool,
+    /// `ChapterSegmentUUID` (RFC 9559 §5.1.7.1.4.6) — the 16-byte
+    /// SegmentUUID of another Segment to play during this chapter. `None`
+    /// → omitted; a non-16-byte value is rejected at queue time.
+    pub segment_uuid: Option<Vec<u8>>,
+    /// `ChapterSegmentEditionUID` (RFC 9559 §5.1.7.1.4.7, `range: not 0`).
+    /// `None` → omitted.
+    pub segment_edition_uid: Option<u64>,
+    /// `ChapterPhysicalEquiv` (RFC 9559 §5.1.7.1.4.8). `None` → omitted.
+    pub physical_equiv: Option<u64>,
     /// Zero or more `ChapterDisplay` children. Each one carries one
     /// language-tagged title string. A chapter with zero displays is
     /// legal per RFC 9559 §5.1.7 but produces an "untitled" atom that
     /// most players surface as `Chapter N` — the convenience constructor
     /// [`MkvMuxer::add_chapter`] always emits exactly one display.
     pub display: Vec<ChapterDisplay>,
+    /// Zero or more `ChapProcess` masters (RFC 9559 §5.1.7.1.4.14) — the
+    /// chapter-codec commands (DVD-menu / Matroska-Script) attached to
+    /// this atom. Empty → no `ChapProcess` child written.
+    pub chap_processes: Vec<MkvChapProcess>,
+}
+
+impl Default for MkvChapter {
+    fn default() -> Self {
+        Self {
+            time_start_ns: 0,
+            time_end_ns: None,
+            uid: None,
+            string_uid: None,
+            hidden: false,
+            // RFC 9559 §5.1.7.1.4: ChapterFlagEnabled has spec default 1.
+            enabled: true,
+            segment_uuid: None,
+            segment_edition_uid: None,
+            physical_equiv: None,
+            display: Vec::new(),
+            chap_processes: Vec::new(),
+        }
+    }
+}
+
+/// One `ChapProcess` master (RFC 9559 §5.1.7.1.4.14) queued on an
+/// [`MkvChapter`] — the write-side mirror of
+/// [`crate::demux::ChapProcess`]. The container never executes a chapter
+/// command; it writes the raw payloads verbatim.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkvChapProcess {
+    /// `ChapProcessCodecID` (RFC 9559 §5.1.7.1.4.15) — `0` = Matroska
+    /// Script, `1` = DVD-menu. Always written (mandatory; the demuxer
+    /// materialises the `0` default, but we emit it explicitly so a
+    /// round-trip preserves the exact on-disk shape).
+    pub codec_id: u64,
+    /// `ChapProcessPrivate` (RFC 9559 §5.1.7.1.4.16) — optional codec
+    /// data. `None` → omitted.
+    pub private: Option<Vec<u8>>,
+    /// `ChapProcessCommand` masters (RFC 9559 §5.1.7.1.4.17), in write
+    /// order.
+    pub commands: Vec<MkvChapProcessCommand>,
+}
+
+/// One `ChapProcessCommand` master (RFC 9559 §5.1.7.1.4.17) — the
+/// write-side mirror of [`crate::demux::ChapProcessCommand`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkvChapProcessCommand {
+    /// `ChapProcessTime` (RFC 9559 §5.1.7.1.4.18) — `0` during the whole
+    /// chapter, `1` before playback, `2` after. Always written.
+    pub time: u64,
+    /// `ChapProcessData` (RFC 9559 §5.1.7.1.4.19) — the command payload,
+    /// written verbatim.
+    pub data: Vec<u8>,
 }
 
 /// One `ChapterDisplay` row — a chapter title in one language.
@@ -2749,6 +2827,7 @@ impl MkvMuxer {
                 language: "eng".into(),
                 country: None,
             }],
+            ..Default::default()
         })
     }
 
@@ -2767,6 +2846,29 @@ impl MkvMuxer {
                 return Err(Error::invalid(format!(
                     "MKV muxer: chapter end_time_ns ({end}) < start_time_ns ({})",
                     chapter.time_start_ns
+                )));
+            }
+        }
+        // RFC 9559 §5.1.7.1.4.1: ChapterUID has range "not 0".
+        if chapter.uid == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: ChapterUID 0 is out of range — RFC 9559 §5.1.7.1.4.1 ranges it as \
+                 \"not 0\"; pass None to auto-derive a non-zero UID",
+            ));
+        }
+        // §5.1.7.1.4.7: ChapterSegmentEditionUID has range "not 0".
+        if chapter.segment_edition_uid == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: ChapterSegmentEditionUID 0 is out of range — RFC 9559 §5.1.7.1.4.7 \
+                 ranges it as \"not 0\"",
+            ));
+        }
+        // §5.1.7.1.4.6: ChapterSegmentUUID is a 16-byte SegmentUUID.
+        if let Some(uuid) = &chapter.segment_uuid {
+            if uuid.len() != 16 {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: ChapterSegmentUUID must be 16 bytes (RFC 9559 §5.1.7.1.4.6), got {}",
+                    uuid.len()
                 )));
             }
         }
@@ -4778,13 +4880,39 @@ fn build_chapters_element(chapters: &[MkvChapter]) -> Vec<u8> {
 }
 
 /// Body of one `ChapterAtom` master (the caller wraps it in
-/// `ids::CHAPTER_ATOM`).
-fn build_chapter_atom(uid: u64, ch: &MkvChapter) -> Vec<u8> {
+/// `ids::CHAPTER_ATOM`). `default_uid` is the auto-derived 1-based UID used
+/// when the chapter didn't pin one. Children are emitted in RFC 9559
+/// §5.1.7.1.4 subsection order; the demuxer parses by element id so the
+/// order is for validator-friendliness, not correctness.
+fn build_chapter_atom(default_uid: u64, ch: &MkvChapter) -> Vec<u8> {
     let mut body = Vec::new();
-    write_uint_element(&mut body, ids::CHAPTER_UID, uid);
+    write_uint_element(&mut body, ids::CHAPTER_UID, ch.uid.unwrap_or(default_uid));
+    if let Some(suid) = ch.string_uid.as_deref() {
+        if !suid.is_empty() {
+            write_string_element(&mut body, ids::CHAPTER_STRING_UID, suid);
+        }
+    }
     write_uint_element(&mut body, ids::CHAPTER_TIME_START, ch.time_start_ns);
     if let Some(end) = ch.time_end_ns {
         write_uint_element(&mut body, ids::CHAPTER_TIME_END, end);
+    }
+    // ChapterFlagHidden / ChapterFlagEnabled: write only the non-default
+    // value (§5.1.7.1.4.5 default 0, enabled default 1), so a plain chapter
+    // stays byte-compatible with the prior writer.
+    if ch.hidden {
+        write_uint_element(&mut body, ids::CHAPTER_FLAG_HIDDEN, 1);
+    }
+    if !ch.enabled {
+        write_uint_element(&mut body, ids::CHAPTER_FLAG_ENABLED, 0);
+    }
+    if let Some(uuid) = &ch.segment_uuid {
+        write_bytes_element(&mut body, ids::CHAPTER_SEGMENT_UUID, uuid);
+    }
+    if let Some(seuid) = ch.segment_edition_uid {
+        write_uint_element(&mut body, ids::CHAPTER_SEGMENT_EDITION_UID, seuid);
+    }
+    if let Some(pe) = ch.physical_equiv {
+        write_uint_element(&mut body, ids::CHAPTER_PHYSICAL_EQUIV, pe);
     }
     for disp in &ch.display {
         let mut display_body = Vec::new();
@@ -4794,6 +4922,22 @@ fn build_chapter_atom(uid: u64, ch: &MkvChapter) -> Vec<u8> {
             write_string_element(&mut display_body, ids::CHAP_COUNTRY, country);
         }
         write_master_element(&mut body, ids::CHAPTER_DISPLAY, &display_body);
+    }
+    for proc in &ch.chap_processes {
+        let mut proc_body = Vec::new();
+        // ChapProcessCodecID (§5.1.7.1.4.15) — mandatory, written
+        // explicitly even at the `0` default so the round-trip is exact.
+        write_uint_element(&mut proc_body, ids::CHAP_PROCESS_CODEC_ID, proc.codec_id);
+        if let Some(priv_data) = &proc.private {
+            write_bytes_element(&mut proc_body, ids::CHAP_PROCESS_PRIVATE, priv_data);
+        }
+        for cmd in &proc.commands {
+            let mut cmd_body = Vec::new();
+            write_uint_element(&mut cmd_body, ids::CHAP_PROCESS_TIME, cmd.time);
+            write_bytes_element(&mut cmd_body, ids::CHAP_PROCESS_DATA, &cmd.data);
+            write_master_element(&mut proc_body, ids::CHAP_PROCESS_COMMAND, &cmd_body);
+        }
+        write_master_element(&mut body, ids::CHAP_PROCESS, &proc_body);
     }
     body
 }

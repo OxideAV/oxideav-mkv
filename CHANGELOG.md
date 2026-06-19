@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: complete `ChapterAtom` write surface (RFC 9559 §5.1.7.1.4). The
+  `mux::MkvChapter` struct now carries the atom fields the writer previously
+  dropped — `uid` (§5.1.7.1.4.1, auto-derived non-zero when `None`),
+  `string_uid` (§5.1.7.1.4.2), `hidden` (§5.1.7.1.4.5),
+  `enabled` (§5.1.7.1.4, default `1` materialised, written only when
+  cleared), `segment_uuid` (§5.1.7.1.4.6, 16-byte), `segment_edition_uid`
+  (§5.1.7.1.4.7), `physical_equiv` (§5.1.7.1.4.8) — plus the
+  `ChapProcess > ChapProcessCommand` chapter-codec command tree
+  (§5.1.7.1.4.14..§5.1.7.1.4.19) via new `mux::MkvChapProcess` /
+  `mux::MkvChapProcessCommand`, the write-side mirror of the existing
+  `demux::ChapProcess` / `demux::ChapProcessCommand` read surface. The full
+  atom + process tree round-trips through the typed `MkvDemuxer::chapters()`.
+  `add_chapter_full` rejects `ChapterUID 0` / `ChapterSegmentEditionUID 0`
+  (range "not 0") and a non-16-byte `ChapterSegmentUUID`. New
+  `tests/mux_chapter_process.rs` (5 cases). `MkvChapter` gained a manual
+  `Default` (so `..Default::default()` works while keeping `enabled = true`).
 - `SilentTracks` (RFC 9559 Appendix A.1 / A.2, ids `0x5854` / `0x58D7`),
   read **and** write. Demuxer: a new `ClusterRecord::silent_track_numbers`
   field surfaces the per-Cluster list of `SilentTrackNumber` values (the

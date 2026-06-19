@@ -249,6 +249,7 @@ fn attachments_master_sits_after_tracks_before_first_cluster() {
             time_start_ns: 0,
             time_end_ns: Some(1_000_000_000),
             display: Vec::new(),
+            ..Default::default()
         })
         .expect("queue chapter");
         mx.add_attachment(MkvAttachment::new(
