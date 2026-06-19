@@ -1230,6 +1230,40 @@ impl MkvBlockAddition {
     }
 }
 
+/// The full set of `BlockGroup` (RFC 9559 §5.1.3.5) children a single
+/// packet can be wrapped with via [`MkvMuxer::write_packet_with_block_group`]
+/// — the write-side counterpart of
+/// [`MkvDemuxer::block_group_meta`](crate::demux::MkvDemuxer::block_group_meta)
+/// plus [`MkvDemuxer::block_additions`](crate::demux::MkvDemuxer::block_additions).
+///
+/// Every field is optional; an all-default `BlockGroupOptions` still forces
+/// a `BlockGroup` wrapper (rather than a bare `SimpleBlock`) so the caller
+/// can pin the on-disk shape, but in practice at least one field is set.
+/// On-disk child order follows the §5.1.3.5 subsection order: `Block`,
+/// `BlockAdditions`, `BlockDuration`, `ReferencePriority`, `ReferenceBlock`
+/// (one per entry), `CodecState`, `DiscardPadding`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockGroupOptions {
+    /// `BlockAdditions` (§5.1.3.5.2) — validated exactly as
+    /// [`MkvMuxer::write_packet_with_additions`] validates them.
+    pub additions: Vec<MkvBlockAddition>,
+    /// `ReferenceBlock` values (§5.1.3.5.5), one element written per entry,
+    /// in slice order. Each is a signed track-tick offset relative to this
+    /// Block's timestamp. A non-empty list marks the Block as a
+    /// non-keyframe. When empty, the muxer falls back to deriving a single
+    /// `ReferenceBlock` from the most recent same-track Block for a
+    /// non-keyframe packet (matching [`MkvMuxer::write_packet_with_additions`]).
+    pub reference_blocks: Vec<i64>,
+    /// `ReferencePriority` (§5.1.3.5.4, uinteger, default `0`). Written only
+    /// when non-zero — `0` is the spec default and a mandatory element with
+    /// a default may stay off-disk at that default.
+    pub reference_priority: u64,
+    /// `CodecState` (§5.1.3.5.6, binary) verbatim bytes. `None` → no child.
+    pub codec_state: Option<Vec<u8>>,
+    /// `DiscardPadding` (§5.1.3.5.7, signed nanoseconds). `None` → no child.
+    pub discard_padding: Option<i64>,
+}
+
 /// A `TrackOperation` (RFC 9559 §5.1.4.1.30) hint queued via
 /// [`MkvMuxer::set_track_operation`]: the recipe that turns the carrying
 /// `TrackEntry` into a *virtual* track assembled from other tracks in the
@@ -3556,7 +3590,7 @@ impl MkvMuxer {
     fn write_packet_inner(
         &mut self,
         packet: &Packet,
-        additions: Option<&[MkvBlockAddition]>,
+        group: Option<&BlockGroupOptions>,
     ) -> Result<()> {
         if !self.header_written {
             return Err(Error::other("MKV muxer: write_header not called"));
@@ -3605,7 +3639,7 @@ impl MkvMuxer {
         // would land *after* this one in the file.
         if self.lacing_mode != LacingMode::None {
             for other_idx in 0..self.lace_pending.len() {
-                if (other_idx != stream_idx || additions.is_some())
+                if (other_idx != stream_idx || group.is_some())
                     && !self.lace_pending[other_idx].frames.is_empty()
                 {
                     self.flush_lace(other_idx)?;
@@ -3657,7 +3691,7 @@ impl MkvMuxer {
                 MediaType::Video => packet.flags.keyframe,
                 _ => true,
             };
-            if indexable && (self.lacing_mode == LacingMode::None || additions.is_some()) {
+            if indexable && (self.lacing_mode == LacingMode::None || group.is_some()) {
                 // Non-lacing path (and the BlockGroup-with-additions
                 // path, which always writes immediately): the block
                 // lands at `pre_block_pos`, emit the cue now with the
@@ -3674,30 +3708,31 @@ impl MkvMuxer {
             // actually know where the (possibly laced) block lands.
         }
 
-        if let Some(adds) = additions {
+        if let Some(opts) = group {
             // BlockGroup path (RFC 9559 §5.1.3.5): Block + BlockAdditions
             // (+ BlockDuration when the packet carries a duration,
-            // + ReferenceBlock when it is not a keyframe). A plain Block
+            // + ReferencePriority / ReferenceBlock / CodecState /
+            // DiscardPadding per the caller's options). A plain Block
             // has no KEY flag bit — keyframe-ness is signalled by the
             // *absence* of ReferenceBlock (§5.1.3.5.5: "If the BlockGroup
             // doesn't have a ReferenceBlock element, then the Block it
             // contains can be decoded without using any other Block
             // data").
-            let reference_block = if packet.flags.keyframe {
-                None
+            //
+            // ReferenceBlock list resolution (§5.1.3.5.5): an explicit
+            // list from the caller is written verbatim; otherwise a
+            // non-keyframe packet derives a single ReferenceBlock from the
+            // most recently written Block on the same track (`0` when none
+            // exists — "cannot be decoded on its own, but the necessary
+            // reference Block(s) is unknown"), and a keyframe writes none.
+            let reference_blocks: Vec<i64> = if !opts.reference_blocks.is_empty() {
+                opts.reference_blocks.clone()
+            } else if packet.flags.keyframe {
+                Vec::new()
             } else {
-                // §5.1.3.5.5 — a timestamp relative to this Block's, in
-                // track ticks (= ms at our 1 ms TimestampScale), pointing
-                // at a Block this one depends on. We reference the most
-                // recently written Block on the same track; when there is
-                // none, the spec-sanctioned `0` says "cannot be decoded
-                // on its own, but the necessary reference Block(s) is
-                // unknown".
-                Some(
-                    self.last_block_pts_ms[stream_idx]
-                        .map(|prev| prev - pts_ms)
-                        .unwrap_or(0),
-                )
+                vec![self.last_block_pts_ms[stream_idx]
+                    .map(|prev| prev - pts_ms)
+                    .unwrap_or(0)]
             };
             // BlockDuration (§5.1.3.5.3) in track ticks (ms). Only
             // emitted when the packet carries a non-negative duration —
@@ -3706,15 +3741,18 @@ impl MkvMuxer {
                 .map(|d| pts_to_ms(d, stream_time_base))
                 .filter(|d| *d >= 0)
                 .map(|d| d as u64);
-            let group = build_block_group(
+            let bytes = build_block_group(
                 track_number,
                 timecode_offset as i16,
                 &packet.data,
-                adds,
+                &opts.additions,
                 duration_ms,
-                reference_block,
+                &reference_blocks,
+                opts.reference_priority,
+                opts.codec_state.as_deref(),
+                opts.discard_padding,
             );
-            self.output.write_all(&group)?;
+            self.output.write_all(&bytes)?;
         } else if self.lacing_mode == LacingMode::None {
             // Fast path: emit a standalone SimpleBlock with lacing
             // bits = 00 (RFC 9559 §10.3.1). Matches the
@@ -3784,14 +3822,73 @@ impl MkvMuxer {
         if additions.is_empty() {
             return self.write_packet_inner(packet, None);
         }
+        self.validate_additions(packet, additions)?;
+        let opts = BlockGroupOptions {
+            additions: additions.to_vec(),
+            ..Default::default()
+        };
+        self.write_packet_inner(packet, Some(&opts))
+    }
+
+    /// Write one packet wrapped in a `BlockGroup` (RFC 9559 §5.1.3.5)
+    /// carrying the full set of group children specified by `opts` —
+    /// `BlockAdditions` (§5.1.3.5.2), `ReferenceBlock`(s) (§5.1.3.5.5),
+    /// `ReferencePriority` (§5.1.3.5.4), `CodecState` (§5.1.3.5.6) and
+    /// `DiscardPadding` (§5.1.3.5.7). This is the write-side counterpart of
+    /// [`MkvDemuxer::block_group_meta`](crate::demux::MkvDemuxer::block_group_meta);
+    /// a mux→demux round-trip preserves every child value.
+    ///
+    /// The packet always becomes its own `BlockGroup` (never a
+    /// `SimpleBlock`, never laced) and flushes the track's pending lace
+    /// first so Block order is preserved — exactly as
+    /// [`MkvMuxer::write_packet_with_additions`] does.
+    ///
+    /// On-disk child order follows §5.1.3.5: `Block`, `BlockAdditions`,
+    /// `BlockDuration`, `ReferencePriority`, `ReferenceBlock`(s),
+    /// `CodecState`, `DiscardPadding`. `BlockDuration` is derived from the
+    /// packet's duration as usual.
+    ///
+    /// Validation mirrors [`MkvMuxer::write_packet_with_additions`] for the
+    /// `additions` field (non-zero `BlockAddID`s, within the declared
+    /// `MaxBlockAdditionID`, unique); the other children carry no
+    /// cross-field constraints the muxer can check. When `opts.additions`
+    /// is empty the addition checks are skipped (no `MaxBlockAdditionID`
+    /// declaration is required for a group that only sets, e.g.,
+    /// `DiscardPadding`).
+    pub fn write_packet_with_block_group(
+        &mut self,
+        packet: &Packet,
+        opts: &BlockGroupOptions,
+    ) -> Result<()> {
+        if !self.header_written {
+            return Err(Error::other("MKV muxer: write_header not called"));
+        }
+        if !opts.additions.is_empty() {
+            self.validate_additions(packet, &opts.additions)?;
+        } else {
+            // Still range-check the stream index even when there are no
+            // additions to validate, so a bad index errors before any byte.
+            let stream_idx = packet.stream_index as usize;
+            if stream_idx >= self.streams.len() {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: unknown stream index {stream_idx}"
+                )));
+            }
+        }
+        self.write_packet_inner(packet, Some(opts))
+    }
+
+    /// Shared `BlockAdditions` validation (RFC 9559 §5.1.3.5.2.3 +
+    /// §5.1.4.1.16) used by both `write_packet_with_additions` and
+    /// `write_packet_with_block_group`. Runs before any byte is written.
+    fn validate_additions(&self, packet: &Packet, additions: &[MkvBlockAddition]) -> Result<()> {
         if !self.header_written {
             return Err(Error::other("MKV muxer: write_header not called"));
         }
         let stream_idx = packet.stream_index as usize;
         if stream_idx >= self.streams.len() {
             return Err(Error::invalid(format!(
-                "MKV muxer: unknown stream index {}",
-                stream_idx
+                "MKV muxer: unknown stream index {stream_idx}"
             )));
         }
         let declared = self.max_block_addition_ids[stream_idx].unwrap_or(0);
@@ -3824,7 +3921,7 @@ impl MkvMuxer {
                 )));
             }
         }
-        self.write_packet_inner(packet, Some(additions))
+        Ok(())
     }
 
     fn start_cluster(&mut self, timecode_ms: i64) -> Result<()> {
@@ -4113,15 +4210,29 @@ fn build_simple_block(
 ///   from the spec default `1` (a mandatory element with a default may
 ///   stay off-disk at that default).
 /// * `BlockDuration` (§5.1.3.5.3, uinteger, track ticks) when `Some`.
+/// * `ReferencePriority` (§5.1.3.5.4, uinteger) when non-zero — the spec
+///   default `0` stays off-disk.
 /// * `ReferenceBlock` (§5.1.3.5.5, signed integer, track ticks relative
-///   to this Block's timestamp) when `Some` — i.e. for non-keyframes.
+///   to this Block's timestamp): one element per `reference_blocks` entry
+///   (a non-keyframe references at least one Block; a keyframe none).
+/// * `CodecState` (§5.1.3.5.6, binary) when `Some`.
+/// * `DiscardPadding` (§5.1.3.5.7, signed integer, Matroska Ticks) when
+///   `Some`.
+///
+/// An empty `additions` slice writes no `BlockAdditions` master at all —
+/// `BlockMore` is mandatory inside one (§5.1.3.5.2.1 `minOccurs: 1`), so an
+/// empty master would be malformed.
+#[allow(clippy::too_many_arguments)]
 fn build_block_group(
     track: u64,
     tc_offset: i16,
     frame: &[u8],
     additions: &[MkvBlockAddition],
     duration_ticks: Option<u64>,
-    reference_block: Option<i64>,
+    reference_blocks: &[i64],
+    reference_priority: u64,
+    codec_state: Option<&[u8]>,
+    discard_padding: Option<i64>,
 ) -> Vec<u8> {
     // Block child: same §10.2 header layout as SimpleBlock minus the
     // keyframe / discardable flag bits, lacing bits 00.
@@ -4134,22 +4245,35 @@ fn build_block_group(
     let mut group_body = Vec::new();
     write_bytes_element(&mut group_body, ids::BLOCK, &block_body);
 
-    let mut additions_body = Vec::new();
-    for a in additions {
-        let mut more = Vec::with_capacity(8 + a.data.len());
-        write_bytes_element(&mut more, ids::BLOCK_ADDITIONAL, &a.data);
-        if a.id != 1 {
-            write_uint_element(&mut more, ids::BLOCK_ADD_ID, a.id);
+    if !additions.is_empty() {
+        let mut additions_body = Vec::new();
+        for a in additions {
+            let mut more = Vec::with_capacity(8 + a.data.len());
+            write_bytes_element(&mut more, ids::BLOCK_ADDITIONAL, &a.data);
+            if a.id != 1 {
+                write_uint_element(&mut more, ids::BLOCK_ADD_ID, a.id);
+            }
+            write_master_element(&mut additions_body, ids::BLOCK_MORE, &more);
         }
-        write_master_element(&mut additions_body, ids::BLOCK_MORE, &more);
+        write_master_element(&mut group_body, ids::BLOCK_ADDITIONS, &additions_body);
     }
-    write_master_element(&mut group_body, ids::BLOCK_ADDITIONS, &additions_body);
 
     if let Some(d) = duration_ticks {
         write_uint_element(&mut group_body, ids::BLOCK_DURATION, d);
     }
-    if let Some(r) = reference_block {
-        write_int_element(&mut group_body, ids::REFERENCE_BLOCK, r);
+    // ReferencePriority's spec default is 0; a mandatory element at its
+    // default may stay off-disk.
+    if reference_priority != 0 {
+        write_uint_element(&mut group_body, ids::REFERENCE_PRIORITY, reference_priority);
+    }
+    for r in reference_blocks {
+        write_int_element(&mut group_body, ids::REFERENCE_BLOCK, *r);
+    }
+    if let Some(s) = codec_state {
+        write_bytes_element(&mut group_body, ids::CODEC_STATE, s);
+    }
+    if let Some(p) = discard_padding {
+        write_int_element(&mut group_body, ids::DISCARD_PADDING, p);
     }
 
     let mut out = Vec::with_capacity(8 + group_body.len());

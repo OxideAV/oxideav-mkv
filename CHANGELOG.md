@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- BlockGroup meta surface (RFC 9559 §5.1.3.5.4..§5.1.3.5.7), read **and**
+  write. Demuxer: `MkvDemuxer::block_group_meta() -> Option<&demux::BlockGroupMeta>`
+  folds the four non-`Block`, non-`BlockAdditions` `BlockGroup` children the
+  `Packet` type has no slot for — `ReferenceBlock` (§5.1.3.5.5, every value, in
+  on-disk order; was previously read only to flip the keyframe flag and then
+  discarded), `ReferencePriority` (§5.1.3.5.4, spec default `0` materialised),
+  `CodecState` (§5.1.3.5.6, verbatim codec-private bytes), `DiscardPadding`
+  (§5.1.3.5.7, signed Matroska Ticks). Same call discipline as
+  `block_additions()` (read after `next_packet()`, invalidated by `seek_to`).
+  Muxer: `MkvMuxer::write_packet_with_block_group(&Packet, &mux::BlockGroupOptions)`
+  writes the full group child set in §5.1.3.5 order, deriving a single
+  `ReferenceBlock` from the previous same-track Block when the caller leaves the
+  list empty for a non-keyframe (the prior `write_packet_with_additions`
+  behaviour) and writing the caller's explicit references verbatim otherwise.
+  An empty `BlockAdditions` no longer emits a malformed empty master, and a
+  group whose only child is e.g. `DiscardPadding` needs no `MaxBlockAdditionID`
+  declaration. New `ids::{REFERENCE_PRIORITY, CODEC_STATE, DISCARD_PADDING,
+  SILENT_TRACKS, SILENT_TRACK_NUMBER}`. Covered by `tests/mux_block_group.rs`
+  (5 round-trip cases).
 - Demuxer: typed `SeekHead` accessor (RFC 9559 §5.1.1, including
   §5.1.1.1..§5.1.1.1.2). `MkvDemuxer::seek_entries() -> &[demux::SeekEntry]`
   surfaces the MetaSeek index — the `SeekHead > Seek` rows that point each

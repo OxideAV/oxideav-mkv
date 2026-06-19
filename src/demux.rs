@@ -15,8 +15,8 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
 use crate::ebml::{
-    crc32_ieee, read_bytes, read_element_header, read_float, read_string, read_uint, read_vint,
-    skip, VINT_UNKNOWN_SIZE,
+    crc32_ieee, read_bytes, read_element_header, read_float, read_int, read_string, read_uint,
+    read_vint, skip, VINT_UNKNOWN_SIZE,
 };
 use crate::ids;
 
@@ -746,6 +746,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         track_translates,
         max_block_addition_ids,
         last_block_additions: None,
+        last_block_group_meta: None,
         track_audience_flags,
         track_audio,
         track_timing,
@@ -2317,6 +2318,78 @@ impl BlockAddition {
     /// `AlphaMode` is `1`.
     pub fn is_codec_defined(&self) -> bool {
         self.id == 1
+    }
+}
+
+/// The non-`Block`, non-`BlockAdditions` children of a `BlockGroup`
+/// (RFC 9559 §5.1.3.5) attached to the most recently returned packet.
+///
+/// `BlockDuration` (§5.1.3.5.3) is already surfaced on the packet's
+/// `duration` field; the remaining four children carry information the
+/// `Packet` type has no slot for, so they are folded into this side
+/// record reachable through [`MkvDemuxer::block_group_meta`]:
+///
+/// * [`reference_blocks`](Self::reference_blocks) — every `ReferenceBlock`
+///   (§5.1.3.5.5, signed integer, track ticks relative to this Block's
+///   timestamp). A `BlockGroup` may carry several when the frame depends
+///   on more than one reference. Empty for a keyframe (no `ReferenceBlock`
+///   child) and for packets that came from a `SimpleBlock`.
+/// * [`reference_priority`](Self::reference_priority) — `ReferencePriority`
+///   (§5.1.3.5.4, uinteger, default `0`). `0` means the frame is not
+///   referenced.
+/// * [`codec_state`](Self::codec_state) — `CodecState` (§5.1.3.5.6, binary,
+///   `minver: 2`): a new codec state private to the codec. `None` when the
+///   child is absent.
+/// * [`discard_padding`](Self::discard_padding) — `DiscardPadding`
+///   (§5.1.3.5.7, signed integer, `minver: 4`): nanoseconds of silent data
+///   added to the Block (positive = end, negative = beginning), to be
+///   discarded during playback. `None` when the child is absent.
+///
+/// For a laced `Block`, every de-laced frame reports the same meta — the
+/// `BlockGroup` children attach to the Block as a whole.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockGroupMeta {
+    reference_blocks: Vec<i64>,
+    reference_priority: u64,
+    codec_state: Option<Vec<u8>>,
+    discard_padding: Option<i64>,
+}
+
+impl BlockGroupMeta {
+    /// `ReferenceBlock` values (RFC 9559 §5.1.3.5.5), in on-disk order.
+    /// Each is a track-tick offset relative to this Block's timestamp
+    /// identifying a Block this one depends on. Empty for a keyframe.
+    pub fn reference_blocks(&self) -> &[i64] {
+        &self.reference_blocks
+    }
+
+    /// `ReferencePriority` (RFC 9559 §5.1.3.5.4). The spec default `0`
+    /// (frame not referenced) is materialised when the child is absent.
+    pub fn reference_priority(&self) -> u64 {
+        self.reference_priority
+    }
+
+    /// `CodecState` (RFC 9559 §5.1.3.5.6) — verbatim codec-private state
+    /// bytes, or `None` when the `BlockGroup` has no `CodecState` child.
+    pub fn codec_state(&self) -> Option<&[u8]> {
+        self.codec_state.as_deref()
+    }
+
+    /// `DiscardPadding` (RFC 9559 §5.1.3.5.7) in Matroska Ticks
+    /// (nanoseconds). `None` when the `BlockGroup` has no `DiscardPadding`
+    /// child.
+    pub fn discard_padding(&self) -> Option<i64> {
+        self.discard_padding
+    }
+
+    /// True when none of the four optional children were present — i.e.
+    /// the `BlockGroup` carried only a `Block` (and possibly
+    /// `BlockAdditions` / `BlockDuration`, surfaced elsewhere).
+    pub fn is_empty(&self) -> bool {
+        self.reference_blocks.is_empty()
+            && self.reference_priority == 0
+            && self.codec_state.is_none()
+            && self.discard_padding.is_none()
     }
 }
 
@@ -5991,7 +6064,12 @@ pub struct MkvDemuxer {
     /// and for Blocks that carried no additions. The additions are
     /// shared via `Arc` because every frame de-laced from one Block
     /// shares the Block's single `BlockAdditions` master.
-    out_queue: std::collections::VecDeque<(Packet, Option<std::sync::Arc<Vec<BlockAddition>>>)>,
+    #[allow(clippy::type_complexity)]
+    out_queue: std::collections::VecDeque<(
+        Packet,
+        Option<std::sync::Arc<Vec<BlockAddition>>>,
+        Option<std::sync::Arc<BlockGroupMeta>>,
+    )>,
     time_base: TimeBase,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
@@ -6132,6 +6210,13 @@ pub struct MkvDemuxer {
     /// packet's Block carried none (or no packet has been returned yet,
     /// or a seek invalidated it).
     last_block_additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
+    /// The non-`Block` `BlockGroup` children (`ReferenceBlock`,
+    /// `ReferencePriority`, `CodecState`, `DiscardPadding`) attached to the
+    /// most recently returned packet — see
+    /// [`MkvDemuxer::block_group_meta`]. `None` for packets from a
+    /// `SimpleBlock` or a `BlockGroup` that carried only the `Block` (and
+    /// possibly `BlockAdditions` / `BlockDuration`).
+    last_block_group_meta: Option<std::sync::Arc<BlockGroupMeta>>,
     /// Per-stream [`TrackAudienceFlags`] (RFC 9559 §5.1.4.1.6..§5.1.4.1.11),
     /// indexed by stream index. Every track surfaces a record — `FlagForced`
     /// has a spec default of `0` and the §minver-4 flags carry no default
@@ -6181,11 +6266,14 @@ impl Demuxer for MkvDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            if let Some((p, additions)) = self.out_queue.pop_front() {
+            if let Some((p, additions, meta)) = self.out_queue.pop_front() {
                 // Keep the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2)
-                // reachable through `block_additions()` until the next
-                // packet is returned (or a seek invalidates it).
+                // and the `BlockGroup` meta children (§5.1.3.5.4..§5.1.3.5.7)
+                // reachable through `block_additions()` / `block_group_meta()`
+                // until the next packet is returned (or a seek invalidates
+                // them).
                 self.last_block_additions = additions;
+                self.last_block_group_meta = meta;
                 return Ok(p);
             }
             self.advance()?;
@@ -6275,6 +6363,7 @@ impl Demuxer for MkvDemuxer {
         self.cluster_state = ClusterState::Idle;
         self.out_queue.clear();
         self.last_block_additions = None;
+        self.last_block_group_meta = None;
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -6714,6 +6803,27 @@ impl MkvDemuxer {
             .as_deref()
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// The [`BlockGroupMeta`] (RFC 9559 §5.1.3.5.4..§5.1.3.5.7 —
+    /// `ReferenceBlock`, `ReferencePriority`, `CodecState`,
+    /// `DiscardPadding`) attached to the most recently returned packet, or
+    /// `None` when that packet came from a `SimpleBlock` or from a
+    /// `BlockGroup` whose only non-`Block` children were `BlockAdditions`
+    /// and/or `BlockDuration` (both surfaced elsewhere — additions through
+    /// [`MkvDemuxer::block_additions`], duration on the packet itself).
+    ///
+    /// Same call discipline as [`MkvDemuxer::block_additions`]: read it
+    /// after `next_packet()` and before the next `next_packet()` /
+    /// `seek_to`. For a laced Block every de-laced frame reports the same
+    /// meta — the `BlockGroup` children attach to the Block as a whole.
+    ///
+    /// Note `ReferenceBlock`'s *presence* (rather than this surface) drives
+    /// the packet's keyframe flag: a `BlockGroup` with no `ReferenceBlock`
+    /// yields `keyframe = true`, mirroring §5.1.3.5.5. The values here let a
+    /// caller reconstruct the exact reference graph the Writer recorded.
+    pub fn block_group_meta(&self) -> Option<&BlockGroupMeta> {
+        self.last_block_group_meta.as_deref()
     }
 
     /// [`TrackAudienceFlags`] (RFC 9559 §5.1.4.1.6..§5.1.4.1.11) for the
@@ -7384,6 +7494,7 @@ impl MkvDemuxer {
         let mut duration: Option<i64> = None;
         let mut is_keyframe = true;
         let mut additions: Option<std::sync::Arc<Vec<BlockAddition>>> = None;
+        let mut meta = BlockGroupMeta::default();
         while self.input.stream_position()? < end {
             let e = read_element_header(&mut *self.input)?;
             match e.id {
@@ -7394,8 +7505,25 @@ impl MkvDemuxer {
                     duration = Some(read_uint(&mut *self.input, e.size as usize)? as i64);
                 }
                 ids::REFERENCE_BLOCK => {
+                    // §5.1.3.5.5 — signed track-tick offset to a Block this
+                    // one depends on. Its presence marks the Block as a
+                    // non-keyframe; the value is surfaced through
+                    // `block_group_meta()`. A BlockGroup may carry several.
                     is_keyframe = false;
-                    skip(&mut *self.input, e.size)?;
+                    meta.reference_blocks
+                        .push(read_int(&mut *self.input, e.size as usize)?);
+                }
+                ids::REFERENCE_PRIORITY => {
+                    // §5.1.3.5.4 — uinteger cache priority, default 0.
+                    meta.reference_priority = read_uint(&mut *self.input, e.size as usize)?;
+                }
+                ids::CODEC_STATE => {
+                    // §5.1.3.5.6 — codec-private state bytes.
+                    meta.codec_state = Some(read_bytes(&mut *self.input, e.size as usize)?);
+                }
+                ids::DISCARD_PADDING => {
+                    // §5.1.3.5.7 — signed nanoseconds of silent padding.
+                    meta.discard_padding = Some(read_int(&mut *self.input, e.size as usize)?);
                 }
                 ids::BLOCK_ADDITIONS => {
                     // RFC 9559 §5.1.3.5.2 — per-Block side-channel
@@ -7414,7 +7542,19 @@ impl MkvDemuxer {
             // For BlockGroup, the lacing flags are in the same place as
             // SimpleBlock (the "keyframe" bit doesn't exist in plain Block —
             // keyframe-ness is inferred from absence of ReferenceBlock).
-            self.queue_block_packets_with(&b, cluster_timecode, is_keyframe, duration, additions)?;
+            let meta = if meta.is_empty() {
+                None
+            } else {
+                Some(std::sync::Arc::new(meta))
+            };
+            self.queue_block_packets_with(
+                &b,
+                cluster_timecode,
+                is_keyframe,
+                duration,
+                additions,
+                meta,
+            )?;
         }
         Ok(())
     }
@@ -7429,8 +7569,10 @@ impl MkvDemuxer {
         // BlockGroup/Block has the same layout but no keyframe bit.
         // We pass through whatever's set in the flags byte for SimpleBlock.
         // A SimpleBlock can never carry BlockAdditions (the element lives
-        // only on BlockGroup, RFC 9559 §5.1.3.5.2).
-        self.queue_block_packets_with(bytes, cluster_timecode, true, None, None)
+        // only on BlockGroup, RFC 9559 §5.1.3.5.2) nor the BlockGroup meta
+        // children (ReferenceBlock / ReferencePriority / CodecState /
+        // DiscardPadding).
+        self.queue_block_packets_with(bytes, cluster_timecode, true, None, None, None)
     }
 
     fn queue_block_packets_with(
@@ -7440,6 +7582,7 @@ impl MkvDemuxer {
         default_keyframe: bool,
         explicit_duration: Option<i64>,
         additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
+        meta: Option<std::sync::Arc<BlockGroupMeta>>,
     ) -> Result<()> {
         let mut cur = std::io::Cursor::new(bytes);
         let (track_number, _) = crate::ebml::read_vint(&mut cur, false)?;
@@ -7498,10 +7641,12 @@ impl MkvDemuxer {
             pkt.dts = Some(pts);
             pkt.duration = per_frame;
             pkt.flags.keyframe = keyframe_flag || default_keyframe;
-            // BlockAdditions (RFC 9559 §5.1.3.5.2) attach to the Block as
-            // a whole; every frame de-laced from a laced Block shares the
-            // same additions (the spec gives no per-lace-frame split).
-            self.out_queue.push_back((pkt, additions.clone()));
+            // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta
+            // children attach to the Block as a whole; every frame de-laced
+            // from a laced Block shares the same additions / meta (the spec
+            // gives no per-lace-frame split).
+            self.out_queue
+                .push_back((pkt, additions.clone(), meta.clone()));
         }
         Ok(())
     }

@@ -325,6 +325,22 @@ pub const BLOCK_GROUP: u32 = 0xA0;
 pub const BLOCK: u32 = 0xA1;
 pub const BLOCK_DURATION: u32 = 0x9B;
 pub const REFERENCE_BLOCK: u32 = 0xFB;
+// ReferencePriority (RFC 9559 §5.1.3.5.4, uinteger, default 0): cache
+// priority of a referenced frame. CodecState (§5.1.3.5.6, binary,
+// minver 2): a new codec state private to the codec. DiscardPadding
+// (§5.1.3.5.7, integer, minver 4): nanoseconds of silent padding added
+// to the Block (positive = end, negative = beginning), discarded during
+// playback.
+pub const REFERENCE_PRIORITY: u32 = 0xFA;
+pub const CODEC_STATE: u32 = 0xA4;
+pub const DISCARD_PADDING: u32 = 0x75A2;
+// SilentTracks (RFC 9559 Appendix A.1, master, id 0x5854) and
+// SilentTrackNumber (A.2, uinteger, id 0x58D7): the Cluster-level list of
+// track numbers not used in that part of the stream. Deprecated
+// (maxver 0) but still emitted by historical Writers, so the demuxer
+// surfaces them and the muxer can round-trip them.
+pub const SILENT_TRACKS: u32 = 0x5854;
+pub const SILENT_TRACK_NUMBER: u32 = 0x58D7;
 
 // BlockAdditions (RFC 9559 §5.1.3.5.2): per-BlockGroup side channel of
 // additional binary data completing the Block. Each `BlockMore`
