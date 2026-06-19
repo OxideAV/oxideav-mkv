@@ -35,7 +35,7 @@
 use std::io::Cursor;
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_core::{NullCodecResolver, ReadSeek};
+use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
 
 /// Bound on how many packets we drain per fuzz input. A pathological
 /// but legitimate stream could otherwise spin the fuzzer on a single
@@ -76,4 +76,40 @@ fuzz_target!(|data: &[u8]| {
     // — and runs the CueRelativePosition / cluster pre-open code.
     // If the file had no Cues this returns Err; that's fine.
     let _ = dmx.seek_to(0, 0);
+
+    // Second pass through the *typed* demuxer (`open_typed`), exercising
+    // the typed-accessor surface the trait `open` path doesn't reach:
+    // the per-Block BlockGroup side channels (`block_additions`,
+    // `block_group_meta`), the Cluster records (which now carry
+    // `SilentTrackNumber` lists), and the Chapters / SeekHead trees. A
+    // crafted BlockGroup / SilentTracks / Chapters subtree must populate
+    // these without panicking or leaving an inconsistent invariant.
+    let rs2: Box<dyn ReadSeek> = Box::new(Cursor::new(data.to_vec()));
+    if let Ok(mut tdmx) = oxideav_mkv::demux::open_typed(rs2, &NullCodecResolver) {
+        // Pre-packet typed trees built entirely during open().
+        let _ = tdmx.chapters().len();
+        let _ = tdmx.seek_entries().len();
+        let _ = tdmx.cluster_records().len();
+        for _ in 0..MAX_PACKETS_PER_INPUT {
+            match tdmx.next_packet() {
+                Ok(_) => {
+                    // Per-packet side channels: read them while they are
+                    // valid (between this packet and the next).
+                    let _ = tdmx.block_additions().len();
+                    if let Some(meta) = tdmx.block_group_meta() {
+                        let _ = meta.reference_blocks().len();
+                        let _ = meta.reference_priority();
+                        let _ = meta.codec_state().map(|s| s.len());
+                        let _ = meta.discard_padding();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Cluster records accumulate as the walk progresses; touch the
+        // SilentTrackNumber lists post-walk.
+        for rec in tdmx.cluster_records() {
+            let _ = rec.silent_track_numbers.len();
+        }
+    }
 });
