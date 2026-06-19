@@ -59,6 +59,17 @@ the unified `oxideav` aggregator to wire decoding automatically.
   unknown-size Segment/Cluster both supported.
 - Clusters: `SimpleBlock` and `BlockGroup -> Block`, all three lacing
   modes (Xiph, fixed, EBML-signed-delta).
+- **Typed `BlockGroup` meta** (`demux::open_typed`):
+  `MkvDemuxer::block_group_meta() -> Option<&BlockGroupMeta>` surfaces the
+  four `BlockGroup` children the `Packet` type has no slot for —
+  `ReferenceBlock` (RFC 9559 §5.1.3.5.5, every value in on-disk order),
+  `ReferencePriority` (§5.1.3.5.4, default `0` materialised), `CodecState`
+  (§5.1.3.5.6), and `DiscardPadding` (§5.1.3.5.7) — alongside the existing
+  `block_additions()` side channel (same read-after-`next_packet` call
+  discipline, cleared on seek).
+- **`SilentTracks`** (RFC 9559 Appendix A.1 / A.2): per-Cluster
+  `SilentTrackNumber` lists surface on `ClusterRecord::silent_track_numbers`
+  in on-disk order (deprecated element, but read for faithful re-mux).
 - Metadata lift: title, muxer, encoder, date (Matroska `DateUTC` ->
   ISO-8601), Tags `SimpleTag` name/value pairs with **target-scope
   resolution** (`Tags.Targets.TagTrackUID` -> `tag:track:N:<name>`,
@@ -624,7 +635,16 @@ the unified `oxideav` aggregator to wire decoding automatically.
   end_ns, title)` queues a single English-language `ChapterAtom`;
   `add_chapter_full(MkvChapter)` takes a fully-specified record with
   multilingual `ChapterDisplay` rows (`ChapString` + `ChapLanguage`
-  + optional `ChapCountry`). Chapters must be added before
+  + optional `ChapCountry`) plus the complete `ChapterAtom` field set —
+  `ChapterUID` (§5.1.7.1.4.1, auto-derived non-zero when `None`),
+  `ChapterStringUID` (.2), `ChapterFlagHidden` (.5), `ChapterFlagEnabled`
+  (default `1`, written only when cleared), `ChapterSegmentUUID` (.6,
+  16-byte), `ChapterSegmentEditionUID` (.7), `ChapterPhysicalEquiv` (.8),
+  and the `ChapProcess > ChapProcessCommand` chapter-codec command tree
+  (§5.1.7.1.4.14–19) via `MkvChapProcess` / `MkvChapProcessCommand`
+  (write-side mirror of the demux `ChapProcess` surface). `add_chapter_full`
+  rejects `ChapterUID 0` / `ChapterSegmentEditionUID 0` (range "not 0") and
+  a non-16-byte `ChapterSegmentUUID`. Chapters must be added before
   `write_header`; the muxer emits a single `EditionEntry` between
   Tracks and the first Cluster and patches the SeekHead `Chapters`
   slot to point at it (slot is voided if no chapters were queued).
@@ -905,6 +925,21 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `max_block_addition_id` typed accessors — a mux→demux pipeline
   preserves every addition byte-for-byte, plus the packet's keyframe
   flag and duration.
+- **Full `BlockGroup` child set on write** (RFC 9559 §5.1.3.5.4–§5.1.3.5.7):
+  `MkvMuxer::write_packet_with_block_group(&packet, &BlockGroupOptions)`
+  wraps a packet in a `BlockGroup` carrying any combination of
+  `BlockAdditions`, an explicit multi-`ReferenceBlock` list (§5.1.3.5.5),
+  `ReferencePriority` (§5.1.3.5.4, written only when non-zero),
+  `CodecState` (§5.1.3.5.6) and `DiscardPadding` (§5.1.3.5.7), emitted in
+  §5.1.3.5 order. The write-side mirror of `MkvDemuxer::block_group_meta`
+  — a mux→demux round-trip preserves every child value. A group needing
+  no additions skips the `MaxBlockAdditionID` requirement.
+- **`SilentTracks` on write** (RFC 9559 Appendix A.1 / A.2):
+  `MkvMuxer::set_next_cluster_silent_tracks(&[track_numbers])` queues a
+  `SilentTrackNumber` list for the next Cluster the muxer opens (drained
+  after one Cluster to match the element's per-Cluster scope);
+  `MkvMuxer::track_number(stream_index)` maps a stream index to its
+  on-wire `TrackNumber`.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
@@ -1206,6 +1241,17 @@ forged 2 GiB `FileName`; an out-of-range `CueRelativePosition` in
 shapes. All checks land as standard `cargo test` targets so a regression
 on any one surfaces in CI without waiting for a fuzz cycle.
 
+`tests/ebml_walker_property.rs` adds deterministic property-style coverage
+for the EBML element walker (RFC 8794) that backs the whole demuxer — a
+seeded splitmix64 PRNG drives ~100k generated cases per run (no
+`proptest`/`quickcheck` dependency): VINT `write_vint`↔`read_vint`
+round-trips with `min_width` honoured across the full 56-bit range, the
+unknown-size sentinel at every width, `read_element_header` round-trips, a
+sequential `read_element_header` + `skip` walk that recovers every element
+id and lands exactly on the buffer end, and a no-panic / no-backward-seek
+guarantee over arbitrary byte streams and every prefix of a well-formed
+tree.
+
 ## Fuzzing
 
 A cargo-fuzz harness for the demuxer lives in `fuzz/`. It drives
@@ -1213,7 +1259,11 @@ A cargo-fuzz harness for the demuxer lives in `fuzz/`. It drives
 the `seek_to` cluster pre-open path — over arbitrary bytes — against the
 contract that no call panics, aborts, integer-overflows (in a debug
 build), or attempts an attacker-controlled allocation that exceeds what
-the input can back. The seed corpus in `fuzz/corpus/demux/` covers a
+the input can back. A second pass through `open_typed` additionally
+fuzzes the typed-accessor surface — the per-Block `block_additions` /
+`block_group_meta` side channels, the `ClusterRecord` `SilentTrackNumber`
+lists, and the Chapters / SeekHead trees. The seed corpus in
+`fuzz/corpus/demux/` covers a
 minimal valid Matroska file, a minimal valid WebM file, an EBML-header-
 only stream, and two regression inputs (one for an EBML size-overflow,
 one for a zero-frame-size fixed-lacing `SimpleBlock`).
