@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Property-style test coverage for the EBML element walker (RFC 8794) in
+  `tests/ebml_walker_property.rs` — a seeded splitmix64 PRNG drives ~100k
+  generated cases per run (no `proptest`/`quickcheck` dependency, keeping
+  the clean-room surface minimal). Pins: VINT `write_vint`↔`read_vint`
+  round-trip with `min_width` honoured across the full 56-bit range; the
+  unknown-size sentinel at every width (1..8); `read_element_header`
+  round-trip with `header_len` accounting; a sequential `read_element_header`
+  + `skip` walk recovering every element id and landing exactly on the
+  buffer end; and no-panic / no-backward-seek on arbitrary byte streams and
+  every prefix of a well-formed tree. Complements the existing
+  demux-only libFuzzer target in `fuzz/`.
 - Muxer: complete `ChapterAtom` write surface (RFC 9559 §5.1.7.1.4). The
   `mux::MkvChapter` struct now carries the atom fields the writer previously
   dropped — `uid` (§5.1.7.1.4.1, auto-derived non-zero when `None`),
