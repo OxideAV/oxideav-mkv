@@ -822,7 +822,7 @@ impl CrcStatus {
 /// practice writers report the full element size, matching what a
 /// reverse walker would consume to step back across the previous
 /// Cluster.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClusterRecord {
     /// Absolute file offset of the Cluster's body (the byte right after
     /// its id+size header). Stable across re-seeks; used as the dedup
@@ -838,6 +838,15 @@ pub struct ClusterRecord {
     /// Cluster of a Segment (no previous Cluster to size), and on
     /// writers that don't bother emitting it.
     pub prev_size: Option<u64>,
+    /// `SilentTracks > SilentTrackNumber` values (RFC 9559 Appendix A.1 /
+    /// A.2, ids `0x5854` / `0x58D7`) carried by this Cluster, in on-disk
+    /// order. The list of track numbers "not used in that part of the
+    /// stream" — useful when overlay tracks are present. Empty when the
+    /// Cluster has no `SilentTracks` child (the overwhelmingly common
+    /// case — the element is deprecated, `maxver: 0`, but historical
+    /// Writers emit it). A track marked silent here MAY become active
+    /// again in a later Cluster (A.2).
+    pub silent_track_numbers: Vec<u64>,
 }
 
 /// One `SeekHead > Seek` entry (RFC 9559 §5.1.1.1) — the MetaSeek index
@@ -5774,6 +5783,21 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<BlockAddi
     Ok(out)
 }
 
+/// Parse a `SilentTracks` master (RFC 9559 Appendix A.1, id `0x5854`) into
+/// its `SilentTrackNumber` (A.2, id `0x58D7`) values in on-disk order. Any
+/// other child element is skipped.
+fn parse_silent_tracks(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<u64>> {
+    let mut out: Vec<u64> = Vec::new();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::SILENT_TRACK_NUMBER => out.push(read_uint(r, e.size as usize)?),
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(out)
+}
+
 fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
     // Materialise the typed staging record on first call. An `Audio` master
     // with no children still surfaces a record so the typed builder
@@ -6570,6 +6594,7 @@ impl MkvDemuxer {
             body_offset: body_start,
             position: None,
             prev_size: None,
+            silent_track_numbers: Vec::new(),
         });
         self.cluster_record_by_offset.insert(body_start, idx);
     }
@@ -6592,6 +6617,20 @@ impl MkvDemuxer {
     fn set_cluster_prev_size(&mut self, body_start: u64, v: u64) {
         if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
             self.cluster_records[idx].prev_size = Some(v);
+        }
+    }
+
+    /// Attach `SilentTrackNumber` values (RFC 9559 Appendix A.2) parsed
+    /// from a Cluster's `SilentTracks` (A.1) master to the record keyed by
+    /// `body_start`. No-op when the record is missing — see
+    /// [`Self::set_cluster_position`] for the why. Appends rather than
+    /// replaces, so a (malformed) second `SilentTracks` in one Cluster
+    /// accumulates instead of clobbering.
+    fn set_cluster_silent_tracks(&mut self, body_start: u64, mut nums: Vec<u64>) {
+        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
+            self.cluster_records[idx]
+                .silent_track_numbers
+                .append(&mut nums);
         }
     }
 
@@ -7458,6 +7497,18 @@ impl MkvDemuxer {
                         // can jump back without re-scanning the Segment.
                         let v = read_uint(&mut *self.input, e.size as usize)?;
                         self.set_cluster_prev_size(body_start, v);
+                    }
+                    ids::SILENT_TRACKS => {
+                        // RFC 9559 Appendix A.1 — master listing the track
+                        // numbers (A.2 SilentTrackNumber) not used in this
+                        // part of the stream. Deprecated (maxver 0) but
+                        // surfaced for inspection / re-mux on the Cluster
+                        // record.
+                        let st_end = self.input.stream_position()?.saturating_add(e.size);
+                        let nums = parse_silent_tracks(&mut *self.input, st_end)?;
+                        if !nums.is_empty() {
+                            self.set_cluster_silent_tracks(body_start, nums);
+                        }
                     }
                     ids::SIMPLE_BLOCK => {
                         let bytes = read_bytes(&mut *self.input, e.size as usize)?;

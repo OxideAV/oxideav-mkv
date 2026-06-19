@@ -270,6 +270,14 @@ pub struct MkvMuxer {
     /// signals page/chunk granules (e.g. Ogg).
     stream_pts: Vec<i64>,
     cluster_open: bool,
+    /// `SilentTracks > SilentTrackNumber` (RFC 9559 Appendix A.1 / A.2)
+    /// track numbers to emit on the **next** Cluster the muxer opens, set
+    /// via [`MkvMuxer::set_next_cluster_silent_tracks`]. Drained (cleared)
+    /// when that Cluster's `SilentTracks` master is written, so the list
+    /// applies to exactly one Cluster — matching the per-Cluster scope of
+    /// the element (A.2: a track silent here MAY become active in a later
+    /// Cluster).
+    pending_silent_tracks: Vec<u64>,
     /// Timecode (in ms) at the start of the currently open cluster.
     cluster_timecode_ms: i64,
     /// Byte offset of the currently open cluster header, relative to the
@@ -1399,6 +1407,7 @@ impl MkvMuxer {
             track_numbers: stream_track_numbers,
             stream_pts: vec![0i64; n],
             cluster_open: false,
+            pending_silent_tracks: Vec::new(),
             cluster_timecode_ms: 0,
             cluster_offset_rel: 0,
             cluster_body_start_abs: 0,
@@ -2477,6 +2486,38 @@ impl MkvMuxer {
         }
         self.max_block_addition_ids[stream_index] = Some(max);
         Ok(self)
+    }
+
+    /// Queue a `SilentTracks > SilentTrackNumber` list (RFC 9559 Appendix
+    /// A.1 / A.2) to be written on the **next** Cluster the muxer opens —
+    /// the write-side counterpart of
+    /// [`ClusterRecord::silent_track_numbers`](crate::demux::ClusterRecord::silent_track_numbers).
+    ///
+    /// `track_numbers` are on-wire `TrackNumber`s (the same values the
+    /// muxer assigns each stream, queryable via
+    /// [`MkvMuxer::track_number`]), listing the tracks "not used in that
+    /// part of the stream". The list applies to exactly one Cluster: it is
+    /// drained when that Cluster's header is written, mirroring the
+    /// per-Cluster scope of the element (A.2 — a track silent in one
+    /// Cluster MAY be active again in a later one).
+    ///
+    /// Because the muxer decides Cluster boundaries from packet timing,
+    /// "next Cluster" means the next one opened by a `write_packet*` call
+    /// (or the first, if none is open yet). Call this immediately before
+    /// the first packet of the Cluster you want the element on. Passing an
+    /// empty slice clears any queued list. The element is deprecated
+    /// (`maxver: 0`) but emitted by historical Writers; the muxer offers it
+    /// for faithful re-mux.
+    pub fn set_next_cluster_silent_tracks(&mut self, track_numbers: &[u64]) {
+        self.pending_silent_tracks = track_numbers.to_vec();
+    }
+
+    /// The on-wire `TrackNumber` (RFC 9559 §5.1.4.1.1) the muxer assigned
+    /// the stream at `stream_index`, or `None` for an out-of-range index.
+    /// Useful for building a [`MkvMuxer::set_next_cluster_silent_tracks`]
+    /// list from stream indices.
+    pub fn track_number(&self, stream_index: usize) -> Option<u64> {
+        self.track_numbers.get(stream_index).copied()
     }
 
     /// Read-only accessor for the queued per-stream `MaxBlockAdditionID`
@@ -3942,6 +3983,20 @@ impl MkvMuxer {
         let mut tc = Vec::new();
         write_uint_element(&mut tc, ids::TIMECODE, timecode_ms.max(0) as u64);
         self.output.write_all(&tc)?;
+        // SilentTracks (RFC 9559 Appendix A.1) — emitted once per Cluster
+        // when the caller queued track numbers for this Cluster via
+        // `set_next_cluster_silent_tracks`. The list is drained so it
+        // applies to exactly this one Cluster (A.2: a track silent here MAY
+        // be active again later).
+        if !self.pending_silent_tracks.is_empty() {
+            let mut st_body = Vec::new();
+            for n in self.pending_silent_tracks.drain(..) {
+                write_uint_element(&mut st_body, ids::SILENT_TRACK_NUMBER, n);
+            }
+            let mut st = Vec::new();
+            write_master_element(&mut st, ids::SILENT_TRACKS, &st_body);
+            self.output.write_all(&st)?;
+        }
         self.cluster_timecode_ms = timecode_ms.max(0);
         self.cluster_open = true;
         // New cluster → clear the "already cued this track" flags.

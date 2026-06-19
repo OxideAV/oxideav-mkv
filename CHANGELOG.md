@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `SilentTracks` (RFC 9559 Appendix A.1 / A.2, ids `0x5854` / `0x58D7`),
+  read **and** write. Demuxer: a new `ClusterRecord::silent_track_numbers`
+  field surfaces the per-Cluster list of `SilentTrackNumber` values (the
+  track numbers "not used in that part of the stream") in on-disk order,
+  empty for the common case of a Cluster without the element. Muxer:
+  `MkvMuxer::set_next_cluster_silent_tracks(&[u64])` queues the list for the
+  next Cluster the muxer opens, draining it after one Cluster to match the
+  element's per-Cluster scope (A.2: a track silent here MAY be active again
+  later); `MkvMuxer::track_number(stream_index)` maps a stream index to the
+  assigned on-wire `TrackNumber` so callers can build the list. The element
+  is deprecated (`maxver: 0`) but emitted by historical Writers, so both
+  paths exist for faithful inspection / re-mux. Covered by
+  `tests/silent_tracks.rs` (4 round-trip cases). `ClusterRecord` is no longer
+  `Copy` (it now owns a `Vec`); it stays `Clone`.
 - BlockGroup meta surface (RFC 9559 §5.1.3.5.4..§5.1.3.5.7), read **and**
   write. Demuxer: `MkvDemuxer::block_group_meta() -> Option<&demux::BlockGroupMeta>`
   folds the four non-`Block`, non-`BlockAdditions` `BlockGroup` children the
