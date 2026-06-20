@@ -268,6 +268,86 @@ fn open_rejects_tag_string_with_oversize_size() {
 }
 
 #[test]
+fn open_handles_deeply_nested_simple_tags_without_stack_overflow() {
+    // RFC 9559 §5.1.8.1.2 marks SimpleTag `recursive: True`. A hostile
+    // file can pile thousands of nested SimpleTag headers in a few KB to
+    // try to blow the recursive parser's stack. The demuxer caps the
+    // recursion depth, so this must return cleanly (Ok or Err) without a
+    // panic / stack overflow.
+    //
+    // Build 4000 SimpleTag masters nested inside one another, innermost
+    // first. Each level carries a TagName so it isn't dropped by the
+    // §5.1.8.1.2.1 minOccurs rule below the depth cap.
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&elem_str(ids::TAG_NAME, "LEAF"));
+    let mut node = elem_master(ids::SIMPLE_TAG, &inner);
+    for _ in 0..4000 {
+        let mut body = Vec::new();
+        body.extend_from_slice(&elem_str(ids::TAG_NAME, "N"));
+        body.extend_from_slice(&node);
+        node = elem_master(ids::SIMPLE_TAG, &body);
+    }
+    let tag = elem_master(0x7373 /* Tag */, &node);
+    let tags = elem_master(ids::TAGS, &tag);
+    let bytes = header_plus_segment(&tags);
+    // Contract: returns (no panic / stack overflow). The deep tail past
+    // the depth cap is silently dropped.
+    let _ = open(bytes);
+}
+
+#[test]
+fn open_drops_name_less_nested_simple_tag() {
+    // A nested SimpleTag with no TagName (§5.1.8.1.2.1 minOccurs: 1) must
+    // be dropped on read, not surfaced as a malformed child. The parent
+    // (which has a name) survives. Verify via the typed tags() accessor.
+    let mut child = Vec::new();
+    // Child has NO TagName — only a TagString.
+    child.extend_from_slice(&elem_str(ids::TAG_STRING, "orphan"));
+    let child_master = elem_master(ids::SIMPLE_TAG, &child);
+
+    let mut parent = Vec::new();
+    parent.extend_from_slice(&elem_str(ids::TAG_NAME, "PARENT"));
+    parent.extend_from_slice(&elem_str(ids::TAG_STRING, "p-value"));
+    parent.extend_from_slice(&child_master);
+    let parent_master = elem_master(ids::SIMPLE_TAG, &parent);
+
+    let tag = elem_master(0x7373 /* Tag */, &parent_master);
+    let tags = elem_master(ids::TAGS, &tag);
+
+    // A full segment so open_typed succeeds: Info + Tracks + Cluster +
+    // Tags. One valid non-laced SimpleBlock on track 1 satisfies the
+    // "at least one Cluster" requirement.
+    let mut block_body = Vec::new();
+    block_body.extend_from_slice(&write_vint(1, 0)); // track number 1
+    block_body.extend_from_slice(&0i16.to_be_bytes()); // relative timecode 0
+    block_body.push(0x80); // flags: keyframe, no lacing
+    block_body.extend_from_slice(&[0xAB; 4]); // 4-byte frame payload
+    let mut cluster_body = Vec::new();
+    cluster_body.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster_body.extend_from_slice(&elem_master(ids::SIMPLE_BLOCK, &block_body));
+    let cluster = elem_master(ids::CLUSTER, &cluster_body);
+
+    let mut seg_body = Vec::new();
+    let mut info = Vec::new();
+    info.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
+    seg_body.extend_from_slice(&elem_master(ids::INFO, &info));
+    seg_body.extend_from_slice(&elem_master(ids::TRACKS, &tracks_body_pcm()));
+    seg_body.extend_from_slice(&tags);
+    seg_body.extend_from_slice(&cluster);
+    let bytes = header_plus_segment(&seg_body);
+
+    let dmx = open_typed(bytes).expect("open_typed");
+    let tags_out = dmx.tags();
+    assert_eq!(tags_out.len(), 1);
+    let p = &tags_out[0].simple_tags[0];
+    assert_eq!(p.name, "PARENT");
+    assert!(
+        p.children.is_empty(),
+        "name-less nested SimpleTag must be dropped (§5.1.8.1.2.1 minOccurs)"
+    );
+}
+
+#[test]
 fn open_handles_segment_with_known_size_extending_past_eof() {
     // Segment declares size = 1 MiB but actual body is only the Tracks
     // we ship. Open should still return Err or land with an empty/limited

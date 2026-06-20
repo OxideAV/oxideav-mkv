@@ -1281,7 +1281,7 @@ so the demuxer never hides an unrecognised track.
 
 ## Robustness
 
-`tests/injection_robustness.rs` pins sixteen attacker-shaped byte
+`tests/injection_robustness.rs` pins eighteen attacker-shaped byte
 patterns against the open / `next_packet` / `seek_to` / `attachment_data`
 surface: a `skip` helper that previously cast `u64 as i64` and could
 seek the reader *backwards* on a forged `Size` field; demux-open
@@ -1293,9 +1293,13 @@ declared sub-frame sizes overrun the body, and a fixed-laced
 `SimpleBlock` with `n_frames = 5` over an empty payload; on-demand
 `attachment_data` short-read on a forged 4 GiB `FileData` size and a
 forged 2 GiB `FileName`; an out-of-range `CueRelativePosition` in
-`seek_to`; and an inline fuzz-corpus replay of five malformed seed
-shapes. All checks land as standard `cargo test` targets so a regression
-on any one surfaces in CI without waiting for a fuzz cycle.
+`seek_to`; a 4000-level-deep nested `SimpleTag` chain that must parse
+without a stack overflow (the §5.1.8.1.2 `recursive` depth cap), a
+name-less nested `SimpleTag` that must be dropped (§5.1.8.1.2.1
+`minOccurs: 1`) while its named parent survives; and an inline
+fuzz-corpus replay of five malformed seed shapes. All checks land as
+standard `cargo test` targets so a regression on any one surfaces in CI
+without waiting for a fuzz cycle.
 
 `tests/ebml_walker_property.rs` adds deterministic property-style coverage
 for the EBML element walker (RFC 8794) that backs the whole demuxer — a

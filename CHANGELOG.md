@@ -41,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §5.1.8.1.2.1 `minOccurs: 1` rule. Nested descriptors stay out of the
   flat `metadata()` view (which only ever surfaced top-level
   descriptors). Two `tests/mux_tags.rs` cases cover the round-trip.
+- Tests: two `tests/injection_robustness.rs` cases for the nested-tag
+  parser — a 4000-level-deep nested `SimpleTag` chain that must parse
+  without a stack overflow (proving the §5.1.8.1.2 `recursive` depth
+  cap), and a name-less nested `SimpleTag` that must be dropped
+  (§5.1.8.1.2.1 `minOccurs: 1`) while its named parent survives.
 - Demuxer: `CueBlockNumber` seek fallback (RFC 9559 §5.1.5.1.2.5). When a
   Cues entry carries a `CueBlockNumber` ("Number of the Block in the
   specified Cluster") but no `CueRelativePosition` (§5.1.5.1.2.3) — common
