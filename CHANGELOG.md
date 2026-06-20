@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: complete the `Cues` write surface to match the demuxer's read
+  surface. Every `CueTrackPositions` the muxer emits now carries
+  `CueBlockNumber` (RFC 9559 §5.1.5.1.2.5) — the 1-based ordinal of the
+  indexed Block within its Cluster, counting every `SimpleBlock` /
+  `BlockGroup` across all tracks in write order, so a cue on a Block that
+  is not first in its Cluster is now expressible (`range: not 0` honoured —
+  the first Block is number 1). When the indexed packet carried a usable
+  duration, `CueDuration` (§5.1.5.1.2.4, in Segment Ticks) is written too;
+  §22.1 specifically recommends it for subtitle cues. Both values
+  round-trip through the typed `demux::MkvDemuxer::cue_points()` view
+  (`tests/mux_cue_block_number.rs`). Previously the muxer wrote only
+  `CueTime` / `CueTrack` / `CueClusterPosition` / `CueRelativePosition`.
 - Property-style test coverage for the EBML element walker (RFC 8794) in
   `tests/ebml_walker_property.rs` — a seeded splitmix64 PRNG drives ~100k
   generated cases per run (no `proptest`/`quickcheck` dependency, keeping

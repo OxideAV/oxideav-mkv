@@ -301,6 +301,14 @@ pub struct MkvMuxer {
     /// reset whenever a new cluster opens. Keeps us from emitting a Cue
     /// for every keyframe in a cluster when the first is enough.
     cue_seen_in_cluster: Vec<bool>,
+    /// Number of `Block` / `SimpleBlock` elements written to the currently
+    /// open Cluster so far. Reset to `0` when a new Cluster opens; the next
+    /// block written takes number `cluster_block_count + 1` (RFC 9559
+    /// §5.1.5.1.2.5 `CueBlockNumber` is the 1-based "Number of the Block in
+    /// the specified Cluster"). Captured into a [`CueRecord`] at the moment
+    /// its block is recorded, so the demuxer's typed Cues view round-trips
+    /// the value verbatim.
+    cluster_block_count: u64,
     /// Absolute file offset of the Seek (Cues) entry inside the SeekHead.
     /// In `write_trailer` we either patch the 8-byte SeekPosition payload
     /// at `seek_cues_entry_offset + SEEK_POS_PAYLOAD_OFFSET` with the real
@@ -1458,6 +1466,16 @@ struct CueRecord {
     /// element position inside the Cluster (i.e. immediately after the
     /// Cluster element's id+size header).
     relative_position: u64,
+    /// `CueBlockNumber` (RFC 9559 §5.1.5.1.2.5) — the 1-based number of the
+    /// indexed Block within its Cluster (counting every `SimpleBlock` /
+    /// `BlockGroup` regardless of track, in write order). `range: not 0`,
+    /// so the smallest legal value is `1` (the first block in the cluster).
+    block_number: u64,
+    /// `CueDuration` (RFC 9559 §5.1.5.1.2.4) — the duration of the indexed
+    /// Block in Segment Ticks (ms, matching `TIMECODE_SCALE`). `None` when
+    /// the packet carried no usable duration; absence means "no cue-level
+    /// duration is available" (§5.1.5.1.2.4) and the element is omitted.
+    duration_ms: Option<u64>,
 }
 
 impl MkvMuxer {
@@ -1492,6 +1510,7 @@ impl MkvMuxer {
             segment_data_start: 0,
             cues: Vec::new(),
             cue_seen_in_cluster: vec![false; n],
+            cluster_block_count: 0,
             seek_cues_entry_offset: 0,
             seek_head_written: false,
             header_written: false,
@@ -3838,12 +3857,22 @@ impl MkvMuxer {
                 // Non-lacing path (and the BlockGroup-with-additions
                 // path, which always writes immediately): the block
                 // lands at `pre_block_pos`, emit the cue now with the
-                // correct relative position.
+                // correct relative position. The block about to be
+                // written takes the next 1-based number in the cluster
+                // (RFC 9559 §5.1.5.1.2.5 `CueBlockNumber`), and its
+                // `CueDuration` (§5.1.5.1.2.4) comes from the packet's
+                // derived duration when one is available.
+                let cue_duration_ms = derived_duration
+                    .map(|d| pts_to_ms(d, stream_time_base))
+                    .filter(|d| *d >= 0)
+                    .map(|d| d as u64);
                 self.cues.push(CueRecord {
                     track: track_number,
                     time_ms: pts_ms.max(0) as u64,
                     cluster_offset: self.cluster_offset_rel,
                     relative_position: pre_block_rel,
+                    block_number: self.cluster_block_count + 1,
+                    duration_ms: cue_duration_ms,
                 });
                 self.cue_seen_in_cluster[stream_idx] = true;
             }
@@ -3896,6 +3925,9 @@ impl MkvMuxer {
                 opts.discard_padding,
             );
             self.output.write_all(&bytes)?;
+            // One Block written to the open Cluster — advances the 1-based
+            // `CueBlockNumber` counter (RFC 9559 §5.1.5.1.2.5).
+            self.cluster_block_count += 1;
         } else if self.lacing_mode == LacingMode::None {
             // Fast path: emit a standalone SimpleBlock with lacing
             // bits = 00 (RFC 9559 §10.3.1). Matches the
@@ -3908,6 +3940,9 @@ impl MkvMuxer {
                 std::slice::from_ref(&packet.data),
             );
             self.output.write_all(&block_bytes)?;
+            // One SimpleBlock written to the open Cluster — advances the
+            // 1-based `CueBlockNumber` counter (RFC 9559 §5.1.5.1.2.5).
+            self.cluster_block_count += 1;
         } else {
             self.append_to_lace(stream_idx, timecode_offset as i16, packet)?;
         }
@@ -4101,10 +4136,12 @@ impl MkvMuxer {
         }
         self.cluster_timecode_ms = timecode_ms.max(0);
         self.cluster_open = true;
-        // New cluster → clear the "already cued this track" flags.
+        // New cluster → clear the "already cued this track" flags and the
+        // per-cluster Block counter that backs `CueBlockNumber`.
         for s in self.cue_seen_in_cluster.iter_mut() {
             *s = false;
         }
+        self.cluster_block_count = 0;
         Ok(())
     }
 
@@ -4149,6 +4186,25 @@ impl MkvMuxer {
                 // skip past intervening blocks instead of scanning the
                 // cluster from the start.
                 write_uint_element(&mut ctp, ids::CUE_RELATIVE_POSITION, e.relative_position);
+                // `CueDuration` (RFC 9559 §5.1.5.1.2.4) when the indexed
+                // packet carried a usable duration — §22.1 specifically
+                // recommends it for subtitle cues ("each subtitle frame
+                // SHOULD be referenced by a CuePoint element with a
+                // CueDuration element"). Omitted on absence, per the
+                // §5.1.5.1.2.4 "no duration information available" reading
+                // (rather than materialising a zero, which would falsely
+                // claim a zero-length block). Sits before `CueBlockNumber`
+                // to follow the spec's element definition order.
+                if let Some(dur) = e.duration_ms {
+                    write_uint_element(&mut ctp, ids::CUE_DURATION, dur);
+                }
+                // `CueBlockNumber` (RFC 9559 §5.1.5.1.2.5) — the 1-based
+                // number of the indexed Block within its Cluster. Always
+                // written: it lets a reader land on the exact Block without
+                // relying solely on `CueRelativePosition`, and the value is
+                // never `0` (the counter starts the cluster's first block
+                // at `1`, honouring the element's `range: not 0`).
+                write_uint_element(&mut ctp, ids::CUE_BLOCK_NUMBER, e.block_number);
                 write_master_element(&mut cp, ids::CUE_TRACK_POSITIONS, &ctp);
             }
             write_master_element(&mut body, ids::CUE_POINT, &cp);
@@ -4250,12 +4306,22 @@ impl MkvMuxer {
                     time_ms: pts_ms,
                     cluster_offset: self.cluster_offset_rel,
                     relative_position: pre_block_rel,
+                    // The laced block about to be written takes the next
+                    // 1-based number in the cluster (RFC 9559
+                    // §5.1.5.1.2.5). A laced block aggregates several
+                    // frames, so no single `CueDuration` (§5.1.5.1.2.4)
+                    // applies — absence here means "no cue-level duration."
+                    block_number: self.cluster_block_count + 1,
+                    duration_ms: None,
                 });
                 self.cue_seen_in_cluster[stream_idx] = true;
             }
         }
         let block_bytes = build_simple_block(track_number, tc_offset, keyframe, mode, &frames);
         self.output.write_all(&block_bytes)?;
+        // One SimpleBlock (possibly laced) written to the open Cluster —
+        // advances the 1-based `CueBlockNumber` counter (§5.1.5.1.2.5).
+        self.cluster_block_count += 1;
         Ok(())
     }
 
