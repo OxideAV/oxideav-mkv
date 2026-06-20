@@ -1591,7 +1591,19 @@ struct RawSimpleTag {
     language_bcp47: Option<String>,
     /// `TagDefault` (RFC 9559 §5.1.8.1.2.4) — default 1.
     default: bool,
+    /// Nested `SimpleTag` children (RFC 9559 §5.1.8.1.2 is `recursive:
+    /// True`). Empty for the common flat case. Parsed up to
+    /// [`MAX_SIMPLE_TAG_DEPTH`] levels deep — deeper nesting is dropped
+    /// rather than risk stack exhaustion on a hostile file.
+    children: Vec<RawSimpleTag>,
 }
+
+/// Maximum recursion depth for nested `SimpleTag` elements. RFC 9559
+/// §5.1.8.1.2 permits arbitrary nesting via the `recursive: True` marker,
+/// but a hostile file could pile thousands of nested headers in a few KB
+/// and blow the parser's stack. We cap at the same depth as the
+/// `ChapterAtom` walker — real files nest one or two levels at most.
+const MAX_SIMPLE_TAG_DEPTH: u32 = 16;
 
 fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<()> {
     while r.stream_position()? < end {
@@ -1635,8 +1647,9 @@ fn parse_tag(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
                     language: String::from("und"),
                     language_bcp47: None,
                     default: true,
+                    children: Vec::new(),
                 };
-                parse_simple_tag(r, st_end, &mut s)?;
+                parse_simple_tag(r, st_end, &mut s, MAX_SIMPLE_TAG_DEPTH)?;
                 // Drop SimpleTags with no name — they're malformed per
                 // RFC 9559 §5.1.8.1.2.1 (TagName has minOccurs 1).
                 if !s.name.is_empty() {
@@ -1684,11 +1697,41 @@ fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
     Ok(())
 }
 
-fn parse_simple_tag(r: &mut dyn ReadSeek, end: u64, s: &mut RawSimpleTag) -> Result<()> {
+fn parse_simple_tag(
+    r: &mut dyn ReadSeek,
+    end: u64,
+    s: &mut RawSimpleTag,
+    depth: u32,
+) -> Result<()> {
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
             ids::TAG_NAME => s.name = read_string(r, e.size as usize)?,
+            ids::SIMPLE_TAG => {
+                // RFC 9559 §5.1.8.1.2 is `recursive: True` — a SimpleTag
+                // MAY carry child SimpleTags. Parse them up to the depth
+                // cap; deeper nesting (or a name-less child, per the
+                // §5.1.8.1.2.1 minOccurs rule) is dropped so a hostile
+                // file can't exhaust the stack or surface a malformed
+                // descriptor.
+                let child_end = r.stream_position()?.saturating_add(e.size);
+                if depth == 0 {
+                    skip(r, e.size)?;
+                    continue;
+                }
+                let mut child = RawSimpleTag {
+                    name: String::new(),
+                    value: SimpleTagValue::None,
+                    language: String::from("und"),
+                    language_bcp47: None,
+                    default: true,
+                    children: Vec::new(),
+                };
+                parse_simple_tag(r, child_end, &mut child, depth - 1)?;
+                if !child.name.is_empty() {
+                    s.children.push(child);
+                }
+            }
             ids::TAG_STRING => {
                 let v = read_string(r, e.size as usize)?;
                 // RFC 9559 §5.1.8.1.2.5/§5.1.8.1.2.6 say TagString and
@@ -1751,6 +1794,20 @@ fn parse_simple_tag(r: &mut dyn ReadSeek, end: u64, s: &mut RawSimpleTag) -> Res
 /// Names are lower-cased in the flat view to match `parse_info`'s
 /// convention but preserved verbatim in [`SimpleTag::name`] for round-trip
 /// fidelity.
+/// Recursively map a parsed [`RawSimpleTag`] (including its nested
+/// `children`, RFC 9559 §5.1.8.1.2 `recursive: True`) onto the public
+/// [`SimpleTag`] surface.
+fn simple_tag_from_raw(raw: &RawSimpleTag) -> SimpleTag {
+    SimpleTag {
+        name: raw.name.clone(),
+        value: raw.value.clone(),
+        language: raw.language.clone(),
+        language_bcp47: raw.language_bcp47.clone(),
+        default: raw.default,
+        children: raw.children.iter().map(simple_tag_from_raw).collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_tags(
     raw_tags: Vec<RawTag>,
@@ -1861,13 +1918,7 @@ fn resolve_tags(
         // the flat view exposes.
         let mut typed_simple: Vec<SimpleTag> = Vec::with_capacity(tag.simple_tags.len());
         for raw in &tag.simple_tags {
-            typed_simple.push(SimpleTag {
-                name: raw.name.clone(),
-                value: raw.value.clone(),
-                language: raw.language.clone(),
-                language_bcp47: raw.language_bcp47.clone(),
-                default: raw.default,
-            });
+            typed_simple.push(simple_tag_from_raw(raw));
             // Project into the legacy flat view only when the value is a
             // non-empty string. Binary tag values (cover art, etc.) and
             // empty placeholders are skipped to match the pre-typed
@@ -2102,6 +2153,14 @@ pub struct SimpleTag {
     pub language_bcp47: Option<String>,
     /// `TagDefault` (RFC 9559 §5.1.8.1.2.4). Default per spec is true.
     pub default: bool,
+    /// Nested `SimpleTag` children (RFC 9559 §5.1.8.1.2 `recursive:
+    /// True`). A `SimpleTag` MAY contain child `SimpleTag`s to model
+    /// hierarchical metadata (e.g. a `TITLE` carrying a `SORT_WITH`
+    /// sub-tag). Empty for the common flat case. Parsed up to a fixed
+    /// depth cap; name-less children are dropped per the §5.1.8.1.2.1
+    /// `minOccurs: 1` rule. These do not appear in the flat `metadata()`
+    /// view (which only ever surfaced top-level descriptors).
+    pub children: Vec<SimpleTag>,
 }
 
 /// `TagString` vs `TagBinary` payload — mutually exclusive within one

@@ -29,8 +29,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TargetTypeValue == 0` (`range: not 0`), and any call after
   `write_header`. The `Tags` master carries a leading `CRC-32` child
   (§6.2) and is reachable from a new `SeekHead` `Tags` slot (voided when
-  no tags are queued). Covered by `tests/mux_tags.rs` (14 round-trip
+  no tags are queued). Covered by `tests/mux_tags.rs` (16 round-trip
   cases through the demuxer's flat `metadata()` and typed `tags()` views).
+- Demuxer: nested `SimpleTag` parsing (RFC 9559 §5.1.8.1.2 `recursive:
+  True`). `SimpleTag` gains a `children: Vec<SimpleTag>` field; the
+  `tags()` accessor now surfaces child `SimpleTag`s instead of silently
+  dropping them, so a hierarchical tag (e.g. a `TITLE` carrying a
+  `SORT_WITH` sub-tag, or a name-only `ARTISTS` parent with `ARTIST`
+  leaves) round-trips through a mux→demux pipeline. Parsed up to a fixed
+  16-level depth cap; name-less children are dropped per the
+  §5.1.8.1.2.1 `minOccurs: 1` rule. Nested descriptors stay out of the
+  flat `metadata()` view (which only ever surfaced top-level
+  descriptors). Two `tests/mux_tags.rs` cases cover the round-trip.
 - Demuxer: `CueBlockNumber` seek fallback (RFC 9559 §5.1.5.1.2.5). When a
   Cues entry carries a `CueBlockNumber` ("Number of the Block in the
   specified Cluster") but no `CueRelativePosition` (§5.1.5.1.2.3) — common

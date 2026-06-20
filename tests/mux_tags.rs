@@ -425,6 +425,91 @@ fn multiple_tags_round_trip_in_order() {
 }
 
 #[test]
+fn nested_simple_tags_round_trip() {
+    // RFC 9559 §5.1.8.1.2 `recursive: True`: a SimpleTag carries child
+    // SimpleTags. Build a TITLE with a SORT_WITH sub-tag two levels deep.
+    let streams = [pcm_stream(0)];
+    let parent = MkvSimpleTag {
+        name: "TITLE".into(),
+        value: MkvSimpleTagValue::String("The Album".into()),
+        language: "und".into(),
+        language_bcp47: None,
+        default: true,
+        children: vec![MkvSimpleTag {
+            name: "SORT_WITH".into(),
+            value: MkvSimpleTagValue::String("Album, The".into()),
+            language: "und".into(),
+            language_bcp47: None,
+            default: true,
+            children: vec![MkvSimpleTag::new("DEPTH2", "leaf")],
+        }],
+    };
+    let tags = [MkvTag {
+        targets: MkvTagTargets::default(),
+        simple_tags: vec![parent],
+    }];
+    let bytes = mux_with_tags(&streams, &tags);
+
+    let typed = open_typed(bytes);
+    let t = &typed.tags()[0];
+    assert_eq!(t.simple_tags.len(), 1);
+    let title = &t.simple_tags[0];
+    assert_eq!(title.name, "TITLE");
+    assert_eq!(title.children.len(), 1, "one nested SORT_WITH child");
+
+    let sort = &title.children[0];
+    assert_eq!(sort.name, "SORT_WITH");
+    assert_eq!(sort.value, SimpleTagValue::String("Album, The".into()));
+    assert_eq!(sort.children.len(), 1, "two-level nesting preserved");
+    assert_eq!(sort.children[0].name, "DEPTH2");
+    assert_eq!(
+        sort.children[0].value,
+        SimpleTagValue::String("leaf".into())
+    );
+
+    // The nested descriptors do not leak into the flat metadata view —
+    // only top-level descriptors ever did.
+    let dmx = open_demuxer(mux_with_tags(&streams, &tags));
+    assert!(dmx.metadata().iter().any(|(k, _)| k == "title"));
+    assert!(!dmx.metadata().iter().any(|(k, _)| k == "sort_with"));
+}
+
+#[test]
+fn name_only_parent_simple_tag_round_trips() {
+    // A SimpleTag with no payload (TagString/TagBinary both absent) is
+    // legal as a parent node (RFC 9559 §5.1.8.1.2 — neither value element
+    // has a minOccurs). It must survive with its children.
+    let streams = [pcm_stream(0)];
+    let parent = MkvSimpleTag {
+        name: "ARTISTS".into(),
+        value: MkvSimpleTagValue::None,
+        language: "und".into(),
+        language_bcp47: None,
+        default: true,
+        children: vec![
+            MkvSimpleTag::new("ARTIST", "Alice"),
+            MkvSimpleTag::new("ARTIST", "Bob"),
+        ],
+    };
+    let tags = [MkvTag {
+        targets: MkvTagTargets::default(),
+        simple_tags: vec![parent],
+    }];
+    let bytes = mux_with_tags(&streams, &tags);
+
+    let typed = open_typed(bytes);
+    let parent = &typed.tags()[0].simple_tags[0];
+    assert_eq!(parent.name, "ARTISTS");
+    assert_eq!(parent.value, SimpleTagValue::None);
+    assert_eq!(parent.children.len(), 2);
+    assert_eq!(parent.children[0].name, "ARTIST");
+    assert_eq!(
+        parent.children[1].value,
+        SimpleTagValue::String("Bob".into())
+    );
+}
+
+#[test]
 fn tags_accessor_mirrors_queue() {
     let f = std::fs::File::create(tmp_path("queue")).expect("create");
     let ws: Box<dyn WriteSeek> = Box::new(f);

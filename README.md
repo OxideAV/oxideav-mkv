@@ -89,6 +89,13 @@ the unified `oxideav` aggregator to wire decoding automatically.
   and binary `TagBinary` payloads (e.g. embedded cover-art bytes).
   Tags with only dangling non-zero UIDs are filtered out per
   §5.1.8.1.1.3..§5.1.8.1.1.6; mixed Targets keep their resolvable UIDs.
+  Nested `SimpleTag`s (§5.1.8.1.2 `recursive: True`) surface through
+  `SimpleTag::children` — a hierarchical tag (e.g. a `TITLE` carrying a
+  `SORT_WITH` sub-tag, or a name-only parent grouping several `ARTIST`
+  leaves) is preserved as a tree rather than being flattened or dropped,
+  parsed up to a 16-level depth cap with name-less children dropped per
+  the §5.1.8.1.2.1 `minOccurs: 1` rule. The flat `metadata()` view still
+  surfaces only top-level descriptors.
 - **`Targets::target_level()` typed hierarchy** (RFC 9559 §5.1.8.1.1.1,
   Table 33): `Targets::target_level() -> Option<TargetLevel>` resolves
   the raw `target_type_value` integer into the typed `TargetLevel`
@@ -679,6 +686,39 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `FileDescription` (§5.1.6.1.1) is omitted on disk when `None` or
   empty. `MkvAttachment::new(filename, mime_type, data)` is a
   convenience constructor mirroring the demux-side typed surface.
+- `Tags` (RFC 9559 §5.1.8): `MkvMuxer::add_tag(MkvTag)` queues one `Tag`
+  per call, emitted as the file's single `Tags` master (§5.1.8,
+  `maxOccurs: 1`) sandwiched after `Attachments` and before the first
+  `Cluster` so the demuxer's single-pass header walk catches it. Tags
+  must be added before `write_header`; the SeekHead grew a sixth slot
+  (`Tags`, between `Attachments` and `Cues`) that is patched to the
+  emitted master's offset or voided when no tags were queued, and the
+  master carries a leading `CRC-32` child like the other Top-Level
+  masters (§6.2). `MkvTag` pairs an `MkvTagTargets` scope with one or
+  more `MkvSimpleTag` `(name, value)` descriptors — the write-side mirror
+  of the demux `tags()` surface, field-for-field, so a demux→mux pipeline
+  preserves tags. `MkvTagTargets` carries `TargetTypeValue`
+  (§5.1.8.1.1.1, omitted when `None`, `Some(0)` rejected per `range: not
+  0`), `TargetType` (§5.1.8.1.1.2, informational), and the four
+  `TagTrackUID` / `TagEditionUID` / `TagChapterUID` / `TagAttachmentUID`
+  lists (§5.1.8.1.1.3..§5.1.8.1.1.6 — multi-UID scoping, a `0` UID
+  dropped since "all of that kind" is expressed by omission). The muxer
+  assigns each track `TrackUID == track_number` (1-based), so a tag
+  scoped via `MkvTagTargets::track(N)` resolves back to stream index
+  `N - 1` on read. `MkvSimpleTag` carries `TagName` (§5.1.8.1.2.1,
+  mandatory), `TagLanguage` (§5.1.8.1.2.2, default `"und"` left
+  off-disk), `TagLanguageBCP47` (§5.1.8.1.2.3, written instead of
+  `TagLanguage` when present per the spec's "MUST be ignored" rule),
+  `TagDefault` (§5.1.8.1.2.4, default `1` written only when cleared), a
+  `TagString` (§5.1.8.1.2.5) / `TagBinary` (§5.1.8.1.2.6) payload enum
+  (`MkvSimpleTagValue`), and a `children` list for the spec's
+  `recursive: True` nesting — symmetric with the demux-side
+  `SimpleTag::children`. Queue-time validation rejects an empty
+  `simple_tags` list (§5.1.8.1.2 `minOccurs: 1`), an empty `TagName` at
+  any nesting depth (§5.1.8.1.2.1), `TargetTypeValue 0`, and any call
+  after `write_header`. Convenience constructors: `MkvTag::global(name,
+  value)`, `MkvTagTargets::track(uid)`, `MkvSimpleTag::new(name, value)`
+  / `MkvSimpleTag::binary(name, data)`.
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.
