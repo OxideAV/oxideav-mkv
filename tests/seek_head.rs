@@ -356,15 +356,15 @@ fn seek_head_voids_cues_slot_when_no_cues_emitted() {
         "Cues Seek must be voided when no Cues element was emitted (got {entries:?})"
     );
 
-    // The SeekHead body must still be 105 bytes long (5 × 21-byte entries:
-    // Info, Tracks, Chapters, Attachments, Cues), even with entries
+    // The SeekHead body must still be 126 bytes long (6 × 21-byte entries:
+    // Info, Tracks, Chapters, Attachments, Tags, Cues), even with entries
     // rewritten as Voids — we never resize the SeekHead, so the on-disk
     // size is always identical regardless of whether Cues / Chapters /
-    // Attachments was emitted.
+    // Attachments / Tags was emitted.
     assert_eq!(
         seek_head_body.len(),
-        5 * 21,
-        "SeekHead body size must stay constant whether or not Cues / Chapters / Attachments exist"
+        6 * 21,
+        "SeekHead body size must stay constant whether or not Cues / Chapters / Attachments / Tags exist"
     );
 
     let _ = std::fs::remove_file(&tmp);

@@ -338,6 +338,16 @@ pub struct MkvMuxer {
     /// before the first `Cluster`, so the demuxer's single-pass header
     /// walk picks it up without late-segment rescanning.
     attachments: Vec<MkvAttachment>,
+    /// `Tag` elements queued via [`MkvMuxer::add_tag`]. Materialised into
+    /// a single `Tags` master right after `Attachments` (or after
+    /// `Chapters` / `Tracks` when those are absent) in
+    /// [`MkvMuxer::write_header`]; the `Tags` SeekHead entry is patched at
+    /// the same time. Empty list → no `Tags` element written and the
+    /// SeekHead slot is voided. Honours RFC 9559 §5.1.8 / §6 element
+    /// ordering: the `Tags` master sits among the other Top-Level masters
+    /// before the first `Cluster`, so the demuxer's single-pass header
+    /// walk picks it up without a late-segment rescan.
+    tags: Vec<MkvTag>,
     /// Opt-in block lacing mode (RFC 9559 §10.3). Default is
     /// [`LacingMode::None`] which preserves the legacy
     /// one-SimpleBlock-per-packet behaviour. Anything else causes
@@ -779,6 +789,192 @@ impl MkvAttachment {
             description: None,
         }
     }
+}
+
+/// One `Tag` element (RFC 9559 §5.1.8.1) queued for the muxer to emit
+/// inside the file's single `Tags` master.
+///
+/// A `Tag` pairs a [`MkvTagTargets`] scope (which tracks / editions /
+/// chapters / attachments — or the whole Segment — the metadata applies
+/// to) with one or more [`MkvSimpleTag`] `(name, value)` descriptors
+/// (RFC 9559 §5.1.8.1.2). Mirrors the demux-side [`crate::demux::Tag`]
+/// surface field-for-field so a demux-then-mux pipeline can read a `Tag`
+/// out and feed an `MkvTag` back in without losing scope, language,
+/// default-flag, or binary-payload information.
+///
+/// Element layout written by the muxer (RFC 9559 §5.1.8.1):
+///
+/// ```text
+/// Tag (0x7373)
+///   Targets (0x63C0)                 — always emitted (minOccurs 1)
+///     TargetTypeValue (0x68CA)       — only when Some and != 50 default
+///     TargetType (0x63CA)            — only when Some(non-empty)
+///     TagTrackUID (0x63C5) × N       — non-zero UIDs only
+///     TagEditionUID (0x63C9) × N
+///     TagChapterUID (0x63C4) × N
+///     TagAttachmentUID (0x63C6) × N
+///   SimpleTag (0x67C8) × M           — see MkvSimpleTag
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct MkvTag {
+    /// Scope of this tag — see [`MkvTagTargets`]. An all-default
+    /// `MkvTagTargets` produces a bare `Targets` master (global scope).
+    pub targets: MkvTagTargets,
+    /// One or more `(name, value)` descriptors that share this `Targets`
+    /// scope (RFC 9559 §5.1.8.1.2, `minOccurs: 1`). Written in list
+    /// order.
+    pub simple_tags: Vec<MkvSimpleTag>,
+}
+
+impl MkvTag {
+    /// Convenience constructor for a global-scope tag (empty `Targets`)
+    /// carrying a single `(name, string-value)` descriptor — the common
+    /// case for Segment-level metadata such as `TITLE` / `ARTIST`.
+    pub fn global(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            targets: MkvTagTargets::default(),
+            simple_tags: vec![MkvSimpleTag::new(name, value)],
+        }
+    }
+}
+
+/// `Targets` master (RFC 9559 §5.1.8.1.1) — the scope of an [`MkvTag`].
+///
+/// An all-default value (every field empty / `None`) is the global scope
+/// "the tag value describes everything in the Segment" (§5.1.8.1.1). The
+/// UID lists let one `Tag` scope to several tracks / editions / chapters
+/// / attachments at once (the spec gives each UID element no `maxOccurs`).
+///
+/// UID semantics per RFC 9559 §5.1.8.1.1.3..§5.1.8.1.1.6: a UID of `0`
+/// means "all of that kind in the Segment", so the muxer never writes a
+/// `0` UID element (it would be redundant with omission and the spec
+/// already covers the all-scope case by omission). The caller queues
+/// only the concrete non-zero UIDs it wants to scope to; a `0` in any
+/// list is dropped at write time.
+#[derive(Clone, Debug, Default)]
+pub struct MkvTagTargets {
+    /// `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1, Table 33). `range: not
+    /// 0`. `None` → element omitted (the demuxer surfaces `None`, which
+    /// is distinct from the spec default `50`). `Some(50)` is written
+    /// explicitly only when the caller wants the default materialised;
+    /// see [`MkvTagTargets::target_type_value`] handling in the writer.
+    pub target_type_value: Option<u64>,
+    /// `TargetType` informational string (RFC 9559 §5.1.8.1.1.2) — e.g.
+    /// `"ALBUM"`, `"MOVIE"`, `"TRACK"`. `None` / empty → omitted.
+    pub target_type: Option<String>,
+    /// `TagTrackUID` list (RFC 9559 §5.1.8.1.1.3). Non-zero `TrackUID`s
+    /// this tag scopes to. Zero entries are dropped (a `0` means "all
+    /// tracks", which the spec already expresses by omission).
+    pub track_uids: Vec<u64>,
+    /// `TagEditionUID` list (RFC 9559 §5.1.8.1.1.4).
+    pub edition_uids: Vec<u64>,
+    /// `TagChapterUID` list (RFC 9559 §5.1.8.1.1.5).
+    pub chapter_uids: Vec<u64>,
+    /// `TagAttachmentUID` list (RFC 9559 §5.1.8.1.1.6).
+    pub attachment_uids: Vec<u64>,
+}
+
+impl MkvTagTargets {
+    /// `true` when this is the global scope — no UID lists and no
+    /// informational `TargetType` / `TargetTypeValue`. Produces a bare
+    /// `Targets` master on disk.
+    pub fn is_global(&self) -> bool {
+        self.target_type_value.is_none()
+            && self.target_type.is_none()
+            && self.track_uids.is_empty()
+            && self.edition_uids.is_empty()
+            && self.chapter_uids.is_empty()
+            && self.attachment_uids.is_empty()
+    }
+
+    /// Convenience constructor scoping a tag to a single `TrackUID`
+    /// (RFC 9559 §5.1.8.1.1.3). The muxer assigns each track a
+    /// `TrackUID` equal to its 1-based track number, so a stream at
+    /// index `i` has `TrackUID == i + 1`.
+    pub fn track(track_uid: u64) -> Self {
+        Self {
+            track_uids: vec![track_uid],
+            ..Self::default()
+        }
+    }
+}
+
+/// One `SimpleTag` element (RFC 9559 §5.1.8.1.2) queued for the muxer.
+///
+/// Mirrors the demux-side [`crate::demux::SimpleTag`] surface, plus the
+/// `children` list for the spec's `recursive: True` nesting
+/// (§5.1.8.1.2) — a `SimpleTag` MAY contain child `SimpleTag`s to model
+/// hierarchical metadata (e.g. a `TITLE` with a `SORT_WITH` sub-tag).
+#[derive(Clone, Debug, Default)]
+pub struct MkvSimpleTag {
+    /// `TagName` (RFC 9559 §5.1.8.1.2.1, `minOccurs: 1`). Written
+    /// verbatim — the demuxer preserves case. An empty name is rejected
+    /// at queue time.
+    pub name: String,
+    /// `TagString` (§5.1.8.1.2.5) or `TagBinary` (§5.1.8.1.2.6) payload —
+    /// mutually exclusive per the spec, modelled as one enum.
+    pub value: MkvSimpleTagValue,
+    /// `TagLanguage` (RFC 9559 §5.1.8.1.2.2, default `"und"`). Written
+    /// explicitly only when not `"und"` and no BCP-47 language is set,
+    /// so a default-language tag stays minimal on disk.
+    pub language: String,
+    /// `TagLanguageBCP47` (RFC 9559 §5.1.8.1.2.3, `minver: 4`). When
+    /// `Some`, the spec says `TagLanguage` MUST be ignored, so the muxer
+    /// omits `TagLanguage` entirely and writes only the BCP-47 element.
+    pub language_bcp47: Option<String>,
+    /// `TagDefault` (RFC 9559 §5.1.8.1.2.4, default `1` / true). Written
+    /// explicitly only when cleared (`false`), so a default-true tag
+    /// stays minimal on disk and the demuxer materialises the default.
+    pub default: bool,
+    /// Nested `SimpleTag`s (RFC 9559 §5.1.8.1.2 `recursive: True`).
+    /// Empty for the common flat case.
+    pub children: Vec<MkvSimpleTag>,
+}
+
+impl MkvSimpleTag {
+    /// Convenience constructor for a default-language (`"und"`),
+    /// default-flag (`true`), string-valued, leaf `SimpleTag`.
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: MkvSimpleTagValue::String(value.into()),
+            language: String::from("und"),
+            language_bcp47: None,
+            default: true,
+            children: Vec::new(),
+        }
+    }
+
+    /// Convenience constructor for a binary-valued leaf `SimpleTag`
+    /// (RFC 9559 §5.1.8.1.2.6 `TagBinary`) — e.g. an embedded thumbnail
+    /// referenced from a tag.
+    pub fn binary(name: impl Into<String>, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name: name.into(),
+            value: MkvSimpleTagValue::Binary(data.into()),
+            language: String::from("und"),
+            language_bcp47: None,
+            default: true,
+            children: Vec::new(),
+        }
+    }
+}
+
+/// `TagString` vs `TagBinary` payload — mutually exclusive within one
+/// `SimpleTag` per RFC 9559 §5.1.8.1.2.5 / §5.1.8.1.2.6. Mirrors the
+/// demux-side [`crate::demux::SimpleTagValue`].
+#[derive(Clone, Debug, Default)]
+pub enum MkvSimpleTagValue {
+    /// `TagString` (RFC 9559 §5.1.8.1.2.5) — UTF-8 text payload.
+    String(String),
+    /// `TagBinary` (RFC 9559 §5.1.8.1.2.6) — opaque bytes.
+    Binary(Vec<u8>),
+    /// Neither payload element — the `SimpleTag` carries only a name (and
+    /// possibly children). RFC 9559 gives neither `TagString` nor
+    /// `TagBinary` a `minOccurs`, so a name-only `SimpleTag` is legal
+    /// (typical for a parent node in a `recursive` nesting).
+    #[default]
+    None,
 }
 
 /// Internal record of a per-track `Video > FlagInterlaced` +
@@ -1518,6 +1714,7 @@ impl MkvMuxer {
             doc_type,
             chapters: Vec::new(),
             attachments: Vec::new(),
+            tags: Vec::new(),
             lacing_mode: LacingMode::None,
             lace_pending: vec![LaceBuffer::default(); n],
             video_interlacings: vec![None; n],
@@ -2956,6 +3153,57 @@ impl MkvMuxer {
         &self.attachments
     }
 
+    /// Queue a metadata `Tag` (RFC 9559 §5.1.8.1). Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise — the
+    /// `Tags` master is emitted up front so the demuxer's single-pass
+    /// header walk catches it.
+    ///
+    /// The file carries a single `Tags` master (RFC 9559 §5.1.8,
+    /// `maxOccurs: 1`); every `add_tag` call appends one `Tag` child to
+    /// it in arrival order. Spec validation applied at queue time so the
+    /// caller sees the error attached to the offending call:
+    ///
+    /// * Each `Tag` MUST carry at least one `SimpleTag` (§5.1.8.1.2,
+    ///   `minOccurs: 1`) — a tag with an empty `simple_tags` list is
+    ///   rejected.
+    /// * Every `SimpleTag` (at every nesting depth) MUST have a non-empty
+    ///   `TagName` (§5.1.8.1.2.1, `minOccurs: 1`) — an empty name is
+    ///   rejected.
+    /// * `target_type_value == Some(0)` is rejected per `range: not 0`
+    ///   (§5.1.8.1.1.1).
+    ///
+    /// Zero `TagTrackUID` / `TagEditionUID` / `TagChapterUID` /
+    /// `TagAttachmentUID` entries are *not* rejected: a `0` UID means
+    /// "all of that kind in the Segment" per §5.1.8.1.1.3..§5.1.8.1.1.6,
+    /// which the muxer expresses by omitting the element, so a `0` in any
+    /// list is silently dropped at write time rather than failing the
+    /// call.
+    pub fn add_tag(&mut self, tag: MkvTag) -> Result<()> {
+        if self.header_written {
+            return Err(Error::other("MKV muxer: add_tag called after write_header"));
+        }
+        if tag.simple_tags.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: Tag requires at least one SimpleTag (RFC 9559 §5.1.8.1.2, minOccurs=1)",
+            ));
+        }
+        if tag.targets.target_type_value == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: TargetTypeValue range: not 0 (RFC 9559 §5.1.8.1.1.1)",
+            ));
+        }
+        validate_simple_tags(&tag.simple_tags)?;
+        self.tags.push(tag);
+        Ok(())
+    }
+
+    /// Read-only view of the queued tag list. Mirrors
+    /// [`MkvMuxer::attachments`] for tests / upstream callers that want
+    /// to confirm the list before sealing the header.
+    pub fn tags(&self) -> &[MkvTag] {
+        &self.tags
+    }
+
     /// Construct a plain Matroska muxer. Thin wrapper around the boxed
     /// [`open`] factory for callers that want a concrete type back (e.g. to
     /// introspect its state in tests).
@@ -3026,7 +3274,8 @@ impl Muxer for MkvMuxer {
         let tracks_seek_entry_in_buf = info_seek_entry_in_buf + SEEK_ENTRY_LEN;
         let chapters_seek_entry_in_buf = tracks_seek_entry_in_buf + SEEK_ENTRY_LEN;
         let attachments_seek_entry_in_buf = chapters_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        let cues_seek_entry_in_buf = attachments_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        let tags_seek_entry_in_buf = attachments_seek_entry_in_buf + SEEK_ENTRY_LEN;
+        let cues_seek_entry_in_buf = tags_seek_entry_in_buf + SEEK_ENTRY_LEN;
         // Sanity: SeekHead occupies a known total size; the next element
         // starts immediately after.
         debug_assert_eq!(seek_head_bytes.len(), SEEK_HEAD_TOTAL_LEN);
@@ -3648,6 +3897,22 @@ impl Muxer for MkvMuxer {
             Some(attachments_offset_in_buf)
         };
 
+        // Tags (optional). Same shape as Chapters / Attachments: emit the
+        // single `Tags` master sandwiched after Attachments and before the
+        // first Cluster when `add_tag` was called before `write_header`.
+        // RFC 9559 §5.1.8 lets the master appear anywhere in the Segment;
+        // sitting it here keeps the demuxer's pre-Cluster header walk
+        // single-pass. If no tags were queued, the SeekHead Tags slot
+        // stays at its placeholder zero and gets voided below.
+        let tags_offset_opt: Option<u64> = if self.tags.is_empty() {
+            None
+        } else {
+            let tags_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
+            let tags_bytes = build_tags_element(&self.tags);
+            all.extend_from_slice(&tags_bytes);
+            Some(tags_offset_in_buf)
+        };
+
         // Patch the Info / Tracks SeekPositions in the SeekHead now that we
         // know where each element landed inside `all`. Cues stays as zero
         // and is patched in `write_trailer`.
@@ -3687,6 +3952,20 @@ impl Muxer for MkvMuxer {
                 // the Chapters slot above.
                 let void = void_seek_entry();
                 all[attachments_seek_entry_in_buf..attachments_seek_entry_in_buf + SEEK_ENTRY_LEN]
+                    .copy_from_slice(&void);
+            }
+        }
+        match tags_offset_opt {
+            Some(off) => write_u64_be_at(
+                &mut all,
+                tags_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                off,
+            ),
+            None => {
+                // No Tags element emitted — same void treatment as the
+                // Chapters / Attachments slots above.
+                let void = void_seek_entry();
+                all[tags_seek_entry_in_buf..tags_seek_entry_in_buf + SEEK_ENTRY_LEN]
                     .copy_from_slice(&void);
             }
         }
@@ -4823,13 +5102,13 @@ fn write_master_element_with_crc(buf: &mut Vec<u8>, id: u32, body: &[u8]) {
 // front, so they're patched directly into the buffer before we flush.
 
 /// Number of bytes consumed by the SeekHead header (id + size VINT) before
-/// the first Seek child. `4 + 1 = 5` for the 105-byte body (5 × 21).
+/// the first Seek child. `4 + 1 = 5` for the 126-byte body (6 × 21).
 const SEEK_HEAD_HEADER_LEN: usize = 5;
 /// Number of Seek entries the SeekHead reserves: Info, Tracks, Chapters,
-/// Attachments, Cues. Chapters / Attachments / Cues are voided in
-/// `write_header` / `write_trailer` respectively when those elements
+/// Attachments, Tags, Cues. Chapters / Attachments / Tags are voided in
+/// `write_header` and Cues in `write_trailer` when those elements
 /// turn out to be empty.
-const SEEK_HEAD_ENTRY_COUNT: usize = 5;
+const SEEK_HEAD_ENTRY_COUNT: usize = 6;
 /// Total size of the SeekHead element on disk: header + N × 21-byte
 /// Seek entries.
 const SEEK_HEAD_TOTAL_LEN: usize = SEEK_HEAD_HEADER_LEN + SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN;
@@ -4846,8 +5125,8 @@ const SEEK_ENTRY_LEN: usize = 21;
 const SEEK_POS_PAYLOAD_OFFSET: usize = 13;
 
 /// Build the initial SeekHead with placeholder positions for Info,
-/// Tracks, Chapters, Attachments, and Cues. The caller patches in the
-/// real positions via `write_u64_be_at` once each element's offset is
+/// Tracks, Chapters, Attachments, Tags, and Cues. The caller patches in
+/// the real positions via `write_u64_be_at` once each element's offset is
 /// known (or rewrites the slot as a Void if the element ends up not
 /// being emitted).
 fn build_initial_seek_head() -> Vec<u8> {
@@ -4856,6 +5135,7 @@ fn build_initial_seek_head() -> Vec<u8> {
     body.extend_from_slice(&seek_entry(ids::TRACKS, 0));
     body.extend_from_slice(&seek_entry(ids::CHAPTERS, 0));
     body.extend_from_slice(&seek_entry(ids::ATTACHMENTS, 0));
+    body.extend_from_slice(&seek_entry(ids::TAGS, 0));
     body.extend_from_slice(&seek_entry(ids::CUES, 0));
     debug_assert_eq!(body.len(), SEEK_HEAD_ENTRY_COUNT * SEEK_ENTRY_LEN);
     let mut out = Vec::with_capacity(SEEK_HEAD_TOTAL_LEN);
@@ -5069,5 +5349,171 @@ fn build_attached_file(index: u64, att: &MkvAttachment) -> Vec<u8> {
     // method `add_attachment` rejects an explicit `Some(0)` up front.
     let uid = att.uid.unwrap_or(index);
     write_uint_element(&mut body, ids::FILE_UID, uid);
+    body
+}
+
+// --- Tags -----------------------------------------------------------------
+//
+// One `Tags` master per file (RFC 9559 §5.1.8, `maxOccurs: 1`), containing
+// one `Tag` per queued [`MkvTag`], in arrival order. Per RFC 9559 §5.1.8.1
+// the on-disk child set is:
+//
+//   Tags (0x1254C367)
+//     Tag (0x7373) × N
+//       Targets (0x63C0)              — mandatory master, §5.1.8.1.1
+//         TargetTypeValue (0x68CA)    — uinteger, default 50, range: not 0
+//         TargetType      (0x63CA)    — string, informational
+//         TagTrackUID     (0x63C5)×M  — uinteger, default 0 (= all)
+//         TagEditionUID   (0x63C9)×M
+//         TagChapterUID   (0x63C4)×M
+//         TagAttachmentUID(0x63C6)×M
+//       SimpleTag (0x67C8) × P        — recursive, §5.1.8.1.2
+//         TagName         (0x45A3)    — UTF-8, mandatory
+//         TagLanguage     (0x447A)    — string, default "und"
+//         TagLanguageBCP47(0x447B)    — string, minver 4
+//         TagDefault      (0x4484)    — uinteger, default 1
+//         TagString       (0x4487)    — UTF-8 \  mutually
+//         TagBinary       (0x4485)    — binary /  exclusive
+//         SimpleTag       (0x67C8)×Q  — nested children
+//
+// We emit children in the demux side's parse order so the typed
+// [`crate::demux::Tag`] surface round-trips field-for-field.
+
+/// Walk every `SimpleTag` (at every nesting depth) and reject an empty
+/// `TagName` — `TagName` is `minOccurs: 1` per RFC 9559 §5.1.8.1.2.1 and
+/// the demuxer drops a name-less `SimpleTag` on read, which would break a
+/// round-trip silently. Called from [`MkvMuxer::add_tag`] so the caller
+/// sees the error at queue time.
+fn validate_simple_tags(simple_tags: &[MkvSimpleTag]) -> Result<()> {
+    for st in simple_tags {
+        if st.name.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: SimpleTag TagName is mandatory (RFC 9559 §5.1.8.1.2.1, minOccurs=1)",
+            ));
+        }
+        validate_simple_tags(&st.children)?;
+    }
+    Ok(())
+}
+
+/// Build the bytes of the file's single `Tags` master element from the
+/// queued tag list. Caller appends the returned slice into the muxer's
+/// outgoing buffer. The master carries a leading `CRC-32` child like the
+/// other Top-Level masters (RFC 9559 §6.2).
+fn build_tags_element(tags: &[MkvTag]) -> Vec<u8> {
+    let mut tags_body = Vec::new();
+    for tag in tags {
+        let tag_body = build_tag(tag);
+        write_master_element(&mut tags_body, ids::TAG, &tag_body);
+    }
+    let mut out = Vec::with_capacity(tags_body.len() + 8 + CRC32_CHILD_LEN);
+    write_master_element_with_crc(&mut out, ids::TAGS, &tags_body);
+    out
+}
+
+/// Body of one `Tag` master (the caller wraps it in `ids::TAG`). The
+/// `Targets` master is always emitted (§5.1.8.1.1 `minOccurs: 1`), even
+/// for a global-scope tag where it is empty.
+fn build_tag(tag: &MkvTag) -> Vec<u8> {
+    let mut body = Vec::new();
+    // Targets master — always present (minOccurs 1). For a global-scope
+    // tag the body is empty, which the demuxer reads as global scope.
+    let targets_body = build_tag_targets(&tag.targets);
+    write_master_element(&mut body, ids::TARGETS, &targets_body);
+    for st in &tag.simple_tags {
+        let st_body = build_simple_tag(st);
+        write_master_element(&mut body, ids::SIMPLE_TAG, &st_body);
+    }
+    body
+}
+
+/// Body of one `Targets` master (the caller wraps it in `ids::TARGETS`).
+///
+/// Per-element omission rules:
+/// * `TargetTypeValue` (§5.1.8.1.1.1) — written only when `Some`. The
+///   spec default is `50`; the demuxer surfaces `None` for an absent
+///   element (distinct from a materialised `50`), so the muxer writes the
+///   element exactly when the caller asked for an explicit value, leaving
+///   the default unmaterialised when `None`. `Some(0)` is rejected at
+///   queue time (`range: not 0`).
+/// * `TargetType` (§5.1.8.1.1.2) — written only when `Some(non-empty)`.
+/// * The four UID lists — only non-zero entries are written; a `0` UID
+///   means "all of that kind" (§5.1.8.1.1.3..§5.1.8.1.1.6) which is
+///   already expressed by omission, so a `0` is dropped.
+fn build_tag_targets(t: &MkvTagTargets) -> Vec<u8> {
+    let mut body = Vec::new();
+    if let Some(ttv) = t.target_type_value {
+        write_uint_element(&mut body, ids::TARGET_TYPE_VALUE, ttv);
+    }
+    if let Some(tt) = t.target_type.as_deref() {
+        if !tt.is_empty() {
+            write_string_element(&mut body, ids::TARGET_TYPE, tt);
+        }
+    }
+    for &uid in &t.track_uids {
+        if uid != 0 {
+            write_uint_element(&mut body, ids::TAG_TRACK_UID, uid);
+        }
+    }
+    for &uid in &t.edition_uids {
+        if uid != 0 {
+            write_uint_element(&mut body, ids::TAG_EDITION_UID, uid);
+        }
+    }
+    for &uid in &t.chapter_uids {
+        if uid != 0 {
+            write_uint_element(&mut body, ids::TAG_CHAPTER_UID, uid);
+        }
+    }
+    for &uid in &t.attachment_uids {
+        if uid != 0 {
+            write_uint_element(&mut body, ids::TAG_ATTACHMENT_UID, uid);
+        }
+    }
+    body
+}
+
+/// Body of one `SimpleTag` master (the caller wraps it in
+/// `ids::SIMPLE_TAG`). Recursive per RFC 9559 §5.1.8.1.2.
+///
+/// Per-element handling:
+/// * `TagName` (§5.1.8.1.2.1) — always written (mandatory). Validated
+///   non-empty at queue time.
+/// * `TagLanguageBCP47` (§5.1.8.1.2.3) vs `TagLanguage` (§5.1.8.1.2.2) —
+///   when a BCP-47 language is present the spec says `TagLanguage` MUST be
+///   ignored, so the muxer writes only the BCP-47 element. Otherwise the
+///   `TagLanguage` element is written only when it differs from the spec
+///   default `"und"`, keeping a default-language tag minimal.
+/// * `TagDefault` (§5.1.8.1.2.4) — written only when cleared (`false`),
+///   since the spec default is `1` (true).
+/// * `TagString` (§5.1.8.1.2.5) / `TagBinary` (§5.1.8.1.2.6) — mutually
+///   exclusive; the `None` value writes neither (a name-only / parent
+///   node).
+/// * Nested `SimpleTag`s last, recursively.
+fn build_simple_tag(st: &MkvSimpleTag) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_string_element(&mut body, ids::TAG_NAME, &st.name);
+    match st.language_bcp47.as_deref() {
+        Some(bcp) if !bcp.is_empty() => {
+            write_string_element(&mut body, ids::TAG_LANGUAGE_BCP47, bcp);
+        }
+        _ => {
+            if !st.language.is_empty() && st.language != "und" {
+                write_string_element(&mut body, ids::TAG_LANGUAGE, &st.language);
+            }
+        }
+    }
+    if !st.default {
+        write_uint_element(&mut body, ids::TAG_DEFAULT, 0);
+    }
+    match &st.value {
+        MkvSimpleTagValue::String(s) => write_string_element(&mut body, ids::TAG_STRING, s),
+        MkvSimpleTagValue::Binary(b) => write_bytes_element(&mut body, ids::TAG_BINARY, b),
+        MkvSimpleTagValue::None => {}
+    }
+    for child in &st.children {
+        let child_body = build_simple_tag(child);
+        write_master_element(&mut body, ids::SIMPLE_TAG, &child_body);
+    }
     body
 }

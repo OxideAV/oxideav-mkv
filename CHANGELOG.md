@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: `Tags` writing (RFC 9559 §5.1.8). New `MkvMuxer::add_tag(MkvTag)`
+  queues metadata descriptors emitted as the file's single `Tags` master
+  before the first `Cluster`, symmetric with the long-standing demux-side
+  `tags()` read surface. `MkvTag` pairs an `MkvTagTargets` scope
+  (`TargetTypeValue` §5.1.8.1.1.1, `TargetType` §5.1.8.1.1.2, and the four
+  `TagTrackUID` / `TagEditionUID` / `TagChapterUID` / `TagAttachmentUID`
+  lists §5.1.8.1.1.3..§5.1.8.1.1.6 — multi-UID scoping supported) with one
+  or more `MkvSimpleTag` `(name, value)` descriptors carrying `TagName`
+  (§5.1.8.1.2.1), `TagLanguage` (§5.1.8.1.2.2, default `und` omitted),
+  `TagLanguageBCP47` (§5.1.8.1.2.3, wins over `TagLanguage`), `TagDefault`
+  (§5.1.8.1.2.4, default `1` written only when cleared), and a
+  `TagString` (§5.1.8.1.2.5) / `TagBinary` (§5.1.8.1.2.6) payload enum.
+  `MkvSimpleTag` supports the spec's `recursive: True` nesting via a
+  `children` list. Convenience constructors `MkvTag::global`,
+  `MkvTagTargets::track`, `MkvSimpleTag::new` / `::binary`. Queue-time
+  validation rejects an empty `simple_tags` list (§5.1.8.1.2 `minOccurs:
+  1`), an empty `TagName` at any nesting depth (§5.1.8.1.2.1), a
+  `TargetTypeValue == 0` (`range: not 0`), and any call after
+  `write_header`. The `Tags` master carries a leading `CRC-32` child
+  (§6.2) and is reachable from a new `SeekHead` `Tags` slot (voided when
+  no tags are queued). Covered by `tests/mux_tags.rs` (14 round-trip
+  cases through the demuxer's flat `metadata()` and typed `tags()` views).
 - Demuxer: `CueBlockNumber` seek fallback (RFC 9559 §5.1.5.1.2.5). When a
   Cues entry carries a `CueBlockNumber` ("Number of the Block in the
   specified Cluster") but no `CueRelativePosition` (§5.1.5.1.2.3) — common
