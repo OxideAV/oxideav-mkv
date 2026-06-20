@@ -327,6 +327,13 @@ the unified `oxideav` aggregator to wire decoding automatically.
   Cluster — finer seek granularity than the legacy "scan from cluster
   start" path, which is preserved as a fallback when the cue has no
   `CueRelativePosition` or the encoded position is out of range.
+- **`CueBlockNumber` seek fallback** (RFC 9559 §5.1.5.1.2.5): when a Cues
+  entry carries `CueBlockNumber` ("Number of the Block in the specified
+  Cluster") but no `CueRelativePosition` — common for files indexed by
+  older tools — `seek_to` walks the Cluster body counting `SimpleBlock` /
+  `BlockGroup` elements and lands the reader on the exact 1-based n-th
+  Block instead of scanning from the Cluster start. Out-of-range or
+  malformed block numbers degrade gracefully to the cluster-start walk.
 - **Typed `Cues` accessor** (RFC 9559 §5.1.5.1, including
   §5.1.5.1.1..§5.1.5.1.2.8 and the reclaimed Appendix A.37..A.39
   `CueReference` children): `MkvDemuxer::cue_points() -> &[CuePoint]`
@@ -624,10 +631,19 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `SimpleBlock` payload.
 - `Cues` element emitted in `write_trailer` - index entries for every
   video keyframe and every audio cluster-start, so the resulting file
-  is seekable without a second pass. Each entry carries
+  is seekable without a second pass. Each entry carries the full
+  `CueTrackPositions` sub-tree, symmetric with the demux read surface:
   `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3, recommended by §22.1)
   so seek-aware readers jump straight to the indexed `SimpleBlock`
-  inside the Cluster instead of scanning from the cluster header.
+  inside the Cluster; `CueBlockNumber` (§5.1.5.1.2.5) — the 1-based
+  ordinal of the indexed Block within its Cluster (every block counted
+  across all tracks in write order, `range: not 0` honoured); and
+  `CueDuration` (§5.1.5.1.2.4) when the indexed packet carried a usable
+  duration. **Subtitle tracks** follow §22.1's stronger recommendation
+  ("each subtitle frame SHOULD be referenced by a CuePoint element with
+  a CueDuration element"): a `MediaType::Subtitle` track is indexed once
+  per *frame* (each carrying its `CueDuration`), while audio/video keep
+  the once-per-cluster cadence.
 - Codec-specific fields: `CodecPrivate` normalisation for FLAC (`fLaC`
   magic prepended), Opus `CodecDelay` derived from the `OpusHead`
   pre-skip plus an 80 ms `SeekPreRoll` per the WebM spec.
