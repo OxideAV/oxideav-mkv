@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: `CueBlockNumber` seek fallback (RFC 9559 §5.1.5.1.2.5). When a
+  Cues entry carries a `CueBlockNumber` ("Number of the Block in the
+  specified Cluster") but no `CueRelativePosition` (§5.1.5.1.2.3) — common
+  for files indexed by older tools — `seek_to` now walks the Cluster body
+  counting `SimpleBlock` / `BlockGroup` elements and lands the reader on
+  the exact 1-based n-th Block instead of falling back to a cluster-start
+  scan. Out-of-range / malformed block numbers degrade gracefully to the
+  cluster-start walk (no panic). The flat seek index and the typed
+  `cue_points()` view both carry `CueBlockNumber` now. Covered by
+  `tests/cue_block_number_seek.rs`.
 - Muxer: per-frame subtitle cue emission (RFC 9559 §22.1 — "each subtitle
   frame SHOULD be referenced by a CuePoint element with a CueDuration
   element"). A `MediaType::Subtitle` track is now indexed once per *frame*

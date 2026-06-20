@@ -5024,6 +5024,12 @@ struct CueEntry {
     /// when the cue carried no `CueRelativePosition` child (legal — the
     /// element is optional, only `maxOccurs: 1`).
     relative_position: Option<u64>,
+    /// `CueBlockNumber` (RFC 9559 §5.1.5.1.2.5) — the 1-based number of the
+    /// referenced Block within the Cluster. Used by `seek_to` as a fallback
+    /// when `relative_position` is absent: a file indexed by block number
+    /// but not byte offset still seeks precisely to the right Block. `None`
+    /// when the cue carried no `CueBlockNumber` child.
+    block_number: Option<u64>,
 }
 
 /// One `Cues > CuePoint` (RFC 9559 §5.1.5.1) as it appears on disk,
@@ -5171,6 +5177,7 @@ fn parse_cue_track_positions(
     let mut track: u64 = 0;
     let mut cluster_offset: Option<u64> = None;
     let mut relative_position: Option<u64> = None;
+    let mut block_number: Option<u64> = None;
     let mut tp = CueTrackPositions::default();
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
@@ -5190,7 +5197,11 @@ fn parse_cue_track_positions(
                 tp.relative_position = Some(v);
             }
             ids::CUE_DURATION => tp.duration = Some(read_uint(r, e.size as usize)?),
-            ids::CUE_BLOCK_NUMBER => tp.block_number = Some(read_uint(r, e.size as usize)?),
+            ids::CUE_BLOCK_NUMBER => {
+                let v = read_uint(r, e.size as usize)?;
+                block_number = Some(v);
+                tp.block_number = Some(v);
+            }
             ids::CUE_CODEC_STATE => tp.codec_state = read_uint(r, e.size as usize)?,
             ids::CUE_REFERENCE => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
@@ -5206,6 +5217,7 @@ fn parse_cue_track_positions(
             time,
             cluster_offset: off,
             relative_position,
+            block_number,
         });
     }
     typed.push(tp);
@@ -6378,6 +6390,7 @@ impl Demuxer for MkvDemuxer {
         let cue_time = cue.time;
         let cue_cluster_offset = cue.cluster_offset;
         let relative_position = cue.relative_position;
+        let block_number = cue.block_number;
 
         let abs = self.segment_data_start + cue_cluster_offset;
         self.input.seek(SeekFrom::Start(abs))?;
@@ -6401,12 +6414,17 @@ impl Demuxer for MkvDemuxer {
         // block, skipping any earlier blocks the cue is not interested
         // in.
         //
-        // Without a relative position we leave the reader at the Cluster
+        // Without a relative position we fall back to `CueBlockNumber`
+        // (RFC 9559 §5.1.5.1.2.5) when the cue carries one — a file
+        // indexed by block number but not byte offset still seeks
+        // precisely. Failing both, we leave the reader at the Cluster
         // header and fall back to the regular `advance()` loop (which
         // walks every child from the start), preserving the legacy
         // behaviour byte-for-byte.
         if let Some(rel) = relative_position {
             self.apply_cue_relative_position(rel)?;
+        } else if let Some(n) = block_number {
+            self.apply_cue_block_number(n)?;
         }
 
         // Convert the landed ticks back into the stream's time base.
@@ -7350,6 +7368,95 @@ impl MkvDemuxer {
         // the record so a subsequent direct walk that re-enters this
         // Cluster (e.g. on a back-then-forward seek) can populate the
         // fields without creating a duplicate row.
+        self.input.seek(SeekFrom::Start(target))?;
+        self.register_cluster_record(body_start);
+        self.cluster_state = ClusterState::InCluster {
+            body_start,
+            body_end,
+            cluster_timecode,
+        };
+        Ok(())
+    }
+
+    /// Seek-helper fallback for a Cues entry that carries a
+    /// `CueBlockNumber` (RFC 9559 §5.1.5.1.2.5) but no
+    /// `CueRelativePosition` (§5.1.5.1.2.3): walk the Cluster body
+    /// counting `SimpleBlock` / `BlockGroup` elements and stop at the
+    /// `n`-th one (1-based, per the element's `range: not 0`), leaving the
+    /// reader at that Block's header start so the regular `advance()` loop
+    /// reads it next. Captures the Cluster `Timestamp` on the way (RFC
+    /// 9559 §5.1.3.1) so Block timestamps decode correctly.
+    ///
+    /// The reader is assumed to be positioned at the Cluster element header
+    /// (the same precondition as `apply_cue_relative_position`). On any
+    /// malformed walk, an out-of-range `n`, or a non-Cluster element, the
+    /// reader is rewound to the Cluster header and the regular `advance()`
+    /// walk takes over — byte-for-byte the legacy behaviour, so the seek
+    /// still lands at the start of the right Cluster.
+    fn apply_cue_block_number(&mut self, n: u64) -> Result<()> {
+        let cluster_head_pos = self.input.stream_position()?;
+        if n == 0 {
+            // §5.1.5.1.2.5 ranges CueBlockNumber as "not 0"; a 0 is
+            // malformed — leave the reader at the Cluster header.
+            return Ok(());
+        }
+        let e = read_element_header(&mut *self.input)?;
+        if e.id != ids::CLUSTER {
+            self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+            return Ok(());
+        }
+        let body_start = self.input.stream_position()?;
+        let is_unknown_size = e.size == VINT_UNKNOWN_SIZE;
+        let body_end = if is_unknown_size {
+            self.segment_data_end
+        } else {
+            body_start.saturating_add(e.size)
+        };
+        self.validate_cluster_crc(body_start, body_end, is_unknown_size)?;
+        self.input.seek(SeekFrom::Start(body_start))?;
+
+        let mut cluster_timecode: i64 = 0;
+        let mut block_count: u64 = 0;
+        let mut pos = body_start;
+        let mut target: Option<u64> = None;
+        while pos < body_end {
+            self.input.seek(SeekFrom::Start(pos))?;
+            let child = match read_element_header(&mut *self.input) {
+                Ok(c) => c,
+                Err(_) => {
+                    self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+                    return Ok(());
+                }
+            };
+            let child_body_start = self.input.stream_position()?;
+            if child.id == ids::TIMECODE {
+                cluster_timecode = read_uint(&mut *self.input, child.size as usize)? as i64;
+            }
+            if child.id == ids::SIMPLE_BLOCK || child.id == ids::BLOCK_GROUP {
+                block_count += 1;
+                if block_count == n {
+                    // `pos` is this Block's header start — exactly where
+                    // `advance()` must resume.
+                    target = Some(pos);
+                    break;
+                }
+            }
+            let next = child_body_start.saturating_add(child.size);
+            if next > body_end || next <= pos {
+                self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+                return Ok(());
+            }
+            pos = next;
+        }
+        let target = match target {
+            Some(t) => t,
+            None => {
+                // Fewer than `n` Blocks in the Cluster — degrade to a
+                // Cluster-start walk rather than overshoot.
+                self.input.seek(SeekFrom::Start(cluster_head_pos))?;
+                return Ok(());
+            }
+        };
         self.input.seek(SeekFrom::Start(target))?;
         self.register_cluster_record(body_start);
         self.cluster_state = ClusterState::InCluster {
