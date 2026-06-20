@@ -3833,10 +3833,15 @@ impl MkvMuxer {
             ));
         }
 
-        // Cue index: record the first indexable packet per (cluster, track).
-        // For video we only index keyframes (random-access points). For
-        // audio/subtitle we index the cluster-start regardless, since every
-        // audio frame is independently decodable.
+        // Cue index. For video we index the first keyframe (random-access
+        // point) per (cluster, track). For audio we index the first frame
+        // per cluster — every audio frame is independently decodable, so
+        // the cluster-start is a valid seek target and §22.1 recommends at
+        // most one audio cue per ~500 ms / cluster. For SUBTITLE tracks
+        // §22.1 is stronger: "each subtitle frame SHOULD be referenced by a
+        // CuePoint element with a CueDuration element" — so we index EVERY
+        // subtitle frame (bypassing the per-cluster dedup) and carry its
+        // CueDuration (§5.1.5.1.2.4).
         //
         // `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) is measured from the
         // first possible element position inside the Cluster (i.e. the byte
@@ -3848,7 +3853,11 @@ impl MkvMuxer {
         // computed inside `flush_lace`.
         let pre_block_pos = self.output.stream_position().unwrap_or(0);
         let pre_block_rel = pre_block_pos.saturating_sub(self.cluster_body_start_abs);
-        if !self.cue_seen_in_cluster[stream_idx] {
+        let is_subtitle = media_type == MediaType::Subtitle;
+        // Subtitle tracks index every frame; others index only once per
+        // cluster (gated by `cue_seen_in_cluster`).
+        let dedup_allows = is_subtitle || !self.cue_seen_in_cluster[stream_idx];
+        if dedup_allows {
             let indexable = match media_type {
                 MediaType::Video => packet.flags.keyframe,
                 _ => true,

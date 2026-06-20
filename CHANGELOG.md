@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: per-frame subtitle cue emission (RFC 9559 §22.1 — "each subtitle
+  frame SHOULD be referenced by a CuePoint element with a CueDuration
+  element"). A `MediaType::Subtitle` track is now indexed once per *frame*
+  rather than once per *cluster*: every subtitle Block gets its own
+  `CuePoint` carrying the frame's `CueDuration` (§5.1.5.1.2.4) and a
+  distinct `CueBlockNumber` (§5.1.5.1.2.5). Audio/video indexing is
+  unchanged (one cue per cluster — §22.1's "at most once every 500 ms"
+  guidance for audio, keyframes for video). Covered by
+  `tests/mux_subtitle_cues.rs`, including a regression guard that audio is
+  still indexed once per cluster.
 - Muxer: complete the `Cues` write surface to match the demuxer's read
   surface. Every `CueTrackPositions` the muxer emits now carries
   `CueBlockNumber` (RFC 9559 §5.1.5.1.2.5) — the 1-based ordinal of the
