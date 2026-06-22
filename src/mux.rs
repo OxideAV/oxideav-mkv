@@ -260,6 +260,89 @@ impl MkvTrackTiming {
     }
 }
 
+/// A queued `TrackEntry` identity / selection hint (RFC 9559 §5.1.4.1.18 /
+/// .19 / .20 / .23 / .4 / .5 / .12 / .24) installed via
+/// [`MkvMuxer::set_track_identity`]. Each field is `Option`; a `Some(v)`
+/// writes the element explicitly, a `None` leaves it off-disk so the demuxer
+/// surfaces `None` for the strings / `AttachmentLink` and materialises the
+/// spec default `1` for the three selection flags.
+///
+/// Pairs symmetrically with the demux-side
+/// [`crate::demux::MkvDemuxer::track_identity`] /
+/// [`crate::demux::TrackIdentity`] typed accessor — a mux→demux pipeline
+/// preserves every supplied element bit-exactly.
+///
+/// Two language fields are carried: `language` (Matroska form, §5.1.4.1.19,
+/// spec default `"eng"`) and `language_bcp47` (BCP-47, §5.1.4.1.20). Per the
+/// spec, when `language_bcp47` is present any `Language` element MUST be
+/// ignored — so when both are `Some`, the muxer writes **only**
+/// `LanguageBCP47`, mirroring how `TagLanguageBCP47` is handled. This hint's
+/// `language` field, when set, also overrides the `StreamInfo`-derived
+/// `Language` the muxer would otherwise emit from `CodecParameters::language`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkvTrackIdentity {
+    /// `Name` (RFC 9559 §5.1.4.1.18) — a human-readable track name. `None`
+    /// omits the element (it has no spec default).
+    pub name: Option<String>,
+    /// `CodecName` (RFC 9559 §5.1.4.1.23) — a human-readable codec name.
+    /// `None` omits the element (no spec default).
+    pub codec_name: Option<String>,
+    /// `Language` (RFC 9559 §5.1.4.1.19), Matroska (ISO 639-2) form. Spec
+    /// default `"eng"`. `None` defers to the `StreamInfo`-derived language;
+    /// `Some(v)` overrides it. Ignored on disk when `language_bcp47` is
+    /// `Some` (the spec says `Language` MUST be ignored in that case).
+    pub language: Option<String>,
+    /// `LanguageBCP47` (RFC 9559 §5.1.4.1.20, `minver: 4`), BCP-47 form.
+    /// `None` omits the element. When `Some`, it supersedes `language`.
+    pub language_bcp47: Option<String>,
+    /// `FlagEnabled` (RFC 9559 §5.1.4.1.4, default `1`). `None` omits the
+    /// element (the demuxer materialises `1`); `Some(v)` writes it.
+    pub flag_enabled: Option<bool>,
+    /// `FlagDefault` (RFC 9559 §5.1.4.1.5, default `1`). `None` omits the
+    /// element; `Some(v)` writes it.
+    pub flag_default: Option<bool>,
+    /// `FlagLacing` (RFC 9559 §5.1.4.1.12, default `1`). `None` defers to the
+    /// muxer's auto-derived value (`1` when a lacing mode is opted in, else
+    /// `0`); `Some(v)` overrides it explicitly. Note that setting `Some(true)`
+    /// only advertises that the track MAY carry laced Blocks — it does not by
+    /// itself enable lacing; use [`MkvMuxer::with_block_lacing`] for that.
+    pub flag_lacing: Option<bool>,
+    /// `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`) — the `FileUID`
+    /// of an attachment this codec uses. Range `not 0`; `None` omits the
+    /// element; a `Some(0)` is rejected at queue time.
+    pub attachment_link: Option<u64>,
+}
+
+impl MkvTrackIdentity {
+    /// Convenience constructor that sets only the track `Name` (§5.1.4.1.18).
+    pub fn named(name: impl Into<String>) -> Self {
+        MkvTrackIdentity {
+            name: Some(name.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Convenience constructor that sets only the BCP-47 language
+    /// (§5.1.4.1.20). Use the struct fields for the Matroska-form `Language`.
+    pub fn language_bcp47(lang: impl Into<String>) -> Self {
+        MkvTrackIdentity {
+            language_bcp47: Some(lang.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Convenience constructor for the "forced subtitle that is not a default
+    /// track" shape: `FlagDefault = 0`. Pair with
+    /// [`MkvMuxer::set_track_audience_flags`] to set the §5.1.4.1.6
+    /// `FlagForced` itself.
+    pub fn non_default() -> Self {
+        MkvTrackIdentity {
+            flag_default: Some(false),
+            ..Default::default()
+        }
+    }
+}
+
 pub struct MkvMuxer {
     output: Box<dyn WriteSeek>,
     streams: Vec<StreamInfo>,
@@ -495,6 +578,15 @@ pub struct MkvMuxer {
     /// default `1.0`. `Some(_)` writes each populated child explicitly. The
     /// slice is sized to `streams.len()`.
     track_timing: Vec<Option<MkvTrackTiming>>,
+    /// Per-stream `TrackEntry` identity / selection hints queued via
+    /// [`MkvMuxer::set_track_identity`] (RFC 9559 §5.1.4.1.18 / .19 / .20 /
+    /// .23 / .4 / .5 / .12 / .24). `None` (the default) means the muxer omits
+    /// the optional identity strings / `AttachmentLink`, lets the demuxer
+    /// materialise the §default `1` for the three selection flags, and falls
+    /// back to the `StreamInfo`-derived `Language` / auto-derived `FlagLacing`.
+    /// `Some(_)` writes each populated child explicitly. The slice is sized to
+    /// `streams.len()`.
+    track_identity: Vec<Option<MkvTrackIdentity>>,
     /// Per-stream timestamp (ms, = track ticks at the muxer's 1 ms
     /// `TimestampScale`) of the most recently written Block. Used to
     /// derive the `ReferenceBlock` (RFC 9559 §5.1.3.5.5) relative value
@@ -1729,6 +1821,7 @@ impl MkvMuxer {
             max_block_addition_ids: vec![None; n],
             track_audio: vec![None; n],
             track_timing: vec![None; n],
+            track_identity: vec![None; n],
             last_block_pts_ms: vec![None; n],
             track_operations: vec![None; n],
             content_encodings: vec![None; n],
@@ -3003,6 +3096,84 @@ impl MkvMuxer {
         *self.track_timing.get(stream_index)?
     }
 
+    /// Set the per-track identity / selection elements (RFC 9559 §5.1.4.1.18 /
+    /// .19 / .20 / .23 / .4 / .5 / .12 / .24) for one stream — `Name`,
+    /// `CodecName`, the `Language` / `LanguageBCP47` pair, the three selection
+    /// flags (`FlagEnabled` / `FlagDefault` / `FlagLacing`), and
+    /// `AttachmentLink`. Must be called before [`Muxer::write_header`]; the
+    /// elements live in the `TrackEntry`, which is written exactly once at
+    /// header time.
+    ///
+    /// Per-field omission rule: each `Some(v)` writes the element explicitly,
+    /// each `None` stays off-disk. There is **no track-type restriction** —
+    /// the spec carries all eight on every `TrackEntry`. The `language` field,
+    /// when `Some`, overrides the `StreamInfo`-derived `Language`; the
+    /// `flag_lacing` field, when `Some`, overrides the muxer's auto-derived
+    /// `FlagLacing`. Per §5.1.4.1.20, when both `language` and
+    /// `language_bcp47` are `Some` the muxer writes only `LanguageBCP47`
+    /// (`Language` MUST be ignored when BCP-47 is present).
+    ///
+    /// Spec checks enforced at queue time: `AttachmentLink` is ranged `not 0`
+    /// (a `Some(0)` is rejected, §5.1.4.1.24); an empty `Name` / `CodecName` /
+    /// `Language` / `LanguageBCP47` string is rejected (a zero-length element
+    /// is meaningless and would round-trip as an empty value).
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` out of range, a `Some("")` string,
+    ///   or `attachment_link == Some(0)`.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the previously
+    /// queued value (last-write-wins). Returns a mutable reference back so
+    /// calls can chain builder-style. Pairs symmetrically with the demux-side
+    /// [`crate::demux::MkvDemuxer::track_identity`].
+    pub fn set_track_identity(
+        &mut self,
+        stream_index: usize,
+        identity: MkvTrackIdentity,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_identity called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_identity stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        for (field, val) in [
+            ("name", &identity.name),
+            ("codec_name", &identity.codec_name),
+            ("language", &identity.language),
+            ("language_bcp47", &identity.language_bcp47),
+        ] {
+            if val.as_deref() == Some("") {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: set_track_identity {field} must not be an empty string"
+                )));
+            }
+        }
+        // RFC 9559 §5.1.4.1.24: AttachmentLink is ranged "not 0".
+        if identity.attachment_link == Some(0) {
+            return Err(Error::invalid(
+                "MKV muxer: set_track_identity attachment_link 0 out of range (must be not 0)"
+                    .to_string(),
+            ));
+        }
+        self.track_identity[stream_index] = Some(identity);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream identity hint installed
+    /// via [`MkvMuxer::set_track_identity`]. Returns `None` for any stream
+    /// that didn't have the API called. Mostly useful for tests.
+    pub fn track_identity(&self, stream_index: usize) -> Option<&MkvTrackIdentity> {
+        self.track_identity.get(stream_index)?.as_ref()
+    }
+
     /// Queue a chapter atom with one English-language `ChapterDisplay`
     /// carrying `title`. Must be called before [`MkvMuxer::write_header`];
     /// returns [`Error::other`] if the header has already been emitted.
@@ -3311,12 +3482,29 @@ impl Muxer for MkvMuxer {
             // ends up laced is made at write time based on packet
             // sizes / keyframe boundaries. With LacingMode::None the
             // muxer never laces, so FlagLacing stays at 0.
-            let flag_lacing = if self.lacing_mode == LacingMode::None {
-                0
-            } else {
-                1
+            // A `set_track_identity` hint with an explicit `flag_lacing`
+            // overrides the auto-derived value (RFC 9559 §5.1.4.1.12).
+            let identity = self.track_identity[i].as_ref();
+            let flag_lacing = match identity.and_then(|id| id.flag_lacing) {
+                Some(v) => v as u64,
+                None if self.lacing_mode == LacingMode::None => 0,
+                None => 1,
             };
             write_uint_element(&mut t, ids::FLAG_LACING, flag_lacing);
+            // Identity selection flags (RFC 9559 §5.1.4.1.4 / .5) queued via
+            // `set_track_identity`. Per-element omission rule: each `Some(v)`
+            // is written explicitly as 0/1; each `None` stays off-disk (the
+            // demuxer materialises the spec default `1`). `FlagLacing` is
+            // handled above because the muxer auto-derives it from the lacing
+            // mode when the hint leaves it `None`.
+            if let Some(id) = identity {
+                if let Some(v) = id.flag_enabled {
+                    write_uint_element(&mut t, ids::FLAG_ENABLED, v as u64);
+                }
+                if let Some(v) = id.flag_default {
+                    write_uint_element(&mut t, ids::FLAG_DEFAULT, v as u64);
+                }
+            }
             // Audience flags (RFC 9559 §5.1.4.1.6..§5.1.4.1.11) — six
             // TrackEntry-level uinteger elements queued via
             // `set_track_audience_flags`. Per-element omission rule:
@@ -3373,11 +3561,30 @@ impl Muxer for MkvMuxer {
                     write_float_element(&mut t, ids::TRACK_TIMESTAMP_SCALE, v);
                 }
             }
-            // RFC 9559 §5.1.4.1.2.1 (Language): per-track ISO 639-2/T
-            // tag. Spec default is `"eng"`, so we only emit the element
-            // when the caller supplied an explicit value — parsers fall
-            // back to the default when the element is omitted.
-            if let Some(lang) = s.params.language.as_deref() {
+            // Identity strings (RFC 9559 §5.1.4.1.18 / .23) queued via
+            // `set_track_identity`. `Name` and `CodecName` carry no spec
+            // default — written only when the hint supplies them.
+            if let Some(id) = identity {
+                if let Some(name) = id.name.as_deref() {
+                    write_string_element(&mut t, ids::NAME, name);
+                }
+                if let Some(cn) = id.codec_name.as_deref() {
+                    write_string_element(&mut t, ids::CODEC_NAME, cn);
+                }
+            }
+            // Language (RFC 9559 §5.1.4.1.19) / LanguageBCP47 (§5.1.4.1.20).
+            // Precedence: a `set_track_identity` hint's `language_bcp47` wins
+            // and, per the spec, suppresses any `Language` element ("any
+            // Language elements ... MUST be ignored" when BCP-47 is present);
+            // otherwise the hint's `language` overrides the
+            // `StreamInfo`-derived `Language`, which is itself the fallback.
+            // The Matroska-form spec default is `"eng"`, so the element is
+            // omitted entirely when no source supplies a value.
+            let hint_bcp47 = identity.and_then(|id| id.language_bcp47.as_deref());
+            let hint_lang = identity.and_then(|id| id.language.as_deref());
+            if let Some(bcp47) = hint_bcp47 {
+                write_string_element(&mut t, ids::LANGUAGE_BCP47, bcp47);
+            } else if let Some(lang) = hint_lang.or(s.params.language.as_deref()) {
                 write_string_element(&mut t, ids::LANGUAGE, lang);
             }
             if let Some(name) = codec_id::to_matroska(&s.params.codec_id) {
@@ -3392,6 +3599,13 @@ impl Muxer for MkvMuxer {
             let cp = encode_codec_private(&s.params.codec_id, &s.params.extradata);
             if !cp.is_empty() {
                 write_bytes_element(&mut t, ids::CODEC_PRIVATE, &cp);
+            }
+            // AttachmentLink (RFC 9559 §5.1.4.1.24, `maxver: 3`) queued via
+            // `set_track_identity` — the `FileUID` of an attachment this
+            // codec uses. Range "not 0" enforced at queue time; written only
+            // when the hint supplies it.
+            if let Some(link) = identity.and_then(|id| id.attachment_link) {
+                write_uint_element(&mut t, ids::ATTACHMENT_LINK, link);
             }
             // Codec-specific timing fields (Opus uses CodecDelay = pre_skip in ns
             // and a recommended SeekPreRoll of 80 ms).

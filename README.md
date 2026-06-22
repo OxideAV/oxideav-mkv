@@ -1092,6 +1092,36 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `MkvDemuxer::track_timing` typed accessor — a mux→demux pipeline
   preserves every supplied child bit-exactly, including the
   `DefaultDuration`-derived nominal frame rate.
+- **`TrackEntry` identity / selection on write** (RFC 9559 §5.1.4.1.18 /
+  .19 / .20 / .23 / .4 / .5 / .12 / .24):
+  `MkvMuxer::set_track_identity(stream_index, MkvTrackIdentity)` queues a
+  per-track hint whose eight `Option` slots — `name` (`Name`, id `0x536E`),
+  `codec_name` (`CodecName`, id `0x258688`), `language` (`Language`, id
+  `0x22B59C`), `language_bcp47` (`LanguageBCP47`, id `0x22B59D`),
+  `flag_enabled` (`FlagEnabled`, id `0xB9`), `flag_default` (`FlagDefault`,
+  id `0x88`), `flag_lacing` (`FlagLacing`, id `0x9C`), and `attachment_link`
+  (`AttachmentLink`, id `0x7446`) — land directly inside the `TrackEntry` (no
+  gating master) at `write_header` time. Per-field omission rule: each
+  `Some(v)` writes the element explicitly, each `None` stays off-disk (the
+  demuxer materialises the §default `1` for the three selection flags and
+  `None` for the strings / link). The `language` slot, when `Some`, overrides
+  the `StreamInfo`-derived `Language`; the `flag_lacing` slot, when `Some`,
+  overrides the muxer's auto-derived `FlagLacing`. Per §5.1.4.1.20, when both
+  `language` and `language_bcp47` are `Some` the muxer writes only
+  `LanguageBCP47` (the spec says `Language` MUST be ignored when BCP-47 is
+  present), mirroring the `TagLanguageBCP47` handling. There is **no
+  track-type restriction** — the spec carries all eight on every
+  `TrackEntry`. Spec checks enforced at queue time: `attachment_link` is
+  ranged `not 0` (a `Some(0)` is rejected, §5.1.4.1.24); an empty `Name` /
+  `CodecName` / `Language` / `LanguageBCP47` string is rejected; plus
+  post-`write_header` use and out-of-range `stream_index`. Convenience
+  constructors `MkvTrackIdentity::named(name)` /
+  `MkvTrackIdentity::language_bcp47(lang)` / `MkvTrackIdentity::non_default()`
+  cover the common shapes; a read-back `MkvMuxer::track_identity(stream_index)`
+  returns the queued hint pre-`write_header`. Pairs symmetrically with the new
+  `MkvDemuxer::track_identity` typed accessor — a mux→demux pipeline preserves
+  every supplied element, including the BCP-47 precedence and the
+  explicit-`0`-vs-absent flag distinction.
 - **`TrackOperation` on write** (RFC 9559 §5.1.4.1.30):
   `MkvMuxer::set_track_operation(stream_index, MkvTrackOperation)` queues a
   per-track *virtual-track* recipe that lands as a `TrackOperation` master

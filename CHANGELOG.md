@@ -26,6 +26,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports the precedence. The effective language now also lifts onto the flat
   `StreamInfo` view with BCP-47 taking precedence. `is_default()` reports the
   all-absent state.
+- Muxer: `TrackEntry` identity / selection writing (RFC 9559 §5.1.4.1.18 /
+  .19 / .20 / .23 / .4 / .5 / .12 / .24). New
+  `MkvMuxer::set_track_identity(stream_index, MkvTrackIdentity)` queues a
+  per-track hint whose eight `Option` slots — `name` (`Name`), `codec_name`
+  (`CodecName`), `language` (`Language`), `language_bcp47` (`LanguageBCP47`),
+  `flag_enabled` (`FlagEnabled`), `flag_default` (`FlagDefault`),
+  `flag_lacing` (`FlagLacing`), `attachment_link` (`AttachmentLink`) — land
+  directly inside the `TrackEntry` at `write_header` time. Per-field omission
+  rule: each `Some(v)` writes the element, each `None` stays off-disk. The
+  `language` field overrides the `StreamInfo`-derived `Language`; the
+  `flag_lacing` field overrides the auto-derived value. Per §5.1.4.1.20, when
+  both `language` and `language_bcp47` are `Some` the muxer writes only
+  `LanguageBCP47` (`Language` MUST be ignored when BCP-47 is present).
+  Queue-time validation rejects an empty `Name` / `CodecName` / `Language` /
+  `LanguageBCP47` string, `attachment_link == Some(0)` (§5.1.4.1.24 "not 0"),
+  an out-of-range `stream_index`, and any call after `write_header`.
+  Convenience constructors `MkvTrackIdentity::named` / `::language_bcp47` /
+  `::non_default`, plus a read-back `MkvMuxer::track_identity` accessor. Pairs
+  symmetrically with the demux-side `MkvDemuxer::track_identity` — a mux→demux
+  pipeline round-trips every element.
 - Muxer: `Tags` writing (RFC 9559 §5.1.8). New `MkvMuxer::add_tag(MkvTag)`
   queues metadata descriptors emitted as the file's single `Tags` master
   before the first `Cluster`, symmetric with the long-standing demux-side
