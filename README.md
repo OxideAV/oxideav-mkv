@@ -184,6 +184,31 @@ the unified `oxideav` aggregator to wire decoding automatically.
   (a non-finite / non-positive payload is dropped, since the spec range is
   `> 0x0p+0`). `TrackTiming::is_empty()` reports the all-absent state — a
   track that carried none of the three elements.
+- **Typed `TrackIdentity` accessor** (RFC 9559 §5.1.4.1.18 / .19 / .20 / .23 /
+  .4 / .5 / .12 / .24): `MkvDemuxer::track_identity(stream_index) ->
+  Option<&TrackIdentity>` (and the per-stream `all_track_identity()` slice)
+  folds the eight `TrackEntry`-level identity / selection elements — `Name`
+  (id `0x536E`, §5.1.4.1.18), `Language` (id `0x22B59C`, §5.1.4.1.19),
+  `LanguageBCP47` (id `0x22B59D`, §5.1.4.1.20), `CodecName` (id `0x258688`,
+  §5.1.4.1.23), `FlagEnabled` (id `0xB9`, §5.1.4.1.4), `FlagDefault` (id
+  `0x88`, §5.1.4.1.5), `FlagLacing` (id `0x9C`, §5.1.4.1.12), and
+  `AttachmentLink` (id `0x7446`, §5.1.4.1.24) — into one record per track.
+  The elements sit directly on `TrackEntry` (no gating master), so every
+  valid track surfaces a record; `track_identity` returns `None` only for an
+  out-of-range stream index. The four strings carry no spec default and stay
+  `Option` (`name()` / `codec_name()` / `language_matroska()` /
+  `language_bcp47()`); `language()` returns the effective language honouring
+  the §5.1.4.1.20 precedence (`LanguageBCP47` supersedes `Language` — "any
+  Language elements ... MUST be ignored"), and `uses_bcp47()` reports it. The
+  three selection flags carry the spec default `1`: `enabled()` / `default()`
+  / `lacing_allowed()` materialise it while `*_explicit()` preserve the
+  on-disk presence so a re-muxer can distinguish "writer was silent" from
+  "writer explicitly cleared the flag". `attachment_link()` surfaces the
+  `FileUID` of an attachment the track's codec uses (e.g. a font for an
+  ASS/SSA subtitle track), matching an `Attachment::uid` from `attachments()`;
+  a spec-illegal `0` (range "not 0") is dropped at parse time.
+  `TrackIdentity::is_default()` reports the all-absent state. The effective
+  language also lifts onto the flat `StreamInfo` view (BCP-47 preferred).
 - **Typed `TrackCodecTiming` accessor** (RFC 9559 §5.1.4.1.25 + §5.1.4.1.26):
   `MkvDemuxer::track_codec_timing(stream_index) -> Option<&TrackCodecTiming>`
   (and the per-stream `all_track_codec_timing()` slice) folds the two

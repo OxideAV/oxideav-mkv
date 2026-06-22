@@ -116,9 +116,16 @@ pub const FLAG_ORIGINAL: u32 = 0x55AE;
 pub const FLAG_COMMENTARY: u32 = 0x55AF;
 pub const NAME: u32 = 0x536E;
 pub const LANGUAGE: u32 = 0x22B59C;
+/// `LanguageBCP47` (RFC 9559 §5.1.4.1.20, `minver: 4`). The track's language
+/// in [RFC5646] (BCP-47) form. When present, any `Language` element in the
+/// same `TrackEntry` MUST be ignored.
+pub const LANGUAGE_BCP47: u32 = 0x22B59D;
 pub const CODEC_ID: u32 = 0x86;
 pub const CODEC_PRIVATE: u32 = 0x63A2;
 pub const CODEC_NAME: u32 = 0x258688;
+/// `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`). The `FileUID`
+/// (§5.1.6.5) of an attachment this track's codec uses. Range "not 0".
+pub const ATTACHMENT_LINK: u32 = 0x7446;
 pub const CODEC_DELAY: u32 = 0x56AA;
 pub const SEEK_PRE_ROLL: u32 = 0x56BB;
 pub const VIDEO: u32 = 0xE0;

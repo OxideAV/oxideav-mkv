@@ -352,12 +352,13 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             params.width = Some(t.width as u32);
             params.height = Some(t.height as u32);
         }
-        // RFC 9559 §5.1.4.1.2.1: surface the per-track Language when
-        // the file carried one. We deliberately do NOT synthesise the
-        // spec default "eng" here — callers iterating streams keep the
-        // "absent" signal so re-muxing doesn't add a Language element
-        // that wasn't in the source.
-        if let Some(lang) = t.language.clone() {
+        // RFC 9559 §5.1.4.1.19 / §5.1.4.1.20: surface the per-track language
+        // when the file carried one. `LanguageBCP47` supersedes `Language`
+        // ("any Language elements ... MUST be ignored" when BCP-47 is present),
+        // so prefer it. We deliberately do NOT synthesise the spec default
+        // "eng" here — callers iterating streams keep the "absent" signal so
+        // re-muxing doesn't add a language element that wasn't in the source.
+        if let Some(lang) = t.language_bcp47.clone().or_else(|| t.language.clone()) {
             params.language = Some(lang);
         }
         streams.push(StreamInfo {
@@ -519,6 +520,26 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         .map(|t| TrackCodecTiming {
             codec_delay_explicit: t.codec_timing_raw.0,
             seek_pre_roll_explicit: t.codec_timing_raw.1,
+        })
+        .collect();
+
+    // Per-stream `TrackIdentity` (RFC 9559 §5.1.4.1.18 / .19 / .20 / .23 / .4 /
+    // .5 / .12 / .24), indexed by stream index. A record surfaces for every
+    // track (every element sits on `TrackEntry` directly, no gating master).
+    // String / link fields stay `Option` (no spec default); the three flag
+    // defaults (`1`) are folded in on the typed surface, with the on-disk
+    // presence preserved via the `*_explicit` accessors.
+    let track_identity: Vec<TrackIdentity> = tracks
+        .iter()
+        .map(|t| TrackIdentity {
+            name: t.name.clone(),
+            codec_name: t.codec_name.clone(),
+            language: t.language.clone(),
+            language_bcp47: t.language_bcp47.clone(),
+            flag_enabled: t.flag_enabled,
+            flag_default: t.flag_default,
+            flag_lacing: t.flag_lacing,
+            attachment_link: t.attachment_link,
         })
         .collect();
 
@@ -751,6 +772,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         track_audio,
         track_timing,
         track_codec_timing,
+        track_identity,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
     })
@@ -1224,12 +1246,37 @@ struct TrackEntry {
     /// inspect the malformed file; the typed surface's `fourcc()` accessor
     /// returns `None` whenever the byte length isn't exactly 4.
     uncompressed_fourcc_raw: Option<Vec<u8>>,
-    /// `Language` (RFC 9559 §5.1.4.1.2.1) — ISO 639-2/T three-letter
+    /// `Language` (RFC 9559 §5.1.4.1.19) — Matroska-form (ISO 639-2)
     /// tag for the track's primary language. `None` when the element
     /// was absent from the file; the spec default `"eng"` is *not*
     /// materialised here so the typed surface can distinguish
     /// "container said English" from "container said nothing".
     language: Option<String>,
+    /// `LanguageBCP47` (RFC 9559 §5.1.4.1.20, `minver: 4`) — the track's
+    /// language in [RFC5646] BCP-47 form. `None` when absent. When present,
+    /// it supersedes any `Language` element in the same `TrackEntry` per the
+    /// spec ("any Language elements ... MUST be ignored").
+    language_bcp47: Option<String>,
+    /// `Name` (RFC 9559 §5.1.4.1.18) — a human-readable track name. `None`
+    /// when absent (the element has no spec default).
+    name: Option<String>,
+    /// `CodecName` (RFC 9559 §5.1.4.1.23) — a human-readable codec name.
+    /// `None` when absent (no spec default).
+    codec_name: Option<String>,
+    /// `FlagEnabled` (RFC 9559 §5.1.4.1.4, `minver: 2`, default `1`). `None`
+    /// when the on-disk element was absent; the `1` default is materialised
+    /// on the typed [`TrackIdentity`] surface rather than here.
+    flag_enabled: Option<u64>,
+    /// `FlagDefault` (RFC 9559 §5.1.4.1.5, default `1`). `None` when absent;
+    /// the default is materialised on the typed surface.
+    flag_default: Option<u64>,
+    /// `FlagLacing` (RFC 9559 §5.1.4.1.12, default `1`). `None` when absent;
+    /// the default is materialised on the typed surface.
+    flag_lacing: Option<u64>,
+    /// `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`) — the `FileUID` of
+    /// an attachment this codec uses. `None` when absent; a spec-illegal `0`
+    /// (range "not 0") is dropped at parse time.
+    attachment_link: Option<u64>,
     /// `BlockAdditionMapping` masters (RFC 9559 §5.1.4.1.17) captured during
     /// the `TrackEntry` walk, one entry per master in on-disk order. Empty
     /// when the `TrackEntry` carried no `BlockAdditionMapping` child (the
@@ -2799,6 +2846,168 @@ impl TrackTiming {
         self.default_duration.is_none()
             && self.default_decoded_field_duration.is_none()
             && self.track_timestamp_scale_explicit.is_none()
+    }
+}
+
+/// A track's human-readable identity and selection metadata — the
+/// `TrackEntry`-level elements that name the track, declare its language, and
+/// gate automatic player selection, folded into one record.
+///
+/// Covered elements (all sit directly on `TrackEntry`, no gating master):
+///
+/// * `Name` (RFC 9559 §5.1.4.1.18) — a human-readable track name (utf-8).
+///   No spec default; absence surfaces as `None` from [`name`](Self::name).
+/// * `Language` (§5.1.4.1.19) — the track language in Matroska form
+///   (ISO 639-2). Spec default `"eng"`.
+/// * `LanguageBCP47` (§5.1.4.1.20, `minver: 4`) — the track language in
+///   [RFC5646] (BCP-47) form. When present it supersedes `Language`
+///   ("any Language elements ... MUST be ignored"); the
+///   [`language`](Self::language) accessor honours that precedence, while
+///   [`language_matroska`](Self::language_matroska) /
+///   [`language_bcp47`](Self::language_bcp47) expose each raw value.
+/// * `CodecName` (§5.1.4.1.23) — a human-readable codec name (utf-8).
+/// * `FlagEnabled` (§5.1.4.1.4, `minver: 2`, default `1`) — set to `1` if the
+///   track is usable.
+/// * `FlagDefault` (§5.1.4.1.5, default `1`) — set to `1` if the track is
+///   eligible for automatic selection by the player (see §19).
+/// * `FlagLacing` (§5.1.4.1.12, default `1`) — set to `1` if the track MAY
+///   carry laced Blocks. When `0`, all Blocks MUST have lacing disabled.
+/// * `AttachmentLink` (§5.1.4.1.24, `maxver: 3`) — the `FileUID` of an
+///   attachment this codec uses (e.g. a font for a subtitle track).
+///
+/// The three boolean flags carry a spec default (`1` for all of them); the
+/// default-materialising accessors ([`enabled`](Self::enabled) /
+/// [`default`](Self::default) / [`lacing_allowed`](Self::lacing_allowed)) fold
+/// it in, while the `*_explicit` accessors preserve the on-disk presence so a
+/// re-muxer can avoid emitting an element the source omitted. A record
+/// surfaces for every track (the elements sit on `TrackEntry` directly);
+/// [`is_default`](Self::is_default) reports the common all-absent state in
+/// which the record carries only the materialised defaults. Surfaced per
+/// stream via [`MkvDemuxer::track_identity`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackIdentity {
+    name: Option<String>,
+    codec_name: Option<String>,
+    language: Option<String>,
+    language_bcp47: Option<String>,
+    flag_enabled: Option<u64>,
+    flag_default: Option<u64>,
+    flag_lacing: Option<u64>,
+    attachment_link: Option<u64>,
+}
+
+impl TrackIdentity {
+    /// `Name` (RFC 9559 §5.1.4.1.18) — a human-readable track name. `None`
+    /// when the element was absent (it has no spec default).
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// `CodecName` (RFC 9559 §5.1.4.1.23) — a human-readable codec name.
+    /// `None` when absent (no spec default).
+    pub fn codec_name(&self) -> Option<&str> {
+        self.codec_name.as_deref()
+    }
+
+    /// The track's effective language, honouring the §5.1.4.1.20 precedence:
+    /// `LanguageBCP47` when present (it supersedes `Language`), otherwise
+    /// `Language`. `None` when neither element was on disk — the spec default
+    /// `"eng"` is *not* materialised so the "absent" signal survives for
+    /// faithful re-mux. Use [`language_matroska`](Self::language_matroska) /
+    /// [`language_bcp47`](Self::language_bcp47) to inspect each raw value.
+    pub fn language(&self) -> Option<&str> {
+        self.language_bcp47.as_deref().or(self.language.as_deref())
+    }
+
+    /// `Language` (RFC 9559 §5.1.4.1.19) exactly as it appeared on disk, in
+    /// Matroska (ISO 639-2) form. `None` when the element was absent. Note
+    /// that per the spec this value MUST be ignored when
+    /// [`language_bcp47`](Self::language_bcp47) is `Some` — [`language`](Self::language)
+    /// already applies that rule.
+    pub fn language_matroska(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+
+    /// `LanguageBCP47` (RFC 9559 §5.1.4.1.20) exactly as it appeared on disk,
+    /// in [RFC5646] (BCP-47) form. `None` when the element was absent.
+    pub fn language_bcp47(&self) -> Option<&str> {
+        self.language_bcp47.as_deref()
+    }
+
+    /// `true` when [`language_bcp47`](Self::language_bcp47) is present and
+    /// therefore takes precedence over any `Language` element on the same
+    /// `TrackEntry` (RFC 9559 §5.1.4.1.20).
+    pub fn uses_bcp47(&self) -> bool {
+        self.language_bcp47.is_some()
+    }
+
+    /// `FlagEnabled` (RFC 9559 §5.1.4.1.4) with the spec default `1`
+    /// materialised: a track with no explicit element is reported as enabled.
+    /// Use [`enabled_explicit`](Self::enabled_explicit) when the on-disk
+    /// presence matters.
+    pub fn enabled(&self) -> bool {
+        self.flag_enabled.map(|v| v != 0).unwrap_or(true)
+    }
+
+    /// `FlagEnabled` (RFC 9559 §5.1.4.1.4) as it appeared on disk. `Some(v)`
+    /// when the writer emitted the element (including an explicit `0`); `None`
+    /// when silent (the `1` default applies on [`enabled`](Self::enabled)).
+    pub fn enabled_explicit(&self) -> Option<bool> {
+        self.flag_enabled.map(|v| v != 0)
+    }
+
+    /// `FlagDefault` (RFC 9559 §5.1.4.1.5) with the spec default `1`
+    /// materialised: a track with no explicit element is eligible for
+    /// automatic player selection. Use [`default_explicit`](Self::default_explicit)
+    /// when the on-disk presence matters.
+    pub fn default(&self) -> bool {
+        self.flag_default.map(|v| v != 0).unwrap_or(true)
+    }
+
+    /// `FlagDefault` (RFC 9559 §5.1.4.1.5) as it appeared on disk. `Some(v)`
+    /// when present (including an explicit `0`); `None` when silent.
+    pub fn default_explicit(&self) -> Option<bool> {
+        self.flag_default.map(|v| v != 0)
+    }
+
+    /// `FlagLacing` (RFC 9559 §5.1.4.1.12) with the spec default `1`
+    /// materialised: a track with no explicit element MAY carry laced Blocks.
+    /// When `false`, all the track's Blocks MUST have lacing disabled. Use
+    /// [`lacing_allowed_explicit`](Self::lacing_allowed_explicit) when the
+    /// on-disk presence matters.
+    pub fn lacing_allowed(&self) -> bool {
+        self.flag_lacing.map(|v| v != 0).unwrap_or(true)
+    }
+
+    /// `FlagLacing` (RFC 9559 §5.1.4.1.12) as it appeared on disk. `Some(v)`
+    /// when present (including an explicit `0`); `None` when silent.
+    pub fn lacing_allowed_explicit(&self) -> Option<bool> {
+        self.flag_lacing.map(|v| v != 0)
+    }
+
+    /// `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`) — the `FileUID`
+    /// (§5.1.6.5) of an attachment this track's codec uses, e.g. a font
+    /// referenced by an ASS/SSA subtitle track. `None` when absent or when a
+    /// spec-illegal `0` was dropped at parse time (range "not 0"). The value
+    /// matches an [`Attachment::uid`] surfaced by [`MkvDemuxer::attachments`].
+    pub fn attachment_link(&self) -> Option<u64> {
+        self.attachment_link
+    }
+
+    /// `true` when the track carried none of the identity elements on disk —
+    /// no `Name`, `CodecName`, `Language`, `LanguageBCP47`, `AttachmentLink`,
+    /// and none of the three flags. In that state the record carries only the
+    /// materialised flag defaults (all `true`) and is information-free beyond
+    /// them.
+    pub fn is_default(&self) -> bool {
+        self.name.is_none()
+            && self.codec_name.is_none()
+            && self.language.is_none()
+            && self.language_bcp47.is_none()
+            && self.flag_enabled.is_none()
+            && self.flag_default.is_none()
+            && self.flag_lacing.is_none()
+            && self.attachment_link.is_none()
     }
 }
 
@@ -5441,6 +5650,30 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             ids::CODEC_ID => t.codec_id_string = read_string(r, e.size as usize)?,
             ids::CODEC_PRIVATE => t.codec_private = read_bytes(r, e.size as usize)?,
             ids::LANGUAGE => t.language = Some(read_string(r, e.size as usize)?),
+            // Track identity strings (RFC 9559 §5.1.4.1.18 / .20 / .23). `Name`
+            // and `CodecName` are utf-8; `LanguageBCP47` is an ASCII `string`.
+            // Each is `maxOccurs: 1` and carries no spec default — absence stays
+            // observable as `None` on the typed [`TrackIdentity`] surface.
+            ids::NAME => t.name = Some(read_string(r, e.size as usize)?),
+            ids::CODEC_NAME => t.codec_name = Some(read_string(r, e.size as usize)?),
+            ids::LANGUAGE_BCP47 => t.language_bcp47 = Some(read_string(r, e.size as usize)?),
+            // Track-selection / behaviour flags (RFC 9559 §5.1.4.1.4 / .5 / .12).
+            // All three are 0-or-1 uintegers with spec default `1`; the on-disk
+            // presence is preserved as `Some(_)` so the typed surface can
+            // distinguish "writer was silent" (default `1` materialised) from
+            // "writer explicitly cleared the flag" (`Some(0)`).
+            ids::FLAG_ENABLED => t.flag_enabled = Some(read_uint(r, e.size as usize)?),
+            ids::FLAG_DEFAULT => t.flag_default = Some(read_uint(r, e.size as usize)?),
+            ids::FLAG_LACING => t.flag_lacing = Some(read_uint(r, e.size as usize)?),
+            // `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`). Range
+            // "not 0" — a spec-illegal `0` is dropped so the typed surface
+            // never reports a zero attachment UID.
+            ids::ATTACHMENT_LINK => {
+                let v = read_uint(r, e.size as usize)?;
+                if v != 0 {
+                    t.attachment_link = Some(v);
+                }
+            }
             ids::AUDIO => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_audio(r, body_end, t)?;
@@ -6335,6 +6568,11 @@ pub struct MkvDemuxer {
     /// indexed by stream index. One record per track — `CodecDelay` and
     /// `SeekPreRoll` folded together. See [`MkvDemuxer::track_codec_timing`].
     track_codec_timing: Vec<TrackCodecTiming>,
+    /// Per-stream [`TrackIdentity`] (RFC 9559 §5.1.4.1.18 / .19 / .20 / .23 /
+    /// .4 / .5 / .12 / .24), indexed by stream index. One record per track —
+    /// `Name`, `CodecName`, the language pair, the three selection flags, and
+    /// `AttachmentLink` folded together. See [`MkvDemuxer::track_identity`].
+    track_identity: Vec<TrackIdentity>,
     /// Per-Cluster typed records (RFC 9559 §5.1.3.2 / §5.1.3.3 —
     /// `Position` / `PrevSize`), appended in first-encounter order as
     /// the demuxer opens each Cluster through [`Demuxer::next_packet`]
@@ -7037,6 +7275,34 @@ impl MkvDemuxer {
     /// track. See [`MkvDemuxer::track_timing`] for the per-field semantics.
     pub fn all_track_timing(&self) -> &[TrackTiming] {
         &self.track_timing
+    }
+
+    /// [`TrackIdentity`] (RFC 9559 §5.1.4.1.18 / .19 / .20 / .23 / .4 / .5 /
+    /// .12 / .24) for the stream at `stream_index` — the track's `Name`,
+    /// `CodecName`, language pair (`Language` / `LanguageBCP47`), the three
+    /// selection flags (`FlagEnabled` / `FlagDefault` / `FlagLacing`), and
+    /// `AttachmentLink` folded into one record. Returns `None` only when
+    /// `stream_index` is out of range; every valid track surfaces a record
+    /// (the elements sit on `TrackEntry` directly, so there is no gating
+    /// master). A track that carried none of them surfaces a record reporting
+    /// [`TrackIdentity::is_default`] `true` — string fields `None`, all three
+    /// flags at their materialised `1` default.
+    ///
+    /// This is the typed companion to the flat [`StreamInfo::params`] view,
+    /// which only lifts the effective language onto
+    /// [`CodecParameters::language`](oxideav_core::CodecParameters); the typed
+    /// record additionally surfaces the human-readable names, both raw
+    /// language forms, the selection flags, and the attachment link.
+    pub fn track_identity(&self, stream_index: u32) -> Option<&TrackIdentity> {
+        self.track_identity.get(stream_index as usize)
+    }
+
+    /// All per-stream [`TrackIdentity`] records (RFC 9559 §5.1.4.1.18 / .19 /
+    /// .20 / .23 / .4 / .5 / .12 / .24), indexed by stream index. One record
+    /// per track. See [`MkvDemuxer::track_identity`] for the per-field
+    /// semantics.
+    pub fn all_track_identity(&self) -> &[TrackIdentity] {
+        &self.track_identity
     }
 
     /// [`TrackCodecTiming`] (RFC 9559 §5.1.4.1.25 + §5.1.4.1.26) for the stream

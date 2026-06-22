@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: typed `TrackIdentity` accessor (RFC 9559 §5.1.4.1.18 / .19 / .20 /
+  .23 / .4 / .5 / .12 / .24). `MkvDemuxer::track_identity(stream_index)` (and
+  the per-stream `all_track_identity()` slice) folds eight `TrackEntry`-level
+  identity / selection elements — `Name` (§5.1.4.1.18), `Language`
+  (§5.1.4.1.19), `LanguageBCP47` (§5.1.4.1.20), `CodecName` (§5.1.4.1.23),
+  `FlagEnabled` (§5.1.4.1.4), `FlagDefault` (§5.1.4.1.5), `FlagLacing`
+  (§5.1.4.1.12), and `AttachmentLink` (§5.1.4.1.24) — into one record per
+  track. The four strings carry no spec default and stay `Option`; the three
+  selection flags carry the spec default `1`, materialised on
+  `enabled()` / `default()` / `lacing_allowed()` while the `*_explicit`
+  accessors preserve the on-disk presence; `AttachmentLink` is a "not 0"
+  uinteger (a spec-illegal `0` is dropped). `language()` honours the
+  §5.1.4.1.20 precedence — `LanguageBCP47` supersedes `Language` — while
+  `language_matroska()` / `language_bcp47()` expose each raw form; `uses_bcp47()`
+  reports the precedence. The effective language now also lifts onto the flat
+  `StreamInfo` view with BCP-47 taking precedence. `is_default()` reports the
+  all-absent state.
 - Muxer: `Tags` writing (RFC 9559 §5.1.8). New `MkvMuxer::add_tag(MkvTag)`
   queues metadata descriptors emitted as the file's single `Tags` master
   before the first `Cluster`, symmetric with the long-standing demux-side
