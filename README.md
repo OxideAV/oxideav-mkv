@@ -250,6 +250,32 @@ the unified `oxideav` aggregator to wire decoding automatically.
   mirroring the tolerant `ChapterTranslate` parse. Returns an empty slice for a
   track with no `TrackTranslate` child (the common case) or an out-of-range
   `stream_index`.
+- **Typed `TrackLegacy` accessor** (RFC 9559 Appendix A.19..A.23 +
+  A.28..A.32): `MkvDemuxer::track_legacy(stream_index) ->
+  Option<&TrackLegacy>` (and the per-stream `all_track_legacy()` slice)
+  folds the reclaimed `TrackEntry`-level legacy elements — the ones the
+  RFC 9559 core body no longer documents but whose Element IDs stay
+  reserved in the registry, and which historical Writers still emit — into
+  one typed record per track. Two families share the record: the
+  codec-description metadata (`CodecSettings` A.19 utf-8, `CodecInfoURL`
+  A.20 + `CodecDownloadURL` A.21 string lists, `CodecDecodeAll` A.22
+  uinteger — `can_decode_damaged()` predicate), the **ordered**
+  `TrackOverlay` fallback list (A.23 — "the order of multiple TrackOverlay
+  matters", surfaced verbatim so the preference chain is preserved), and
+  the DivXTrickTrack Smooth-FF/RW pairing quintet (`TrickTrackUID` A.28,
+  `TrickTrackSegmentUID` A.29, `TrickTrackFlag` A.30 — `is_trick_track()`,
+  `TrickMasterTrackUID` A.31, `TrickMasterTrackSegmentUID` A.32). None of
+  the appendix entries carries a spec default or range, so every field is a
+  pure on-disk projection: absence is always observable (`None` / empty
+  `Vec`), a present `0` round-trips as `Some(0)` distinct from omission, and
+  an off-length SegmentUID binary is preserved verbatim for inspection. The
+  accessor returns `None` (never a hollow record) when the `TrackEntry`
+  carried none of these — the common case for a modern file — or for an
+  out-of-range `stream_index`; `TrackLegacy::is_empty()` reports the
+  all-absent state. The container surfaces these for a faithful re-mux and
+  never interprets them. The mux side writes the populated fields via
+  `MkvMuxer::set_track_legacy` (see the Muxer section) — a mux→demux
+  pipeline round-trips every populated field verbatim.
 - **Typed per-Cluster `Position` / `PrevSize` records** (RFC 9559
   §5.1.3.2 / §5.1.3.3): `MkvDemuxer::cluster_records() ->
   &[ClusterRecord]` surfaces each Cluster's optional `Position`
@@ -1174,6 +1200,23 @@ the unified `oxideav` aggregator to wire decoding automatically.
   demuxer surfaces an empty `track_translates` slice. Pairs symmetrically with
   the new `MkvDemuxer::track_translates` typed accessor — a mux→demux pipeline
   round-trips every mapping field-for-field.
+- **Reclaimed Appendix-A `TrackLegacy` on write** (RFC 9559 Appendix
+  A.19..A.23 + A.28..A.32): `MkvMuxer::set_track_legacy(stream_index,
+  MkvTrackLegacy)` queues the historical `TrackEntry`-level legacy elements —
+  `CodecSettings` / `CodecInfoURL` / `CodecDownloadURL` / `CodecDecodeAll`
+  codec-description metadata, the ordered `TrackOverlay` fallback list, and the
+  DivXTrickTrack pairing quintet — which land inside the carrying `TrackEntry`
+  (after the `TrackTranslate` masters) at `write_header` time. Only populated
+  fields reach the disk: an absent field (`None` / empty `Vec`) keeps its
+  element off-disk, so the demuxer observes the same absence. The appendix
+  specifies no defaults, so a `Some(0)` `decode_all` / `trick_track_flag` is
+  written as an explicit `0` distinct from omission. Spec rules enforced at
+  queue time: rejects post-`write_header` use, an out-of-range `stream_index`,
+  and a `TrickTrackSegmentUID` / `TrickMasterTrackSegmentUID` whose length is
+  not the canonical 16 bytes (a `SegmentUUID` is a 128-bit value). Calling with
+  an all-absent record clears the queue; repeated calls are last-write-wins.
+  Pairs symmetrically with the `MkvDemuxer::track_legacy` typed accessor — a
+  mux→demux pipeline round-trips every populated field verbatim.
 - **Linked-Segment `Info` on write** (RFC 9559 §5.1.2.1..§5.1.2.8 + Section 17):
   `MkvMuxer::set_segment_linking(SegmentLinking)` queues the Linked-Segment
   metadata that lands inside the `Info` master at `write_header` time, in the
