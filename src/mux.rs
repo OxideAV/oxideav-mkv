@@ -645,6 +645,14 @@ pub struct MkvMuxer {
     /// demuxer surfaces an empty slice from `track_translates`. The slice is
     /// sized to `streams.len()`.
     track_translates: Vec<Vec<MkvTrackTranslate>>,
+    /// Per-stream reclaimed Appendix-A `TrackLegacy` hints queued via
+    /// [`MkvMuxer::set_track_legacy`] (RFC 9559 Appendix A.19..A.23 +
+    /// A.28..A.32). Materialised as the populated legacy elements directly
+    /// inside the carrying `TrackEntry` at `write_header` time. `None` (the
+    /// default) means the muxer omits all of them for that stream, so the
+    /// demuxer surfaces `None` from `track_legacy`. The slice is sized to
+    /// `streams.len()`.
+    track_legacy: Vec<Option<MkvTrackLegacy>>,
 }
 
 /// One `TrackTranslate` mapping (RFC 9559 §5.1.4.1.27) queued for a track via
@@ -678,6 +686,72 @@ impl MkvTrackTranslate {
             codec,
             edition_uids: Vec::new(),
         }
+    }
+}
+
+/// The reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
+/// Appendix A.19..A.23 + A.28..A.32) queued for a track via
+/// [`MkvMuxer::set_track_legacy`]. The mux-side mirror of the demux-side
+/// [`TrackLegacy`](crate::demux::TrackLegacy): a mux→demux pipeline
+/// round-trips every populated field verbatim.
+///
+/// These are historical Matroska `TrackEntry` children the RFC 9559 core
+/// body no longer documents but whose Element IDs remain reserved. The
+/// muxer writes only the fields the caller populated — an absent field
+/// (`None` / empty `Vec`) keeps its element off-disk, so the demuxer
+/// observes the same absence. None carries a spec default, so there is no
+/// "default suppression" rule: a `Some(0)` `decode_all` / `trick_track_flag`
+/// is written as an explicit `0`, distinct from omission.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkvTrackLegacy {
+    /// `CodecSettings` (Appendix A.19, utf-8) — a string describing the
+    /// encoding settings used. `None` → element omitted.
+    pub codec_settings: Option<String>,
+    /// `CodecInfoURL` (Appendix A.20, string) — URLs with information about
+    /// the codec, written in slice order. Empty → no element.
+    pub codec_info_urls: Vec<String>,
+    /// `CodecDownloadURL` (Appendix A.21, string) — URLs to download the
+    /// codec, written in slice order. Empty → no element.
+    pub codec_download_urls: Vec<String>,
+    /// `CodecDecodeAll` (Appendix A.22, uinteger) — `1` if the codec can
+    /// decode damaged data. `None` → element omitted; `Some(0)` writes an
+    /// explicit `0`.
+    pub decode_all: Option<u64>,
+    /// `TrackOverlay` (Appendix A.23, uinteger) — the *ordered* overlay-track
+    /// fallback `TrackNumber`s. Written in slice order; the appendix makes the
+    /// order load-bearing (first entry preferred). Empty → no element.
+    pub track_overlays: Vec<u64>,
+    /// `TrickTrackUID` (Appendix A.28, uinteger). `None` → omitted.
+    pub trick_track_uid: Option<u64>,
+    /// `TrickTrackSegmentUID` (Appendix A.29, binary) — the SegmentUUID of the
+    /// Segment containing [`Self::trick_track_uid`]. Written verbatim; `None`
+    /// → omitted.
+    pub trick_track_segment_uid: Option<Vec<u8>>,
+    /// `TrickTrackFlag` (Appendix A.30, uinteger) — `1` if this track is a
+    /// Smooth FF/RW track. `None` → omitted; `Some(0)` writes an explicit `0`.
+    pub trick_track_flag: Option<u64>,
+    /// `TrickMasterTrackUID` (Appendix A.31, uinteger). `None` → omitted.
+    pub trick_master_track_uid: Option<u64>,
+    /// `TrickMasterTrackSegmentUID` (Appendix A.32, binary). Written verbatim;
+    /// `None` → omitted.
+    pub trick_master_track_segment_uid: Option<Vec<u8>>,
+}
+
+impl MkvTrackLegacy {
+    /// `true` when no field is populated — queuing such a record is a no-op
+    /// (no element reaches the disk). Mirrors
+    /// [`TrackLegacy::is_empty`](crate::demux::TrackLegacy::is_empty).
+    pub fn is_empty(&self) -> bool {
+        self.codec_settings.is_none()
+            && self.codec_info_urls.is_empty()
+            && self.codec_download_urls.is_empty()
+            && self.decode_all.is_none()
+            && self.track_overlays.is_empty()
+            && self.trick_track_uid.is_none()
+            && self.trick_track_segment_uid.is_none()
+            && self.trick_track_flag.is_none()
+            && self.trick_master_track_uid.is_none()
+            && self.trick_master_track_segment_uid.is_none()
     }
 }
 
@@ -1853,6 +1927,7 @@ impl MkvMuxer {
             track_operations: vec![None; n],
             content_encodings: vec![None; n],
             track_translates: vec![Vec::new(); n],
+            track_legacy: vec![None; n],
         })
     }
 
@@ -2255,6 +2330,82 @@ impl MkvMuxer {
             .get(stream_index)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Queue the reclaimed Appendix-A `TrackEntry`-level legacy elements
+    /// (RFC 9559 Appendix A.19..A.23 + A.28..A.32) for a stream — the
+    /// historical `CodecSettings` / `CodecInfoURL` / `CodecDownloadURL` /
+    /// `CodecDecodeAll` codec-description metadata, the ordered `TrackOverlay`
+    /// fallback list, and the DivXTrickTrack pairing quintet. Each populated
+    /// field lands as its element directly inside the carrying `TrackEntry`
+    /// (after the `TrackTranslate` masters) at `write_header` time.
+    ///
+    /// Only populated fields reach the disk: an absent field (`None` / empty
+    /// `Vec`) keeps its element off-disk, so the demuxer observes the same
+    /// absence. The appendix specifies no defaults, so a `Some(0)`
+    /// `decode_all` / `trick_track_flag` is written as an explicit `0`,
+    /// distinct from omission. Calling with an all-absent record (or `None`)
+    /// clears any previously-queued legacy elements; repeated calls are
+    /// last-write-wins.
+    ///
+    /// Spec rules enforced at queue time (before any byte is written): rejects
+    /// post-`write_header` use, an out-of-range `stream_index`, and a SegmentUID
+    /// binary (`TrickTrackSegmentUID` / `TrickMasterTrackSegmentUID`) whose
+    /// length is not the canonical 16 bytes (a `SegmentUUID` is a 128-bit
+    /// value per RFC 9559 §5.1.2.1).
+    ///
+    /// Pairs symmetrically with
+    /// [`MkvDemuxer::track_legacy`](crate::demux::MkvDemuxer::track_legacy) —
+    /// a mux→demux pipeline round-trips every populated field verbatim.
+    ///
+    /// Returns a mutable reference back so calls can chain builder-style.
+    pub fn set_track_legacy(
+        &mut self,
+        stream_index: usize,
+        legacy: MkvTrackLegacy,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_legacy called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_legacy stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        for (label, uid) in [
+            ("TrickTrackSegmentUID", &legacy.trick_track_segment_uid),
+            (
+                "TrickMasterTrackSegmentUID",
+                &legacy.trick_master_track_segment_uid,
+            ),
+        ] {
+            if let Some(bytes) = uid {
+                if bytes.len() != 16 {
+                    return Err(Error::invalid(format!(
+                        "MKV muxer: set_track_legacy given a {label} of {} bytes \
+                         (a SegmentUUID is a 128-bit / 16-byte value)",
+                        bytes.len()
+                    )));
+                }
+            }
+        }
+        self.track_legacy[stream_index] = if legacy.is_empty() {
+            None
+        } else {
+            Some(legacy)
+        };
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `TrackLegacy` hint
+    /// installed via [`MkvMuxer::set_track_legacy`]. Returns `None` for any
+    /// stream that didn't have the API called (or was cleared). Mostly useful
+    /// for tests.
+    pub fn track_legacy(&self, stream_index: usize) -> Option<&MkvTrackLegacy> {
+        self.track_legacy.get(stream_index)?.as_ref()
     }
 
     /// Set the per-track `ContentEncodings` (RFC 9559 §5.1.4.1.31) chain —
@@ -4269,6 +4420,44 @@ impl Muxer for MkvMuxer {
                     write_uint_element(&mut tt_body, ids::TRACK_TRANSLATE_EDITION_UID, uid);
                 }
                 write_master_element(&mut t, ids::TRACK_TRANSLATE, &tt_body);
+            }
+            // Reclaimed Appendix-A legacy elements (RFC 9559 Appendix
+            // A.19..A.23 + A.28..A.32) queued via `set_track_legacy`. Only the
+            // populated fields are written; the setter has already validated
+            // that the two SegmentUID binaries are 16 bytes. The order follows
+            // the registry id ordering for determinism; no element carries a
+            // spec default, so an explicit `Some(0)` is emitted as a real `0`.
+            if let Some(leg) = &self.track_legacy[i] {
+                if let Some(s) = &leg.codec_settings {
+                    write_string_element(&mut t, ids::CODEC_SETTINGS, s);
+                }
+                for url in &leg.codec_info_urls {
+                    write_string_element(&mut t, ids::CODEC_INFO_URL, url);
+                }
+                for url in &leg.codec_download_urls {
+                    write_string_element(&mut t, ids::CODEC_DOWNLOAD_URL, url);
+                }
+                if let Some(v) = leg.decode_all {
+                    write_uint_element(&mut t, ids::CODEC_DECODE_ALL, v);
+                }
+                for &n in &leg.track_overlays {
+                    write_uint_element(&mut t, ids::TRACK_OVERLAY, n);
+                }
+                if let Some(v) = leg.trick_track_uid {
+                    write_uint_element(&mut t, ids::TRICK_TRACK_UID, v);
+                }
+                if let Some(b) = &leg.trick_track_segment_uid {
+                    write_bytes_element(&mut t, ids::TRICK_TRACK_SEGMENT_UID, b);
+                }
+                if let Some(v) = leg.trick_track_flag {
+                    write_uint_element(&mut t, ids::TRICK_TRACK_FLAG, v);
+                }
+                if let Some(v) = leg.trick_master_track_uid {
+                    write_uint_element(&mut t, ids::TRICK_MASTER_TRACK_UID, v);
+                }
+                if let Some(b) = &leg.trick_master_track_segment_uid {
+                    write_bytes_element(&mut t, ids::TRICK_MASTER_TRACK_SEGMENT_UID, b);
+                }
             }
             write_master_element(&mut tracks_body, ids::TRACK_ENTRY, &t);
         }
