@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: Linked-Segment `Info` write surface (RFC 9559 §5.1.2.1..§5.1.2.8 +
+  Section 17) — `MkvMuxer::set_segment_linking(SegmentLinking)` queues the
+  `SegmentUUID` / `SegmentFilename` / `PrevUUID` / `PrevFilename` / `NextUUID`
+  / `NextFilename` / `SegmentFamily`(s) / `ChapterTranslate`(s) children, and
+  the muxer materialises them into the `Info` master in §5.1.2 element order
+  (before `TimestampScale`). The mux-side mirror of the existing demux-side
+  `MkvDemuxer::segment_linking()` accessor, so a demuxed `SegmentLinking`
+  round-trips through the muxer byte-for-byte. The setter enforces the §5.1.2
+  spec rules: the 128-bit UID elements are `length: 16` (§5.1.2.1 / .3 / .5 /
+  .7 — an off-length UID is rejected); `PrevUUID` / `NextUUID` MUST NOT equal
+  `SegmentUUID` (§5.1.2.3 / .5); a `SegmentFamily` is REQUIRED when a
+  `ChapterTranslate` is present (§5.1.2.7 usage note); each `ChapterTranslate`
+  carries a non-empty `ChapterTranslateID` (§5.1.2.8.1, `minOccurs: 1`). The
+  read-only `segment_linking()` accessor exposes the queued record before the
+  header is sealed. An all-default record writes nothing (standalone Segment).
 - Demuxer: typed `TrackIdentity` accessor (RFC 9559 §5.1.4.1.18 / .19 / .20 /
   .23 / .4 / .5 / .12 / .24). `MkvDemuxer::track_identity(stream_index)` (and
   the per-stream `all_track_identity()` slice) folds eight `TrackEntry`-level

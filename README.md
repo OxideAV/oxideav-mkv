@@ -1174,6 +1174,27 @@ the unified `oxideav` aggregator to wire decoding automatically.
   demuxer surfaces an empty `track_translates` slice. Pairs symmetrically with
   the new `MkvDemuxer::track_translates` typed accessor — a mux→demux pipeline
   round-trips every mapping field-for-field.
+- **Linked-Segment `Info` on write** (RFC 9559 §5.1.2.1..§5.1.2.8 + Section 17):
+  `MkvMuxer::set_segment_linking(SegmentLinking)` queues the Linked-Segment
+  metadata that lands inside the `Info` master at `write_header` time, in the
+  §5.1.2 element order (before `TimestampScale`): `SegmentUUID` (§5.1.2.1),
+  `SegmentFilename` (§5.1.2.2), `PrevUUID` (§5.1.2.3), `PrevFilename`
+  (§5.1.2.4), `NextUUID` (§5.1.2.5), `NextFilename` (§5.1.2.6), every
+  `SegmentFamily` (§5.1.2.7), and every `ChapterTranslate` (§5.1.2.8 —
+  `ChapterTranslateID` + `ChapterTranslateCodec` + zero or more
+  `ChapterTranslateEditionUID`). The setter takes the **same** demux-side
+  `SegmentLinking` record `MkvDemuxer::segment_linking()` produces, so a
+  mux→demux pipeline round-trips every UID / filename / family / translate
+  field byte-for-byte — the Segment-level twin of the `set_track_translates`
+  surface. Spec rules enforced at queue time (before any byte is written):
+  rejects post-`write_header` use; an off-length UID (§5.1.2.1 / .3 / .5 / .7
+  are all `length: 16`); a `PrevUUID` / `NextUUID` equal to `SegmentUUID`
+  (§5.1.2.3 / .5 "MUST NOT be equal"); a `ChapterTranslate` without the
+  REQUIRED `SegmentFamily` (§5.1.2.7 usage note); and an empty
+  `ChapterTranslateID` (§5.1.2.8.1, `minOccurs: 1`). The read-only
+  `segment_linking()` accessor exposes the queued record before sealing. An
+  all-default record (or omitting the call) writes nothing — the common
+  standalone Segment, which the demuxer surfaces as an empty `SegmentLinking`.
 - **`ContentEncodings` on write** (RFC 9559 §5.1.4.1.31):
   `MkvMuxer::set_track_content_encodings(stream_index, ContentEncodings)`
   queues a per-track transformation chain that lands as a

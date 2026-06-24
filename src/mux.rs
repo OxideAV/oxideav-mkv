@@ -32,9 +32,10 @@ use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
 use crate::demux::{
-    AlphaMode, ChromaSitingHorz, ChromaSitingVert, ColourRange, ContentEncodingTransform,
-    ContentEncodings, DisplayUnit, FieldOrder, FlagInterlaced, MatrixCoefficients, Primaries,
-    ProjectionType, StereoMode, TrackPlaneType, TransferCharacteristics,
+    AlphaMode, ChapterTranslate, ChromaSitingHorz, ChromaSitingVert, ColourRange,
+    ContentEncodingTransform, ContentEncodings, DisplayUnit, FieldOrder, FlagInterlaced,
+    MatrixCoefficients, Primaries, ProjectionType, SegmentLinking, StereoMode, TrackPlaneType,
+    TransferCharacteristics,
 };
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
@@ -431,6 +432,18 @@ pub struct MkvMuxer {
     /// before the first `Cluster`, so the demuxer's single-pass header
     /// walk picks it up without a late-segment rescan.
     tags: Vec<MkvTag>,
+    /// Linked-Segment `Info` metadata queued via
+    /// [`MkvMuxer::set_segment_linking`] (RFC 9559 §5.1.2.1..§5.1.2.8 +
+    /// Section 17). `None` (the default) means the muxer emits a plain
+    /// standalone Segment with no linking elements — the common case.
+    /// When `Some`, the `SegmentUUID` / `PrevUUID` / `NextUUID` /
+    /// `SegmentFamily` / `*Filename` / `ChapterTranslate` children are
+    /// written into the `Info` master right after `WritingApp`, in the
+    /// RFC 9559 §5.1.2 element order. The mux-side mirror of the demux-side
+    /// [`MkvDemuxer::segment_linking`](crate::demux::MkvDemuxer::segment_linking)
+    /// accessor, so a demuxed [`SegmentLinking`] round-trips through the
+    /// muxer unchanged.
+    segment_linking: Option<SegmentLinking>,
     /// Opt-in block lacing mode (RFC 9559 §10.3). Default is
     /// [`LacingMode::None`] which preserves the legacy
     /// one-SimpleBlock-per-packet behaviour. Anything else causes
@@ -1807,6 +1820,7 @@ impl MkvMuxer {
             chapters: Vec::new(),
             attachments: Vec::new(),
             tags: Vec::new(),
+            segment_linking: None,
             lacing_mode: LacingMode::None,
             lace_pending: vec![LaceBuffer::default(); n],
             video_interlacings: vec![None; n],
@@ -3375,6 +3389,108 @@ impl MkvMuxer {
         &self.tags
     }
 
+    /// Queue the Linked-Segment `Info` metadata (RFC 9559 §5.1.2.1..§5.1.2.8 +
+    /// Section 17) the muxer writes into the `Info` master, right after
+    /// `WritingApp`. The mux-side mirror of the demux-side
+    /// [`MkvDemuxer::segment_linking`](crate::demux::MkvDemuxer::segment_linking)
+    /// accessor: feed it a [`SegmentLinking`] obtained from another file's
+    /// demuxer (or one built by hand) and the same `SegmentUUID` / `PrevUUID`
+    /// / `NextUUID` / `SegmentFamily` / `*Filename` / `ChapterTranslate`
+    /// children round-trip onto disk unchanged.
+    ///
+    /// Must be called before [`MkvMuxer::write_header`].
+    ///
+    /// # Errors / validation (RFC 9559 §5.1.2)
+    ///
+    /// * The three 128-bit UID elements — `SegmentUUID` (§5.1.2.1),
+    ///   `PrevUUID` (§5.1.2.3), `NextUUID` (§5.1.2.5) — and every
+    ///   `SegmentFamily` (§5.1.2.7) carry a fixed `length: 16`. A
+    ///   wrong-length value is rejected (the demuxer keeps off-length bytes
+    ///   verbatim for inspection, but the muxer refuses to write a
+    ///   spec-violating element).
+    /// * `PrevUUID` / `NextUUID` MUST NOT equal `SegmentUUID`
+    ///   (§5.1.2.3 / §5.1.2.5). A self-referential link is rejected.
+    /// * If any `ChapterTranslate` (§5.1.2.8) is present, a `SegmentFamily`
+    ///   is REQUIRED (§5.1.2.7 usage note); omitting it is rejected.
+    /// * Each `ChapterTranslate` carries a mandatory non-empty
+    ///   `ChapterTranslateID` (§5.1.2.8.1, `minOccurs: 1`); an empty id is
+    ///   rejected.
+    ///
+    /// An all-default (empty) [`SegmentLinking`] is accepted and writes
+    /// nothing — equivalent to never calling the setter.
+    pub fn set_segment_linking(&mut self, linking: SegmentLinking) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_segment_linking called after write_header",
+            ));
+        }
+        // RFC 9559 §5.1.2.1 / .3 / .5 / .7: the 128-bit UID elements are
+        // `length: 16`. Reject any off-length UID rather than emit a
+        // spec-violating element.
+        for (name, uuid) in [
+            ("SegmentUUID", &linking.segment_uuid),
+            ("PrevUUID", &linking.prev_uuid),
+            ("NextUUID", &linking.next_uuid),
+        ] {
+            if let Some(bytes) = uuid {
+                if bytes.len() != 16 {
+                    return Err(Error::invalid(format!(
+                        "MKV muxer: {name} must be exactly 16 bytes (RFC 9559 §5.1.2, length: 16), got {}",
+                        bytes.len()
+                    )));
+                }
+            }
+        }
+        for fam in &linking.families {
+            if fam.len() != 16 {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: SegmentFamily must be exactly 16 bytes (RFC 9559 §5.1.2.7, length: 16), got {}",
+                    fam.len()
+                )));
+            }
+        }
+        // RFC 9559 §5.1.2.3 / §5.1.2.5: "PrevUUID MUST NOT be equal to the
+        // SegmentUUID" / "NextUUID MUST NOT be equal to the SegmentUUID".
+        if let Some(seg) = &linking.segment_uuid {
+            if linking.prev_uuid.as_deref() == Some(seg.as_slice()) {
+                return Err(Error::invalid(
+                    "MKV muxer: PrevUUID MUST NOT equal SegmentUUID (RFC 9559 §5.1.2.3)",
+                ));
+            }
+            if linking.next_uuid.as_deref() == Some(seg.as_slice()) {
+                return Err(Error::invalid(
+                    "MKV muxer: NextUUID MUST NOT equal SegmentUUID (RFC 9559 §5.1.2.5)",
+                ));
+            }
+        }
+        // RFC 9559 §5.1.2.7 usage note: "If the Segment Info contains a
+        // ChapterTranslate element, [SegmentFamily] is REQUIRED."
+        if !linking.chapter_translates.is_empty() && linking.families.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: SegmentFamily is REQUIRED when a ChapterTranslate is present (RFC 9559 §5.1.2.7)",
+            ));
+        }
+        // RFC 9559 §5.1.2.8.1: ChapterTranslateID is `minOccurs: 1` — the
+        // mapping is meaningless without the binary value identifying this
+        // Segment in the chapter-codec data.
+        for ct in &linking.chapter_translates {
+            if ct.id.is_empty() {
+                return Err(Error::invalid(
+                    "MKV muxer: ChapterTranslate requires a non-empty ChapterTranslateID (RFC 9559 §5.1.2.8.1, minOccurs: 1)",
+                ));
+            }
+        }
+        self.segment_linking = Some(linking);
+        Ok(self)
+    }
+
+    /// Read-only view of the queued Linked-Segment metadata, if any. Mirrors
+    /// [`MkvMuxer::tags`] for tests / callers that want to confirm what was
+    /// queued before sealing the header.
+    pub fn segment_linking(&self) -> Option<&SegmentLinking> {
+        self.segment_linking.as_ref()
+    }
+
     /// Construct a plain Matroska muxer. Thin wrapper around the boxed
     /// [`open`] factory for callers that want a concrete type back (e.g. to
     /// introspect its state in tests).
@@ -3455,6 +3571,13 @@ impl Muxer for MkvMuxer {
         // Info element.
         let info_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
         let mut info_body = Vec::new();
+        // Linked-Segment elements (RFC 9559 §5.1.2.1..§5.1.2.8) precede
+        // TimestampScale in the §5.1.2 element order. Written only when the
+        // caller queued them via `set_segment_linking`; absent on the common
+        // standalone Segment.
+        if let Some(linking) = &self.segment_linking {
+            write_segment_linking(&mut info_body, linking);
+        }
         write_uint_element(&mut info_body, ids::TIMECODE_SCALE, 1_000_000); // 1 ms
         write_string_element(&mut info_body, ids::MUXING_APP, "oxideav");
         write_string_element(&mut info_body, ids::WRITING_APP, "oxideav");
@@ -5206,6 +5329,56 @@ fn encode_codec_private(codec_id: &oxideav_core::CodecId, extradata: &[u8]) -> V
 }
 
 // --- Element-writing helpers ----------------------------------------------
+
+/// Write the Linked-Segment `Info` children (RFC 9559 §5.1.2.1..§5.1.2.8) into
+/// `buf`, in the §5.1.2 element order: `SegmentUUID`, `SegmentFilename`,
+/// `PrevUUID`, `PrevFilename`, `NextUUID`, `NextFilename`, `SegmentFamily`(s),
+/// `ChapterTranslate`(s). All present/absent decisions follow the queued
+/// [`SegmentLinking`]; an all-default record writes nothing. Validation
+/// (16-byte UID lengths, PrevUUID/NextUUID ≠ SegmentUUID, SegmentFamily
+/// required with ChapterTranslate, non-empty ChapterTranslateID) was enforced
+/// at `set_segment_linking` time, so this writer assumes a well-formed record.
+fn write_segment_linking(buf: &mut Vec<u8>, linking: &SegmentLinking) {
+    if let Some(uuid) = &linking.segment_uuid {
+        write_bytes_element(buf, ids::SEGMENT_UID, uuid);
+    }
+    if let Some(name) = &linking.segment_filename {
+        write_string_element(buf, ids::SEGMENT_FILENAME, name);
+    }
+    if let Some(uuid) = &linking.prev_uuid {
+        write_bytes_element(buf, ids::PREV_UID, uuid);
+    }
+    if let Some(name) = &linking.prev_filename {
+        write_string_element(buf, ids::PREV_FILENAME, name);
+    }
+    if let Some(uuid) = &linking.next_uuid {
+        write_bytes_element(buf, ids::NEXT_UID, uuid);
+    }
+    if let Some(name) = &linking.next_filename {
+        write_string_element(buf, ids::NEXT_FILENAME, name);
+    }
+    for fam in &linking.families {
+        write_bytes_element(buf, ids::SEGMENT_FAMILY, fam);
+    }
+    for ct in &linking.chapter_translates {
+        write_chapter_translate(buf, ct);
+    }
+}
+
+/// Write one `Segment\Info\ChapterTranslate` master (RFC 9559 §5.1.2.8) into
+/// `buf`. Child order follows §5.1.2.8: the mandatory `ChapterTranslateID`
+/// (§5.1.2.8.1) and `ChapterTranslateCodec` (§5.1.2.8.2), then any
+/// `ChapterTranslateEditionUID`s (§5.1.2.8.3, unbounded — empty means "all
+/// editions using the given codec").
+fn write_chapter_translate(buf: &mut Vec<u8>, ct: &ChapterTranslate) {
+    let mut body = Vec::new();
+    write_bytes_element(&mut body, ids::CHAPTER_TRANSLATE_ID, &ct.id);
+    write_uint_element(&mut body, ids::CHAPTER_TRANSLATE_CODEC, ct.codec);
+    for &edition_uid in &ct.edition_uids {
+        write_uint_element(&mut body, ids::CHAPTER_TRANSLATE_EDITION_UID, edition_uid);
+    }
+    write_master_element(buf, ids::CHAPTER_TRANSLATE, &body);
+}
 
 fn write_uint_element(buf: &mut Vec<u8>, id: u32, value: u64) {
     let n = if value == 0 {
