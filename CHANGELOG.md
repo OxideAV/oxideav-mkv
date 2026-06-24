@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: Segment `Info` metadata write surface — `Title` (RFC 9559 §5.1.2.12)
+  and `DateUTC` (§5.1.2.11). `MkvMuxer::set_title(impl Into<String>)` queues
+  the Segment's general name; `set_date_utc_ns(i64)` queues the creation date
+  as signed nanoseconds since the Matroska epoch (2001-01-01T00:00:00 UTC, the
+  `date` element type), with `set_date_utc_unix_secs(i64)` rebasing a Unix
+  timestamp onto that epoch (pre-2001 instants yield a negative, still-valid
+  `DateUTC`). Both land in the `Info` master in §5.1.2 element order (after
+  `TimestampScale`, before `MuxingApp`) and round-trip onto the demuxer's flat
+  metadata view (`"title"` / `"date"`). The `date` writer fixes the on-disk
+  width at 8 bytes (the only legal `date` length). All three setters reject
+  post-`write_header` use; omitting them writes neither element.
+
 - Muxer: Linked-Segment `Info` write surface (RFC 9559 §5.1.2.1..§5.1.2.8 +
   Section 17) — `MkvMuxer::set_segment_linking(SegmentLinking)` queues the
   `SegmentUUID` / `SegmentFilename` / `PrevUUID` / `PrevFilename` / `NextUUID`

@@ -1195,6 +1195,18 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `segment_linking()` accessor exposes the queued record before sealing. An
   all-default record (or omitting the call) writes nothing — the common
   standalone Segment, which the demuxer surfaces as an empty `SegmentLinking`.
+- **`Info` metadata on write** (RFC 9559 §5.1.2.11 / §5.1.2.12):
+  `MkvMuxer::set_title(impl Into<String>)` writes the Segment `Title`
+  (§5.1.2.12, the general name), and `MkvMuxer::set_date_utc_ns(i64)` writes
+  the Segment `DateUTC` (§5.1.2.11) as signed nanoseconds since the Matroska
+  epoch (2001-01-01T00:00:00 UTC — the `date` element type), at a fixed 8-byte
+  on-disk width. `MkvMuxer::set_date_utc_unix_secs(i64)` is a convenience that
+  rebases a Unix timestamp onto that epoch (a pre-2001 instant produces a
+  negative, still-valid `DateUTC`). Both elements land in the `Info` master in
+  §5.1.2 element order (after `TimestampScale`, before `MuxingApp`) and
+  round-trip onto the demuxer's flat metadata view under the `"title"` /
+  `"date"` keys (the latter formatted back to ISO-8601). All three setters
+  reject post-`write_header` use; omitting them writes neither element.
 - **`ContentEncodings` on write** (RFC 9559 §5.1.4.1.31):
   `MkvMuxer::set_track_content_encodings(stream_index, ContentEncodings)`
   queues a per-track transformation chain that lands as a

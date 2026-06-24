@@ -444,6 +444,17 @@ pub struct MkvMuxer {
     /// accessor, so a demuxed [`SegmentLinking`] round-trips through the
     /// muxer unchanged.
     segment_linking: Option<SegmentLinking>,
+    /// `Title` (RFC 9559 §5.1.2.12, id `0x7BA9`) — the Segment's general
+    /// name, queued via [`MkvMuxer::set_title`]. `None` (the default) omits
+    /// the element. Written into the `Info` master between `TimestampScale`
+    /// and `MuxingApp`, in §5.1.2 element order.
+    info_title: Option<String>,
+    /// `DateUTC` (RFC 9559 §5.1.2.11, id `0x4461`) — the Segment creation
+    /// date, queued via [`MkvMuxer::set_date_utc_ns`] as nanoseconds since
+    /// the Matroska epoch (2001-01-01T00:00:00 UTC). `None` (the default)
+    /// omits the element. Written into the `Info` master right after
+    /// `Duration`, in §5.1.2 element order.
+    info_date_utc_ns: Option<i64>,
     /// Opt-in block lacing mode (RFC 9559 §10.3). Default is
     /// [`LacingMode::None`] which preserves the legacy
     /// one-SimpleBlock-per-packet behaviour. Anything else causes
@@ -1821,6 +1832,8 @@ impl MkvMuxer {
             attachments: Vec::new(),
             tags: Vec::new(),
             segment_linking: None,
+            info_title: None,
+            info_date_utc_ns: None,
             lacing_mode: LacingMode::None,
             lace_pending: vec![LaceBuffer::default(); n],
             video_interlacings: vec![None; n],
@@ -3491,6 +3504,58 @@ impl MkvMuxer {
         self.segment_linking.as_ref()
     }
 
+    /// Queue the Segment `Title` (RFC 9559 §5.1.2.12, id `0x7BA9`) — the
+    /// general name of the Segment — for the `Info` master. Written between
+    /// `TimestampScale` and `MuxingApp` in §5.1.2 element order. Surfaces on
+    /// the demuxer's flat metadata view under the `"title"` key.
+    ///
+    /// Must be called before [`MkvMuxer::write_header`]. Last-write-wins;
+    /// passing an empty string still emits an (empty) `Title` element, matching
+    /// the spec's `maxOccurs: 1` with no length floor.
+    pub fn set_title(&mut self, title: impl Into<String>) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_title called after write_header",
+            ));
+        }
+        self.info_title = Some(title.into());
+        Ok(self)
+    }
+
+    /// Queue the Segment `DateUTC` (RFC 9559 §5.1.2.11, id `0x4461`) — the
+    /// date and time the Segment was created — as **nanoseconds since the
+    /// Matroska epoch** (2001-01-01T00:00:00 UTC), the on-disk representation
+    /// of the `date` element type. Written into the `Info` master right after
+    /// `Duration` in §5.1.2 element order. The demuxer decodes the same value
+    /// back onto its flat metadata view under the `"date"` key (as an ISO-8601
+    /// string).
+    ///
+    /// Use [`MkvMuxer::set_date_utc_unix_secs`] when you have a Unix timestamp
+    /// instead. Must be called before [`MkvMuxer::write_header`].
+    pub fn set_date_utc_ns(&mut self, ns_since_2001: i64) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_date_utc_ns called after write_header",
+            ));
+        }
+        self.info_date_utc_ns = Some(ns_since_2001);
+        Ok(self)
+    }
+
+    /// Convenience wrapper over [`MkvMuxer::set_date_utc_ns`] that accepts a
+    /// Unix timestamp (seconds since 1970-01-01T00:00:00 UTC) and rebases it
+    /// onto the Matroska epoch (2001-01-01) the `DateUTC` element uses.
+    ///
+    /// The Matroska epoch is `978_307_200` seconds after the Unix epoch, so a
+    /// pre-2001 timestamp yields a negative `DateUTC` (the element is a signed
+    /// `date`). Must be called before [`MkvMuxer::write_header`].
+    pub fn set_date_utc_unix_secs(&mut self, unix_secs: i64) -> Result<&mut Self> {
+        // RFC 9559 §5.1.2.11 `date` type: nanoseconds since 2001-01-01 UTC.
+        const UNIX_2001: i64 = 978_307_200;
+        let ns = (unix_secs - UNIX_2001).saturating_mul(1_000_000_000);
+        self.set_date_utc_ns(ns)
+    }
+
     /// Construct a plain Matroska muxer. Thin wrapper around the boxed
     /// [`open`] factory for callers that want a concrete type back (e.g. to
     /// introspect its state in tests).
@@ -3579,6 +3644,15 @@ impl Muxer for MkvMuxer {
             write_segment_linking(&mut info_body, linking);
         }
         write_uint_element(&mut info_body, ids::TIMECODE_SCALE, 1_000_000); // 1 ms
+                                                                            // RFC 9559 §5.1.2 element order: Duration (.10) — not emitted —, then
+                                                                            // DateUTC (.11), Title (.12), MuxingApp (.13), WritingApp (.14).
+        if let Some(ns) = self.info_date_utc_ns {
+            // §5.1.2.11 `date`: signed nanoseconds since the 2001-01-01 epoch.
+            write_date_element(&mut info_body, ids::DATE_UTC, ns);
+        }
+        if let Some(title) = &self.info_title {
+            write_string_element(&mut info_body, ids::TITLE, title);
+        }
         write_string_element(&mut info_body, ids::MUXING_APP, "oxideav");
         write_string_element(&mut info_body, ids::WRITING_APP, "oxideav");
         write_master_element_with_crc(&mut all, ids::INFO, &info_body);
@@ -5329,6 +5403,18 @@ fn encode_codec_private(codec_id: &oxideav_core::CodecId, extradata: &[u8]) -> V
 }
 
 // --- Element-writing helpers ----------------------------------------------
+
+/// Write a `date` element (RFC 9559 §5.1.2.11 / RFC 8794 §7.6): a signed
+/// 8-byte big-endian integer counting nanoseconds since the Matroska epoch
+/// (2001-01-01T00:00:00 UTC). The width is **fixed at 8 bytes** (the `date`
+/// type's only legal on-disk length), unlike the minimal-width
+/// [`write_int_element`] — the demuxer's `DateUTC` handler decodes only the
+/// 8-byte form.
+fn write_date_element(buf: &mut Vec<u8>, id: u32, ns_since_2001: i64) {
+    buf.extend_from_slice(&write_element_id(id));
+    buf.extend_from_slice(&write_vint(8, 0));
+    buf.extend_from_slice(&ns_since_2001.to_be_bytes());
+}
 
 /// Write the Linked-Segment `Info` children (RFC 9559 §5.1.2.1..§5.1.2.8) into
 /// `buf`, in the §5.1.2 element order: `SegmentUUID`, `SegmentFilename`,
