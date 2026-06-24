@@ -131,6 +131,37 @@ pub const SEEK_PRE_ROLL: u32 = 0x56BB;
 pub const VIDEO: u32 = 0xE0;
 pub const AUDIO: u32 = 0xE1;
 
+// Reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
+// Appendix A.19..A.23 + A.28..A.32). These are historical Matroska
+// `TrackEntry` children the core spec body no longer documents but whose IDs
+// remain reserved; the demuxer surfaces them verbatim (typed `TrackLegacy`
+// record) so a faithful re-mux round-trips them. None carries a spec default
+// or range — the appendix gives only type/id/path/documentation.
+//
+// `CodecSettings` (A.19, utf-8): a string describing the encoding settings.
+// `CodecInfoURL` (A.20, string): a URL with information about the codec.
+// `CodecDownloadURL` (A.21, string): a URL to download the codec.
+// `CodecDecodeAll` (A.22, uinteger): 1 if the codec can decode damaged data.
+// `TrackOverlay` (A.23, uinteger): the TrackNumber of a track to use when this
+//   track has a gap on `SilentTracks`. Multiple values are ordered — the first
+//   is preferred, then the second, etc.
+pub const CODEC_SETTINGS: u32 = 0x3A9697;
+pub const CODEC_INFO_URL: u32 = 0x3B4040;
+pub const CODEC_DOWNLOAD_URL: u32 = 0x26B240;
+pub const CODEC_DECODE_ALL: u32 = 0xAA;
+pub const TRACK_OVERLAY: u32 = 0x6FAB;
+
+// DivXTrickTrack pairing quintet (RFC 9559 Appendix A.28..A.32). These tie a
+// video track to its Smooth FF/RW companion in a paired EBML structure. The
+// `*UID` fields are `uinteger` TrackUIDs; the `*SegmentUID` fields are 16-byte
+// SegmentUUID binaries; `TrickTrackFlag` is a 0-or-1 uinteger marking this
+// track itself as the Smooth FF/RW track. Surfaced verbatim for re-mux.
+pub const TRICK_TRACK_UID: u32 = 0xC0;
+pub const TRICK_TRACK_SEGMENT_UID: u32 = 0xC1;
+pub const TRICK_TRACK_FLAG: u32 = 0xC6;
+pub const TRICK_MASTER_TRACK_UID: u32 = 0xC7;
+pub const TRICK_MASTER_TRACK_SEGMENT_UID: u32 = 0xC4;
+
 // TrackTranslate (RFC 9559 §5.1.4.1.27): a per-TrackEntry master that maps
 // this track to a track value addressed by a Chapter Codec. A Chapter Codec
 // (e.g. DVD menu, Matroska Script) may need to reference a specific track but

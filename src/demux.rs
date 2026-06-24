@@ -438,6 +438,21 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let track_translates: Vec<Vec<TrackTranslate>> =
         tracks.iter().map(|t| t.track_translates.clone()).collect();
 
+    // Per-stream reclaimed Appendix-A `TrackLegacy` records (RFC 9559
+    // Appendix A.19..A.23 + A.28..A.32), indexed by stream index. `None` for
+    // a track that carried none of the legacy elements (the common case for a
+    // modern file), so a `Some(_)` always holds at least one populated field.
+    let track_legacy: Vec<Option<TrackLegacy>> = tracks
+        .iter()
+        .map(|t| {
+            if t.legacy.is_empty() {
+                None
+            } else {
+                Some(t.legacy.clone())
+            }
+        })
+        .collect();
+
     // Per-stream `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16), indexed by
     // stream index. The spec default `0` ("there is no BlockAdditions for
     // this track") is already materialised on the raw record.
@@ -765,6 +780,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_uncompressed_fourccs,
         block_addition_mappings,
         track_translates,
+        track_legacy,
         max_block_addition_ids,
         last_block_additions: None,
         last_block_group_meta: None,
@@ -1096,6 +1112,118 @@ pub struct TrackTranslate {
     pub edition_uids: Vec<u64>,
 }
 
+/// The reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
+/// Appendix A.19..A.23 + A.28..A.32), surfaced per stream via
+/// [`MkvDemuxer::track_legacy`].
+///
+/// These are historical Matroska `TrackEntry` children the RFC 9559 core
+/// body no longer documents, but whose Element IDs remain reserved in the
+/// registry (Section 27.x) and which historical Writers still emit. The
+/// container surfaces them verbatim so a faithful re-mux round-trips them;
+/// none is interpreted. Every field carries no spec default or range — the
+/// Appendix gives only type / id / path / documentation — so absence is
+/// always observable (`None` / empty `Vec`).
+///
+/// Two distinct families share this record:
+///
+/// * **Codec-description metadata** (A.19..A.22): `codec_settings`
+///   (`CodecSettings`, utf-8), `codec_info_urls` (`CodecInfoURL`, string),
+///   `codec_download_urls` (`CodecDownloadURL`, string), and `decode_all`
+///   (`CodecDecodeAll`, uinteger — `1` if the codec can decode damaged data).
+/// * **`TrackOverlay`** (A.23) — the overlay-track fallback list, *ordered*
+///   per the appendix note ("The order of multiple TrackOverlay matters; the
+///   first one is the one that should be used").
+/// * **DivXTrickTrack pairing** (A.28..A.32): the Smooth FF/RW companion
+///   references — `trick_track_uid`, `trick_track_segment_uid`,
+///   `trick_track_flag`, `trick_master_track_uid`,
+///   `trick_master_track_segment_uid`.
+///
+/// [`TrackLegacy::is_empty`] reports the all-absent state — the overwhelmingly
+/// common case for a modern file, in which case the typed accessor returns
+/// `None` rather than a hollow record.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrackLegacy {
+    /// `CodecSettings` (RFC 9559 Appendix A.19, id `0x3A9697`, utf-8) — a
+    /// string describing the encoding settings used. `None` when absent.
+    pub codec_settings: Option<String>,
+    /// `CodecInfoURL` (RFC 9559 Appendix A.20, id `0x3B4040`, string) — URLs
+    /// with information about the codec used, in on-disk order. The appendix
+    /// does not bound the occurrence count, so this is a `Vec`; the common
+    /// case is empty (no element) or a single entry.
+    pub codec_info_urls: Vec<String>,
+    /// `CodecDownloadURL` (RFC 9559 Appendix A.21, id `0x26B240`, string) —
+    /// URLs to download the codec, in on-disk order (see
+    /// [`Self::codec_info_urls`] for the multiplicity rationale).
+    pub codec_download_urls: Vec<String>,
+    /// `CodecDecodeAll` (RFC 9559 Appendix A.22, id `0xAA`, uinteger) — `1`
+    /// if the codec can decode potentially damaged data. Surfaced verbatim
+    /// (`None` when absent); see [`TrackLegacy::can_decode_damaged`] for the
+    /// boolean predicate.
+    pub decode_all: Option<u64>,
+    /// `TrackOverlay` (RFC 9559 Appendix A.23, id `0x6FAB`, uinteger) — the
+    /// `TrackNumber`(s) of tracks to play instead of this one when this track
+    /// has a gap on `SilentTracks`. **Order is load-bearing** per the appendix:
+    /// the first entry is preferred, then the second, etc. Surfaced in on-disk
+    /// order so the preference chain is preserved.
+    pub track_overlays: Vec<u64>,
+    /// `TrickTrackUID` (RFC 9559 Appendix A.28, id `0xC0`, uinteger) — the
+    /// `TrackUID` of the Smooth FF/RW companion track in the paired EBML
+    /// structure. `None` when absent.
+    pub trick_track_uid: Option<u64>,
+    /// `TrickTrackSegmentUID` (RFC 9559 Appendix A.29, id `0xC1`, binary) —
+    /// the `SegmentUUID` of the Segment containing [`Self::trick_track_uid`].
+    /// Surfaced verbatim (`None` when absent); a non-16-byte payload is
+    /// preserved as-is for inspection.
+    pub trick_track_segment_uid: Option<Vec<u8>>,
+    /// `TrickTrackFlag` (RFC 9559 Appendix A.30, id `0xC6`, uinteger) — `1`
+    /// if this video track *is* a Smooth FF/RW track. Surfaced verbatim
+    /// (`None` when absent); see [`TrackLegacy::is_trick_track`].
+    pub trick_track_flag: Option<u64>,
+    /// `TrickMasterTrackUID` (RFC 9559 Appendix A.31, id `0xC7`, uinteger) —
+    /// the `TrackUID` of the normal-speed video track this Smooth FF/RW track
+    /// corresponds to. `None` when absent.
+    pub trick_master_track_uid: Option<u64>,
+    /// `TrickMasterTrackSegmentUID` (RFC 9559 Appendix A.32, id `0xC4`,
+    /// binary) — the `SegmentUUID` of the Segment containing
+    /// [`Self::trick_master_track_uid`]. Surfaced verbatim (`None` when
+    /// absent).
+    pub trick_master_track_segment_uid: Option<Vec<u8>>,
+}
+
+impl TrackLegacy {
+    /// `true` when every reclaimed legacy element was absent on disk — the
+    /// common case for a modern file. The typed accessor returns `None`
+    /// rather than an all-absent record, so a `Some(_)` result always carries
+    /// at least one populated field.
+    pub fn is_empty(&self) -> bool {
+        self.codec_settings.is_none()
+            && self.codec_info_urls.is_empty()
+            && self.codec_download_urls.is_empty()
+            && self.decode_all.is_none()
+            && self.track_overlays.is_empty()
+            && self.trick_track_uid.is_none()
+            && self.trick_track_segment_uid.is_none()
+            && self.trick_track_flag.is_none()
+            && self.trick_master_track_uid.is_none()
+            && self.trick_master_track_segment_uid.is_none()
+    }
+
+    /// Whether `CodecDecodeAll` (Appendix A.22) was present and non-zero —
+    /// the codec can decode potentially damaged data. Returns `false` both
+    /// when the element was absent and when it carried an explicit `0`; use
+    /// [`Self::decode_all`] directly to tell those apart.
+    pub fn can_decode_damaged(&self) -> bool {
+        self.decode_all.unwrap_or(0) != 0
+    }
+
+    /// Whether `TrickTrackFlag` (Appendix A.30) was present and non-zero —
+    /// this track is itself a Smooth FF/RW track. Returns `false` for both
+    /// absence and an explicit `0`.
+    pub fn is_trick_track(&self) -> bool {
+        self.trick_track_flag.unwrap_or(0) != 0
+    }
+}
+
 /// Check a Top-Level master element for a leading `CRC-32` child and, if
 /// present, validate it. `body_start` / `body_end` bracket the element's
 /// data (the bytes after its EBML header). On return the reader is left at
@@ -1290,6 +1418,13 @@ struct TrackEntry {
     /// the element only appears on files whose Chapter Codec addresses
     /// specific tracks, e.g. DVD-menu chapters).
     track_translates: Vec<TrackTranslate>,
+    /// Reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
+    /// Appendix A.19..A.23 + A.28..A.32) captured during the `TrackEntry`
+    /// walk. The accumulator is surfaced through the typed [`TrackLegacy`]
+    /// record (or `None` when [`TrackLegacy::is_empty`]). Each field is a
+    /// pure on-disk projection — no spec default is materialised, since the
+    /// appendix specifies none.
+    legacy: TrackLegacy,
     /// `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16) — the maximum
     /// `BlockAddID` value any of the track's Blocks may carry. The spec
     /// default `0` ("there is no BlockAdditions for this track") is
@@ -5709,6 +5844,48 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
                 let tt = parse_track_translate(r, body_end)?;
                 t.track_translates.push(tt);
             }
+            // Reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
+            // Appendix A.19..A.23 + A.28..A.32). Each is surfaced verbatim onto
+            // the [`TrackLegacy`] accumulator: the appendix gives no defaults
+            // or ranges, so absence stays observable and no synthetic value is
+            // materialised. `CodecInfoURL` / `CodecDownloadURL` / `TrackOverlay`
+            // are unbounded and order-preserving (TrackOverlay's order is
+            // load-bearing per A.23), so they accumulate in on-disk order; the
+            // rest are singletons where a duplicate keeps the last on-disk value.
+            ids::CODEC_SETTINGS => {
+                t.legacy.codec_settings = Some(read_string(r, e.size as usize)?);
+            }
+            ids::CODEC_INFO_URL => {
+                t.legacy
+                    .codec_info_urls
+                    .push(read_string(r, e.size as usize)?);
+            }
+            ids::CODEC_DOWNLOAD_URL => {
+                t.legacy
+                    .codec_download_urls
+                    .push(read_string(r, e.size as usize)?);
+            }
+            ids::CODEC_DECODE_ALL => {
+                t.legacy.decode_all = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::TRACK_OVERLAY => {
+                t.legacy.track_overlays.push(read_uint(r, e.size as usize)?);
+            }
+            ids::TRICK_TRACK_UID => {
+                t.legacy.trick_track_uid = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::TRICK_TRACK_SEGMENT_UID => {
+                t.legacy.trick_track_segment_uid = Some(read_bytes(r, e.size as usize)?);
+            }
+            ids::TRICK_TRACK_FLAG => {
+                t.legacy.trick_track_flag = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::TRICK_MASTER_TRACK_UID => {
+                t.legacy.trick_master_track_uid = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::TRICK_MASTER_TRACK_SEGMENT_UID => {
+                t.legacy.trick_master_track_segment_uid = Some(read_bytes(r, e.size as usize)?);
+            }
             // RFC 9559 §5.1.4.1.16 — maximum BlockAddID value the track's
             // Blocks may carry. Default 0 = "no BlockAdditions"; absence
             // and explicit 0 decode identically, so the raw field holds
@@ -6529,6 +6706,11 @@ pub struct MkvDemuxer {
     /// index. Empty `Vec` for tracks with no chapter-codec mapping (the
     /// common case). See [`MkvDemuxer::track_translates`].
     track_translates: Vec<Vec<TrackTranslate>>,
+    /// Per-stream reclaimed Appendix-A `TrackLegacy` records (RFC 9559
+    /// Appendix A.19..A.23 + A.28..A.32), indexed by stream index. `None` for
+    /// a track that carried none of the legacy elements (the common case for
+    /// a modern file). See [`MkvDemuxer::track_legacy`].
+    track_legacy: Vec<Option<TrackLegacy>>,
     /// Per-stream `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16), indexed
     /// by stream index, spec default `0` materialised — see
     /// [`MkvDemuxer::max_block_addition_id`].
@@ -7117,6 +7299,31 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::track_translates`].
     pub fn all_track_translates(&self) -> &[Vec<TrackTranslate>] {
         &self.track_translates
+    }
+
+    /// The reclaimed Appendix-A `TrackEntry`-level legacy elements (RFC 9559
+    /// Appendix A.19..A.23 + A.28..A.32) for the stream at `stream_index`,
+    /// folded into one typed [`TrackLegacy`] record. Returns `None` when the
+    /// `TrackEntry` carried none of them (the common case for a modern file —
+    /// the typed surface never synthesises a hollow record) or when
+    /// `stream_index` is out of range.
+    ///
+    /// These are historical Matroska `TrackEntry` children the RFC 9559 core
+    /// body no longer documents but whose Element IDs remain reserved: the
+    /// `CodecSettings` / `CodecInfoURL` / `CodecDownloadURL` / `CodecDecodeAll`
+    /// codec-description metadata, the ordered `TrackOverlay` fallback list,
+    /// and the DivXTrickTrack Smooth-FF/RW pairing quintet. The container
+    /// surfaces them verbatim for a faithful re-mux and never interprets them.
+    pub fn track_legacy(&self, stream_index: u32) -> Option<&TrackLegacy> {
+        self.track_legacy.get(stream_index as usize)?.as_ref()
+    }
+
+    /// All per-stream [`TrackLegacy`] records (RFC 9559 Appendix A.19..A.23 +
+    /// A.28..A.32), indexed by stream index. Each slot is `None` when the
+    /// corresponding `TrackEntry` carried no legacy element. See
+    /// [`MkvDemuxer::track_legacy`].
+    pub fn all_track_legacy(&self) -> &[Option<TrackLegacy>] {
+        &self.track_legacy
     }
 
     /// `MaxBlockAdditionID` (RFC 9559 §5.1.4.1.16) for the stream at
