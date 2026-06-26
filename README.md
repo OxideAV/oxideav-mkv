@@ -80,7 +80,18 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `ReferencePriority` (§5.1.3.5.4, default `0` materialised), `CodecState`
   (§5.1.3.5.6), and `DiscardPadding` (§5.1.3.5.7) — alongside the existing
   `block_additions()` side channel (same read-after-`next_packet` call
-  discipline, cleared on seek).
+  discipline, cleared on seek). The same record also surfaces the reclaimed
+  DivX trick-track / old-lacing `BlockGroup` children (RFC 9559 Appendix
+  A.3..A.14) for a faithful re-mux: `block_virtual()` (`BlockVirtual`, A.3),
+  `reference_virtual()` (`ReferenceVirtual`, A.4), `slices()` (every
+  `Slices > TimeSlice` master, A.5..A.11 — each `TimeSlice` folds `LaceNumber` /
+  `FrameNumber` / `BlockAdditionID` / `Delay` / `SliceDuration`), and
+  `reference_frame()` (`ReferenceFrame`, A.12..A.14 — `ReferenceOffset` +
+  `ReferenceTimestamp`). Every reclaimed field is a pure on-disk projection
+  (`None`/empty = absent, present `0` = `Some(0)`); none is interpreted by the
+  container. The muxer writes them through `BlockGroupOptions`
+  (`block_virtual` / `reference_virtual` / `slices` / `reference_frame`), so a
+  mux→demux pipeline round-trips every populated child.
 - **`SilentTracks`** (RFC 9559 Appendix A.1 / A.2): per-Cluster
   `SilentTrackNumber` lists surface on `ClusterRecord::silent_track_numbers`
   in on-disk order (deprecated element, but read for faithful re-mux).
@@ -264,16 +275,19 @@ the unified `oxideav` aggregator to wire decoding automatically.
   mirroring the tolerant `ChapterTranslate` parse. Returns an empty slice for a
   track with no `TrackTranslate` child (the common case) or an out-of-range
   `stream_index`.
-- **Typed `TrackLegacy` accessor** (RFC 9559 Appendix A.19..A.23 +
+- **Typed `TrackLegacy` accessor** (RFC 9559 Appendix A.16..A.23 +
   A.28..A.32): `MkvDemuxer::track_legacy(stream_index) ->
   Option<&TrackLegacy>` (and the per-stream `all_track_legacy()` slice)
   folds the reclaimed `TrackEntry`-level legacy elements — the ones the
   RFC 9559 core body no longer documents but whose Element IDs stay
   reserved in the registry, and which historical Writers still emit — into
-  one typed record per track. Two families share the record: the
+  one typed record per track. Three families share the record: the
   codec-description metadata (`CodecSettings` A.19 utf-8, `CodecInfoURL`
   A.20 + `CodecDownloadURL` A.21 string lists, `CodecDecodeAll` A.22
-  uinteger — `can_decode_damaged()` predicate), the **ordered**
+  uinteger — `can_decode_damaged()` predicate), the cache / offset hints
+  (`MinCache` A.16, `MaxCache` A.17, signed `TrackOffset` A.18 — a
+  Matroska-Tick playback-offset the container surfaces but does not apply),
+  the **ordered**
   `TrackOverlay` fallback list (A.23 — "the order of multiple TrackOverlay
   matters", surfaced verbatim so the preference chain is preserved), and
   the DivXTrickTrack Smooth-FF/RW pairing quintet (`TrickTrackUID` A.28,
@@ -1096,8 +1110,14 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `BlockAdditions`, an explicit multi-`ReferenceBlock` list (§5.1.3.5.5),
   `ReferencePriority` (§5.1.3.5.4, written only when non-zero),
   `CodecState` (§5.1.3.5.6) and `DiscardPadding` (§5.1.3.5.7), emitted in
-  §5.1.3.5 order. The write-side mirror of `MkvDemuxer::block_group_meta`
-  — a mux→demux round-trip preserves every child value. A group needing
+  §5.1.3.5 order, plus the reclaimed DivX trick-track / old-lacing children
+  (RFC 9559 Appendix A.3..A.14): `block_virtual` (`BlockVirtual`),
+  `reference_virtual` (`ReferenceVirtual`), `slices` (a `Vec<TimeSlice>`
+  emitted as one `Slices` master, each `TimeSlice` built via
+  `TimeSlice::from_fields`), and `reference_frame` (`ReferenceFrame::from_fields`).
+  The write-side mirror of `MkvDemuxer::block_group_meta`
+  — a mux→demux round-trip preserves every child value, including an empty
+  `TimeSlice` (the on-disk element count is preserved). A group needing
   no additions skips the `MaxBlockAdditionID` requirement.
 - **`SilentTracks` on write** (RFC 9559 Appendix A.1 / A.2):
   `MkvMuxer::set_next_cluster_silent_tracks(&[track_numbers])` queues a
@@ -1259,11 +1279,12 @@ the unified `oxideav` aggregator to wire decoding automatically.
   the new `MkvDemuxer::track_translates` typed accessor — a mux→demux pipeline
   round-trips every mapping field-for-field.
 - **Reclaimed Appendix-A `TrackLegacy` on write** (RFC 9559 Appendix
-  A.19..A.23 + A.28..A.32): `MkvMuxer::set_track_legacy(stream_index,
+  A.16..A.23 + A.28..A.32): `MkvMuxer::set_track_legacy(stream_index,
   MkvTrackLegacy)` queues the historical `TrackEntry`-level legacy elements —
   `CodecSettings` / `CodecInfoURL` / `CodecDownloadURL` / `CodecDecodeAll`
-  codec-description metadata, the ordered `TrackOverlay` fallback list, and the
-  DivXTrickTrack pairing quintet — which land inside the carrying `TrackEntry`
+  codec-description metadata, the `MinCache` / `MaxCache` / signed `TrackOffset`
+  cache-and-offset hints (A.16..A.18), the ordered `TrackOverlay` fallback
+  list, and the DivXTrickTrack pairing quintet — which land inside the carrying `TrackEntry`
   (after the `TrackTranslate` masters) at `write_header` time. Only populated
   fields reach the disk: an absent field (`None` / empty `Vec`) keeps its
   element off-disk, so the demuxer observes the same absence. The appendix

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: write side for the reclaimed `BlockGroup` children (RFC 9559 Appendix
+  A.3..A.14) — `BlockGroupOptions` gains `block_virtual`, `reference_virtual`,
+  `slices` (a `Vec<TimeSlice>` written as one `Slices` master) and
+  `reference_frame` (`ReferenceFrame`), the symmetric counterpart of the
+  demux-side `BlockGroupMeta`. `TimeSlice::from_fields` / `ReferenceFrame::from_fields`
+  constructors let a caller build the masters; only populated fields reach the
+  disk, and an empty `TimeSlice` still preserves the on-disk element count. A
+  mux→demux pipeline round-trips every populated reclaimed child.
+
 - Demuxer + Muxer: three more reclaimed `TrackEntry`-level legacy elements on
   `TrackLegacy` / `MkvTrackLegacy` (RFC 9559 Appendix A.16..A.18) — `MinCache`
   (A.16, `0x6DE7`, uinteger), `MaxCache` (A.17, `0x6DF8`, uinteger), and

@@ -2733,6 +2733,25 @@ pub struct TimeSlice {
 }
 
 impl TimeSlice {
+    /// Construct a `TimeSlice` from its five optional reclaimed fields. The
+    /// mux side uses this to queue a `Slices > TimeSlice` for a faithful
+    /// re-mux; a `None` field emits no child for that element.
+    pub fn from_fields(
+        lace_number: Option<u64>,
+        frame_number: Option<u64>,
+        block_addition_id: Option<u64>,
+        delay: Option<u64>,
+        slice_duration: Option<u64>,
+    ) -> Self {
+        Self {
+            lace_number,
+            frame_number,
+            block_addition_id,
+            delay,
+            slice_duration,
+        }
+    }
+
     /// `LaceNumber` (A.7) — the reverse frame number in the lace
     /// (`0` = last frame, `1` = next to last, …). `None` when absent.
     pub fn lace_number(&self) -> Option<u64> {
@@ -2784,6 +2803,16 @@ pub struct ReferenceFrame {
 }
 
 impl ReferenceFrame {
+    /// Construct a `ReferenceFrame` from its two optional reclaimed fields.
+    /// The mux side uses this to queue a `ReferenceFrame` master for a
+    /// faithful re-mux; a `None` field emits no child for that element.
+    pub fn from_fields(reference_offset: Option<u64>, reference_timestamp: Option<u64>) -> Self {
+        Self {
+            reference_offset,
+            reference_timestamp,
+        }
+    }
+
     /// `ReferenceOffset` (A.13) — the relative byte offset from the
     /// previous `BlockGroup` for this Smooth FF/RW video track to this
     /// containing `BlockGroup`. `None` when absent.

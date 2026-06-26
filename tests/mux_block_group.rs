@@ -130,6 +130,7 @@ fn roundtrip_all_block_group_children() {
             reference_priority: 0,
             codec_state: None,
             discard_padding: Some(-1_500),
+            ..Default::default()
         };
         mx.write_packet_with_block_group(&p, &opts)
             .expect("non-keyframe block group");
@@ -177,6 +178,56 @@ fn roundtrip_all_block_group_children() {
     let adds = dmx.block_additions();
     assert_eq!(adds.len(), 2);
     assert_eq!(adds[1].block_add_id(), 2);
+}
+
+#[test]
+fn roundtrip_reclaimed_block_group_children() {
+    // RFC 9559 Appendix A.3..A.14 — BlockVirtual / ReferenceVirtual /
+    // Slices > TimeSlice / ReferenceFrame written through the muxer and read
+    // back through block_group_meta(), for a faithful re-mux.
+    use oxideav_mkv::demux::{ReferenceFrame, TimeSlice};
+
+    let streams = [video_stream(0)];
+    let bytes = mux_with(&streams, |mx| {
+        mx.write_header().expect("write_header");
+        let p = packet(0, 0, true, 0x33, 20);
+        let opts = BlockGroupOptions {
+            block_virtual: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            reference_virtual: Some(-9_001),
+            slices: vec![
+                TimeSlice::from_fields(Some(0), Some(7), Some(2), Some(100), Some(200)),
+                // An empty TimeSlice still preserves the on-disk count.
+                TimeSlice::from_fields(None, None, None, None, None),
+            ],
+            reference_frame: Some(ReferenceFrame::from_fields(Some(4096), Some(33))),
+            ..Default::default()
+        };
+        mx.write_packet_with_block_group(&p, &opts)
+            .expect("legacy block group");
+    });
+
+    // ReferenceVirtual (0xFD) and the Slices master (0x8E) are single-byte
+    // ids; verify the round-trip below rather than scanning raw bytes.
+    let mut dmx = demux_typed(bytes);
+    let p = dmx.next_packet().expect("packet");
+    assert_eq!(p.data, vec![0x33; 20]);
+    let m = dmx.block_group_meta().expect("legacy meta present");
+
+    assert_eq!(m.block_virtual(), Some(&[0xDE, 0xAD, 0xBE, 0xEF][..]));
+    assert_eq!(m.reference_virtual(), Some(-9_001));
+
+    let slices = m.slices();
+    assert_eq!(slices.len(), 2, "both TimeSlice masters round-trip");
+    assert_eq!(slices[0].lace_number(), Some(0));
+    assert_eq!(slices[0].frame_number(), Some(7));
+    assert_eq!(slices[0].block_addition_id(), Some(2));
+    assert_eq!(slices[0].delay(), Some(100));
+    assert_eq!(slices[0].slice_duration(), Some(200));
+    assert!(slices[1].is_empty(), "empty TimeSlice preserved");
+
+    let rf = m.reference_frame().expect("reference_frame present");
+    assert_eq!(rf.reference_offset(), Some(4096));
+    assert_eq!(rf.reference_timestamp(), Some(33));
 }
 
 #[test]

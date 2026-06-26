@@ -1773,6 +1773,25 @@ pub struct BlockGroupOptions {
     pub codec_state: Option<Vec<u8>>,
     /// `DiscardPadding` (§5.1.3.5.7, signed nanoseconds). `None` → no child.
     pub discard_padding: Option<i64>,
+    /// `BlockVirtual` (RFC 9559 Appendix A.3, binary) verbatim bytes — a
+    /// reclaimed data-less Block. `None` → no child. Written for a faithful
+    /// re-mux; the container does not interpret it.
+    pub block_virtual: Option<Vec<u8>>,
+    /// `ReferenceVirtual` (RFC 9559 Appendix A.4, signed integer) — the
+    /// Segment Position of a virtual Block's data. `None` → no child.
+    pub reference_virtual: Option<i64>,
+    /// `Slices > TimeSlice` masters (RFC 9559 Appendix A.5..A.11), written in
+    /// slice order, one `TimeSlice` per entry inside a single `Slices` master.
+    /// Empty → no `Slices` child. Each [`TimeSlice`](crate::demux::TimeSlice)
+    /// emits only the fields the caller set (`Some(_)`); an empty `TimeSlice`
+    /// still writes an empty `TimeSlice` master so the on-disk count is
+    /// preserved.
+    pub slices: Vec<crate::demux::TimeSlice>,
+    /// `ReferenceFrame` master (RFC 9559 Appendix A.12..A.14) — the Smooth
+    /// FF/RW trick-track back-reference. `None` → no child; a present
+    /// [`ReferenceFrame`](crate::demux::ReferenceFrame) emits only its set
+    /// children.
+    pub reference_frame: Option<crate::demux::ReferenceFrame>,
 }
 
 /// A `TrackOperation` (RFC 9559 §5.1.4.1.30) hint queued via
@@ -5006,6 +5025,10 @@ impl MkvMuxer {
                 opts.reference_priority,
                 opts.codec_state.as_deref(),
                 opts.discard_padding,
+                opts.block_virtual.as_deref(),
+                opts.reference_virtual,
+                &opts.slices,
+                opts.reference_frame.as_ref(),
             );
             self.output.write_all(&bytes)?;
             // One Block written to the open Cluster — advances the 1-based
@@ -5539,6 +5562,10 @@ fn build_block_group(
     reference_priority: u64,
     codec_state: Option<&[u8]>,
     discard_padding: Option<i64>,
+    block_virtual: Option<&[u8]>,
+    reference_virtual: Option<i64>,
+    slices: &[crate::demux::TimeSlice],
+    reference_frame: Option<&crate::demux::ReferenceFrame>,
 ) -> Vec<u8> {
     // Block child: same §10.2 header layout as SimpleBlock minus the
     // keyframe / discardable flag bits, lacing bits 00.
@@ -5580,6 +5607,50 @@ fn build_block_group(
     }
     if let Some(p) = discard_padding {
         write_int_element(&mut group_body, ids::DISCARD_PADDING, p);
+    }
+
+    // Reclaimed DivX trick-track / old-lacing children (RFC 9559 Appendix
+    // A.3..A.14), written for a faithful re-mux. Only populated fields reach
+    // the disk; the appendix names no defaults, so a present `0` is a real
+    // value distinct from absence.
+    if let Some(bv) = block_virtual {
+        write_bytes_element(&mut group_body, ids::BLOCK_VIRTUAL, bv);
+    }
+    if let Some(rv) = reference_virtual {
+        write_int_element(&mut group_body, ids::REFERENCE_VIRTUAL, rv);
+    }
+    if !slices.is_empty() {
+        let mut slices_body = Vec::new();
+        for ts in slices {
+            let mut ts_body = Vec::new();
+            if let Some(v) = ts.lace_number() {
+                write_uint_element(&mut ts_body, ids::LACE_NUMBER, v);
+            }
+            if let Some(v) = ts.frame_number() {
+                write_uint_element(&mut ts_body, ids::FRAME_NUMBER, v);
+            }
+            if let Some(v) = ts.block_addition_id() {
+                write_uint_element(&mut ts_body, ids::TIME_SLICE_BLOCK_ADDITION_ID, v);
+            }
+            if let Some(v) = ts.delay() {
+                write_uint_element(&mut ts_body, ids::DELAY, v);
+            }
+            if let Some(v) = ts.slice_duration() {
+                write_uint_element(&mut ts_body, ids::SLICE_DURATION, v);
+            }
+            write_master_element(&mut slices_body, ids::TIME_SLICE, &ts_body);
+        }
+        write_master_element(&mut group_body, ids::SLICES, &slices_body);
+    }
+    if let Some(rf) = reference_frame {
+        let mut rf_body = Vec::new();
+        if let Some(v) = rf.reference_offset() {
+            write_uint_element(&mut rf_body, ids::REFERENCE_OFFSET, v);
+        }
+        if let Some(v) = rf.reference_timestamp() {
+            write_uint_element(&mut rf_body, ids::REFERENCE_TIMESTAMP, v);
+        }
+        write_master_element(&mut group_body, ids::REFERENCE_FRAME, &rf_body);
     }
 
     let mut out = Vec::with_capacity(8 + group_body.len());
