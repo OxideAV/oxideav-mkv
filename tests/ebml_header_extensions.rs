@@ -155,6 +155,11 @@ fn header_with_two_extensions() {
     assert_eq!(h.doc_type, "matroska");
     assert_eq!(h.doc_type_version, 4);
     assert_eq!(h.doc_type_read_version, 2);
+    // Version/length quartet was written explicitly (1/1/4/8) in the header.
+    assert_eq!(h.ebml_version, 1);
+    assert_eq!(h.ebml_read_version, 1);
+    assert_eq!(h.ebml_max_id_length, 4);
+    assert_eq!(h.ebml_max_size_length, 8);
     assert_eq!(h.doc_type_extensions.len(), 2);
     assert_eq!(
         h.doc_type_extensions[0],
@@ -184,6 +189,25 @@ fn header_defaults_when_versions_absent() {
     assert_eq!(h.doc_type_version, 1, "spec default materialised");
     assert_eq!(h.doc_type_read_version, 1, "spec default materialised");
     assert!(h.doc_type_extensions.is_empty());
+}
+
+/// A bare EBML header carrying only `DocType` (no EBMLVersion / EBMLReadVersion
+/// / EBMLMaxIDLength / EBMLMaxSizeLength elements) materialises every RFC 8794
+/// §11.2 spec default: 1 / 1 / 4 / 8.
+#[test]
+fn version_length_quartet_defaults_when_absent() {
+    let mut hb = Vec::new();
+    hb.extend_from_slice(&elem_str(ids::EBML_DOC_TYPE, "matroska"));
+    let header = elem_master(ids::EBML_HEADER, &hb);
+    let mut bytes = header;
+    bytes.extend_from_slice(&minimal_segment());
+
+    let dmx = demux(bytes);
+    let h = dmx.ebml_header();
+    assert_eq!(h.ebml_version, 1, "EBMLVersion default");
+    assert_eq!(h.ebml_read_version, 1, "EBMLReadVersion default");
+    assert_eq!(h.ebml_max_id_length, 4, "EBMLMaxIDLength default");
+    assert_eq!(h.ebml_max_size_length, 8, "EBMLMaxSizeLength default");
 }
 
 /// A malformed `DocTypeExtension` is dropped: one missing its mandatory
@@ -275,7 +299,14 @@ fn mux_write_round_trips_through_demux() {
     let _ = std::fs::remove_file(&tmp);
 
     let dmx = demux(bytes);
-    assert_eq!(dmx.ebml_header().doc_type_extensions, exts);
+    let h = dmx.ebml_header();
+    assert_eq!(h.doc_type_extensions, exts);
+    // Muxer writes the version/length quartet at the canonical 1/1/4/8.
+    assert_eq!(h.ebml_version, 1);
+    assert_eq!(h.ebml_read_version, 1);
+    assert_eq!(h.ebml_max_id_length, 4);
+    assert_eq!(h.ebml_max_size_length, 8);
+    assert_eq!(h.doc_type, "matroska");
 }
 
 /// Omitting the call keeps the header free of `DocTypeExtension` masters.

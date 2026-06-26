@@ -41,8 +41,14 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     // EBML header fields (RFC 8794 §11.2). `DocType` defaults to "matroska"
     // only as a guard; a real file always carries it. The other fields carry
     // their RFC 8794 spec defaults so an absent element materialises the right
-    // value: EBMLVersion / EBMLReadVersion / DocTypeVersion default `1`,
-    // DocTypeReadVersion default `1`.
+    // value: EBMLVersion / EBMLReadVersion (§11.2.2 / §11.2.3) default `1`,
+    // EBMLMaxIDLength (§11.2.4) default `4`, EBMLMaxSizeLength (§11.2.5)
+    // default `8`, DocTypeVersion / DocTypeReadVersion (§11.2.6 / §11.2.8)
+    // default `1`.
+    let mut ebml_version: u64 = 1;
+    let mut ebml_read_version: u64 = 1;
+    let mut ebml_max_id_length: u64 = 4;
+    let mut ebml_max_size_length: u64 = 8;
     let mut doc_type = String::from("matroska");
     let mut doc_type_version: u64 = 1;
     let mut doc_type_read_version: u64 = 1;
@@ -52,6 +58,18 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     while input.stream_position()? < ebml_end {
         let e = read_element_header(&mut *input)?;
         match e.id {
+            ids::EBML_VERSION => {
+                ebml_version = read_uint(&mut *input, e.size as usize)?;
+            }
+            ids::EBML_READ_VERSION => {
+                ebml_read_version = read_uint(&mut *input, e.size as usize)?;
+            }
+            ids::EBML_MAX_ID_LENGTH => {
+                ebml_max_id_length = read_uint(&mut *input, e.size as usize)?;
+            }
+            ids::EBML_MAX_SIZE_LENGTH => {
+                ebml_max_size_length = read_uint(&mut *input, e.size as usize)?;
+            }
             ids::EBML_DOC_TYPE => {
                 doc_type = read_string(&mut *input, e.size as usize)?;
             }
@@ -76,6 +94,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         )));
     }
     let ebml_header = EbmlHeader {
+        ebml_version,
+        ebml_read_version,
+        ebml_max_id_length,
+        ebml_max_size_length,
         doc_type: doc_type.clone(),
         doc_type_version,
         doc_type_read_version,
@@ -3456,6 +3478,21 @@ pub struct DocTypeExtension {
 /// [`doc_type_extensions`]: EbmlHeader::doc_type_extensions
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EbmlHeader {
+    /// `EBMLVersion` (RFC 8794 §11.2.2): the version of EBML used to create the
+    /// file. Spec default `1` materialised when absent.
+    pub ebml_version: u64,
+    /// `EBMLReadVersion` (RFC 8794 §11.2.3): the minimum EBML version a reader
+    /// must support to read the file. Spec default `1` materialised when
+    /// absent.
+    pub ebml_read_version: u64,
+    /// `EBMLMaxIDLength` (RFC 8794 §11.2.4): the maximum length in octets of
+    /// the Element IDs in the EBML body. Spec default `4` materialised when
+    /// absent.
+    pub ebml_max_id_length: u64,
+    /// `EBMLMaxSizeLength` (RFC 8794 §11.2.5): the maximum length in octets of
+    /// the Element Data Size VINTs in the EBML body. Spec default `8`
+    /// materialised when absent.
+    pub ebml_max_size_length: u64,
     /// `DocType` (RFC 8794 §11.2.7): the document type — `"matroska"` or
     /// `"webm"` (the open path rejects anything else).
     pub doc_type: String,

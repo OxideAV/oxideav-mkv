@@ -11,7 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Demuxer + Muxer: EBML-header `DocTypeExtension` surface (RFC 8794 §11.2,
   including §11.2.9..§11.2.11). `MkvDemuxer::ebml_header() -> &EbmlHeader`
-  surfaces the parsed header — `doc_type`, the `doc_type_version` /
+  surfaces the full parsed header — the `EBMLVersion` / `EBMLReadVersion` /
+  `EBMLMaxIDLength` / `EBMLMaxSizeLength` quartet (§11.2.2..§11.2.5, spec
+  defaults `1` / `1` / `4` / `8` materialised when absent), `doc_type`, the
+  `doc_type_version` /
   `doc_type_read_version` pair (spec default `1` materialised when absent), and
   every well-formed `DocTypeExtension` (name + version) in document order; a
   malformed extension missing either mandatory child is dropped at parse time.

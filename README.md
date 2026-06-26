@@ -56,7 +56,10 @@ the unified `oxideav` aggregator to wire decoding automatically.
 
 - EBML header parse, DocType validation (`matroska` / `webm`).
 - **Typed EBML header accessor** (RFC 8794 §11.2): `MkvDemuxer::ebml_header()
-  -> &EbmlHeader` surfaces the parsed header — `doc_type`,
+  -> &EbmlHeader` surfaces the full parsed header — `ebml_version` /
+  `ebml_read_version` / `ebml_max_id_length` / `ebml_max_size_length`
+  (§11.2.2..§11.2.5, spec defaults `1` / `1` / `4` / `8` materialised when
+  absent), `doc_type`,
   `doc_type_version` / `doc_type_read_version` (spec default `1` materialised
   when the element was absent), and every well-formed `DocTypeExtension`
   (§11.2.9..§11.2.11) declaration in document order. Each `DocTypeExtension`
