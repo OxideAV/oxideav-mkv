@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: reclaimed DivX trick-track / old-lacing `BlockGroup` children
+  (RFC 9559 Appendix A.3..A.14) on `BlockGroupMeta`, surfaced for a faithful
+  re-mux. `block_group_meta()` now also exposes `block_virtual()`
+  (`BlockVirtual`, A.3 binary), `reference_virtual()` (`ReferenceVirtual`, A.4
+  integer — Segment Position of a virtual Block's data), `slices()` (every
+  `Slices > TimeSlice` master, A.5..A.11, each a new `TimeSlice` folding
+  `LaceNumber` / `FrameNumber` / `BlockAdditionID` / `Delay` / `SliceDuration`),
+  and `reference_frame()` (`ReferenceFrame`, A.12..A.14 — `ReferenceOffset` +
+  `ReferenceTimestamp` for a Smooth FF/RW trick track). Every field is a pure
+  on-disk projection (`None`/empty = absent, present `0` = `Some(0)`); none is
+  interpreted by the container. New public types `TimeSlice` + `ReferenceFrame`.
+
 - Demuxer + Muxer: EBML-header `DocTypeExtension` surface (RFC 8794 §11.2,
   including §11.2.9..§11.2.11). `MkvDemuxer::ebml_header() -> &EbmlHeader`
   surfaces the full parsed header — the `EBMLVersion` / `EBMLReadVersion` /

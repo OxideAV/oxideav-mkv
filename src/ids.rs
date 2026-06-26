@@ -414,6 +414,42 @@ pub const DISCARD_PADDING: u32 = 0x75A2;
 pub const SILENT_TRACKS: u32 = 0x5854;
 pub const SILENT_TRACK_NUMBER: u32 = 0x58D7;
 
+// Deprecated DivX trick-track / old-lacing BlockGroup children
+// (RFC 9559 Appendix A.3..A.14). The RFC 9559 core body no longer
+// documents these, but their Element IDs stay reserved in the registry
+// and historical Writers still emit them, so the demuxer surfaces them
+// (and the muxer can round-trip them) for a faithful re-mux. None is
+// interpreted by the container.
+//
+// BlockVirtual (A.3, binary): a Block with no data, stored at the place
+// the real Block would be in display order. ReferenceVirtual (A.4,
+// integer): the Segment Position of the data that would otherwise be in
+// the position of the virtual Block.
+pub const BLOCK_VIRTUAL: u32 = 0xA2;
+pub const REFERENCE_VIRTUAL: u32 = 0xFD;
+// Slices (A.5, master) > TimeSlice (A.6, master): extra per-frame time
+// information about the data in the Block; interpreting it is not
+// required for playback. TimeSlice children: LaceNumber (A.7, uinteger —
+// the reverse frame number in the lace, 0 = last frame), FrameNumber
+// (A.8, uinteger — number of the frame to generate from this lace),
+// TimeSliceBlockAdditionID (A.9, uinteger — id of the BlockAdditional,
+// 0 = main Block), Delay (A.10, uinteger — Track-Tick delay), and
+// SliceDuration (A.11, uinteger — Track-Tick duration).
+pub const SLICES: u32 = 0x8E;
+pub const TIME_SLICE: u32 = 0xE8;
+pub const LACE_NUMBER: u32 = 0xCC;
+pub const FRAME_NUMBER: u32 = 0xCD;
+pub const TIME_SLICE_BLOCK_ADDITION_ID: u32 = 0xCB;
+pub const DELAY: u32 = 0xCE;
+pub const SLICE_DURATION: u32 = 0xCF;
+// ReferenceFrame (A.12, master) for Smooth FF/RW DivX trick tracks >
+// ReferenceOffset (A.13, uinteger — relative byte offset from the
+// previous BlockGroup to this one) + ReferenceTimestamp (A.14, uinteger —
+// Track-Tick timestamp of the BlockGroup pointed to by ReferenceOffset).
+pub const REFERENCE_FRAME: u32 = 0xC8;
+pub const REFERENCE_OFFSET: u32 = 0xC9;
+pub const REFERENCE_TIMESTAMP: u32 = 0xCA;
+
 // BlockAdditions (RFC 9559 §5.1.3.5.2): per-BlockGroup side channel of
 // additional binary data completing the Block. Each `BlockMore`
 // (§5.1.3.5.2.1) pairs one `BlockAdditional` payload (§5.1.3.5.2.2) with

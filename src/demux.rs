@@ -2666,12 +2666,122 @@ impl BlockAddition {
 ///
 /// For a laced `Block`, every de-laced frame reports the same meta — the
 /// `BlockGroup` children attach to the Block as a whole.
+///
+/// In addition to the four current children above, a `BlockGroup` written
+/// by a historical Writer can carry the reclaimed DivX trick-track /
+/// old-lacing children (RFC 9559 Appendix A.3..A.14). These are surfaced
+/// verbatim for a faithful re-mux through:
+///
+/// * [`block_virtual`](Self::block_virtual) — `BlockVirtual` (A.3, binary):
+///   a Block with no data stored where the real Block would be in display
+///   order. `None` when absent.
+/// * [`reference_virtual`](Self::reference_virtual) — `ReferenceVirtual`
+///   (A.4, integer): the Segment Position of the data that would otherwise
+///   be in the position of the virtual Block. `None` when absent.
+/// * [`slices`](Self::slices) — every `Slices > TimeSlice` (A.5..A.11)
+///   master, in on-disk order. Each [`TimeSlice`] folds the five reclaimed
+///   per-lace timing fields. Empty when the `BlockGroup` carried no
+///   `Slices` child (the common case).
+/// * [`reference_frame`](Self::reference_frame) — `ReferenceFrame`
+///   (A.12..A.14): the Smooth FF/RW trick-track back-reference, folding
+///   `ReferenceOffset` and `ReferenceTimestamp`. `None` when absent.
+///
+/// None of the reclaimed children is interpreted by the container.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlockGroupMeta {
     reference_blocks: Vec<i64>,
     reference_priority: u64,
     codec_state: Option<Vec<u8>>,
     discard_padding: Option<i64>,
+    block_virtual: Option<Vec<u8>>,
+    reference_virtual: Option<i64>,
+    slices: Vec<TimeSlice>,
+    reference_frame: Option<ReferenceFrame>,
+}
+
+/// A reclaimed `Slices > TimeSlice` master (RFC 9559 Appendix A.6..A.11)
+/// carried by a historical `BlockGroup`. Each field is a pure on-disk
+/// projection — absence is observable (`None`), a present `0` round-trips
+/// as `Some(0)`. The container never interprets these; interpreting a
+/// `TimeSlice` is explicitly "not required for playback" (A.6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimeSlice {
+    lace_number: Option<u64>,
+    frame_number: Option<u64>,
+    block_addition_id: Option<u64>,
+    delay: Option<u64>,
+    slice_duration: Option<u64>,
+}
+
+impl TimeSlice {
+    /// `LaceNumber` (A.7) — the reverse frame number in the lace
+    /// (`0` = last frame, `1` = next to last, …). `None` when absent.
+    pub fn lace_number(&self) -> Option<u64> {
+        self.lace_number
+    }
+
+    /// `FrameNumber` (A.8) — the number of the frame to generate from this
+    /// lace with this delay. `None` when absent.
+    pub fn frame_number(&self) -> Option<u64> {
+        self.frame_number
+    }
+
+    /// `BlockAdditionID` (A.9) — the id of the `BlockAdditional` element
+    /// (`0` = the main Block). `None` when absent.
+    pub fn block_addition_id(&self) -> Option<u64> {
+        self.block_addition_id
+    }
+
+    /// `Delay` (A.10) — the delay to apply, in Track Ticks. `None` when
+    /// absent.
+    pub fn delay(&self) -> Option<u64> {
+        self.delay
+    }
+
+    /// `SliceDuration` (A.11) — the duration to apply, in Track Ticks.
+    /// `None` when absent.
+    pub fn slice_duration(&self) -> Option<u64> {
+        self.slice_duration
+    }
+
+    /// True when none of the five reclaimed fields were present on disk.
+    pub fn is_empty(&self) -> bool {
+        self.lace_number.is_none()
+            && self.frame_number.is_none()
+            && self.block_addition_id.is_none()
+            && self.delay.is_none()
+            && self.slice_duration.is_none()
+    }
+}
+
+/// A reclaimed `ReferenceFrame` master (RFC 9559 Appendix A.12..A.14)
+/// describing the last reference frame of a Smooth FF/RW DivX trick
+/// track. Both children are pure on-disk projections (`None` = absent).
+/// The container never interprets these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferenceFrame {
+    reference_offset: Option<u64>,
+    reference_timestamp: Option<u64>,
+}
+
+impl ReferenceFrame {
+    /// `ReferenceOffset` (A.13) — the relative byte offset from the
+    /// previous `BlockGroup` for this Smooth FF/RW video track to this
+    /// containing `BlockGroup`. `None` when absent.
+    pub fn reference_offset(&self) -> Option<u64> {
+        self.reference_offset
+    }
+
+    /// `ReferenceTimestamp` (A.14) — the timestamp of the `BlockGroup`
+    /// pointed to by `ReferenceOffset`, in Track Ticks. `None` when absent.
+    pub fn reference_timestamp(&self) -> Option<u64> {
+        self.reference_timestamp
+    }
+
+    /// True when neither child was present on disk.
+    pub fn is_empty(&self) -> bool {
+        self.reference_offset.is_none() && self.reference_timestamp.is_none()
+    }
 }
 
 impl BlockGroupMeta {
@@ -2701,7 +2811,36 @@ impl BlockGroupMeta {
         self.discard_padding
     }
 
-    /// True when none of the four optional children were present — i.e.
+    /// `BlockVirtual` (RFC 9559 Appendix A.3) — the verbatim bytes of a
+    /// reclaimed data-less Block stored where the real Block would be in
+    /// display order. `None` when the `BlockGroup` has no `BlockVirtual`
+    /// child (the common case). Never interpreted by the container.
+    pub fn block_virtual(&self) -> Option<&[u8]> {
+        self.block_virtual.as_deref()
+    }
+
+    /// `ReferenceVirtual` (RFC 9559 Appendix A.4) — the Segment Position
+    /// of the data that would otherwise be in the position of the virtual
+    /// Block. `None` when absent.
+    pub fn reference_virtual(&self) -> Option<i64> {
+        self.reference_virtual
+    }
+
+    /// Every reclaimed `Slices > TimeSlice` master (RFC 9559 Appendix
+    /// A.5..A.11) the `BlockGroup` carried, in on-disk order. Empty for the
+    /// common case (no `Slices` child). See [`TimeSlice`].
+    pub fn slices(&self) -> &[TimeSlice] {
+        &self.slices
+    }
+
+    /// The reclaimed `ReferenceFrame` master (RFC 9559 Appendix
+    /// A.12..A.14) describing the last reference frame of a Smooth FF/RW
+    /// DivX trick track. `None` when absent. See [`ReferenceFrame`].
+    pub fn reference_frame(&self) -> Option<&ReferenceFrame> {
+        self.reference_frame.as_ref()
+    }
+
+    /// True when none of the optional children were present — i.e.
     /// the `BlockGroup` carried only a `Block` (and possibly
     /// `BlockAdditions` / `BlockDuration`, surfaced elsewhere).
     pub fn is_empty(&self) -> bool {
@@ -2709,6 +2848,10 @@ impl BlockGroupMeta {
             && self.reference_priority == 0
             && self.codec_state.is_none()
             && self.discard_padding.is_none()
+            && self.block_virtual.is_none()
+            && self.reference_virtual.is_none()
+            && self.slices.is_empty()
+            && self.reference_frame.is_none()
     }
 }
 
@@ -6475,6 +6618,60 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<BlockAddi
     Ok(out)
 }
 
+/// Parse a `Slices` master (RFC 9559 Appendix A.5, id `0x8E`) into its
+/// `TimeSlice` (A.6, id `0xE8`) children, appending each to `out` in
+/// on-disk order. Each `TimeSlice` folds the five reclaimed per-lace
+/// timing fields (A.7..A.11). A `TimeSlice` that carried none of them
+/// still surfaces (an empty record) so a re-mux can preserve the element
+/// count. Non-`TimeSlice` children of `Slices` are skipped.
+fn parse_slices(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<TimeSlice>) -> Result<()> {
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::TIME_SLICE => {
+                let ts_end = r.stream_position()?.saturating_add(e.size);
+                let mut ts = TimeSlice::default();
+                while r.stream_position()? < ts_end {
+                    let c = read_element_header(r)?;
+                    match c.id {
+                        ids::LACE_NUMBER => ts.lace_number = Some(read_uint(r, c.size as usize)?),
+                        ids::FRAME_NUMBER => ts.frame_number = Some(read_uint(r, c.size as usize)?),
+                        ids::TIME_SLICE_BLOCK_ADDITION_ID => {
+                            ts.block_addition_id = Some(read_uint(r, c.size as usize)?)
+                        }
+                        ids::DELAY => ts.delay = Some(read_uint(r, c.size as usize)?),
+                        ids::SLICE_DURATION => {
+                            ts.slice_duration = Some(read_uint(r, c.size as usize)?)
+                        }
+                        _ => skip(r, c.size)?,
+                    }
+                }
+                out.push(ts);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(())
+}
+
+/// Parse a `ReferenceFrame` master (RFC 9559 Appendix A.12, id `0xC8`)
+/// into its `ReferenceOffset` (A.13, id `0xC9`) and `ReferenceTimestamp`
+/// (A.14, id `0xCA`) uinteger children. Any other child is skipped.
+fn parse_reference_frame(r: &mut dyn ReadSeek, end: u64) -> Result<ReferenceFrame> {
+    let mut rf = ReferenceFrame::default();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::REFERENCE_OFFSET => rf.reference_offset = Some(read_uint(r, e.size as usize)?),
+            ids::REFERENCE_TIMESTAMP => {
+                rf.reference_timestamp = Some(read_uint(r, e.size as usize)?)
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(rf)
+}
+
 /// Parse a `SilentTracks` master (RFC 9559 Appendix A.1, id `0x5854`) into
 /// its `SilentTrackNumber` (A.2, id `0x58D7`) values in on-disk order. Any
 /// other child element is skipped.
@@ -8532,6 +8729,27 @@ impl MkvDemuxer {
                     if !list.is_empty() {
                         additions = Some(std::sync::Arc::new(list));
                     }
+                }
+                ids::BLOCK_VIRTUAL => {
+                    // RFC 9559 Appendix A.3 — reclaimed data-less Block.
+                    meta.block_virtual = Some(read_bytes(&mut *self.input, e.size as usize)?);
+                }
+                ids::REFERENCE_VIRTUAL => {
+                    // RFC 9559 Appendix A.4 — reclaimed Segment Position of
+                    // a virtual Block's data.
+                    meta.reference_virtual = Some(read_int(&mut *self.input, e.size as usize)?);
+                }
+                ids::SLICES => {
+                    // RFC 9559 Appendix A.5..A.11 — reclaimed per-frame
+                    // time-slice descriptions; surfaced for re-mux.
+                    let s_end = self.input.stream_position()?.saturating_add(e.size);
+                    parse_slices(&mut *self.input, s_end, &mut meta.slices)?;
+                }
+                ids::REFERENCE_FRAME => {
+                    // RFC 9559 Appendix A.12..A.14 — reclaimed Smooth FF/RW
+                    // trick-track back-reference.
+                    let rf_end = self.input.stream_position()?.saturating_add(e.size);
+                    meta.reference_frame = Some(parse_reference_frame(&mut *self.input, rf_end)?);
                 }
                 _ => skip(&mut *self.input, e.size)?,
             }
