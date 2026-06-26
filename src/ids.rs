@@ -303,6 +303,27 @@ pub const FIELD_ORDER: u32 = 0x9D;
 // the multi-track alternative. Spec default is `0` (mono).
 pub const STEREO_MODE: u32 = 0x53B8;
 
+// OldStereoMode (RFC 9559 §5.1.4.1.28.5, maxver 2): the "bogus" StereoMode
+// value libmatroska prior to 0.9.0 wrote at id 0x53B9 instead of the correct
+// 0x53B8 (`StereoMode`). §18.10 records the bug: "There was also a bug in
+// [libmatroska] prior to 0.9.0 that would save/read it as 0x53B9 instead of
+// 0x53B8". The element has its **own** value space (Table 7) that is NOT
+// compatible with the modern `StereoMode` Table 5: only 0 (mono), 1 (right
+// eye), 2 (left eye), 3 (both eyes) ever appear here. Writers MUST NOT emit
+// it; Readers MAY support legacy files by checking for it. The container
+// surfaces it verbatim through a separate typed enum so a legacy file's 3D
+// intent is observable, and the muxer can round-trip it for a faithful
+// re-mux of such a file (the only situation in which a Writer touches it).
+pub const OLD_STEREO_MODE: u32 = 0x53B9;
+
+// OldStereoMode values (RFC 9559 §5.1.4.1.28.5, Table 7). Distinct value
+// space from the modern StereoMode (Table 5) — these four are the only
+// values that can appear in OldStereoMode.
+pub const OLD_STEREO_MODE_MONO: u64 = 0;
+pub const OLD_STEREO_MODE_RIGHT_EYE: u64 = 1;
+pub const OLD_STEREO_MODE_LEFT_EYE: u64 = 2;
+pub const OLD_STEREO_MODE_BOTH_EYES: u64 = 3;
+
 // Video > Colour master (RFC 9559 §5.1.4.1.28.16): the BT.709/2020/2100-style
 // colour-format description applied to the encoded video — chroma sub-sampling
 // and siting, signal range, transfer characteristics, colour primaries,

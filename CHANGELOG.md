@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: legacy `Video > OldStereoMode` (RFC 9559 §5.1.4.1.28.5, id
+  `0x53B9`, `maxver 2`) — the "bogus" stereo-3D mode value libmatroska prior to
+  0.9.0 wrote at the wrong Element ID (`0x53B9` instead of `0x53B8`, §18.10).
+  `MkvDemuxer::video_old_stereo_mode(stream_index) -> Option<OldStereoMode>`
+  (+ the `video_old_stereo_modes()` slice) surfaces it through a new typed enum
+  (`Mono` / `RightEye` / `LeftEye` / `BothEyes` / `Other(u64)`) kept separate
+  from the modern `StereoMode` because their value spaces (Table 7 vs Table 5)
+  are incompatible; no spec default is materialised, so absence reads `None`.
+  `MkvMuxer::set_video_old_stereo_mode(stream_index, OldStereoMode)` writes it
+  inside the `Video` master as a legacy / re-mux-only surface (omitted by
+  default, since a Writer MUST NOT emit it for new files). A mux→demux pipeline
+  round-trips the value bit-exactly. This closes the **last** RFC 9559
+  element-ID-registry entry the crate had not yet read or written — every
+  registry element is now both decoded and writable.
+
 - Muxer: Segment `Info` metadata write surface — `Title` (RFC 9559 §5.1.2.12)
   and `DateUTC` (§5.1.2.11). `MkvMuxer::set_title(impl Into<String>)` queues
   the Segment's general name; `set_date_utc_ns(i64)` queues the creation date

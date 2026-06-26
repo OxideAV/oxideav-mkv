@@ -599,6 +599,23 @@ the unified `oxideav` aggregator to wire decoding automatically.
   TrackCombinePlanes`, §5.1.4.1.30.1) is independent and surfaces
   through `track_operation`; a single track MAY carry both. A convenience
   `StereoMode::is_stereo()` returns `true` for any non-`Mono` packing.
+- **`Video > OldStereoMode` typed decode** (RFC 9559 §5.1.4.1.28.5, id
+  `0x53B9`, `maxver 2`): `MkvDemuxer::video_old_stereo_mode(stream_index) ->
+  Option<OldStereoMode>` (and the per-stream `video_old_stereo_modes()` slice)
+  surfaces the "bogus" stereo-3D mode value that [libmatroska] prior to 0.9.0
+  wrote at the *wrong* Element ID (`0x53B9` instead of `0x53B8`, §18.10). The
+  spec marks the element `maxver 2` and says a Writer MUST NOT use it, but a
+  Reader MAY support legacy files by reading it — which this accessor does. Its
+  value space (Table 7) is **incompatible** with the modern `StereoMode`
+  (Table 5): only `Mono` (`0`) / `RightEye` (`1`) / `LeftEye` (`2`) /
+  `BothEyes` (`3`) appear here, plus `Other(u64)` for any out-of-Table-7 value,
+  so the surface is deliberately kept **separate** from `video_stereo_mode`.
+  Unlike `StereoMode`, **no** spec default is materialised — a modern file with
+  no `OldStereoMode` element returns `None`, never a synthesised `Mono`; a
+  track MAY carry both (a transitional file aware of the libmatroska bug), and
+  the two surfaces report independently. `OldStereoMode::is_stereo()` /
+  `to_raw()` mirror the `StereoMode` helpers. This closes the last RFC 9559
+  element-registry entry the crate had not yet handled.
 - **`Video > Projection` typed decode** (RFC 9559 §5.1.4.1.28.41,
   including §5.1.4.1.28.42..§5.1.4.1.28.46):
   `MkvDemuxer::video_projection(stream_index)` (and the per-stream
@@ -854,6 +871,22 @@ the unified `oxideav` aggregator to wire decoding automatically.
   downstream tool that might infer something else. Pairs symmetrically
   with the existing `MkvDemuxer::video_stereo_mode` /
   `MkvDemuxer::video_alpha_mode` typed accessors.
+- **`Video > OldStereoMode` on write** (RFC 9559 §5.1.4.1.28.5, id `0x53B9`):
+  `MkvMuxer::set_video_old_stereo_mode(stream_index, OldStereoMode)` queues the
+  legacy libmatroska-bug element, written inside the track's `Video` master at
+  `write_header` time. This is a **legacy / re-mux-only** surface: the spec
+  marks the element `maxver 2` and says a Writer MUST NOT use it for new files
+  (modern stereo-3D belongs in `set_video_stereo_mode` or
+  `set_track_operation`). It exists solely so a faithful re-mux of a Matroska
+  v2 / libmatroska-bug source can round-trip the element the demuxer surfaced
+  through `video_old_stereo_mode`. `OldStereoMode::to_raw()` round-trips every
+  Table 7 value plus the `Other(u64)` forward-compat variant. Omitting the call
+  (the default) keeps the element off-disk — the correct behaviour for every
+  modern file. Spec rules enforced at queue time: rejects post-`write_header`
+  use, out-of-range `stream_index`, and calls on non-video tracks. Pairs
+  symmetrically with `MkvDemuxer::video_old_stereo_mode` — a mux→demux pipeline
+  preserves the legacy value bit-exactly. With this, **every element in the
+  RFC 9559 element-ID registry is now both read and written**.
 - **`Video > UncompressedFourCC` on write** (RFC 9559 §5.1.4.1.28.15):
   `MkvMuxer::set_video_uncompressed_fourcc(stream_index, [u8; 4])`
   queues a per-track FourCC hint that lands inside the track's
@@ -1367,7 +1400,9 @@ so the demuxer never hides an unrecognised track.
   the full `Colour` master (§5.1.4.1.28.16) — including HDR metadata
   (`MaxCLL` / `MaxFALL` / `MasteringMetadata`) — surfaces through
   `video_colour`; `StereoMode` (§5.1.4.1.28.3) surfaces through
-  `video_stereo_mode`; the `Projection` master (§5.1.4.1.28.41) —
+  `video_stereo_mode` and the legacy `OldStereoMode` (§5.1.4.1.28.5, id
+  `0x53B9`) through `video_old_stereo_mode`; the `Projection` master
+  (§5.1.4.1.28.41) —
   including `ProjectionType`, the verbatim ISOBMFF-mirrored
   `ProjectionPrivate` payload, and the yaw / pitch / roll pose triple —
   surfaces through `video_projection`; `AlphaMode` (§5.1.4.1.28.4)
@@ -1406,9 +1441,10 @@ so the demuxer never hides an unrecognised track.
   `MkvProjection::equirectangular()` and `MkvProjection::rotated()` cover
   the 360°-VR and roll-only shapes), and the reclaimed Appendix-A
   `AspectRatioType` element (`MkvMuxer::set_video_aspect_ratio_type`,
-  Appendix A.24, id `0x54B3`) are written. The `Video` sub-element set
-  is now fully symmetric — every element the demux side reads, the mux
-  side can write.
+  Appendix A.24, id `0x54B3`), and the legacy `OldStereoMode`
+  (`MkvMuxer::set_video_old_stereo_mode`, §5.1.4.1.28.5, id `0x53B9`) are
+  written. The `Video` sub-element set is now fully symmetric — every
+  element the demux side reads, the mux side can write.
 
 ## Robustness
 

@@ -623,6 +623,17 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         .map(|t| t.stereo_mode_raw.map(StereoMode::from_raw))
         .collect();
 
+    // Per-stream `OldStereoMode` (RFC 9559 §5.1.4.1.28.5, id `0x53B9`), indexed
+    // by stream index. `None` unless the legacy element was physically on disk
+    // — `parse_video` does not materialise a default for it, since a modern
+    // file legitimately has no `OldStereoMode`. Kept separate from
+    // `video_stereo_modes` because the two value spaces are incompatible
+    // (§18.10).
+    let video_old_stereo_modes: Vec<Option<OldStereoMode>> = tracks
+        .iter()
+        .map(|t| t.old_stereo_mode_raw.map(OldStereoMode::from_raw))
+        .collect();
+
     // Per-stream `Projection` (RFC 9559 §5.1.4.1.28.41), indexed by stream
     // index. `None` for non-video tracks and for video tracks whose `Video`
     // master carried no `Projection` child. `parse_video` materialises the
@@ -774,6 +785,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         video_geometries,
         video_colours,
         video_stereo_modes,
+        video_old_stereo_modes,
         video_projections,
         video_alpha_modes,
         video_aspect_ratio_types,
@@ -1349,6 +1361,13 @@ struct TrackEntry {
     /// master exists but no `StereoMode` child is present, this carries the
     /// spec default `0` (mono) so the typed surface materialises it.
     stereo_mode_raw: Option<u64>,
+    /// Raw `OldStereoMode` (RFC 9559 §5.1.4.1.28.5, id `0x53B9`) captured
+    /// during the `Video` walk. Unlike `stereo_mode_raw`, the spec default is
+    /// **not** materialised — this stays `None` unless the legacy element was
+    /// physically on disk, because a modern file legitimately has no
+    /// `OldStereoMode` at all. Surfaced verbatim through the separate
+    /// [`OldStereoMode`] typed surface.
+    old_stereo_mode_raw: Option<u64>,
     /// Raw `Projection` master (RFC 9559 §5.1.4.1.28.41) captured during the
     /// `Video` walk. `None` when the track is not a video track or its
     /// `Video` master carried no `Projection` child. When the `Projection`
@@ -3482,6 +3501,75 @@ impl StereoMode {
             StereoMode::BothEyesLacedLeftFirst => ids::STEREO_MODE_BOTH_EYES_LACED_LEFT_FIRST,
             StereoMode::BothEyesLacedRightFirst => ids::STEREO_MODE_BOTH_EYES_LACED_RIGHT_FIRST,
             StereoMode::Other(v) => v,
+        }
+    }
+}
+
+/// `OldStereoMode` (RFC 9559 §5.1.4.1.28.5, Table 7): the legacy, "bogus"
+/// stereo-3D mode value that [libmatroska] prior to 0.9.0 wrote at the wrong
+/// Element ID (`0x53B9`) with an incompatible value space. §18.10 records the
+/// bug; the spec marks the element `maxver: 2` and says a Writer MUST NOT use
+/// it, but a Reader MAY support legacy files by reading it.
+///
+/// Surfaced per stream via [`MkvDemuxer::video_old_stereo_mode`], kept
+/// **separate** from the modern [`StereoMode`] surface because the two value
+/// spaces are not interchangeable: Table 7 enumerates only `0` (mono), `1`
+/// (right eye), `2` (left eye), `3` (both eyes), and "they are not compatible
+/// with the StereoMode values found in Matroska v3 and above" (§18.10). A
+/// caller that finds a `Some(OldStereoMode)` and a `Some(StereoMode::Mono)`
+/// on the same track should trust the old value only when the file is a
+/// Matroska v2 / libmatroska-bug artifact.
+///
+/// Unlike [`StereoMode`], absence is **not** materialised as a default — the
+/// accessor returns `None` when the legacy element wasn't on disk, since a
+/// modern file legitimately has no `OldStereoMode` at all. Values outside
+/// Table 7 pass through [`OldStereoMode::Other`] rather than being dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OldStereoMode {
+    /// `0` — mono (no stereo packing).
+    Mono,
+    /// `1` — right eye.
+    RightEye,
+    /// `2` — left eye.
+    LeftEye,
+    /// `3` — both eyes (laced in one Block).
+    BothEyes,
+    /// Any value not in §5.1.4.1.28.5 Table 7. Surfaced rather than dropped so
+    /// callers debugging a malformed legacy file can still see the writer's
+    /// intent.
+    Other(u64),
+}
+
+impl OldStereoMode {
+    /// Map a raw `OldStereoMode` integer onto the enum, preserving values
+    /// outside §5.1.4.1.28.5 Table 7 via [`OldStereoMode::Other`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            ids::OLD_STEREO_MODE_MONO => OldStereoMode::Mono,
+            ids::OLD_STEREO_MODE_RIGHT_EYE => OldStereoMode::RightEye,
+            ids::OLD_STEREO_MODE_LEFT_EYE => OldStereoMode::LeftEye,
+            ids::OLD_STEREO_MODE_BOTH_EYES => OldStereoMode::BothEyes,
+            other => OldStereoMode::Other(other),
+        }
+    }
+
+    /// `true` when this OldStereoMode is anything other than
+    /// [`OldStereoMode::Mono`].
+    pub fn is_stereo(&self) -> bool {
+        !matches!(self, OldStereoMode::Mono)
+    }
+
+    /// Inverse of [`OldStereoMode::from_raw`]: convert the typed enum back to
+    /// its on-disk `OldStereoMode` value (RFC 9559 §5.1.4.1.28.5, Table 7).
+    /// [`OldStereoMode::Other`] round-trips its wrapped value verbatim. Used by
+    /// the muxer's legacy `Video > OldStereoMode` write path.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            OldStereoMode::Mono => ids::OLD_STEREO_MODE_MONO,
+            OldStereoMode::RightEye => ids::OLD_STEREO_MODE_RIGHT_EYE,
+            OldStereoMode::LeftEye => ids::OLD_STEREO_MODE_LEFT_EYE,
+            OldStereoMode::BothEyes => ids::OLD_STEREO_MODE_BOTH_EYES,
+            OldStereoMode::Other(v) => v,
         }
     }
 }
@@ -6338,6 +6426,10 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     // StereoMode (§5.1.4.1.28.3, default 0 = mono). A `Video` master with
     // no explicit `StereoMode` decodes to `Mono` on the typed surface.
     let mut stereo_mode: u64 = ids::STEREO_MODE_MONO;
+    // OldStereoMode (§5.1.4.1.28.5, id 0x53B9, maxver 2). No spec default is
+    // materialised — stays `None` unless the legacy element is physically
+    // present, because a modern file has no `OldStereoMode` at all.
+    let mut old_stereo_mode: Option<u64> = None;
     // AlphaMode (§5.1.4.1.28.4, default 0 = none).
     let mut alpha_mode: u64 = ids::ALPHA_MODE_NONE;
     while r.stream_position()? < end {
@@ -6348,6 +6440,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::FLAG_INTERLACED => flag_interlaced = read_uint(r, e.size as usize)?,
             ids::FIELD_ORDER => field_order = read_uint(r, e.size as usize)?,
             ids::STEREO_MODE => stereo_mode = read_uint(r, e.size as usize)?,
+            ids::OLD_STEREO_MODE => old_stereo_mode = Some(read_uint(r, e.size as usize)?),
             ids::ALPHA_MODE => alpha_mode = read_uint(r, e.size as usize)?,
             ids::ASPECT_RATIO_TYPE => {
                 // Reclaimed Appendix A.24 element — no spec default; surface only
@@ -6416,6 +6509,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
         display_unit,
     ));
     t.stereo_mode_raw = Some(stereo_mode);
+    t.old_stereo_mode_raw = old_stereo_mode;
     t.alpha_mode_raw = Some(alpha_mode);
     Ok(())
 }
@@ -6673,6 +6767,13 @@ pub struct MkvDemuxer {
     /// for a `Video` master with no explicit child. See
     /// [`MkvDemuxer::video_stereo_mode`].
     video_stereo_modes: Vec<Option<StereoMode>>,
+    /// Per-stream `OldStereoMode` (RFC 9559 §5.1.4.1.28.5, id `0x53B9`) — the
+    /// legacy libmatroska-bug stereo-3D mode — indexed by stream index. `None`
+    /// unless the legacy element was physically on disk (no spec default is
+    /// materialised). Kept distinct from `video_stereo_modes` because the
+    /// value spaces are incompatible (§18.10). See
+    /// [`MkvDemuxer::video_old_stereo_mode`].
+    video_old_stereo_modes: Vec<Option<OldStereoMode>>,
     /// Per-stream `Projection` (RFC 9559 §5.1.4.1.28.41) — the spherical /
     /// VR-video projection plus the yaw / pitch / roll pose triple —
     /// indexed by stream index. `None` for non-video tracks and for video
@@ -7689,6 +7790,42 @@ impl MkvDemuxer {
     /// semantics.
     pub fn video_stereo_modes(&self) -> &[Option<StereoMode>] {
         &self.video_stereo_modes
+    }
+
+    /// `OldStereoMode` (RFC 9559 §5.1.4.1.28.5, id `0x53B9`) for the stream at
+    /// `stream_index`, or `None` when the track carried no such legacy element.
+    ///
+    /// `OldStereoMode` is the "bogus" stereo-3D value libmatroska prior to
+    /// 0.9.0 wrote at the wrong Element ID (`0x53B9` instead of `0x53B8`,
+    /// §18.10). The spec marks it `maxver: 2` and tells Writers MUST NOT use
+    /// it, but Readers MAY support legacy files by reading it — which is what
+    /// this accessor does. The value space ([`OldStereoMode`], Table 7) is
+    /// **incompatible** with the modern [`StereoMode`] (Table 5): only `0`
+    /// (mono), `1` (right eye), `2` (left eye), `3` (both eyes) appear here,
+    /// so the surface is deliberately kept separate from
+    /// [`MkvDemuxer::video_stereo_mode`]. Values outside Table 7 pass through
+    /// [`OldStereoMode::Other`].
+    ///
+    /// Unlike `video_stereo_mode`, **no** spec default is materialised — a
+    /// modern file with no `OldStereoMode` element returns `None`, never a
+    /// synthesised `Mono`. A caller reconstructing a legacy file's 3D intent
+    /// should prefer the modern `StereoMode` when present and fall back to
+    /// `OldStereoMode` only for a Matroska v2 / libmatroska-bug artifact.
+    ///
+    /// Returns `None` for an out-of-range `stream_index`.
+    pub fn video_old_stereo_mode(&self, stream_index: u32) -> Option<OldStereoMode> {
+        self.video_old_stereo_modes
+            .get(stream_index as usize)
+            .and_then(|v| *v)
+    }
+
+    /// All per-stream `OldStereoMode`s (RFC 9559 §5.1.4.1.28.5), indexed by
+    /// stream index. The slice has one entry per stream — `None` for every
+    /// track that carried no `OldStereoMode` element (the common case; only
+    /// legacy libmatroska-bug files carry it). See
+    /// [`MkvDemuxer::video_old_stereo_mode`] for the semantics.
+    pub fn video_old_stereo_modes(&self) -> &[Option<OldStereoMode>] {
+        &self.video_old_stereo_modes
     }
 
     /// `Projection` (RFC 9559 §5.1.4.1.28.41) for the stream at

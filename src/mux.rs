@@ -34,8 +34,8 @@ use crate::codec_id;
 use crate::demux::{
     AlphaMode, ChapterTranslate, ChromaSitingHorz, ChromaSitingVert, ColourRange,
     ContentEncodingTransform, ContentEncodings, DisplayUnit, FieldOrder, FlagInterlaced,
-    MatrixCoefficients, Primaries, ProjectionType, SegmentLinking, StereoMode, TrackPlaneType,
-    TransferCharacteristics,
+    MatrixCoefficients, OldStereoMode, Primaries, ProjectionType, SegmentLinking, StereoMode,
+    TrackPlaneType, TransferCharacteristics,
 };
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
@@ -490,6 +490,17 @@ pub struct MkvMuxer {
     /// `streams.len()`; non-video tracks must stay `None` (validated
     /// at `set_video_stereo_mode` time).
     video_stereo_modes: Vec<Option<StereoMode>>,
+    /// Per-stream `Video > OldStereoMode` hint queued via
+    /// [`MkvMuxer::set_video_old_stereo_mode`] (RFC 9559 §5.1.4.1.28.5,
+    /// id `0x53B9`). Materialised inside each video track's `Video` master at
+    /// `write_header` time. `None` (the default) means the muxer omits the
+    /// element entirely — the overwhelmingly common case, since a Writer MUST
+    /// NOT emit this legacy element for new files. It exists only so a faithful
+    /// re-mux of a Matroska v2 / libmatroska-bug source can round-trip the
+    /// element the demuxer surfaced. The slice is sized to `streams.len()`;
+    /// non-video tracks must stay `None` (validated at
+    /// `set_video_old_stereo_mode` time).
+    video_old_stereo_modes: Vec<Option<OldStereoMode>>,
     /// Per-stream `Video > AlphaMode` hint queued via
     /// [`MkvMuxer::set_video_alpha_mode`] (RFC 9559 §5.1.4.1.28.4).
     /// Materialised inside each video track's `Video` master at
@@ -1912,6 +1923,7 @@ impl MkvMuxer {
             lace_pending: vec![LaceBuffer::default(); n],
             video_interlacings: vec![None; n],
             video_stereo_modes: vec![None; n],
+            video_old_stereo_modes: vec![None; n],
             video_alpha_modes: vec![None; n],
             video_geometries: vec![None; n],
             video_uncompressed_fourccs: vec![None; n],
@@ -2113,6 +2125,72 @@ impl MkvMuxer {
     /// then call `write_header`.
     pub fn video_stereo_mode(&self, stream_index: usize) -> Option<StereoMode> {
         *self.video_stereo_modes.get(stream_index)?
+    }
+
+    /// Set the per-track legacy `Video > OldStereoMode` (RFC 9559
+    /// §5.1.4.1.28.5, id `0x53B9`) for one stream. Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] otherwise — the
+    /// element lives in the `Video` master inside `Tracks`, written exactly
+    /// once at header time.
+    ///
+    /// **This is a legacy / re-mux-only surface.** `OldStereoMode` is the
+    /// "bogus" stereo-3D value libmatroska prior to 0.9.0 wrote at the wrong
+    /// Element ID (`0x53B9` instead of `0x53B8`, §18.10). The spec marks the
+    /// element `maxver: 2` and tells Writers MUST NOT use it for new files —
+    /// modern stereo-3D belongs in `StereoMode` (see
+    /// [`MkvMuxer::set_video_stereo_mode`]) or `TrackOperation`. This setter
+    /// exists only so a faithful re-mux of a Matroska v2 / libmatroska-bug
+    /// source can round-trip the element the demuxer surfaced through
+    /// [`MkvDemuxer::video_old_stereo_mode`]. Omitting the call (the default)
+    /// keeps the element off-disk — the correct behaviour for every modern
+    /// file. The two value spaces are incompatible (Table 7 vs Table 5), so
+    /// this never mixes with `set_video_stereo_mode`; a caller copying a
+    /// legacy file should propagate whichever element the source carried.
+    ///
+    /// Spec rules enforced at queue time:
+    ///
+    /// * `stream_index` must point at an existing stream. Out-of-range indices
+    ///   return [`Error::invalid`].
+    /// * The target stream's [`MediaType`] must be [`MediaType::Video`].
+    ///   Non-video tracks have no `Video` master and the call is rejected.
+    ///
+    /// [`OldStereoMode::Other(v)`] round-trips its wrapped value verbatim.
+    /// Calling this twice on the same `stream_index` overwrites the previously
+    /// queued value. Returns a mutable reference back so calls can chain
+    /// builder-style.
+    pub fn set_video_old_stereo_mode(
+        &mut self,
+        stream_index: usize,
+        mode: OldStereoMode,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_video_old_stereo_mode called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_old_stereo_mode stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if self.streams[stream_index].params.media_type != MediaType::Video {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_video_old_stereo_mode on stream {stream_index} ({}) — only Video tracks carry a Video master",
+                self.streams[stream_index].params.codec_id.as_str()
+            )));
+        }
+        self.video_old_stereo_modes[stream_index] = Some(mode);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `OldStereoMode` hint
+    /// installed via [`MkvMuxer::set_video_old_stereo_mode`]. Returns `None`
+    /// for any stream that didn't have the API called (the muxer omits the
+    /// legacy element — the correct behaviour for modern files). Mostly useful
+    /// for tests.
+    pub fn video_old_stereo_mode(&self, stream_index: usize) -> Option<OldStereoMode> {
+        *self.video_old_stereo_modes.get(stream_index)?
     }
 
     /// Set the per-track `Video > AlphaMode` (RFC 9559 §5.1.4.1.28.4) for
@@ -4031,6 +4109,17 @@ impl Muxer for MkvMuxer {
                 // it lets the demuxer materialise the spec default `0` mono.
                 if let Some(sm) = self.video_stereo_modes[i] {
                     write_uint_element(&mut video, ids::STEREO_MODE, sm.to_raw());
+                }
+                // OldStereoMode (§5.1.4.1.28.5, id 0x53B9) — the legacy
+                // libmatroska-bug element. Written ONLY when the caller
+                // explicitly opted in via `set_video_old_stereo_mode`, which
+                // exists solely so a faithful re-mux of a Matroska v2 /
+                // libmatroska-bug file can round-trip the element the demuxer
+                // surfaced. The spec marks it maxver 2 and says a Writer MUST
+                // NOT use it for new files — never emitted unless the caller
+                // copies it deliberately from a legacy source.
+                if let Some(osm) = self.video_old_stereo_modes[i] {
+                    write_uint_element(&mut video, ids::OLD_STEREO_MODE, osm.to_raw());
                 }
                 // AlphaMode (§5.1.4.1.28.4) — written only when the caller
                 // explicitly opted in via `set_video_alpha_mode`. Omitting
