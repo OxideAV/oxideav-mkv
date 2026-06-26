@@ -1203,7 +1203,7 @@ pub struct TrackTranslate {
 /// [`TrackLegacy::is_empty`] reports the all-absent state — the overwhelmingly
 /// common case for a modern file, in which case the typed accessor returns
 /// `None` rather than a hollow record.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TrackLegacy {
     /// `CodecSettings` (RFC 9559 Appendix A.19, id `0x3A9697`, utf-8) — a
     /// string describing the encoding settings used. `None` when absent.
@@ -1238,6 +1238,19 @@ pub struct TrackLegacy {
     /// Timestamp to adjust the track's playback offset. Surfaced verbatim
     /// (`None` when absent); the container does not apply it.
     pub track_offset: Option<i64>,
+    /// `GammaValue` (RFC 9559 Appendix A.25, id `0x2FB523`, float) — the
+    /// gamma value, nested in the `Video` master. `None` when absent.
+    pub gamma_value: Option<f64>,
+    /// `FrameRate` (RFC 9559 Appendix A.26, id `0x2383E3`, float) —
+    /// informational frames-per-second for a constant-frame-rate track,
+    /// nested in the `Video` master. The appendix marks it informational and
+    /// not for VFR; surfaced verbatim (`None` when absent), never used for
+    /// timing by the container.
+    pub frame_rate: Option<f64>,
+    /// `ChannelPositions` (RFC 9559 Appendix A.27, id `0x7D7B`, binary) — a
+    /// table of horizontal angles for each successive channel, nested in the
+    /// `Audio` master. Surfaced verbatim (`None` when absent).
+    pub channel_positions: Option<Vec<u8>>,
     /// `TrackOverlay` (RFC 9559 Appendix A.23, id `0x6FAB`, uinteger) — the
     /// `TrackNumber`(s) of tracks to play instead of this one when this track
     /// has a gap on `SilentTracks`. **Order is load-bearing** per the appendix:
@@ -1281,6 +1294,9 @@ impl TrackLegacy {
             && self.min_cache.is_none()
             && self.max_cache.is_none()
             && self.track_offset.is_none()
+            && self.gamma_value.is_none()
+            && self.frame_rate.is_none()
+            && self.channel_positions.is_none()
             && self.track_overlays.is_empty()
             && self.trick_track_uid.is_none()
             && self.trick_track_segment_uid.is_none()
@@ -6751,6 +6767,10 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     // (`SamplingFrequency = 8000.0`, `Channels = 1`); the existing flat
     // `t.sample_rate` / `t.channels` / `t.bit_depth` legacy fields keep
     // their previous semantics so non-typed callers don't regress.
+    // ChannelPositions (RFC 9559 Appendix A.27) is a reclaimed Audio child
+    // surfaced on `TrackLegacy`; stage it locally so it can be written back
+    // after the `t.audio_raw` borrow below is released.
+    let mut channel_positions: Option<Vec<u8>> = None;
     let raw = t.audio_raw.get_or_insert_with(RawTrackAudio::default);
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
@@ -6773,8 +6793,14 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                 raw.bit_depth = Some(v);
                 t.bit_depth = v;
             }
+            ids::CHANNEL_POSITIONS => {
+                channel_positions = Some(read_bytes(r, e.size as usize)?);
+            }
             _ => skip(r, e.size)?,
         }
+    }
+    if let Some(cp) = channel_positions {
+        t.legacy.channel_positions = Some(cp);
     }
     Ok(())
 }
@@ -6849,6 +6875,14 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::STEREO_MODE => stereo_mode = read_uint(r, e.size as usize)?,
             ids::OLD_STEREO_MODE => old_stereo_mode = Some(read_uint(r, e.size as usize)?),
             ids::ALPHA_MODE => alpha_mode = read_uint(r, e.size as usize)?,
+            ids::GAMMA_VALUE => {
+                // RFC 9559 Appendix A.25 — reclaimed Video gamma value.
+                t.legacy.gamma_value = Some(read_float(r, e.size as usize)?);
+            }
+            ids::FRAME_RATE => {
+                // RFC 9559 Appendix A.26 — reclaimed informational fps.
+                t.legacy.frame_rate = Some(read_float(r, e.size as usize)?);
+            }
             ids::ASPECT_RATIO_TYPE => {
                 // Reclaimed Appendix A.24 element — no spec default; surface only
                 // when the file actually carries it.

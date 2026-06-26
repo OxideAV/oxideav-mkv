@@ -123,6 +123,11 @@ fn full_legacy_record_round_trips() {
         min_cache: Some(2),
         max_cache: Some(10),
         track_offset: Some(-1_000_000),
+        gamma_value: Some(2.2),
+        frame_rate: Some(23.976),
+        // ChannelPositions is Audio-only; this is a video track, so leave it
+        // unset (covered by its own test).
+        channel_positions: None,
         track_overlays: vec![7, 3, 5],
         trick_track_uid: Some(0xDEAD),
         trick_track_segment_uid: Some(seg_a.clone()),
@@ -146,6 +151,16 @@ fn full_legacy_record_round_trips() {
     assert_eq!(got.min_cache, Some(2));
     assert_eq!(got.max_cache, Some(10));
     assert_eq!(got.track_offset, Some(-1_000_000));
+    assert_eq!(
+        got.gamma_value,
+        Some(2.2),
+        "GammaValue round-trips in Video"
+    );
+    assert_eq!(
+        got.frame_rate,
+        Some(23.976),
+        "FrameRate round-trips in Video"
+    );
     assert_eq!(
         got.track_overlays,
         vec![7, 3, 5],
@@ -289,4 +304,56 @@ fn setter_rejects_non_16_byte_segment_uid() {
     assert!(msg.contains("TrickTrackSegmentUID"), "msg: {msg}");
     assert!(msg.contains("16-byte"), "msg: {msg}");
     let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
+fn channel_positions_round_trips_in_audio_master() {
+    // RFC 9559 Appendix A.27 — ChannelPositions is nested in the Audio
+    // master, so it needs an audio track to land. Drive a one-track audio
+    // MKV and confirm the binary table round-trips through TrackLegacy.
+    let mut p = CodecParameters::audio(CodecId::new("A_PCM/INT/LIT"));
+    p.sample_rate = Some(48_000);
+    p.channels = Some(2);
+    let audio = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 1000),
+        duration: None,
+        start_time: Some(0),
+        params: p,
+    };
+
+    let tmp = tmp_path("chanpos");
+    {
+        let f = std::fs::File::create(&tmp).expect("create tmp");
+        let ws: Box<dyn WriteSeek> = Box::new(f);
+        let mut mx =
+            MkvMuxer::new_matroska(ws, std::slice::from_ref(&audio)).expect("muxer construct");
+        mx.set_track_legacy(
+            0,
+            MkvTrackLegacy {
+                channel_positions: Some(vec![0x00, 0x5A, 0xB4]),
+                ..Default::default()
+            },
+        )
+        .expect("set_track_legacy");
+        mx.write_header().expect("write_header");
+        let mut pkt = Packet::new(0, TimeBase::new(1, 1000), vec![0x01; 32]);
+        pkt.pts = Some(0);
+        pkt.flags.keyframe = true;
+        mx.write_packet(&pkt).expect("packet");
+        mx.write_trailer().expect("write_trailer");
+    }
+    let bytes = std::fs::read(&tmp).expect("re-read");
+    let _ = std::fs::remove_file(&tmp);
+
+    let dmx = demux_typed(bytes);
+    let got = dmx.track_legacy(0).expect("legacy surfaced");
+    assert_eq!(
+        got.channel_positions.as_deref(),
+        Some(&[0x00, 0x5A, 0xB4][..]),
+        "ChannelPositions round-trips through the Audio master"
+    );
+    // Gamma / FrameRate are Video-only and stay absent on an audio track.
+    assert!(got.gamma_value.is_none());
+    assert!(got.frame_rate.is_none());
 }

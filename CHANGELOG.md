@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: three reclaimed Video/Audio-master legacy elements on
+  `TrackLegacy` / `MkvTrackLegacy` (RFC 9559 Appendix A.25..A.27) — `GammaValue`
+  (A.25, `0x2FB523`, float, Video), `FrameRate` (A.26, `0x2383E3`, float, Video
+  — informational fps, never used for timing by the container), and
+  `ChannelPositions` (A.27, `0x7D7B`, binary, Audio — per-channel horizontal
+  angles). Surfaced verbatim from / written into the enclosing `Video` / `Audio`
+  master for a faithful re-mux; a mux→demux pipeline round-trips them. The
+  floats mean `TrackLegacy` / `MkvTrackLegacy` now derive `PartialEq` only (no
+  longer `Eq`).
+
 - Muxer: write side for the reclaimed `BlockGroup` children (RFC 9559 Appendix
   A.3..A.14) — `BlockGroupOptions` gains `block_virtual`, `reference_virtual`,
   `slices` (a `Vec<TimeSlice>` written as one `Slices` master) and

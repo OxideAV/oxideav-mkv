@@ -275,7 +275,7 @@ the unified `oxideav` aggregator to wire decoding automatically.
   mirroring the tolerant `ChapterTranslate` parse. Returns an empty slice for a
   track with no `TrackTranslate` child (the common case) or an out-of-range
   `stream_index`.
-- **Typed `TrackLegacy` accessor** (RFC 9559 Appendix A.16..A.23 +
+- **Typed `TrackLegacy` accessor** (RFC 9559 Appendix A.16..A.27 +
   A.28..A.32): `MkvDemuxer::track_legacy(stream_index) ->
   Option<&TrackLegacy>` (and the per-stream `all_track_legacy()` slice)
   folds the reclaimed `TrackEntry`-level legacy elements — the ones the
@@ -287,7 +287,9 @@ the unified `oxideav` aggregator to wire decoding automatically.
   uinteger — `can_decode_damaged()` predicate), the cache / offset hints
   (`MinCache` A.16, `MaxCache` A.17, signed `TrackOffset` A.18 — a
   Matroska-Tick playback-offset the container surfaces but does not apply),
-  the **ordered**
+  the reclaimed Video/Audio-master children (`GammaValue` A.25 + `FrameRate`
+  A.26 floats nested in `Video`; `ChannelPositions` A.27 binary nested in
+  `Audio` — all surfaced verbatim, none applied), the **ordered**
   `TrackOverlay` fallback list (A.23 — "the order of multiple TrackOverlay
   matters", surfaced verbatim so the preference chain is preserved), and
   the DivXTrickTrack Smooth-FF/RW pairing quintet (`TrickTrackUID` A.28,
@@ -1279,12 +1281,14 @@ the unified `oxideav` aggregator to wire decoding automatically.
   the new `MkvDemuxer::track_translates` typed accessor — a mux→demux pipeline
   round-trips every mapping field-for-field.
 - **Reclaimed Appendix-A `TrackLegacy` on write** (RFC 9559 Appendix
-  A.16..A.23 + A.28..A.32): `MkvMuxer::set_track_legacy(stream_index,
+  A.16..A.27 + A.28..A.32): `MkvMuxer::set_track_legacy(stream_index,
   MkvTrackLegacy)` queues the historical `TrackEntry`-level legacy elements —
   `CodecSettings` / `CodecInfoURL` / `CodecDownloadURL` / `CodecDecodeAll`
   codec-description metadata, the `MinCache` / `MaxCache` / signed `TrackOffset`
-  cache-and-offset hints (A.16..A.18), the ordered `TrackOverlay` fallback
-  list, and the DivXTrickTrack pairing quintet — which land inside the carrying `TrackEntry`
+  cache-and-offset hints (A.16..A.18), the `GammaValue` / `FrameRate` floats
+  (A.25 / A.26, written inside the `Video` master) and `ChannelPositions`
+  binary (A.27, written inside the `Audio` master), the ordered `TrackOverlay`
+  fallback list, and the DivXTrickTrack pairing quintet — which land inside the carrying `TrackEntry`
   (after the `TrackTranslate` masters) at `write_header` time. Only populated
   fields reach the disk: an absent field (`None` / empty `Vec`) keeps its
   element off-disk, so the demuxer observes the same absence. The appendix

@@ -174,6 +174,16 @@ pub const TRACK_OVERLAY: u32 = 0x6FAB;
 pub const MIN_CACHE: u32 = 0x6DE7;
 pub const MAX_CACHE: u32 = 0x6DF8;
 pub const TRACK_OFFSET: u32 = 0x537F;
+// Three reclaimed elements nested in the Video / Audio masters (RFC 9559
+// Appendix A.25..A.27). `GammaValue` (A.25, float, Video): the gamma value.
+// `FrameRate` (A.26, float, Video): informational frames-per-second for a
+// constant-frame-rate track (not to be used for VFR). `ChannelPositions`
+// (A.27, binary, Audio): a table of horizontal angles for each successive
+// channel. Surfaced verbatim on `TrackLegacy` for a faithful re-mux; the
+// container interprets none of them.
+pub const GAMMA_VALUE: u32 = 0x2FB523;
+pub const FRAME_RATE: u32 = 0x2383E3;
+pub const CHANNEL_POSITIONS: u32 = 0x7D7B;
 
 // DivXTrickTrack pairing quintet (RFC 9559 Appendix A.28..A.32). These tie a
 // video track to its Smooth FF/RW companion in a paired EBML structure. The

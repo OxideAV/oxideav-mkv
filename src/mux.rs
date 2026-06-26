@@ -719,7 +719,7 @@ impl MkvTrackTranslate {
 /// observes the same absence. None carries a spec default, so there is no
 /// "default suppression" rule: a `Some(0)` `decode_all` / `trick_track_flag`
 /// is written as an explicit `0`, distinct from omission.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MkvTrackLegacy {
     /// `CodecSettings` (Appendix A.19, utf-8) — a string describing the
     /// encoding settings used. `None` → element omitted.
@@ -745,6 +745,16 @@ pub struct MkvTrackLegacy {
     /// added to each Block's Timestamp to adjust the track's playback offset.
     /// `None` → element omitted; `Some(0)` writes an explicit `0`.
     pub track_offset: Option<i64>,
+    /// `GammaValue` (Appendix A.25, float) — the gamma value, written inside
+    /// the `Video` master. `None` → omitted. Only meaningful on a video track.
+    pub gamma_value: Option<f64>,
+    /// `FrameRate` (Appendix A.26, float) — informational fps, written inside
+    /// the `Video` master. `None` → omitted. Only meaningful on a video track.
+    pub frame_rate: Option<f64>,
+    /// `ChannelPositions` (Appendix A.27, binary) — a table of horizontal
+    /// angles per channel, written inside the `Audio` master. `None` →
+    /// omitted. Only meaningful on an audio track.
+    pub channel_positions: Option<Vec<u8>>,
     /// `TrackOverlay` (Appendix A.23, uinteger) — the *ordered* overlay-track
     /// fallback `TrackNumber`s. Written in slice order; the appendix makes the
     /// order load-bearing (first entry preferred). Empty → no element.
@@ -777,6 +787,9 @@ impl MkvTrackLegacy {
             && self.min_cache.is_none()
             && self.max_cache.is_none()
             && self.track_offset.is_none()
+            && self.gamma_value.is_none()
+            && self.frame_rate.is_none()
+            && self.channel_positions.is_none()
             && self.track_overlays.is_empty()
             && self.trick_track_uid.is_none()
             && self.trick_track_segment_uid.is_none()
@@ -4195,6 +4208,14 @@ impl Muxer for MkvMuxer {
                 if let Some(bd) = bit_depth {
                     write_uint_element(&mut audio, ids::BIT_DEPTH, bd);
                 }
+                // ChannelPositions (RFC 9559 Appendix A.27) — reclaimed Audio
+                // child queued through `set_track_legacy`, written verbatim
+                // for a faithful re-mux.
+                if let Some(leg) = &self.track_legacy[i] {
+                    if let Some(cp) = &leg.channel_positions {
+                        write_bytes_element(&mut audio, ids::CHANNEL_POSITIONS, cp);
+                    }
+                }
                 write_master_element(&mut t, ids::AUDIO, &audio);
             }
             if s.params.media_type == MediaType::Video {
@@ -4460,6 +4481,18 @@ impl Muxer for MkvMuxer {
                         write_float_element(&mut proj, ids::PROJECTION_POSE_ROLL, p.pose_roll);
                     }
                     write_master_element(&mut video, ids::PROJECTION, &proj);
+                }
+                // GammaValue / FrameRate (RFC 9559 Appendix A.25 / A.26) —
+                // reclaimed Video children queued through `set_track_legacy`,
+                // written verbatim for a faithful re-mux. FrameRate is
+                // informational; the container never uses it for timing.
+                if let Some(leg) = &self.track_legacy[i] {
+                    if let Some(g) = leg.gamma_value {
+                        write_float_element(&mut video, ids::GAMMA_VALUE, g);
+                    }
+                    if let Some(fr) = leg.frame_rate {
+                        write_float_element(&mut video, ids::FRAME_RATE, fr);
+                    }
                 }
                 write_master_element(&mut t, ids::VIDEO, &video);
             }
