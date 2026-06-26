@@ -14,6 +14,19 @@ pub const EBML_DOC_TYPE: u32 = 0x4282;
 pub const EBML_DOC_TYPE_VERSION: u32 = 0x4287;
 pub const EBML_DOC_TYPE_READ_VERSION: u32 = 0x4285;
 
+// DocTypeExtension (RFC 8794 §11.2.9..§11.2.11): an EBML-header master that
+// adds extra Elements to the main DocType+DocTypeVersion tuple — used to
+// iterate experimental elements before they integrate into a regular
+// DocTypeVersion. `minOccurs: 0`, unbounded (several may appear). Each carries
+// a mandatory `DocTypeExtensionName` (string, length >0, MUST be unique within
+// the header) and a mandatory `DocTypeExtensionVersion` (uinteger, range "not
+// 0"). An EBML Reader MAY know these extra elements; the container surfaces the
+// (name, version) declarations verbatim so a consumer can decide whether it
+// understands an extension before relying on its elements.
+pub const DOC_TYPE_EXTENSION: u32 = 0x4281;
+pub const DOC_TYPE_EXTENSION_NAME: u32 = 0x4283;
+pub const DOC_TYPE_EXTENSION_VERSION: u32 = 0x4284;
+
 // Top-level Segment.
 pub const SEGMENT: u32 = 0x18538067;
 

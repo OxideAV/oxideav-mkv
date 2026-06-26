@@ -38,13 +38,34 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             hdr.id
         )));
     }
+    // EBML header fields (RFC 8794 §11.2). `DocType` defaults to "matroska"
+    // only as a guard; a real file always carries it. The other fields carry
+    // their RFC 8794 spec defaults so an absent element materialises the right
+    // value: EBMLVersion / EBMLReadVersion / DocTypeVersion default `1`,
+    // DocTypeReadVersion default `1`.
     let mut doc_type = String::from("matroska");
+    let mut doc_type_version: u64 = 1;
+    let mut doc_type_read_version: u64 = 1;
+    // DocTypeExtension masters (RFC 8794 §11.2.9), in document order.
+    let mut doc_type_extensions: Vec<DocTypeExtension> = Vec::new();
     let ebml_end = input.stream_position()?.saturating_add(hdr.size);
     while input.stream_position()? < ebml_end {
         let e = read_element_header(&mut *input)?;
         match e.id {
             ids::EBML_DOC_TYPE => {
                 doc_type = read_string(&mut *input, e.size as usize)?;
+            }
+            ids::EBML_DOC_TYPE_VERSION => {
+                doc_type_version = read_uint(&mut *input, e.size as usize)?;
+            }
+            ids::EBML_DOC_TYPE_READ_VERSION => {
+                doc_type_read_version = read_uint(&mut *input, e.size as usize)?;
+            }
+            ids::DOC_TYPE_EXTENSION => {
+                let ext_end = input.stream_position()?.saturating_add(e.size);
+                if let Some(ext) = parse_doc_type_extension(&mut *input, ext_end)? {
+                    doc_type_extensions.push(ext);
+                }
             }
             _ => skip(&mut *input, e.size)?,
         }
@@ -54,6 +75,12 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
             "MKV: unsupported DocType '{doc_type}'"
         )));
     }
+    let ebml_header = EbmlHeader {
+        doc_type: doc_type.clone(),
+        doc_type_version,
+        doc_type_read_version,
+        doc_type_extensions,
+    };
 
     // Find Segment.
     let seg = read_element_header(&mut *input)?;
@@ -758,6 +785,7 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
 
     Ok(MkvDemuxer {
         input,
+        ebml_header,
         streams,
         track_index_by_number,
         track_number_by_index,
@@ -3383,6 +3411,64 @@ impl FieldOrder {
             FieldOrder::Other(v) => v,
         }
     }
+}
+
+/// One `DocTypeExtension` (RFC 8794 §11.2.9) declared in the EBML header — an
+/// extra (name, version) tuple that adds Elements to the file's main
+/// `DocType` + `DocTypeVersion`. Surfaced verbatim through
+/// [`MkvDemuxer::ebml_header`] so a consumer can decide whether it understands
+/// an extension before relying on its elements; the container itself does not
+/// act on extensions.
+///
+/// Both fields are mandatory in a well-formed extension: the [`name`] is the
+/// per-header-unique lookup key (§11.2.10) and the [`version`] selects which
+/// element set the extension carries (§11.2.11, range "not 0"). A malformed
+/// extension missing either child is dropped at parse time rather than
+/// surfaced with a sentinel.
+///
+/// [`name`]: DocTypeExtension::name
+/// [`version`]: DocTypeExtension::version
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocTypeExtension {
+    /// `DocTypeExtensionName` (RFC 8794 §11.2.10): the name distinguishing
+    /// this extension from others of the same `DocType` + `DocTypeVersion`.
+    /// MUST be unique within the EBML header; never empty.
+    pub name: String,
+    /// `DocTypeExtensionVersion` (RFC 8794 §11.2.11): the extension version.
+    /// Range "not 0"; different versions of the same tuple MAY carry
+    /// completely different element sets.
+    pub version: u64,
+}
+
+/// The parsed EBML header (RFC 8794 §11.2) of a Matroska / WebM file —
+/// surfaced through [`MkvDemuxer::ebml_header`]. The demuxer validates the
+/// header at open time (rejecting an unsupported `DocType`) but otherwise
+/// only needs `DocType` to route the file; this record preserves the rest of
+/// the header for inspection and faithful re-mux.
+///
+/// `DocTypeVersion` / `DocTypeReadVersion` carry the RFC 8794 spec default `1`
+/// when the on-disk element was absent — a reader compares
+/// `doc_type_read_version` against the maximum version it understands to
+/// decide whether the file is safe to read. The [`doc_type_extensions`] list
+/// holds every well-formed `DocTypeExtension` master in document order (empty
+/// for the common file that declares none).
+///
+/// [`doc_type_extensions`]: EbmlHeader::doc_type_extensions
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EbmlHeader {
+    /// `DocType` (RFC 8794 §11.2.7): the document type — `"matroska"` or
+    /// `"webm"` (the open path rejects anything else).
+    pub doc_type: String,
+    /// `DocTypeVersion` (RFC 8794 §11.2.8): the version of `DocType` the file
+    /// was written against. Spec default `1` materialised when absent.
+    pub doc_type_version: u64,
+    /// `DocTypeReadVersion` (RFC 8794 §11.2.6): the minimum `DocTypeVersion` a
+    /// reader must support to read the file. Spec default `1` materialised
+    /// when absent.
+    pub doc_type_read_version: u64,
+    /// Every well-formed `DocTypeExtension` (RFC 8794 §11.2.9) in document
+    /// order — empty for the common file that declares none.
+    pub doc_type_extensions: Vec<DocTypeExtension>,
 }
 
 /// `StereoMode` (RFC 9559 §5.1.4.1.28.3, Table 5): the single-track
@@ -6402,6 +6488,36 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
     Ok(())
 }
 
+/// Parse one `DocTypeExtension` master (RFC 8794 §11.2.9) from the EBML
+/// header. Returns `Some` only when both mandatory children are present and
+/// valid: `DocTypeExtensionName` (§11.2.10, string, `minOccurs: 1`, length
+/// `>0`) and `DocTypeExtensionVersion` (§11.2.11, uinteger, `minOccurs: 1`,
+/// range "not 0"). A malformed extension missing either mandatory child — or
+/// carrying an empty name / zero version — is dropped rather than surfaced,
+/// since the spec makes both load-bearing (the name is the lookup key, the
+/// version selects the element set). Unknown children are skipped
+/// (forward-compat).
+fn parse_doc_type_extension(r: &mut dyn ReadSeek, end: u64) -> Result<Option<DocTypeExtension>> {
+    let mut name: Option<String> = None;
+    let mut version: Option<u64> = None;
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::DOC_TYPE_EXTENSION_NAME => name = Some(read_string(r, e.size as usize)?),
+            ids::DOC_TYPE_EXTENSION_VERSION => version = Some(read_uint(r, e.size as usize)?),
+            _ => skip(r, e.size)?,
+        }
+    }
+    match (name, version) {
+        // Both mandatory children present, name non-empty, version "not 0".
+        (Some(n), Some(v)) if !n.is_empty() && v != 0 => Ok(Some(DocTypeExtension {
+            name: n,
+            version: v,
+        })),
+        _ => Ok(None),
+    }
+}
+
 fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()> {
     // The `Video` master was seen. Materialise the spec defaults for
     // FlagInterlaced (§5.1.4.1.28.1, default 0 = undetermined) and
@@ -6646,6 +6762,9 @@ enum ClusterState {
 /// like [`MkvDemuxer::tags`] that the trait does not expose).
 pub struct MkvDemuxer {
     input: Box<dyn ReadSeek>,
+    /// The parsed EBML header (RFC 8794 §11.2) — `DocType`, the version trio,
+    /// and any `DocTypeExtension` declarations. See [`MkvDemuxer::ebml_header`].
+    ebml_header: EbmlHeader,
     streams: Vec<StreamInfo>,
     track_index_by_number: std::collections::HashMap<u64, u32>,
     /// Reverse of `track_index_by_number`: stream index → MKV TrackNumber.
@@ -7790,6 +7909,21 @@ impl MkvDemuxer {
     /// semantics.
     pub fn video_stereo_modes(&self) -> &[Option<StereoMode>] {
         &self.video_stereo_modes
+    }
+
+    /// The parsed EBML header (RFC 8794 §11.2) of the file — `DocType`, the
+    /// `DocTypeVersion` / `DocTypeReadVersion` pair (spec default `1`
+    /// materialised when absent), and every well-formed `DocTypeExtension`
+    /// (§11.2.9) declaration in document order.
+    ///
+    /// The demuxer only needs `DocType` to route the file (and validates it at
+    /// open time), but this surface preserves the rest for inspection and
+    /// faithful re-mux: a consumer can check `doc_type_read_version` against
+    /// the maximum version it understands before reading, or enumerate the
+    /// `doc_type_extensions` to see which experimental element sets the writer
+    /// declared. See [`EbmlHeader`] for the field semantics.
+    pub fn ebml_header(&self) -> &EbmlHeader {
+        &self.ebml_header
     }
 
     /// `OldStereoMode` (RFC 9559 §5.1.4.1.28.5, id `0x53B9`) for the stream at

@@ -33,9 +33,9 @@ use oxideav_core::{Muxer, WriteSeek};
 use crate::codec_id;
 use crate::demux::{
     AlphaMode, ChapterTranslate, ChromaSitingHorz, ChromaSitingVert, ColourRange,
-    ContentEncodingTransform, ContentEncodings, DisplayUnit, FieldOrder, FlagInterlaced,
-    MatrixCoefficients, OldStereoMode, Primaries, ProjectionType, SegmentLinking, StereoMode,
-    TrackPlaneType, TransferCharacteristics,
+    ContentEncodingTransform, ContentEncodings, DisplayUnit, DocTypeExtension, FieldOrder,
+    FlagInterlaced, MatrixCoefficients, OldStereoMode, Primaries, ProjectionType, SegmentLinking,
+    StereoMode, TrackPlaneType, TransferCharacteristics,
 };
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
@@ -406,6 +406,12 @@ pub struct MkvMuxer {
     header_written: bool,
     trailer_written: bool,
     doc_type: DocType,
+    /// `DocTypeExtension` declarations (RFC 8794 §11.2.9) queued via
+    /// [`MkvMuxer::set_doc_type_extensions`]. Emitted into the EBML header at
+    /// `write_header` time, after `DocTypeReadVersion`. Empty (the default)
+    /// means none are written — the common case. Reuses the demux-side
+    /// [`DocTypeExtension`] record for read/write symmetry.
+    doc_type_extensions: Vec<DocTypeExtension>,
     /// Chapter atoms queued via [`MkvMuxer::add_chapter`] /
     /// [`MkvMuxer::add_chapter_full`]. Materialised into a `Chapters`
     /// master right after `Tracks` in [`MkvMuxer::write_header`]; the
@@ -1913,6 +1919,7 @@ impl MkvMuxer {
             header_written: false,
             trailer_written: false,
             doc_type,
+            doc_type_extensions: Vec::new(),
             chapters: Vec::new(),
             attachments: Vec::new(),
             tags: Vec::new(),
@@ -3751,6 +3758,71 @@ impl MkvMuxer {
         Ok(self)
     }
 
+    /// Queue the EBML-header `DocTypeExtension` declarations (RFC 8794 §11.2.9)
+    /// to write into this file's header. Each [`DocTypeExtension`] adds an
+    /// extra (name, version) tuple to the main `DocType` + `DocTypeVersion`,
+    /// declaring an experimental / out-of-band element set a reader MAY know.
+    /// Emitted in slice order into the EBML header at `write_header` time,
+    /// after `DocTypeReadVersion`.
+    ///
+    /// The setter takes the **same** demux-side [`DocTypeExtension`] record
+    /// [`MkvDemuxer::ebml_header`] surfaces, so a header→header copy of a file
+    /// declaring extensions round-trips them verbatim. Calling with an empty
+    /// slice clears any previously-queued extensions; repeated calls are
+    /// last-write-wins.
+    ///
+    /// Spec rules enforced at queue time (before any byte is written):
+    ///
+    /// * Rejects post-[`MkvMuxer::write_header`] use — the EBML header is
+    ///   written exactly once.
+    /// * An empty `DocTypeExtensionName` (§11.2.10, length `>0`) is rejected.
+    /// * A duplicate `DocTypeExtensionName` is rejected (§11.2.10 "MUST be
+    ///   unique within the EBML Header").
+    /// * A zero `DocTypeExtensionVersion` (§11.2.11, range "not 0") is
+    ///   rejected.
+    ///
+    /// Omitting the call entirely keeps the EBML header free of any
+    /// `DocTypeExtension` — the common case, mirrored by the demuxer surfacing
+    /// an empty `doc_type_extensions` list.
+    pub fn set_doc_type_extensions(
+        &mut self,
+        extensions: Vec<DocTypeExtension>,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_doc_type_extensions called after write_header",
+            ));
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for ext in &extensions {
+            if ext.name.is_empty() {
+                return Err(Error::invalid(
+                    "MKV muxer: DocTypeExtensionName MUST be non-empty (RFC 8794 §11.2.10, length >0)",
+                ));
+            }
+            if ext.version == 0 {
+                return Err(Error::invalid(
+                    "MKV muxer: DocTypeExtensionVersion MUST NOT be 0 (RFC 8794 §11.2.11, range 'not 0')",
+                ));
+            }
+            if !seen.insert(ext.name.as_str()) {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: duplicate DocTypeExtensionName '{}' (RFC 8794 §11.2.10 MUST be unique)",
+                    ext.name
+                )));
+            }
+        }
+        self.doc_type_extensions = extensions;
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued `DocTypeExtension` declarations
+    /// installed via [`MkvMuxer::set_doc_type_extensions`]. Empty when none
+    /// were queued. Mostly useful for tests.
+    pub fn doc_type_extensions(&self) -> &[DocTypeExtension] {
+        &self.doc_type_extensions
+    }
+
     /// Queue the Segment `DateUTC` (RFC 9559 §5.1.2.11, id `0x4461`) — the
     /// date and time the Segment was created — as **nanoseconds since the
     /// Matroska epoch** (2001-01-01T00:00:00 UTC), the on-disk representation
@@ -3823,6 +3895,17 @@ impl Muxer for MkvMuxer {
         // current spec. Matroska also sits at 4/2 for the features we emit.
         write_uint_element(&mut ebml_body, ids::EBML_DOC_TYPE_VERSION, 4);
         write_uint_element(&mut ebml_body, ids::EBML_DOC_TYPE_READ_VERSION, 2);
+        // DocTypeExtension masters (RFC 8794 §11.2.9), if any were queued via
+        // `set_doc_type_extensions`. Each carries a mandatory
+        // `DocTypeExtensionName` (§11.2.10) + `DocTypeExtensionVersion`
+        // (§11.2.11). Queue-time validation already rejected empty names /
+        // zero versions / duplicate names, so we can emit verbatim here.
+        for ext in &self.doc_type_extensions {
+            let mut ext_body = Vec::new();
+            write_string_element(&mut ext_body, ids::DOC_TYPE_EXTENSION_NAME, &ext.name);
+            write_uint_element(&mut ext_body, ids::DOC_TYPE_EXTENSION_VERSION, ext.version);
+            write_master_element(&mut ebml_body, ids::DOC_TYPE_EXTENSION, &ext_body);
+        }
         let mut all = Vec::new();
         write_master_element(&mut all, ids::EBML_HEADER, &ebml_body);
 

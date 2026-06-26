@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: EBML-header `DocTypeExtension` surface (RFC 8794 §11.2,
+  including §11.2.9..§11.2.11). `MkvDemuxer::ebml_header() -> &EbmlHeader`
+  surfaces the parsed header — `doc_type`, the `doc_type_version` /
+  `doc_type_read_version` pair (spec default `1` materialised when absent), and
+  every well-formed `DocTypeExtension` (name + version) in document order; a
+  malformed extension missing either mandatory child is dropped at parse time.
+  `MkvMuxer::set_doc_type_extensions(Vec<DocTypeExtension>)` writes the
+  declarations into the EBML header, with queue-time validation for empty
+  names, zero versions, duplicate names, and post-`write_header` use. A
+  header→header copy round-trips every extension verbatim. New public types
+  `EbmlHeader` + `DocTypeExtension`.
+
 - Demuxer + Muxer: legacy `Video > OldStereoMode` (RFC 9559 §5.1.4.1.28.5, id
   `0x53B9`, `maxver 2`) — the "bogus" stereo-3D mode value libmatroska prior to
   0.9.0 wrote at the wrong Element ID (`0x53B9` instead of `0x53B8`, §18.10).

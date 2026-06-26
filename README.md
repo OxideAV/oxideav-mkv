@@ -55,6 +55,17 @@ the unified `oxideav` aggregator to wire decoding automatically.
 ### Demuxer (`demux::open`)
 
 - EBML header parse, DocType validation (`matroska` / `webm`).
+- **Typed EBML header accessor** (RFC 8794 §11.2): `MkvDemuxer::ebml_header()
+  -> &EbmlHeader` surfaces the parsed header — `doc_type`,
+  `doc_type_version` / `doc_type_read_version` (spec default `1` materialised
+  when the element was absent), and every well-formed `DocTypeExtension`
+  (§11.2.9..§11.2.11) declaration in document order. Each `DocTypeExtension`
+  pairs a per-header-unique `name` (`DocTypeExtensionName`, §11.2.10, length
+  `>0`) with a non-zero `version` (`DocTypeExtensionVersion`, §11.2.11) — the
+  experimental / out-of-band element-set declarations a reader checks before
+  relying on extension elements. A malformed extension missing either
+  mandatory child (or carrying an empty name / zero version) is dropped at
+  parse time. The common file declares none and surfaces an empty list.
 - Segment walk: `Info`, `Tracks`, `Tags`, `Cues`, `Cluster`. Known- and
   unknown-size Segment/Cluster both supported.
 - Clusters: `SimpleBlock` and `BlockGroup -> Block`, all three lacing
@@ -697,6 +708,17 @@ the unified `oxideav` aggregator to wire decoding automatically.
 ### Muxer (`mux::open` and `mux::open_webm`)
 
 - EBML header + Segment (unknown size) for a streaming-friendly layout.
+- **`DocTypeExtension` on write** (RFC 8794 §11.2.9..§11.2.11):
+  `MkvMuxer::set_doc_type_extensions(Vec<DocTypeExtension>)` queues the
+  EBML-header extension declarations, emitted after `DocTypeReadVersion` in
+  the header at `write_header` time. Takes the **same** demux-side
+  `DocTypeExtension` record `MkvDemuxer::ebml_header` surfaces, so a
+  header→header copy round-trips every extension verbatim. Queue-time
+  validation rejects post-`write_header` use, an empty `DocTypeExtensionName`
+  (§11.2.10 length `>0`), a zero `DocTypeExtensionVersion` (§11.2.11 "not 0"),
+  and a duplicate name (§11.2.10 "MUST be unique within the EBML Header").
+  Omitting the call (the default) keeps the header free of extensions — the
+  common case. Pairs symmetrically with `MkvDemuxer::ebml_header`.
 - Fixed-size `SeekHead` at the start of the Segment with Seek entries
   for `Info`, `Tracks`, and `Cues` - so players that pre-walk the
   SeekHead (mpv, Chromium) jump straight to Cues without scanning. The
