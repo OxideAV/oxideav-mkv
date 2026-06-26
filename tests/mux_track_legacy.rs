@@ -120,6 +120,9 @@ fn full_legacy_record_round_trips() {
         ],
         codec_download_urls: vec!["https://x.test/d1".to_string()],
         decode_all: Some(1),
+        min_cache: Some(2),
+        max_cache: Some(10),
+        track_offset: Some(-1_000_000),
         track_overlays: vec![7, 3, 5],
         trick_track_uid: Some(0xDEAD),
         trick_track_segment_uid: Some(seg_a.clone()),
@@ -140,6 +143,9 @@ fn full_legacy_record_round_trips() {
     assert_eq!(got.codec_download_urls, vec!["https://x.test/d1"]);
     assert_eq!(got.decode_all, Some(1));
     assert!(got.can_decode_damaged());
+    assert_eq!(got.min_cache, Some(2));
+    assert_eq!(got.max_cache, Some(10));
+    assert_eq!(got.track_offset, Some(-1_000_000));
     assert_eq!(
         got.track_overlays,
         vec![7, 3, 5],
@@ -172,6 +178,27 @@ fn explicit_zero_flags_round_trip_distinct_from_absence() {
     assert!(!got.can_decode_damaged());
     assert_eq!(got.trick_track_flag, Some(0));
     assert!(!got.is_trick_track());
+}
+
+#[test]
+fn cache_and_offset_round_trip_including_signs_and_zero() {
+    // RFC 9559 Appendix A.16 (MinCache) / A.17 (MaxCache) / A.18
+    // (TrackOffset). MinCache=0 and a positive TrackOffset round-trip
+    // distinct from absence; MaxCache stays absent.
+    let leg = MkvTrackLegacy {
+        min_cache: Some(0),
+        track_offset: Some(2_500_000),
+        ..Default::default()
+    };
+    let dmx = demux_typed(mux_with(move |mx| {
+        mx.set_track_legacy(0, leg).expect("set_track_legacy");
+    }));
+
+    let got = dmx.track_legacy(0).expect("legacy surfaced");
+    assert_eq!(got.min_cache, Some(0), "explicit MinCache 0 round-trips");
+    assert_eq!(got.max_cache, None, "absent MaxCache stays None");
+    assert_eq!(got.track_offset, Some(2_500_000), "positive TrackOffset");
+    assert!(got.decode_all.is_none());
 }
 
 #[test]

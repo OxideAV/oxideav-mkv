@@ -734,6 +734,17 @@ pub struct MkvTrackLegacy {
     /// decode damaged data. `None` → element omitted; `Some(0)` writes an
     /// explicit `0`.
     pub decode_all: Option<u64>,
+    /// `MinCache` (Appendix A.16, uinteger) — the minimum number of frames a
+    /// player should cache. `None` → element omitted; `Some(0)` writes an
+    /// explicit `0`.
+    pub min_cache: Option<u64>,
+    /// `MaxCache` (Appendix A.17, uinteger) — the maximum cache size needed.
+    /// `None` → element omitted; `Some(0)` writes an explicit `0`.
+    pub max_cache: Option<u64>,
+    /// `TrackOffset` (Appendix A.18, signed integer) — a Matroska-Tick value
+    /// added to each Block's Timestamp to adjust the track's playback offset.
+    /// `None` → element omitted; `Some(0)` writes an explicit `0`.
+    pub track_offset: Option<i64>,
     /// `TrackOverlay` (Appendix A.23, uinteger) — the *ordered* overlay-track
     /// fallback `TrackNumber`s. Written in slice order; the appendix makes the
     /// order load-bearing (first entry preferred). Empty → no element.
@@ -763,6 +774,9 @@ impl MkvTrackLegacy {
             && self.codec_info_urls.is_empty()
             && self.codec_download_urls.is_empty()
             && self.decode_all.is_none()
+            && self.min_cache.is_none()
+            && self.max_cache.is_none()
+            && self.track_offset.is_none()
             && self.track_overlays.is_empty()
             && self.trick_track_uid.is_none()
             && self.trick_track_segment_uid.is_none()
@@ -4611,6 +4625,15 @@ impl Muxer for MkvMuxer {
                 }
                 if let Some(v) = leg.decode_all {
                     write_uint_element(&mut t, ids::CODEC_DECODE_ALL, v);
+                }
+                if let Some(v) = leg.min_cache {
+                    write_uint_element(&mut t, ids::MIN_CACHE, v);
+                }
+                if let Some(v) = leg.max_cache {
+                    write_uint_element(&mut t, ids::MAX_CACHE, v);
+                }
+                if let Some(v) = leg.track_offset {
+                    write_int_element(&mut t, ids::TRACK_OFFSET, v);
                 }
                 for &n in &leg.track_overlays {
                     write_uint_element(&mut t, ids::TRACK_OVERLAY, n);

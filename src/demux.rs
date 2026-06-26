@@ -1222,6 +1222,22 @@ pub struct TrackLegacy {
     /// (`None` when absent); see [`TrackLegacy::can_decode_damaged`] for the
     /// boolean predicate.
     pub decode_all: Option<u64>,
+    /// `MinCache` (RFC 9559 Appendix A.16, id `0x6DE7`, uinteger) — the
+    /// minimum number of frames a player should be able to cache during
+    /// playback (`0` = the reference pseudo-cache system is not used).
+    /// Surfaced verbatim (`None` when absent); a present `0` is distinct from
+    /// absence.
+    pub min_cache: Option<u64>,
+    /// `MaxCache` (RFC 9559 Appendix A.17, id `0x6DF8`, uinteger) — the
+    /// maximum cache size necessary to store referenced frames and the
+    /// current frame (`0` = no cache needed). Surfaced verbatim (`None` when
+    /// absent).
+    pub max_cache: Option<u64>,
+    /// `TrackOffset` (RFC 9559 Appendix A.18, id `0x537F`, signed integer) —
+    /// a value, in Matroska Ticks (nanoseconds), to add to the Block's
+    /// Timestamp to adjust the track's playback offset. Surfaced verbatim
+    /// (`None` when absent); the container does not apply it.
+    pub track_offset: Option<i64>,
     /// `TrackOverlay` (RFC 9559 Appendix A.23, id `0x6FAB`, uinteger) — the
     /// `TrackNumber`(s) of tracks to play instead of this one when this track
     /// has a gap on `SilentTracks`. **Order is load-bearing** per the appendix:
@@ -1262,6 +1278,9 @@ impl TrackLegacy {
             && self.codec_info_urls.is_empty()
             && self.codec_download_urls.is_empty()
             && self.decode_all.is_none()
+            && self.min_cache.is_none()
+            && self.max_cache.is_none()
+            && self.track_offset.is_none()
             && self.track_overlays.is_empty()
             && self.trick_track_uid.is_none()
             && self.trick_track_segment_uid.is_none()
@@ -6221,6 +6240,15 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             }
             ids::CODEC_DECODE_ALL => {
                 t.legacy.decode_all = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::MIN_CACHE => {
+                t.legacy.min_cache = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::MAX_CACHE => {
+                t.legacy.max_cache = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::TRACK_OFFSET => {
+                t.legacy.track_offset = Some(read_int(r, e.size as usize)?);
             }
             ids::TRACK_OVERLAY => {
                 t.legacy.track_overlays.push(read_uint(r, e.size as usize)?);

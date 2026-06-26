@@ -163,6 +163,17 @@ pub const CODEC_INFO_URL: u32 = 0x3B4040;
 pub const CODEC_DOWNLOAD_URL: u32 = 0x26B240;
 pub const CODEC_DECODE_ALL: u32 = 0xAA;
 pub const TRACK_OVERLAY: u32 = 0x6FAB;
+// Three more reclaimed TrackEntry-level elements (RFC 9559 Appendix
+// A.16..A.18). `MinCache` (A.16, uinteger): the minimum number of frames a
+// player should be able to cache during playback (0 = the reference
+// pseudo-cache system is not used). `MaxCache` (A.17, uinteger): the maximum
+// cache size necessary to store referenced frames and the current frame (0 =
+// no cache needed). `TrackOffset` (A.18, integer): a value, in Matroska Ticks
+// (nanoseconds), to add to the Block's Timestamp to adjust the track's
+// playback offset. Surfaced verbatim on `TrackLegacy` for a faithful re-mux.
+pub const MIN_CACHE: u32 = 0x6DE7;
+pub const MAX_CACHE: u32 = 0x6DF8;
+pub const TRACK_OFFSET: u32 = 0x537F;
 
 // DivXTrickTrack pairing quintet (RFC 9559 Appendix A.28..A.32). These tie a
 // video track to its Smooth FF/RW companion in a paired EBML structure. The

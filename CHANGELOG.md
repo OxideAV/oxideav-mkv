@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: three more reclaimed `TrackEntry`-level legacy elements on
+  `TrackLegacy` / `MkvTrackLegacy` (RFC 9559 Appendix A.16..A.18) — `MinCache`
+  (A.16, `0x6DE7`, uinteger), `MaxCache` (A.17, `0x6DF8`, uinteger), and
+  `TrackOffset` (A.18, `0x537F`, signed integer, Matroska-Tick playback-offset
+  adjustment). Each is a pure on-disk projection surfaced verbatim for a
+  faithful re-mux (`None` = absent, present `0` = `Some(0)`); the container
+  applies none of them. The muxer writes the populated fields via
+  `set_track_legacy`, so a mux→demux pipeline round-trips them — including a
+  signed/zero `TrackOffset` and an explicit `MinCache = 0`.
+
 - Demuxer: reclaimed DivX trick-track / old-lacing `BlockGroup` children
   (RFC 9559 Appendix A.3..A.14) on `BlockGroupMeta`, surfaced for a faithful
   re-mux. `block_group_meta()` now also exposes `block_virtual()`
