@@ -1076,3 +1076,69 @@ fn targets_target_level_default_50_materialised_when_explicit() {
     // overwrite it.
     assert_eq!(t.targets.target_type.as_deref(), Some("MOVIE"));
 }
+
+/// SimpleTag whose default flag is encoded with the reclaimed bogus id
+/// `TagDefaultBogus` (RFC 9559 Appendix A.43, 0x44B4) instead of the
+/// canonical `TagDefault` (0x4484). Some historical Writers emitted the
+/// wrong id; the demuxer must still surface the default flag.
+fn simple_tag_with_bogus_default(name: &str, value: &str, default: bool) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&elem_str(ids::TAG_NAME, name));
+    body.extend_from_slice(&elem_str(ids::TAG_STRING, value));
+    body.extend_from_slice(&elem_uint(
+        ids::TAG_DEFAULT_BOGUS,
+        if default { 1 } else { 0 },
+    ));
+    elem_master(ids::SIMPLE_TAG, &body)
+}
+
+#[test]
+fn tag_default_bogus_id_read_as_default_flag() {
+    // A SimpleTag carrying TagDefaultBogus=1 surfaces `default == true`,
+    // exactly as if it had used the canonical TagDefault id.
+    let tags_body = tag_with_raw(
+        Some(50),
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[simple_tag_with_bogus_default(
+            "TITLE",
+            "Bogus Default",
+            true,
+        )],
+    );
+    let bytes = build_mkv_with_custom_tags(tags_body);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx =
+        oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+    let tags = dmx.tags();
+    assert_eq!(tags.len(), 1);
+    let st = &tags[0].simple_tags[0];
+    assert_eq!(st.name, "TITLE");
+    assert!(
+        st.default,
+        "TagDefaultBogus (0x44B4) must be read as the default flag"
+    );
+}
+
+#[test]
+fn tag_default_bogus_zero_clears_default_flag() {
+    // TagDefaultBogus=0 must surface `default == false`, not be ignored.
+    let tags_body = tag_with_raw(
+        Some(50),
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+        &[simple_tag_with_bogus_default("ARTIST", "Nobody", false)],
+    );
+    let bytes = build_mkv_with_custom_tags(tags_body);
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let dmx =
+        oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+    let st = &dmx.tags()[0].simple_tags[0];
+    assert!(!st.default, "TagDefaultBogus=0 must clear the default flag");
+}

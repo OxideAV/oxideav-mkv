@@ -2041,7 +2041,12 @@ fn parse_simple_tag(
                     s.language_bcp47 = Some(v);
                 }
             }
-            ids::TAG_DEFAULT => {
+            // `TagDefault` (§5.1.8.1.2.4) and its reclaimed mis-encoded
+            // variant `TagDefaultBogus` (Appendix A.43) both carry the same
+            // boolean default flag; treat the bogus id as a synonym so a
+            // SimpleTag written by a Writer that emitted the wrong id still
+            // surfaces its default flag.
+            ids::TAG_DEFAULT | ids::TAG_DEFAULT_BOGUS => {
                 let v = read_uint(r, e.size as usize)?;
                 s.default = v != 0;
             }
@@ -5690,6 +5695,12 @@ fn parse_attached_file(
     let mut data_offset: u64 = 0;
     let mut data_size: u64 = 0;
     let mut has_data = false;
+    // Reclaimed DivX-font AttachedFile children (RFC 9559 Appendix
+    // A.40..A.42). Read verbatim for faithful re-mux; the container assigns
+    // them no playback semantics.
+    let mut referral: Option<Vec<u8>> = None;
+    let mut used_start_time: Option<u64> = None;
+    let mut used_end_time: Option<u64> = None;
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
@@ -5702,6 +5713,17 @@ fn parse_attached_file(
                     uid = v;
                     attachment_uid_to_index.insert(v, index);
                 }
+            }
+            ids::FILE_REFERRAL => {
+                let mut buf = vec![0u8; e.size as usize];
+                r.read_exact(&mut buf)?;
+                referral = Some(buf);
+            }
+            ids::FILE_USED_START_TIME => {
+                used_start_time = Some(read_uint(r, e.size as usize)?);
+            }
+            ids::FILE_USED_END_TIME => {
+                used_end_time = Some(read_uint(r, e.size as usize)?);
             }
             ids::FILE_DATA => {
                 // Record the on-disk byte range of the payload before skipping
@@ -5746,6 +5768,9 @@ fn parse_attached_file(
         uid,
         data_offset,
         data_size,
+        referral,
+        used_start_time,
+        used_end_time,
     });
     Ok(())
 }
@@ -5800,6 +5825,22 @@ pub struct Attachment {
     /// child (which would be unusual — the spec marks the element as
     /// mandatory).
     pub data_size: u64,
+    /// `FileReferral` (RFC 9559 Appendix A.40, binary) — a reclaimed
+    /// legacy element carrying a binary value a track/codec can refer to
+    /// when the attachment is needed. `None` when absent (the common
+    /// case). Surfaced verbatim for faithful re-mux of historical DivX
+    /// streams; the container does not interpret the bytes.
+    pub referral: Option<Vec<u8>>,
+    /// `FileUsedStartTime` (RFC 9559 Appendix A.41, uinteger) — a
+    /// reclaimed Segment-Tick timestamp at which an optimized font
+    /// attachment comes into context. `None` when absent. A present
+    /// explicit `0` surfaces as `Some(0)` so a re-muxer reproduces it.
+    pub used_start_time: Option<u64>,
+    /// `FileUsedEndTime` (RFC 9559 Appendix A.42, uinteger) — a
+    /// reclaimed Segment-Tick timestamp at which an optimized font
+    /// attachment goes out of context. `None` when absent; present
+    /// explicit `0` surfaces as `Some(0)`.
+    pub used_end_time: Option<u64>,
 }
 
 /// Format a unix timestamp (seconds since 1970-01-01 UTC) as an ISO-8601 date.

@@ -1003,6 +1003,19 @@ pub struct MkvAttachment {
     /// `FileDescription` (RFC 9559 §5.1.6.1.1). Optional human-readable
     /// note. `None` (or `Some("")`) → element omitted on disk.
     pub description: Option<String>,
+    /// `FileReferral` (RFC 9559 Appendix A.40, binary) — reclaimed legacy
+    /// element. `None` → omitted; `Some(bytes)` written verbatim (an empty
+    /// `Some(vec![])` still emits a zero-length element so a demux→mux
+    /// round-trip of a present-but-empty referral is faithful).
+    pub referral: Option<Vec<u8>>,
+    /// `FileUsedStartTime` (RFC 9559 Appendix A.41, uinteger) — reclaimed
+    /// legacy element. `None` → omitted; `Some(v)` written (including a
+    /// present `0`).
+    pub used_start_time: Option<u64>,
+    /// `FileUsedEndTime` (RFC 9559 Appendix A.42, uinteger) — reclaimed
+    /// legacy element. `None` → omitted; `Some(v)` written (including a
+    /// present `0`).
+    pub used_end_time: Option<u64>,
 }
 
 impl MkvAttachment {
@@ -1021,6 +1034,9 @@ impl MkvAttachment {
             data: data.into(),
             uid: None,
             description: None,
+            referral: None,
+            used_start_time: None,
+            used_end_time: None,
         }
     }
 }
@@ -6310,6 +6326,18 @@ fn build_attached_file(index: u64, att: &MkvAttachment) -> Vec<u8> {
     // method `add_attachment` rejects an explicit `Some(0)` up front.
     let uid = att.uid.unwrap_or(index);
     write_uint_element(&mut body, ids::FILE_UID, uid);
+    // Reclaimed DivX-font children (RFC 9559 Appendix A.40..A.42), written
+    // only when the caller supplied them so a non-DivX attachment stays
+    // clean. `Some(empty)` referral still emits a zero-length element.
+    if let Some(referral) = att.referral.as_deref() {
+        write_bytes_element(&mut body, ids::FILE_REFERRAL, referral);
+    }
+    if let Some(t) = att.used_start_time {
+        write_uint_element(&mut body, ids::FILE_USED_START_TIME, t);
+    }
+    if let Some(t) = att.used_end_time {
+        write_uint_element(&mut body, ids::FILE_USED_END_TIME, t);
+    }
     body
 }
 

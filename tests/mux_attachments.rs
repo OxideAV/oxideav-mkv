@@ -158,6 +158,7 @@ fn attachments_round_trip_through_demuxer_metadata() {
             data: FONT_BYTES.to_vec(),
             uid: Some(0xCAFE_F00D_DEAD_BEEF),
             description: Some("Embedded subtitle font".into()),
+            ..Default::default()
         },
     ];
     let bytes = mux_with_attachments_collect(&attachments);
@@ -204,6 +205,7 @@ fn typed_attachments_accessor_round_trip_with_payload_fetch() {
             data: FONT_BYTES.to_vec(),
             uid: Some(0xCAFE_F00D_DEAD_BEEF),
             description: Some("Embedded subtitle font".into()),
+            ..Default::default()
         },
     ];
     let bytes = mux_with_attachments_collect(&attachments);
@@ -427,6 +429,7 @@ fn add_attachment_rejects_explicit_zero_uid() {
         data: vec![0u8; 4],
         uid: Some(0),
         description: None,
+        ..Default::default()
     };
     let err = mx
         .add_attachment(att)
@@ -471,6 +474,7 @@ fn empty_description_is_omitted_on_disk() {
         data: vec![0u8; 4],
         uid: None,
         description: Some("".into()),
+        ..Default::default()
     };
     let bytes = mux_with_attachments_collect(&[att]);
     let dmx = open_demuxer(bytes);
@@ -479,4 +483,98 @@ fn empty_description_is_omitted_on_disk() {
         !md.iter().any(|(k, _)| k == "attachment:1:description"),
         "empty Some(\"\") description must NOT emit an `attachment:1:description` key"
     );
+}
+
+// --- Reclaimed DivX-font AttachedFile children (RFC 9559 Appendix
+// A.40..A.42: FileReferral / FileUsedStartTime / FileUsedEndTime) ----------
+
+#[test]
+fn reclaimed_divx_font_children_round_trip() {
+    // A historical DivX "optimized font" attachment carries the three
+    // reclaimed children. The muxer writes them through the new
+    // `MkvAttachment` fields and the demuxer surfaces them verbatim on
+    // the typed `Attachment` accessor.
+    let att = MkvAttachment {
+        filename: "divx.ttf".into(),
+        mime_type: "application/x-truetype-font".into(),
+        data: FONT_BYTES.to_vec(),
+        uid: Some(0x1234_5678),
+        description: None,
+        referral: Some(b"\xDE\xAD\xBE\xEF".to_vec()),
+        used_start_time: Some(1_000_000),
+        used_end_time: Some(9_500_000),
+    };
+    let bytes = mux_with_attachments_collect(&[att]);
+    let dmx = open_typed(bytes);
+    let atts = dmx.attachments().to_vec();
+    assert_eq!(atts.len(), 1);
+    let a = &atts[0];
+    assert_eq!(a.referral.as_deref(), Some(&b"\xDE\xAD\xBE\xEF"[..]));
+    assert_eq!(a.used_start_time, Some(1_000_000));
+    assert_eq!(a.used_end_time, Some(9_500_000));
+    // Mandatory fields still intact.
+    assert_eq!(a.filename, "divx.ttf");
+    assert_eq!(a.uid, 0x1234_5678);
+}
+
+#[test]
+fn reclaimed_children_absent_when_not_supplied() {
+    // A normal (non-DivX) attachment must NOT emit any of the three
+    // reclaimed elements — the demuxer reports `None` for each.
+    let att = MkvAttachment::new("cover.jpg", "image/jpeg", COVER_BYTES.to_vec());
+    let bytes = mux_with_attachments_collect(&[att]);
+    let dmx = open_typed(bytes);
+    let a = &dmx.attachments()[0];
+    assert_eq!(a.referral, None);
+    assert_eq!(a.used_start_time, None);
+    assert_eq!(a.used_end_time, None);
+}
+
+#[test]
+fn reclaimed_used_times_zero_round_trips_as_some_zero() {
+    // A present explicit `0` must survive as `Some(0)`, distinct from an
+    // absent element (`None`), so a re-mux reproduces the on-disk shape.
+    let att = MkvAttachment {
+        filename: "f.ttf".into(),
+        mime_type: "application/x-truetype-font".into(),
+        data: FONT_BYTES.to_vec(),
+        uid: None,
+        description: None,
+        referral: None,
+        used_start_time: Some(0),
+        used_end_time: Some(0),
+    };
+    let bytes = mux_with_attachments_collect(&[att]);
+    let dmx = open_typed(bytes);
+    let a = &dmx.attachments()[0];
+    assert_eq!(a.used_start_time, Some(0));
+    assert_eq!(a.used_end_time, Some(0));
+    assert_eq!(a.referral, None);
+}
+
+#[test]
+fn reclaimed_empty_referral_round_trips_as_some_empty() {
+    // `Some(vec![])` referral emits a zero-length binary element and must
+    // survive as `Some(vec![])`, not collapse to `None`.
+    let att = MkvAttachment {
+        filename: "f.ttf".into(),
+        mime_type: "application/x-truetype-font".into(),
+        data: FONT_BYTES.to_vec(),
+        uid: None,
+        description: None,
+        referral: Some(Vec::new()),
+        used_start_time: None,
+        used_end_time: None,
+    };
+    let bytes = mux_with_attachments_collect(&[att]);
+    let dmx = open_typed(bytes);
+    let a = &dmx.attachments()[0];
+    assert_eq!(a.referral, Some(Vec::new()));
+}
+
+#[test]
+fn file_media_type_alias_matches_file_mime_type_id() {
+    // RFC 9559 renamed FileMimeType -> FileMediaType (id 0x4660 unchanged).
+    assert_eq!(ids::FILE_MEDIA_TYPE, ids::FILE_MIME_TYPE);
+    assert_eq!(ids::FILE_MEDIA_TYPE, 0x4660);
 }

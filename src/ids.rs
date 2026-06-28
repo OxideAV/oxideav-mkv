@@ -96,6 +96,12 @@ pub const TAG_LANGUAGE: u32 = 0x447A;
 pub const TAG_LANGUAGE_BCP47: u32 = 0x447B;
 pub const TAG_DEFAULT: u32 = 0x4484;
 pub const TAG_BINARY: u32 = 0x4485;
+/// `TagDefaultBogus` (RFC 9559 Appendix A.43, uinteger, id 0x44B4) — a
+/// reclaimed variant of [`TAG_DEFAULT`] that was written with a "bogus"
+/// element ID by some historical Writers (see §5.1.8.1.2.4). Treated as a
+/// synonym for `TagDefault` on read so a `SimpleTag` carrying the
+/// mis-encoded id still surfaces its default flag.
+pub const TAG_DEFAULT_BOGUS: u32 = 0x44B4;
 
 // Tracks > TrackEntry.
 pub const TRACK_ENTRY: u32 = 0xAE;
@@ -547,8 +553,27 @@ pub const ATTACHED_FILE: u32 = 0x61A7;
 pub const FILE_DESCRIPTION: u32 = 0x467E;
 pub const FILE_NAME: u32 = 0x466E;
 pub const FILE_MIME_TYPE: u32 = 0x4660;
+/// `FileMediaType` (RFC 9559 §5.1.6.1.3) — the current spec name for the
+/// `0x4660` element [`FILE_MIME_TYPE`] carries; the historical "MimeType"
+/// label was renamed to "MediaType" in RFC 9559 (the on-wire id is
+/// unchanged). Provided as an alias so spec-name-oriented callers resolve
+/// the same constant.
+pub const FILE_MEDIA_TYPE: u32 = FILE_MIME_TYPE;
 pub const FILE_DATA: u32 = 0x465C;
 pub const FILE_UID: u32 = 0x46AE;
+// Reclaimed DivX-font AttachedFile children (RFC 9559 Appendix A.40..A.42).
+// These three legacy elements survive on old DivX "optimized font" streams
+// and are read/written verbatim for faithful re-mux; the container assigns
+// them no playback semantics.
+/// `FileReferral` (RFC 9559 Appendix A.40, binary) — a binary value a
+/// track/codec can refer to when the attachment is needed.
+pub const FILE_REFERRAL: u32 = 0x4675;
+/// `FileUsedStartTime` (RFC 9559 Appendix A.41, uinteger) — Segment-Tick
+/// timestamp at which an optimized font attachment comes into context.
+pub const FILE_USED_START_TIME: u32 = 0x4661;
+/// `FileUsedEndTime` (RFC 9559 Appendix A.42, uinteger) — Segment-Tick
+/// timestamp at which an optimized font attachment goes out of context.
+pub const FILE_USED_END_TIME: u32 = 0x4662;
 
 // TrackType values.
 pub const TRACK_TYPE_VIDEO: u64 = 1;

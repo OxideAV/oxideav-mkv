@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: three reclaimed DivX-font `AttachedFile` children
+  (RFC 9559 Appendix A.40..A.42) on the typed `demux::Attachment` and
+  `mux::MkvAttachment` — `FileReferral` (A.40, `0x4675`, binary),
+  `FileUsedStartTime` (A.41, `0x4661`, uinteger), and `FileUsedEndTime`
+  (A.42, `0x4662`, uinteger). Read verbatim and written only when supplied,
+  so a non-DivX attachment stays clean and a mux→demux pipeline round-trips
+  a present-but-empty referral (`Some(vec![])`) and an explicit `0` used-time
+  (`Some(0)`) without collapsing either to absent. `MkvAttachment` now derives
+  `Default` over the extended field set; struct-literal constructions take
+  `..Default::default()`.
+- Demuxer: `TagDefaultBogus` (RFC 9559 Appendix A.43, `0x44B4`) is read as a
+  synonym for `TagDefault` (`0x4484`) so a `SimpleTag` written by a historical
+  Writer that emitted the mis-encoded id still surfaces its default flag.
+- `ids`: `FILE_MEDIA_TYPE` alias for `FILE_MIME_TYPE` (`0x4660`, the current
+  RFC 9559 §5.1.6.1.3 name).
+
 - Demuxer + Muxer: three reclaimed Video/Audio-master legacy elements on
   `TrackLegacy` / `MkvTrackLegacy` (RFC 9559 Appendix A.25..A.27) — `GammaValue`
   (A.25, `0x2FB523`, float, Video), `FrameRate` (A.26, `0x2383E3`, float, Video
