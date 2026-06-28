@@ -947,6 +947,17 @@ pub struct ClusterRecord {
     /// Writers emit it). A track marked silent here MAY become active
     /// again in a later Cluster (A.2).
     pub silent_track_numbers: Vec<u64>,
+    /// `EncryptedBlock` payloads (RFC 9559 Appendix A.15, id `0xAF`) carried
+    /// directly by this Cluster, in on-disk order. Each entry is the raw,
+    /// still-Transformed (encrypted and/or signed) block body — structurally
+    /// like a `SimpleBlock` but with its contents opaque to the container.
+    /// Empty for the overwhelmingly common case (the element is reclaimed
+    /// and effectively never written by modern Writers); surfaced verbatim
+    /// so a reader handling its own decryption, or a re-muxer copying a
+    /// legacy stream, can recover the bytes. The container performs no
+    /// decryption and exposes no track binding — `EncryptedBlock` carries no
+    /// usable track-number header once Transformed.
+    pub encrypted_blocks: Vec<Vec<u8>>,
 }
 
 /// One `SeekHead > Seek` entry (RFC 9559 §5.1.1.1) — the MetaSeek index
@@ -7678,6 +7689,7 @@ impl MkvDemuxer {
             position: None,
             prev_size: None,
             silent_track_numbers: Vec::new(),
+            encrypted_blocks: Vec::new(),
         });
         self.cluster_record_by_offset.insert(body_start, idx);
     }
@@ -7714,6 +7726,16 @@ impl MkvDemuxer {
             self.cluster_records[idx]
                 .silent_track_numbers
                 .append(&mut nums);
+        }
+    }
+
+    /// Append an `EncryptedBlock` payload (RFC 9559 Appendix A.15) to the
+    /// Cluster record keyed by `body_start`. No-op when the record is
+    /// missing — see [`Self::set_cluster_position`] for the why. The bytes
+    /// are recorded verbatim; the container never decrypts them.
+    fn push_cluster_encrypted_block(&mut self, body_start: u64, bytes: Vec<u8>) {
+        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
+            self.cluster_records[idx].encrypted_blocks.push(bytes);
         }
     }
 
@@ -8785,6 +8807,18 @@ impl MkvDemuxer {
                         if !nums.is_empty() {
                             self.set_cluster_silent_tracks(body_start, nums);
                         }
+                    }
+                    ids::ENCRYPTED_BLOCK => {
+                        // RFC 9559 Appendix A.15 — a reclaimed Cluster-level
+                        // element holding a SimpleBlock-shaped body whose
+                        // contents are Transformed (encrypted/signed). The
+                        // container can't decode it into a `Packet` (the
+                        // track-number header and timestamp are inside the
+                        // Transformed region), so it surfaces the raw bytes
+                        // on the Cluster record for faithful re-mux / caller
+                        // decryption rather than skipping them silently.
+                        let bytes = read_bytes(&mut *self.input, e.size as usize)?;
+                        self.push_cluster_encrypted_block(body_start, bytes);
                     }
                     ids::SIMPLE_BLOCK => {
                         let bytes = read_bytes(&mut *self.input, e.size as usize)?;

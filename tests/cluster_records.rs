@@ -320,3 +320,63 @@ fn cluster_records_dedup_across_repeat_walks() {
     assert_eq!(recs[0].position, Some(7));
     assert_eq!(recs[0].prev_size, Some(8));
 }
+
+/// Raw `EncryptedBlock` (RFC 9559 Appendix A.15, id `0xAF`) element with an
+/// arbitrary opaque body — the container treats the body as fully Transformed
+/// (encrypted/signed) and never inspects it.
+fn encrypted_block(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&write_element_id(ids::ENCRYPTED_BLOCK));
+    out.extend_from_slice(&write_vint(body.len() as u64, 0));
+    out.extend_from_slice(body);
+    out
+}
+
+#[test]
+fn cluster_records_capture_encrypted_block_payloads() {
+    // A Cluster carrying a normal SimpleBlock plus two EncryptedBlocks. The
+    // SimpleBlock still yields a packet; the EncryptedBlock bodies surface
+    // verbatim on the record in on-disk order.
+    let mut cluster = Vec::new();
+    cluster.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
+    cluster.extend_from_slice(&simple_block(1, 0, true, 0xAA));
+    cluster.extend_from_slice(&encrypted_block(b"\x81\x00\x00\x80enc-one"));
+    cluster.extend_from_slice(&encrypted_block(b"\x81\x00\x10\x80enc-two"));
+    let bytes = build_segment(&[cluster]);
+
+    let mut dmx = open(bytes);
+    let mut payloads = Vec::new();
+    loop {
+        match dmx.next_packet() {
+            Ok(p) => payloads.push(p.data.clone()),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("unexpected: {e:?}"),
+        }
+    }
+    // Only the SimpleBlock produces a packet — EncryptedBlock can't be
+    // decoded into one (its track header is inside the Transformed region).
+    assert_eq!(payloads.len(), 1, "EncryptedBlock must not become a packet");
+
+    let recs = dmx.cluster_records();
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        recs[0].encrypted_blocks,
+        vec![
+            b"\x81\x00\x00\x80enc-one".to_vec(),
+            b"\x81\x00\x10\x80enc-two".to_vec(),
+        ],
+        "both EncryptedBlock bodies must surface verbatim in on-disk order"
+    );
+}
+
+#[test]
+fn cluster_records_no_encrypted_blocks_when_absent() {
+    // A normal Cluster carries no EncryptedBlock — the list stays empty.
+    let bytes = build_segment(&[cluster_body_with(0, None, None, 0xCC)]);
+    let mut dmx = open(bytes);
+    let _ = dmx.next_packet();
+    let _ = dmx.next_packet();
+    let recs = dmx.cluster_records();
+    assert_eq!(recs.len(), 1);
+    assert!(recs[0].encrypted_blocks.is_empty());
+}

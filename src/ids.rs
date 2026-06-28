@@ -440,6 +440,12 @@ pub const DISCARD_PADDING: u32 = 0x75A2;
 // surfaces them and the muxer can round-trip them.
 pub const SILENT_TRACKS: u32 = 0x5854;
 pub const SILENT_TRACK_NUMBER: u32 = 0x58D7;
+/// `EncryptedBlock` (RFC 9559 Appendix A.15, binary, id 0xAF) — a
+/// Cluster-level reclaimed element, "similar to SimpleBlock but the data
+/// inside the Block are Transformed (encrypted and/or signed)". The
+/// container surfaces its raw payload on [`crate::demux::ClusterRecord`]
+/// for faithful re-mux; it does not decrypt or interpret the contents.
+pub const ENCRYPTED_BLOCK: u32 = 0xAF;
 
 // Deprecated DivX trick-track / old-lacing BlockGroup children
 // (RFC 9559 Appendix A.3..A.14). The RFC 9559 core body no longer

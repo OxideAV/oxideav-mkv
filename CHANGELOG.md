@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Writer that emitted the mis-encoded id still surfaces its default flag.
 - `ids`: `FILE_MEDIA_TYPE` alias for `FILE_MIME_TYPE` (`0x4660`, the current
   RFC 9559 §5.1.6.1.3 name).
+- Demuxer: `EncryptedBlock` (RFC 9559 Appendix A.15, `0xAF`) Cluster-level
+  reclaimed element — its raw, still-Transformed (encrypted/signed) body now
+  surfaces on `ClusterRecord::encrypted_blocks` (in on-disk order) instead of
+  being skipped silently. The container performs no decryption and the element
+  yields no `Packet` (its track header is inside the Transformed region); the
+  bytes are exposed verbatim for a caller that decrypts itself or re-muxes a
+  legacy stream.
 
 - Demuxer + Muxer: three reclaimed Video/Audio-master legacy elements on
   `TrackLegacy` / `MkvTrackLegacy` (RFC 9559 Appendix A.25..A.27) — `GammaValue`
