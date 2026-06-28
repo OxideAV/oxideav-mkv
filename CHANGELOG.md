@@ -22,8 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Demuxer: `TagDefaultBogus` (RFC 9559 Appendix A.43, `0x44B4`) is read as a
   synonym for `TagDefault` (`0x4484`) so a `SimpleTag` written by a historical
   Writer that emitted the mis-encoded id still surfaces its default flag.
-- `ids`: `FILE_MEDIA_TYPE` alias for `FILE_MIME_TYPE` (`0x4660`, the current
-  RFC 9559 §5.1.6.1.3 name).
+- `ids`: modern RFC 9559 element-name aliases for the legacy-named id
+  constants the spec renamed without changing the on-wire id —
+  `FILE_MEDIA_TYPE` (= `FILE_MIME_TYPE`, `0x4660`), `TIMESTAMP_SCALE`
+  (= `TIMECODE_SCALE`, `0x2AD7B1`), `TIMESTAMP` (= `TIMECODE`, `0xE7`),
+  `SEGMENT_UUID` (= `SEGMENT_UID`), `PREV_UUID` (= `PREV_UID`), and
+  `NEXT_UUID` (= `NEXT_UID`). Spec-name-oriented callers resolve the same
+  constants the original names already provided.
 - Demuxer: `EncryptedBlock` (RFC 9559 Appendix A.15, `0xAF`) Cluster-level
   reclaimed element — its raw, still-Transformed (encrypted/signed) body now
   surfaces on `ClusterRecord::encrypted_blocks` (in on-disk order) instead of

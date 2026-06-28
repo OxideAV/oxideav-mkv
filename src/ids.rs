@@ -47,8 +47,17 @@ pub const CRC32: u32 = 0xBF;
 
 // Info.
 pub const TIMECODE_SCALE: u32 = 0x2AD7B1;
+/// `TimestampScale` (RFC 9559 §5.1.2.9) — the current spec name for the
+/// `0x2AD7B1` element [`TIMECODE_SCALE`] carries; "Timecode" was renamed to
+/// "Timestamp" throughout RFC 9559 (the on-wire id is unchanged). Alias for
+/// spec-name-oriented callers.
+pub const TIMESTAMP_SCALE: u32 = TIMECODE_SCALE;
 pub const DURATION: u32 = 0x4489;
 pub const SEGMENT_UID: u32 = 0x73A4;
+/// `SegmentUUID` (RFC 9559 §5.1.2.1) — the current spec name for the
+/// `0x73A4` element [`SEGMENT_UID`] carries (renamed UID → UUID in RFC 9559;
+/// on-wire id unchanged). Alias for spec-name-oriented callers.
+pub const SEGMENT_UUID: u32 = SEGMENT_UID;
 pub const MUXING_APP: u32 = 0x4D80;
 pub const WRITING_APP: u32 = 0x5741;
 pub const TITLE: u32 = 0x7BA9;
@@ -65,8 +74,14 @@ pub const DATE_UTC: u32 = 0x4461;
 // file can be remuxed without rewriting its chapter-codec data.
 pub const SEGMENT_FILENAME: u32 = 0x7384;
 pub const PREV_UID: u32 = 0x3CB923;
+/// `PrevUUID` (RFC 9559 §5.1.2.3) — current spec name for [`PREV_UID`]
+/// (`0x3CB923`, renamed UID → UUID; id unchanged). Alias.
+pub const PREV_UUID: u32 = PREV_UID;
 pub const PREV_FILENAME: u32 = 0x3C83AB;
 pub const NEXT_UID: u32 = 0x3EB923;
+/// `NextUUID` (RFC 9559 §5.1.2.5) — current spec name for [`NEXT_UID`]
+/// (`0x3EB923`, renamed UID → UUID; id unchanged). Alias.
+pub const NEXT_UUID: u32 = NEXT_UID;
 pub const NEXT_FILENAME: u32 = 0x3E83BB;
 pub const SEGMENT_FAMILY: u32 = 0x4444;
 pub const CHAPTER_TRANSLATE: u32 = 0x6924;
@@ -417,6 +432,10 @@ pub const BIT_DEPTH: u32 = 0x6264;
 
 // Cluster.
 pub const TIMECODE: u32 = 0xE7;
+/// `Timestamp` (RFC 9559 §5.1.3.1) — current spec name for the Cluster's
+/// `0xE7` element [`TIMECODE`] carries ("Timecode" renamed to "Timestamp"
+/// in RFC 9559; on-wire id unchanged). Alias for spec-name-oriented callers.
+pub const TIMESTAMP: u32 = TIMECODE;
 pub const POSITION: u32 = 0xA7;
 pub const PREV_SIZE: u32 = 0xAB;
 pub const SIMPLE_BLOCK: u32 = 0xA3;
@@ -673,3 +692,27 @@ pub const CONTENT_ENC_ALGO_AES: u64 = 5;
 // AESSettingsCipherMode values (RFC 9559 §5.1.4.1.31.12, Table 26).
 pub const AES_CIPHER_MODE_CTR: u64 = 1;
 pub const AES_CIPHER_MODE_CBC: u64 = 2;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Modern RFC 9559 element-name aliases must resolve to the same
+    /// on-wire ids as the legacy-named constants they wrap (the spec
+    /// renamed Timecode→Timestamp and UID→UUID without changing any id).
+    #[test]
+    fn modern_name_aliases_match_legacy_ids() {
+        assert_eq!(TIMESTAMP_SCALE, TIMECODE_SCALE);
+        assert_eq!(TIMESTAMP_SCALE, 0x2AD7B1);
+        assert_eq!(TIMESTAMP, TIMECODE);
+        assert_eq!(TIMESTAMP, 0xE7);
+        assert_eq!(SEGMENT_UUID, SEGMENT_UID);
+        assert_eq!(SEGMENT_UUID, 0x73A4);
+        assert_eq!(PREV_UUID, PREV_UID);
+        assert_eq!(PREV_UUID, 0x3CB923);
+        assert_eq!(NEXT_UUID, NEXT_UID);
+        assert_eq!(NEXT_UUID, 0x3EB923);
+        assert_eq!(FILE_MEDIA_TYPE, FILE_MIME_TYPE);
+        assert_eq!(FILE_MEDIA_TYPE, 0x4660);
+    }
+}
