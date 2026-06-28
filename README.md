@@ -95,6 +95,15 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - **`SilentTracks`** (RFC 9559 Appendix A.1 / A.2): per-Cluster
   `SilentTrackNumber` lists surface on `ClusterRecord::silent_track_numbers`
   in on-disk order (deprecated element, but read for faithful re-mux).
+- **`EncryptedBlock`** (RFC 9559 Appendix A.15, id `0xAF`): the reclaimed
+  Cluster-level element whose body is structurally a `SimpleBlock` but with
+  its contents Transformed (encrypted and/or signed). Its raw, still-
+  Transformed payload surfaces on `ClusterRecord::encrypted_blocks` in
+  on-disk order rather than being skipped silently — it yields no `Packet`
+  (the track-number header lives inside the Transformed region), so a caller
+  that decrypts itself or a re-muxer copying a legacy stream recovers the
+  bytes verbatim. The container performs no decryption and exposes no track
+  binding.
 - Metadata lift: title, muxer, encoder, date (Matroska `DateUTC` ->
   ISO-8601), Tags `SimpleTag` name/value pairs with **target-scope
   resolution** (`Tags.Targets.TagTrackUID` -> `tag:track:N:<name>`,
@@ -111,7 +120,11 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `TargetTypeValue` informational hints, multi-UID `Targets` masters
   (one `Tag` can scope to several tracks/chapters at once), per-
   `SimpleTag` `TagLanguage` / `TagLanguageBCP47` / `TagDefault`,
-  and binary `TagBinary` payloads (e.g. embedded cover-art bytes).
+  and binary `TagBinary` payloads (e.g. embedded cover-art bytes). The
+  reclaimed `TagDefaultBogus` id (RFC 9559 Appendix A.43, `0x44B4`) — a
+  mis-encoded variant some historical Writers emitted — is read as a
+  synonym for `TagDefault` so a `SimpleTag` carrying it still surfaces
+  its default flag.
   Tags with only dangling non-zero UIDs are filtered out per
   §5.1.8.1.1.3..§5.1.8.1.1.6; mixed Targets keep their resolvable UIDs.
   Nested `SimpleTag`s (§5.1.8.1.2 `recursive: True`) surface through
@@ -367,7 +380,14 @@ the unified `oxideav` aggregator to wire decoding automatically.
   and returned; the demuxer's reader position is preserved across the
   fetch so calling it between `next_packet` calls is safe. The flat
   `metadata()` view also gains an `attachment:N:description` key when
-  the source element was present.
+  the source element was present. Each `Attachment` also surfaces the
+  three reclaimed DivX-font children (RFC 9559 Appendix A.40..A.42) —
+  `referral` (`FileReferral`, A.40, binary), `used_start_time`
+  (`FileUsedStartTime`, A.41) and `used_end_time` (`FileUsedEndTime`,
+  A.42) — as `Option`s (`None` = absent; a present empty referral stays
+  `Some(vec![])` and a present `0` used-time stays `Some(0)`), read and
+  written verbatim by the muxer (`MkvAttachment` carries the same three
+  fields) so a mux→demux pipeline round-trips a legacy font attachment.
 - **Typed `Chapters` accessor** (RFC 9559 §5.1.7):
   `MkvDemuxer::chapters() -> &[Edition]` exposes the structured chapter
   tree the flat `chapter:N:*` metadata view collapses — every
