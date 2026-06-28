@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.9...v0.0.10) - 2026-06-28
+
+### Other
+
+- document reclaimed AttachedFile/EncryptedBlock surfaces + TagDefaultBogus
+- modern RFC 9559 element-name aliases for renamed id constants
+- surface reclaimed Cluster-level EncryptedBlock payloads on demux
+- reclaimed DivX-font AttachedFile children + TagDefaultBogus read
+- add reclaimed Video/Audio legacy elements GammaValue/FrameRate/ChannelPositions (RFC 9559 A.25..A.27)
+- write reclaimed BlockGroup children (RFC 9559 A.3..A.14) for mux symmetry
+- add reclaimed MinCache/MaxCache/TrackOffset TrackEntry elements (RFC 9559 A.16..A.18)
+- surface reclaimed DivX trick-track BlockGroup children (RFC 9559 A.3..A.14)
+- round out EbmlHeader with the RFC 8794 §11.2.2..§11.2.5 version/length quartet
+- EBML-header DocTypeExtension demux + mux (RFC 8794 §11.2.9..§11.2.11)
+- OldStereoMode demux + mux — last RFC 9559 element-registry entry
+- document TrackLegacy demux accessor + mux write path (RFC 9559 App. A.19..A.23 + A.28..A.32)
+- TrackLegacy write path for reclaimed Appendix-A TrackEntry elements (RFC 9559 App. A.19..A.23 + A.28..A.32)
+- typed TrackLegacy accessor for reclaimed Appendix-A TrackEntry elements (RFC 9559 App. A.19..A.23 + A.28..A.32)
+- Segment Info Title + DateUTC write surface (RFC 9559 §5.1.2.11/.12)
+- Linked-Segment Info write surface (RFC 9559 §5.1.2.1..§5.1.2.8 + §17)
+- TrackEntry identity/selection mux write path (RFC 9559 §5.1.4.1.18/.19/.20/.23/.4/.5/.12/.24)
+- typed TrackIdentity demux accessor (RFC 9559 §5.1.4.1.18/.19/.20/.23/.4/.5/.12/.24)
+- nested-SimpleTag robustness + depth-cap coverage
+- nested SimpleTag parsing (RFC 9559 §5.1.8.1.2 recursive)
+- Tags writing (RFC 9559 §5.1.8) — Targets + recursive SimpleTag
+- document completed Cues write surface + CueBlockNumber seek fallback
+- CueBlockNumber seek fallback (RFC 9559 §5.1.5.1.2.5)
+- per-frame subtitle cue emission with CueDuration (RFC 9559 §22.1)
+- complete Cues write surface — CueBlockNumber + CueDuration (RFC 9559 §5.1.5.1.2.4/.5)
+- document BlockGroup meta / SilentTracks / full Chapters / EBML property tests
+- exercise typed BlockGroup-meta / SilentTracks / Chapters accessors
+- Property-style coverage for the EBML element walker (RFC 8794)
+- Complete ChapterAtom write surface + ChapProcess tree (RFC 9559 §5.1.7.1.4)
+- SilentTracks (RFC 9559 Appendix A.1/A.2) Cluster-level read+write
+- Full BlockGroup meta surface (RFC 9559 §5.1.3.5.4..§5.1.3.5.7) read+write
+- typed SeekHead accessor (RFC 9559 §5.1.1)
+- TrackTranslate decode + write (RFC 9559 §5.1.4.1.27)
+- decode + write the reclaimed ContentSignature quartet (RFC 9559 App. A.33..A.36)
+- ContentEncodings write path (RFC 9559 §5.1.4.1.31)
+- demux Linked-Segment Info metadata (RFC 9559 §5.1.2.1..§5.1.2.8)
+- TrackOperation on write (RFC 9559 §5.1.4.1.30)
+
 ### Added
 
 - Demuxer + Muxer: three reclaimed DivX-font `AttachedFile` children
