@@ -35,11 +35,13 @@ fn pcm_stream() -> StreamInfo {
 
 /// Mux 13 one-second-spaced PCM packets (0..=12 s). With the muxer's ~5 s
 /// cluster cadence this produces 3 Clusters (t = 0 / 6000 / 12000 ms).
-fn mux_file(with_hints: bool) -> Vec<u8> {
+fn mux_file(with_hints: bool, tag: &str) -> Vec<u8> {
     let stream = pcm_stream();
     let streams = vec![stream.clone()];
+    // Unique per calling test — tests run in parallel and share the temp
+    // dir, so a shared name races create/read/remove.
     let tmp = std::env::temp_dir().join(format!(
-        "oxideav-mkv-cluster-position-hints-{with_hints}.mkv"
+        "oxideav-mkv-cluster-position-hints-{tag}-{with_hints}.mkv"
     ));
     {
         let f = std::fs::File::create(&tmp).unwrap();
@@ -87,7 +89,7 @@ fn drain_count(dmx: &mut oxideav_mkv::demux::MkvDemuxer) -> usize {
 
 #[test]
 fn hints_round_trip_with_exact_offsets() {
-    let bytes = mux_file(true);
+    let bytes = mux_file(true, "roundtrip");
     let sds = segment_payload_start(&bytes);
 
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(bytes));
@@ -131,7 +133,7 @@ fn hints_round_trip_with_exact_offsets() {
 
 #[test]
 fn hints_are_off_by_default() {
-    let bytes = mux_file(false);
+    let bytes = mux_file(false, "defaults");
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(bytes));
     let mut dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
     assert_eq!(drain_count(&mut dmx), 13);
@@ -156,7 +158,7 @@ fn with_cluster_position_hints_rejected_after_write_header() {
 /// trust the hint survived the damage.
 #[test]
 fn position_hints_verify_after_damage_resync() {
-    let mut bytes = mux_file(true);
+    let mut bytes = mux_file(true, "resync");
     let sds = segment_payload_start(&bytes);
 
     // Corrupt the 2nd Cluster's ID (leading 0x00 bytes make the element
