@@ -907,6 +907,18 @@ the unified `oxideav` aggregator to wire decoding automatically.
   while `PrevSize` stays real. Pairs with the resilient demuxer: a live
   capture cut at an arbitrary byte still demuxes its packet prefix, and
   `seek_to` works through the Cues-less Cluster-Timestamp fallback.
+- **§23.2 live tagging** (`MkvMuxer::write_live_tags`): on a
+  livestreaming muxer, emits a `Tags` element *between Clusters* ("The
+  Tags element can be placed between Clusters each time it is
+  necessary"), flushing in-flight laces and ending the open unknown-size
+  Cluster. The demux side applies the §23.2 MUST-reset when its walk
+  crosses a mid-stream `Tags`: `tags()` is replaced wholesale and the
+  tag-derived flat-metadata entries are swapped in place (Info- /
+  Chapters- / Attachments-derived metadata untouched), with UID scopes
+  resolved against the open-time maps and a leading `CRC-32` validated
+  onto `crc_status()`. The same read path surfaces a *trailing* `Tags`
+  element placed after the last Cluster — a common Writer layout the
+  single-pass open walk never reaches — once the stream is drained.
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.
