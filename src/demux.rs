@@ -1012,6 +1012,7 @@ fn open_typed_impl(
         resilient,
         damage_events,
         resync_floor: 0,
+        first_cluster_offset: cluster_pos,
     })
 }
 
@@ -7744,6 +7745,10 @@ pub struct MkvDemuxer {
     /// after this offset, so repeated failures can never re-match the
     /// same bytes and loop.
     resync_floor: u64,
+    /// Absolute offset of the first `Cluster` element header — the anchor
+    /// for the resilient Cues-less seek fallback
+    /// ([`MkvDemuxer::seek_by_cluster_scan`]).
+    first_cluster_offset: u64,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -7809,6 +7814,13 @@ impl Demuxer for MkvDemuxer {
             )));
         }
         if self.cues.is_empty() {
+            if self.resilient {
+                // Cues-less / damaged-Cues fallback (RFC 9559 §22.1 only
+                // RECOMMENDS a Cues element): linearly scan Cluster
+                // Timestamps and land on the last Cluster at or before
+                // the target.
+                return self.seek_by_cluster_scan(stream_index, pts);
+            }
             return Err(Error::unsupported(
                 "MKV: no Cues index in file — cannot seek",
             ));
@@ -9173,6 +9185,147 @@ impl MkvDemuxer {
                 Ok(())
             }
         }
+    }
+
+    /// Convert a stream-time-base `pts` into Matroska Segment Ticks
+    /// (same math as the Cues seek path).
+    fn stream_pts_to_ticks(&self, stream_index: u32, pts: i64) -> u64 {
+        let stream_tb = self.streams[stream_index as usize].time_base.as_rational();
+        let ticks_i128: i128 = if stream_tb.num == 0 || stream_tb.den == 0 {
+            pts as i128
+        } else {
+            let numer = pts as i128 * stream_tb.num as i128 * 1_000_000_000i128;
+            let denom = stream_tb.den as i128 * self.timecode_scale_ns as i128;
+            if denom == 0 {
+                pts as i128
+            } else {
+                numer / denom
+            }
+        };
+        ticks_i128.max(0) as u64
+    }
+
+    /// Convert Matroska Segment Ticks back into a stream-time-base pts
+    /// (same math as the Cues seek path).
+    fn ticks_to_stream_pts(&self, stream_index: u32, ticks: u64) -> i64 {
+        let stream_tb = self.streams[stream_index as usize].time_base.as_rational();
+        if stream_tb.num == 0 || stream_tb.den == 0 {
+            ticks as i64
+        } else {
+            let numer = ticks as i128 * stream_tb.den as i128 * self.timecode_scale_ns as i128;
+            let denom = stream_tb.num as i128 * 1_000_000_000i128;
+            if denom == 0 {
+                ticks as i64
+            } else {
+                (numer / denom) as i64
+            }
+        }
+    }
+
+    /// Resilient Cues-less seek: walk the Cluster chain from the first
+    /// Cluster, reading each Cluster's `Timestamp` (RFC 9559 §5.1.3.1 —
+    /// SHOULD be the first child, or the second after a `CRC-32`), and
+    /// land on the last Cluster whose timestamp is at or before the
+    /// target. RFC 9559 §22.1 only RECOMMENDS a `Cues` element, so a
+    /// file with no (or damaged, hence skipped) `Cues` is still legal —
+    /// this is the O(clusters) recovery path a resilient Reader offers
+    /// where the strict path returns `Error::Unsupported`.
+    ///
+    /// Damage-tolerant like the rest of the resilient stream walk: an
+    /// unparseable stretch is stepped over with the same Top-Level scan
+    /// `next_packet` resynchronisation uses (no [`DamageEvent`] is
+    /// recorded — the scan is navigation, not packet loss).
+    fn seek_by_cluster_scan(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        let target_ticks = self.stream_pts_to_ticks(stream_index, pts);
+        let mut pos = self.first_cluster_offset;
+        // (cluster header offset, cluster timestamp) of the best-so-far
+        // candidate; the first parseable Cluster seeds it so a target
+        // before the first Cluster lands there (mirroring the Cues path's
+        // first-cue fallback).
+        let mut best: Option<(u64, u64)> = None;
+        while pos < self.segment_data_end {
+            self.input.seek(SeekFrom::Start(pos))?;
+            let e = match read_element_header(&mut *self.input) {
+                Ok(e) => e,
+                Err(_) => {
+                    match scan_top_level_element(
+                        &mut *self.input,
+                        pos.saturating_add(1),
+                        self.segment_data_end,
+                    )? {
+                        Some(off) => {
+                            pos = off;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+            };
+            let body_start = self.input.stream_position()?;
+            let bounded_end = if e.size == VINT_UNKNOWN_SIZE {
+                None
+            } else {
+                Some(body_start.saturating_add(e.size).min(self.segment_data_end))
+            };
+            if e.id == ids::CLUSTER {
+                // Pull the Cluster's Timestamp from its leading children.
+                let mut tc: Option<u64> = None;
+                let child_limit = bounded_end.unwrap_or(self.segment_data_end);
+                while self.input.stream_position()? < child_limit {
+                    let c = match read_element_header(&mut *self.input) {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    match c.id {
+                        ids::TIMECODE => {
+                            tc = read_uint(&mut *self.input, c.size as usize).ok();
+                            break;
+                        }
+                        // §5.1.3.1 usage note: Timestamp SHOULD be first,
+                        // or second after a CRC-32 — tolerate Position /
+                        // PrevSize / SilentTracks in front too.
+                        ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS => {
+                            if skip(&mut *self.input, c.size).is_err() {
+                                break;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(tc) = tc {
+                    if tc <= target_ticks || best.is_none() {
+                        best = Some((pos, tc));
+                    }
+                    if tc >= target_ticks {
+                        // Clusters are stored in ascending time order
+                        // (§11.1) — nothing later can be a better match.
+                        break;
+                    }
+                }
+            }
+            // Advance to the next Top-Level element: directly for a
+            // bounded element, by scanning for an unknown-size one (its
+            // end is only defined by the next sibling — §6.2).
+            pos = match bounded_end {
+                Some(end) if end > pos => end,
+                _ => match scan_top_level_element(
+                    &mut *self.input,
+                    body_start,
+                    self.segment_data_end,
+                )? {
+                    Some(off) => off,
+                    None => break,
+                },
+            };
+        }
+        let (cluster_off, landed_ticks) = best
+            .ok_or_else(|| Error::unsupported("MKV: no parseable Cluster Timestamp to seek by"))?;
+        self.input.seek(SeekFrom::Start(cluster_off))?;
+        self.cluster_state = ClusterState::Idle;
+        self.out_queue.clear();
+        self.last_block_additions = None;
+        self.last_block_group_meta = None;
+        Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
     fn advance(&mut self) -> Result<()> {

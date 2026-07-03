@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: resilient Cues-less seek fallback — on an [`open_resilient`]
+  demuxer, `seek_to` on a file with no usable `Cues` index (absent, or the
+  master was damaged and skipped at open) linearly scans Cluster
+  `Timestamp`s (RFC 9559 §5.1.3.1) and lands on the last Cluster at or
+  before the target, honouring the §11.1 ascending-Cluster-time order to
+  stop early. RFC 9559 §22.1 only RECOMMENDS `Cues`, so a Cues-less file
+  is legal; the strict path still returns `Error::Unsupported` unchanged.
+  Unknown-size Clusters (whose end is only defined by the next sibling)
+  are stepped over with the same vetted Top-Level scan the resync path
+  uses. Targets before the first / after the last Cluster snap to the
+  first / last Cluster, mirroring the Cues path's first-cue fallback.
+
 - Demuxer: damage-resilient open — `demux::open_resilient` /
   `demux::open_resilient_typed`. RFC 9559 §26 leaves error handling to the
   Reader; this Reader recovers instead of failing: a known-size Segment

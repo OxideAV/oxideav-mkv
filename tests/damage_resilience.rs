@@ -409,3 +409,100 @@ fn unrecoverable_tail_ends_stream_cleanly() {
     assert_eq!(events[0].resumed_at(), None);
     assert_eq!(events[0].bytes_skipped(), 64);
 }
+
+// =====================================================================
+// 8. Cues-less seek fallback — RFC 9559 §22.1 only RECOMMENDS Cues; the
+//    resilient path seeks by scanning Cluster Timestamps where the
+//    strict path returns Unsupported.
+// =====================================================================
+
+#[test]
+fn resilient_seek_without_cues_scans_cluster_timestamps() {
+    let bytes = three_cluster_file(); // no Cues element at all
+
+    let mut strict = open_strict(bytes.clone()).expect("open");
+    assert!(
+        strict.seek_to(0, 1500).is_err(),
+        "strict path stays Unsupported without Cues"
+    );
+
+    let mut dmx = open_resilient(bytes).expect("open");
+    // Mid-file target snaps back to the cluster at 1000 ms.
+    let landed = dmx.seek_to(0, 1500).expect("resilient seek");
+    assert_eq!(landed, 1000);
+    assert_eq!(drain(&mut dmx), vec![(1000, 0x22), (2000, 0x33)]);
+    // Back to the start.
+    let landed = dmx.seek_to(0, 0).expect("seek to 0");
+    assert_eq!(landed, 0);
+    assert_eq!(drain(&mut dmx), vec![(0, 0x11), (1000, 0x22), (2000, 0x33)]);
+    // Beyond the last cluster lands on the last cluster.
+    let landed = dmx.seek_to(0, 99_000).expect("seek past end");
+    assert_eq!(landed, 2000);
+    assert_eq!(drain(&mut dmx), vec![(2000, 0x33)]);
+    // Before the first cluster lands on the first cluster (parity with
+    // the Cues path's first-cue fallback: seek returns the landed pts).
+    let landed = dmx.seek_to(0, -5).expect("seek before start");
+    assert_eq!(landed, 0);
+    assert!(
+        dmx.damage_events().is_empty(),
+        "navigation on a clean file records no damage"
+    );
+}
+
+#[test]
+fn resilient_seek_falls_back_when_cues_master_is_damaged() {
+    // A Cues master whose first CuePoint declares a 1 GiB size — the
+    // strict open rejects the file, the resilient open skips the master
+    // (no usable index) and seek falls back to the Cluster scan.
+    let damaged_cues = elem_master(
+        ids::CUES,
+        &elem_forged_size(ids::CUE_POINT, 1 << 30, &[0x00; 4]),
+    );
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&info_master());
+    seg.extend_from_slice(&tracks_master());
+    seg.extend_from_slice(&damaged_cues);
+    seg.extend_from_slice(&cluster(0, 0x11));
+    seg.extend_from_slice(&cluster(1000, 0x22));
+    let bytes = file_with_segment_body(&seg);
+
+    assert!(open_strict(bytes.clone()).is_err());
+
+    let mut dmx = open_resilient(bytes).expect("resilient open");
+    assert!(dmx
+        .damage_events()
+        .iter()
+        .any(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES)));
+    let landed = dmx.seek_to(0, 1000).expect("fallback seek");
+    assert_eq!(landed, 1000);
+    assert_eq!(drain(&mut dmx), vec![(1000, 0x22)]);
+}
+
+#[test]
+fn resilient_seek_steps_over_unknown_size_cluster() {
+    // Cluster 2 uses the unknown-size VINT (legal on Cluster — RFC 8794
+    // §6.2 / RFC 9559 unknownsizeallowed); its end is only defined by the
+    // next sibling, which the scan-based hop finds.
+    let mut c2 = Vec::new();
+    c2.extend_from_slice(&write_element_id(ids::CLUSTER));
+    c2.push(0xFF); // unknown-size VINT
+    c2.extend_from_slice(&elem_uint(ids::TIMECODE, 1000));
+    c2.extend_from_slice(&simple_block(1, 0, true, 0x22));
+
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&info_master());
+    seg.extend_from_slice(&tracks_master());
+    seg.extend_from_slice(&cluster(0, 0x11));
+    seg.extend_from_slice(&c2);
+    seg.extend_from_slice(&cluster(2000, 0x33));
+    let bytes = file_with_segment_body(&seg);
+
+    let mut dmx = open_resilient(bytes).expect("open");
+    let landed = dmx.seek_to(0, 2000).expect("seek");
+    assert_eq!(landed, 2000);
+    assert_eq!(drain(&mut dmx), vec![(2000, 0x33)]);
+    // And a target inside the unknown-size cluster itself.
+    let landed = dmx.seek_to(0, 1400).expect("seek into unknown-size");
+    assert_eq!(landed, 1000);
+    assert_eq!(drain(&mut dmx), vec![(1000, 0x22), (2000, 0x33)]);
+}
