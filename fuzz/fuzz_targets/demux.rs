@@ -112,4 +112,40 @@ fuzz_target!(|data: &[u8]| {
             let _ = rec.silent_track_numbers.len();
         }
     }
+
+    // Third pass through the *resilient* demuxer (`open_resilient_typed`),
+    // exercising the damage-recovery machinery over arbitrary bytes: the
+    // Top-Level resync scanner (chunked byte scan + candidate vetting),
+    // the open-time master-skip path, the Segment-size clamp, and the
+    // Cues-less cluster-scan seek fallback. Two additional contracts on
+    // top of "no panic":
+    //   * a resilient `next_packet` may only fail with the clean
+    //     `Error::Eof` — every other error class must have been recovered
+    //     (resynchronised or converted into a dropped tail);
+    //   * the recovery loop must terminate (the resync floor guarantees
+    //     forward progress, so the bounded drain below completes).
+    let rs3: Box<dyn ReadSeek> = Box::new(Cursor::new(data.to_vec()));
+    if let Ok(mut rdmx) = oxideav_mkv::demux::open_resilient_typed(rs3, &NullCodecResolver) {
+        for _ in 0..MAX_PACKETS_PER_INPUT {
+            match rdmx.next_packet() {
+                Ok(_) => {}
+                Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("resilient next_packet leaked a non-Eof error: {e}"),
+            }
+        }
+        // Damage events must be well-formed: recovery never moves backwards.
+        for ev in rdmx.damage_events() {
+            if let Some(resumed) = ev.resumed_at() {
+                assert!(resumed >= ev.offset(), "resync moved backwards");
+            }
+        }
+        // Cues-less seek fallback (or Cues seek when the index parsed).
+        let _ = rdmx.seek_to(0, 0);
+        let _ = rdmx.seek_to(0, 12_345);
+        for _ in 0..8 {
+            if rdmx.next_packet().is_err() {
+                break;
+            }
+        }
+    }
 });

@@ -724,3 +724,48 @@ fn fuzz_found_colour_unknown_size_crash_bytes_open_without_panic() {
     let r = open(bytes.to_vec());
     assert!(r.is_err(), "fuzz crash bytes unexpectedly opened cleanly");
 }
+
+// =====================================================================
+// 9. Whole-corpus replay through the resilient path — every fuzz seed
+//    (valid, malformed, and crash-regression alike) must either fail
+//    the resilient open or drain to a clean `Error::Eof`. The resilient
+//    demuxer's contract is stronger than the strict one's: it may never
+//    leak a non-Eof error from `next_packet` (damage is recovered or
+//    converted into a dropped tail), so the corpus doubles as a
+//    recovery-loop-termination check.
+// =====================================================================
+
+#[test]
+fn fuzz_corpus_files_replay_through_resilient_path() {
+    use oxideav_core::Demuxer as _;
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/demux");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(dir).expect("fuzz corpus dir") {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        seen += 1;
+        let data = std::fs::read(&path).unwrap();
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(data));
+        let Ok(mut dmx) =
+            oxideav_mkv::demux::open_resilient_typed(rs, &oxideav_core::NullCodecResolver)
+        else {
+            continue; // structurally unusable is a legal outcome
+        };
+        for _ in 0..64 {
+            match dmx.next_packet() {
+                Ok(_) => {}
+                Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("{path:?}: resilient next_packet leaked non-Eof error {e}"),
+            }
+        }
+        // Recovery bookkeeping must be internally consistent.
+        for ev in dmx.damage_events() {
+            if let Some(resumed) = ev.resumed_at() {
+                assert!(resumed >= ev.offset(), "{path:?}: resync moved backwards");
+            }
+        }
+    }
+    assert!(seen >= 5, "corpus seeds present ({seen})");
+}

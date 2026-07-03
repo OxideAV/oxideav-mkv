@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fuzzing: the `demux` fuzz target gained a third pass through
+  `open_resilient_typed`, enforcing the resilient contract over arbitrary
+  bytes — a resilient `next_packet` may only fail with the clean
+  `Error::Eof` (anything else panics the harness), recovery bookkeeping
+  never moves backwards, and both `seek_to` shapes (Cues and the
+  Cues-less cluster-scan fallback) are exercised post-drain. Two new
+  corpus seeds (mid-file corruption, 60% truncation) plus a `cargo test`
+  corpus replay that runs every seed through the resilient path.
+
 - Muxer: opt-in per-Cluster damage-recovery / backward-play hints —
   `MkvMuxer::with_cluster_position_hints()` writes a `Position` child
   (RFC 9559 §5.1.3.2, the Cluster's own Segment Position — "It might help
