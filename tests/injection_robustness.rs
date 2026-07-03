@@ -636,3 +636,91 @@ fn fuzz_corpus_inline_seeds_open_without_panic() {
         assert!(r.is_err(), "fuzz seed '{name}' unexpectedly opened cleanly");
     }
 }
+
+// =====================================================================
+// 8. Unknown-size VINT on a nested master that does not allow it —
+//    RFC 8794 §6.2 permits the unknown-size sentinel only on elements
+//    whose schema declares `unknownsizeallowed` (Segment and Cluster in
+//    RFC 9559). A forged `Colour` / `Projection` / `MasteringMetadata` /
+//    `ChapterTranslate` master carrying the 1-byte `0xFF` unknown-size
+//    VINT used to compute `stream_position + u64::MAX`, tripping the
+//    add-overflow check in a debug build (fuzz-found, 2026-07-03 cycle,
+//    seed preserved in fuzz/corpus/demux/regression_colour_unknown_size
+//    .bin). The parse must instead fail cleanly (the body has no real
+//    bound, so the child walk runs into EoF).
+// =====================================================================
+
+/// Build `id` + the 1-byte unknown-size VINT (`0xFF`) + `body` bytes.
+/// The body is *not* bounded by the header — that is the attack shape.
+fn elem_unknown_size(id: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&write_element_id(id));
+    out.push(0xFF);
+    out.extend_from_slice(body);
+    out
+}
+
+#[test]
+fn open_survives_unknown_size_nested_video_masters() {
+    // A video TrackEntry whose Video master carries a nested master with
+    // the unknown-size sentinel. Try each of the nested-master ids that
+    // compute `body_end = pos + size` on parse.
+    for nested in [ids::COLOUR, ids::PROJECTION] {
+        let mut video = Vec::new();
+        video.extend_from_slice(&elem_uint(ids::PIXEL_WIDTH, 16));
+        video.extend_from_slice(&elem_uint(ids::PIXEL_HEIGHT, 16));
+        video.extend_from_slice(&elem_unknown_size(nested, &[]));
+        let mut tb = Vec::new();
+        tb.extend_from_slice(&elem_uint(ids::TRACK_NUMBER, 1));
+        tb.extend_from_slice(&elem_uint(ids::TRACK_UID, 0xA1));
+        tb.extend_from_slice(&elem_uint(ids::TRACK_TYPE, ids::TRACK_TYPE_VIDEO));
+        tb.extend_from_slice(&elem_str(ids::CODEC_ID, "V_VP8"));
+        tb.extend_from_slice(&elem_master(ids::VIDEO, &video));
+        let track_entry = elem_master(ids::TRACK_ENTRY, &tb);
+        let seg_body = elem_master(ids::TRACKS, &track_entry);
+        let bytes = header_plus_segment(&seg_body);
+        let r = open(bytes);
+        // The unbounded child walk must hit EoF and error out — never
+        // panic on `pos + u64::MAX`.
+        assert!(
+            r.is_err(),
+            "unknown-size nested master 0x{nested:X} unexpectedly opened"
+        );
+    }
+}
+
+#[test]
+fn open_survives_unknown_size_mastering_metadata_and_chapter_translate() {
+    // MasteringMetadata nested inside a bounded Colour master.
+    let mm = elem_unknown_size(ids::MASTERING_METADATA, &[]);
+    let colour = elem_master(ids::COLOUR, &mm);
+    let mut video = Vec::new();
+    video.extend_from_slice(&elem_uint(ids::PIXEL_WIDTH, 16));
+    video.extend_from_slice(&elem_uint(ids::PIXEL_HEIGHT, 16));
+    video.extend_from_slice(&colour);
+    let mut tb = Vec::new();
+    tb.extend_from_slice(&elem_uint(ids::TRACK_NUMBER, 1));
+    tb.extend_from_slice(&elem_uint(ids::TRACK_UID, 0xA1));
+    tb.extend_from_slice(&elem_uint(ids::TRACK_TYPE, ids::TRACK_TYPE_VIDEO));
+    tb.extend_from_slice(&elem_str(ids::CODEC_ID, "V_VP8"));
+    tb.extend_from_slice(&elem_master(ids::VIDEO, &video));
+    let seg_body = elem_master(ids::TRACKS, &elem_master(ids::TRACK_ENTRY, &tb));
+    assert!(open(header_plus_segment(&seg_body)).is_err());
+
+    // ChapterTranslate with the unknown-size sentinel inside Info.
+    let mut info = Vec::new();
+    info.extend_from_slice(&elem_uint(ids::TIMECODE_SCALE, 1_000_000));
+    info.extend_from_slice(&elem_unknown_size(ids::CHAPTER_TRANSLATE, &[]));
+    let mut seg_body = elem_master(ids::INFO, &info);
+    seg_body.extend_from_slice(&elem_master(ids::TRACKS, &tracks_body_pcm()));
+    assert!(open(header_plus_segment(&seg_body)).is_err());
+}
+
+#[test]
+fn fuzz_found_colour_unknown_size_crash_bytes_open_without_panic() {
+    // Verbatim fuzz-found crash input (2026-07-03 scheduled cycle) —
+    // preserved as fuzz/corpus/demux/regression_colour_unknown_size.bin.
+    let bytes: &[u8] = include_bytes!("../fuzz/corpus/demux/regression_colour_unknown_size.bin");
+    let r = open(bytes.to_vec());
+    assert!(r.is_err(), "fuzz crash bytes unexpectedly opened cleanly");
+}

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Demuxer: fuzz-found add-overflow (debug-build panic) when a nested master
+  that computes a bounded body end — `Colour`, `Projection`,
+  `MasteringMetadata`, `ChapterTranslate` — carries the EBML unknown-size
+  VINT. RFC 8794 §6.2 permits the unknown-size sentinel only on elements
+  whose schema declares `unknownsizeallowed` (Segment / Cluster in RFC
+  9559), so the forged size now saturates and the unbounded child walk
+  fails cleanly at EoF instead of panicking on `pos + u64::MAX`. Crash
+  input preserved as `fuzz/corpus/demux/regression_colour_unknown_size.bin`
+  plus three shape-targeted `injection_robustness` tests.
+
 ### Added
 
 - Demuxer + Muxer: three reclaimed DivX-font `AttachedFile` children

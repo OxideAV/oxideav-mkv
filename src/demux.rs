@@ -1747,7 +1747,7 @@ fn parse_info(
                 out.linking.next_filename = Some(read_string(r, e.size as usize)?);
             }
             ids::CHAPTER_TRANSLATE => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 let translate = parse_chapter_translate(r, body_end)?;
                 out.linking.chapter_translates.push(translate);
             }
@@ -6954,7 +6954,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             ids::DISPLAY_HEIGHT => display_height = read_uint(r, e.size as usize)?,
             ids::DISPLAY_UNIT => display_unit = read_uint(r, e.size as usize)?,
             ids::COLOUR => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 // Spec defaults — set up front so an empty `Colour` master
                 // still surfaces the §5.1.4.1.28.17 / §5.1.4.1.28.26 /
                 // §5.1.4.1.28.27 default `2`s and the §5.1.4.1.28.23..
@@ -6974,7 +6974,7 @@ fn parse_video(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
                 t.colour_raw = Some(c);
             }
             ids::PROJECTION => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 // Spec defaults — `ProjectionType` defaults to 0 (rectangular)
                 // per §5.1.4.1.28.42; the three pose floats default to
                 // 0x0p+0 per §5.1.4.1.28.44..46. `parse_projection` overrides
@@ -7040,7 +7040,7 @@ fn parse_colour(r: &mut dyn ReadSeek, end: u64, c: &mut RawColour) -> Result<()>
             ids::MAX_CLL => c.max_cll = Some(read_uint(r, e.size as usize)?),
             ids::MAX_FALL => c.max_fall = Some(read_uint(r, e.size as usize)?),
             ids::MASTERING_METADATA => {
-                let body_end = r.stream_position()? + e.size;
+                let body_end = r.stream_position()?.saturating_add(e.size);
                 let mut m = MasteringMetadata::default();
                 parse_mastering_metadata(r, body_end, &mut m)?;
                 c.mastering_metadata = Some(m);
