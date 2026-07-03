@@ -1,5 +1,7 @@
 # oxideav-mkv
 
+[![CI](https://github.com/OxideAV/oxideav-mkv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-mkv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-mkv.svg)](https://crates.io/crates/oxideav-mkv) [![docs.rs](https://docs.rs/oxideav-mkv/badge.svg)](https://docs.rs/oxideav-mkv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **Matroska (MKV)** and **WebM** container — demuxer + muxer
 built on the EBML primitives from RFC 8794. Zero C dependencies.
 
