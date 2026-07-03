@@ -410,6 +410,41 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `chapter:N:*` keys and `TagChapterUID`-resolved tags use, now extended
   to nested chapters. Returns an empty slice when the file has no
   `Chapters` element.
+- **Damage-resilient open** (`demux::open_resilient` /
+  `demux::open_resilient_typed`): RFC 9559 §26 leaves error handling to
+  the Reader ("Matroska Readers decide how to handle the errors whether
+  or not they are recoverable in their code"); this Reader recovers where
+  the strict `open` fails. A known-size Segment whose declared size runs
+  past the input end is clamped (truncated-file recovery); a damaged
+  Top-Level master before the first Cluster (`Tags`, `Chapters`, `Cues`,
+  ...) is skipped keeping whatever parsed before the error; garbage
+  between Top-Level elements is stepped over by scanning for the next
+  well-formed 4-byte Top-Level element ID; and a corrupt element inside
+  the Cluster stream makes `next_packet` resynchronise on the next
+  plausible Cluster — the §5.1.3.2 damaged-stream resynchronisation
+  unit — instead of ending the stream (a candidate must header-parse and
+  its first child must carry a legal Cluster-child ID per the §5.1.3.1
+  usage note; a resync floor guarantees forward progress). A truncated
+  final Cluster yields the packets that physically fit, then a clean
+  `Error::Eof` — the resilient `next_packet` never surfaces any other
+  error class. Every recovery is recorded as a typed `DamageEvent`
+  (`DamagedMaster(id)` / `GarbageData` / `ClusterStream` /
+  `SegmentTruncated` / `UnrecoverableTail`, each carrying the damage
+  offset, resume offset, and bytes skipped) on
+  `MkvDemuxer::damage_events()` — empty exactly when the file needed no
+  recovery, so strict-minded callers can reject after the fact. The
+  strict `open` / `open_typed` behaviour is unchanged byte-for-byte.
+- **Resilient Cues-less seek fallback**: on an `open_resilient` demuxer,
+  `seek_to` on a file with no usable `Cues` (absent — RFC 9559 §22.1 only
+  RECOMMENDS the element — or damaged and skipped at open) linearly scans
+  Cluster `Timestamp`s (§5.1.3.1) and lands on the last Cluster at or
+  before the target, stopping early on the §11.1 ascending-Cluster-time
+  order. Unknown-size Clusters are stepped over with the same vetted
+  Top-Level scan the resync path uses; targets before the first / past
+  the last Cluster snap to the first / last Cluster. The strict path
+  still returns `Error::Unsupported` — the RFC 9559 §23.2 "neither
+  SeekHead nor Cues at the start SHOULD be considered non-seekable"
+  signal stays observable.
 - Duration: `Segment\Info\Duration` translated to microseconds.
 - **Linked-Segment `Info` metadata** (RFC 9559 §5.1.2.1..§5.1.2.8 +
   Section 17) via `MkvDemuxer::segment_linking()` → [`SegmentLinking`]:
@@ -848,6 +883,30 @@ the unified `oxideav` aggregator to wire decoding automatically.
   after `write_header`. Convenience constructors: `MkvTag::global(name,
   value)`, `MkvTagTargets::track(uid)`, `MkvSimpleTag::new(name, value)`
   / `MkvSimpleTag::binary(name, data)`.
+- **Cluster `Position` / `PrevSize` hints** (RFC 9559 §5.1.3.2 +
+  §5.1.3.3): opt-in via `MkvMuxer::with_cluster_position_hints()`. Every
+  Cluster gains a `Position` child (its own Segment Position — the
+  element the spec offers as a damaged-stream resync hint) right after
+  its `Timestamp`, and every Cluster from the second on gains a
+  `PrevSize` child (the previous Cluster's full element size in octets —
+  the backward-play jump: a Cluster's start minus its `PrevSize` lands on
+  the previous Cluster's ID). Off by default, so muxer output stays
+  byte-identical with prior releases. Round-trip tests verify the exact
+  offset semantics (including on the surviving Clusters after a damage
+  resync); black-box validated against a widely-deployed reader.
+- **Livestreaming layout** (RFC 9559 §25.3.4 + §23.2): opt-in via
+  `MkvMuxer::with_live_streaming()`. Omits the up-front `SeekHead` and
+  writes no `Cues` in `write_trailer` ("SeekHead and Cues are useless" in
+  a live stream; §23.2 says a stream with neither at its start SHOULD be
+  considered non-seekable — the signal a live producer wants to send).
+  Everything other than Clusters still lands before the Clusters, and the
+  Segment / Cluster unknown-size VINTs §23.2 mandates were already the
+  muxer's default, so the output can be cut at any Cluster boundary.
+  Combined with `with_cluster_position_hints()`, each Cluster's
+  `Position` is written as `0` — the §5.1.3.2 live-stream convention —
+  while `PrevSize` stays real. Pairs with the resilient demuxer: a live
+  capture cut at an arbitrary byte still demuxes its packet prefix, and
+  `seek_to` works through the Cues-less Cluster-Timestamp fallback.
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.
@@ -1538,6 +1597,18 @@ fuzz-corpus replay of five malformed seed shapes. All checks land as
 standard `cargo test` targets so a regression on any one surfaces in CI
 without waiting for a fuzz cycle.
 
+`tests/damage_resilience.rs` pins the resilient Reader's recovery
+decisions end-to-end: clean-file parity with the strict path (zero
+`DamageEvent`s), Cluster-stream resync past a corrupt Cluster header and
+past a forged `SimpleBlock` size, an every-truncation-point sweep
+asserting each cut of a multi-cluster file yields a packet *prefix* and
+a clean `Error::Eof` (never a panic, never a non-Eof error), the
+known-size-Segment-past-EoF clamp with its `SegmentTruncated` event,
+damaged-`Tags` / damaged-`Cues` master skips, the unrecoverable-tail
+drop, and the Cues-less seek fallback (including across an unknown-size
+Cluster). `tests/mux_live_streaming.rs` re-runs the cut-anywhere prefix
+property over the §25.3.4 live layout.
+
 `tests/ebml_walker_property.rs` adds deterministic property-style coverage
 for the EBML element walker (RFC 8794) that backs the whole demuxer — a
 seeded splitmix64 PRNG drives ~100k generated cases per run (no
@@ -1559,11 +1630,21 @@ build), or attempts an attacker-controlled allocation that exceeds what
 the input can back. A second pass through `open_typed` additionally
 fuzzes the typed-accessor surface — the per-Block `block_additions` /
 `block_group_meta` side channels, the `ClusterRecord` `SilentTrackNumber`
-lists, and the Chapters / SeekHead trees. The seed corpus in
+lists, and the Chapters / SeekHead trees. A third pass drives
+`open_resilient_typed` with a contract stronger than no-panic: a
+resilient `next_packet` may only fail with the clean `Error::Eof` (any
+other error class panics the harness), damage-event bookkeeping must
+never move backwards, and both seek shapes (Cues index + Cues-less
+cluster-scan fallback) run post-drain — so the recovery loop's
+forward-progress guarantee is fuzz-checked. The seed corpus in
 `fuzz/corpus/demux/` covers a
 minimal valid Matroska file, a minimal valid WebM file, an EBML-header-
-only stream, and two regression inputs (one for an EBML size-overflow,
-one for a zero-frame-size fixed-lacing `SimpleBlock`).
+only stream, three regression inputs (an EBML size-overflow, a
+zero-frame-size fixed-lacing `SimpleBlock`, and the 2026-07 fuzz-found
+unknown-size-`Colour` add-overflow), and two corrupted-file seeds
+(mid-file zeroed bytes, 60% truncation). Every corpus seed also replays
+through the resilient path as a plain `cargo test`
+(`injection_robustness::fuzz_corpus_files_replay_through_resilient_path`).
 
 Run locally with a nightly toolchain:
 
