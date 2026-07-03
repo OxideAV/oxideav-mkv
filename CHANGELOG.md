@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: livestreaming layout (RFC 9559 §25.3.4 + §23.2) —
+  `MkvMuxer::with_live_streaming()` omits the up-front `SeekHead` and
+  writes no `Cues` in `write_trailer` ("SeekHead and Cues are useless" in
+  a live stream; a stream with neither at its start SHOULD read as
+  non-seekable per §23.2 — the signal a live producer wants). Everything
+  other than Clusters still lands before the Clusters as §25.3.4
+  requires, and the Segment / Cluster unknown-size VINTs §23.2 mandates
+  were already the muxer's default, so the output can be cut at any
+  Cluster boundary. Combined with `with_cluster_position_hints()`, each
+  Cluster's `Position` is written as `0` (the §5.1.3.2 live convention)
+  while `PrevSize` stays real. Pairs with the resilient demuxer: a live
+  capture cut at an arbitrary byte still demuxes its packet prefix and
+  stays seekable through the Cues-less Cluster-Timestamp fallback (both
+  pinned by tests). Black-box validated (live file probes and fully
+  decodes cleanly under a widely-deployed reader); the
+  `gen_position_hints` example gained a `--live` flag.
+
 - Fuzzing: the `demux` fuzz target gained a third pass through
   `open_resilient_typed`, enforcing the resilient contract over arbitrary
   bytes — a resilient `next_packet` may only fail with the clean

@@ -372,6 +372,12 @@ pub struct MkvMuxer {
     /// element position" inside the Cluster, the anchor `CueRelativePosition`
     /// (RFC 9559 §5.1.5.1.2.3) is measured against.
     cluster_body_start_abs: u64,
+    /// When `true` (see [`MkvMuxer::with_live_streaming`]), the muxer
+    /// emits the RFC 9559 §25.3.4 livestreaming layout: no `SeekHead`, no
+    /// `Cues`, and (when combined with `cluster_position_hints`) the
+    /// §5.1.3.2 `Position = 0` live convention. Everything other than the
+    /// Clusters is still placed before the Clusters, as §25.3.4 requires.
+    live_streaming: bool,
     /// When `true` (see [`MkvMuxer::with_cluster_position_hints`]), every
     /// Cluster is written with a `Position` child (RFC 9559 §5.1.3.2 — the
     /// Cluster's own Segment Position, "It might help to resynchronize the
@@ -1987,6 +1993,7 @@ impl MkvMuxer {
             cluster_body_start_abs: 0,
             cluster_position_hints: false,
             prev_cluster_start_abs: None,
+            live_streaming: false,
             segment_data_start: 0,
             cues: Vec::new(),
             cue_seen_in_cluster: vec![false; n],
@@ -2086,6 +2093,44 @@ impl MkvMuxer {
     /// [`MkvMuxer::with_cluster_position_hints`] was called.
     pub fn cluster_position_hints(&self) -> bool {
         self.cluster_position_hints
+    }
+
+    /// Opt in to the RFC 9559 §25.3.4 livestreaming layout: "In
+    /// livestreaming, only a few elements make sense. For example,
+    /// SeekHead and Cues are useless." The muxer omits the up-front
+    /// `SeekHead` and writes no `Cues` in `write_trailer`; everything
+    /// other than the Clusters is still placed before the Clusters, as
+    /// §25.3.4 requires (Info, Tracks, Attachments, Tags — the layout the
+    /// muxer already emits). Per §23.2, a stream with neither a SeekHead
+    /// nor a Cues list at its start SHOULD be considered non-seekable by
+    /// players — exactly the signal a live producer wants to send; the
+    /// Segment (and each Cluster) already uses the unknown-size VINT
+    /// §23.2 mandates for a stream with no known end, so the output can
+    /// be cut at any Cluster boundary. When combined with
+    /// [`MkvMuxer::with_cluster_position_hints`], each Cluster's
+    /// `Position` is written as `0` — the §5.1.3.2 live-stream convention
+    /// (`PrevSize` stays real; the previous Cluster's size is known even
+    /// live).
+    ///
+    /// Off by default. Must be called before [`Muxer::write_header`].
+    /// The in-tree demuxer pairs naturally: a resilient open
+    /// ([`crate::demux::open_resilient`]) of a live capture demuxes the
+    /// Cluster stream, survives an arbitrary cut point, and can still
+    /// seek via the Cues-less Cluster-Timestamp scan fallback.
+    pub fn with_live_streaming(&mut self) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_live_streaming called after write_header",
+            ));
+        }
+        self.live_streaming = true;
+        Ok(self)
+    }
+
+    /// Read-only accessor: `true` when [`MkvMuxer::with_live_streaming`]
+    /// was called.
+    pub fn live_streaming(&self) -> bool {
+        self.live_streaming
     }
 
     /// Set the per-track `Video > FlagInterlaced` (RFC 9559 §5.1.4.1.28.1)
@@ -4031,25 +4076,26 @@ impl Muxer for MkvMuxer {
         // voided if no chapters / attachments were queued); Cues stays as a
         // placeholder zero and gets patched in `write_trailer` (or rewritten
         // as a Void element if no Cues was actually emitted).
-        let seek_head_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
-        let seek_head_bytes = build_initial_seek_head();
-        let seek_head_start_in_buf = all.len();
-        all.extend_from_slice(&seek_head_bytes);
-        // Compute where each Seek entry starts inside `all` so we can patch
-        // in the real offsets without rebuilding the buffer. The fixed
-        // layout is documented in `build_initial_seek_head`: each Seek is
-        // exactly `SEEK_ENTRY_LEN` bytes; the SeekPosition payload sits at
-        // `entry_start + SEEK_POS_PAYLOAD_OFFSET`.
-        let info_seek_entry_in_buf = seek_head_start_in_buf + SEEK_HEAD_HEADER_LEN;
-        let tracks_seek_entry_in_buf = info_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        let chapters_seek_entry_in_buf = tracks_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        let attachments_seek_entry_in_buf = chapters_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        let tags_seek_entry_in_buf = attachments_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        let cues_seek_entry_in_buf = tags_seek_entry_in_buf + SEEK_ENTRY_LEN;
-        // Sanity: SeekHead occupies a known total size; the next element
-        // starts immediately after.
-        debug_assert_eq!(seek_head_bytes.len(), SEEK_HEAD_TOTAL_LEN);
-        let _ = seek_head_offset_in_buf; // SeekHead always sits at offset 0 — kept for clarity.
+        // Livestreaming layout (RFC 9559 §25.3.4): "SeekHead and Cues are
+        // useless" in a live stream, and §23.2 says a stream with neither
+        // at its start SHOULD be considered non-seekable — exactly the
+        // signal a live muxer wants to send. Skip the whole fixed-size
+        // SeekHead when live streaming was requested; otherwise the
+        // fixed layout is documented in `build_initial_seek_head`: each
+        // Seek is exactly `SEEK_ENTRY_LEN` bytes and the SeekPosition
+        // payload sits at `entry_start + SEEK_POS_PAYLOAD_OFFSET`, so the
+        // patch section below can write the real offsets in place.
+        let seek_head_start_in_buf = if self.live_streaming {
+            None
+        } else {
+            let seek_head_bytes = build_initial_seek_head();
+            let start = all.len();
+            all.extend_from_slice(&seek_head_bytes);
+            // Sanity: SeekHead occupies a known total size; the next
+            // element starts immediately after.
+            debug_assert_eq!(seek_head_bytes.len(), SEEK_HEAD_TOTAL_LEN);
+            Some(start)
+        };
 
         // Info element.
         let info_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
@@ -4822,67 +4868,77 @@ impl Muxer for MkvMuxer {
 
         // Patch the Info / Tracks SeekPositions in the SeekHead now that we
         // know where each element landed inside `all`. Cues stays as zero
-        // and is patched in `write_trailer`.
-        write_u64_be_at(
-            &mut all,
-            info_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
-            info_offset_in_buf,
-        );
-        write_u64_be_at(
-            &mut all,
-            tracks_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
-            tracks_offset_in_buf,
-        );
-        match chapters_offset_opt {
-            Some(off) => write_u64_be_at(
+        // and is patched in `write_trailer`. In the live-streaming layout
+        // there is no SeekHead at all (§25.3.4) — nothing to patch.
+        if let Some(seek_head_start) = seek_head_start_in_buf {
+            let info_seek_entry_in_buf = seek_head_start + SEEK_HEAD_HEADER_LEN;
+            let tracks_seek_entry_in_buf = info_seek_entry_in_buf + SEEK_ENTRY_LEN;
+            let chapters_seek_entry_in_buf = tracks_seek_entry_in_buf + SEEK_ENTRY_LEN;
+            let attachments_seek_entry_in_buf = chapters_seek_entry_in_buf + SEEK_ENTRY_LEN;
+            let tags_seek_entry_in_buf = attachments_seek_entry_in_buf + SEEK_ENTRY_LEN;
+            let cues_seek_entry_in_buf = tags_seek_entry_in_buf + SEEK_ENTRY_LEN;
+            write_u64_be_at(
                 &mut all,
-                chapters_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
-                off,
-            ),
-            None => {
-                // No Chapters element emitted — rewrite the 21-byte slot
-                // as a Void so SeekHead walkers don't chase a placeholder
-                // zero that resolves to the SeekHead itself.
-                let void = void_seek_entry();
-                all[chapters_seek_entry_in_buf..chapters_seek_entry_in_buf + SEEK_ENTRY_LEN]
-                    .copy_from_slice(&void);
-            }
-        }
-        match attachments_offset_opt {
-            Some(off) => write_u64_be_at(
+                info_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                info_offset_in_buf,
+            );
+            write_u64_be_at(
                 &mut all,
-                attachments_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
-                off,
-            ),
-            None => {
-                // No Attachments element emitted — same void treatment as
-                // the Chapters slot above.
-                let void = void_seek_entry();
-                all[attachments_seek_entry_in_buf..attachments_seek_entry_in_buf + SEEK_ENTRY_LEN]
-                    .copy_from_slice(&void);
+                tracks_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                tracks_offset_in_buf,
+            );
+            match chapters_offset_opt {
+                Some(off) => write_u64_be_at(
+                    &mut all,
+                    chapters_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                    off,
+                ),
+                None => {
+                    // No Chapters element emitted — rewrite the 21-byte slot
+                    // as a Void so SeekHead walkers don't chase a placeholder
+                    // zero that resolves to the SeekHead itself.
+                    let void = void_seek_entry();
+                    all[chapters_seek_entry_in_buf..chapters_seek_entry_in_buf + SEEK_ENTRY_LEN]
+                        .copy_from_slice(&void);
+                }
             }
-        }
-        match tags_offset_opt {
-            Some(off) => write_u64_be_at(
-                &mut all,
-                tags_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
-                off,
-            ),
-            None => {
-                // No Tags element emitted — same void treatment as the
-                // Chapters / Attachments slots above.
-                let void = void_seek_entry();
-                all[tags_seek_entry_in_buf..tags_seek_entry_in_buf + SEEK_ENTRY_LEN]
-                    .copy_from_slice(&void);
+            match attachments_offset_opt {
+                Some(off) => write_u64_be_at(
+                    &mut all,
+                    attachments_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                    off,
+                ),
+                None => {
+                    // No Attachments element emitted — same void treatment as
+                    // the Chapters slot above.
+                    let void = void_seek_entry();
+                    all[attachments_seek_entry_in_buf
+                        ..attachments_seek_entry_in_buf + SEEK_ENTRY_LEN]
+                        .copy_from_slice(&void);
+                }
             }
+            match tags_offset_opt {
+                Some(off) => write_u64_be_at(
+                    &mut all,
+                    tags_seek_entry_in_buf + SEEK_POS_PAYLOAD_OFFSET,
+                    off,
+                ),
+                None => {
+                    // No Tags element emitted — same void treatment as the
+                    // Chapters / Attachments slots above.
+                    let void = void_seek_entry();
+                    all[tags_seek_entry_in_buf..tags_seek_entry_in_buf + SEEK_ENTRY_LEN]
+                        .copy_from_slice(&void);
+                }
+            }
+            // Absolute file offset of the Cues Seek entry — used in
+            // write_trailer to patch in the real Cues offset (or rewrite
+            // the 21-byte slot as a Void element when no Cues was emitted).
+            self.seek_cues_entry_offset = base_pos + cues_seek_entry_in_buf as u64;
+            self.seek_head_written = true;
         }
 
         self.segment_data_start = base_pos + segment_data_start_in_buf;
-        // Absolute file offset of the Cues Seek entry — used in
-        // write_trailer to patch in the real Cues offset (or rewrite the
-        // 21-byte slot as a Void element when no Cues was emitted).
-        self.seek_cues_entry_offset = base_pos + cues_seek_entry_in_buf as u64;
-        self.seek_head_written = true;
         self.output.write_all(&all)?;
         self.header_written = true;
         Ok(())
@@ -4909,7 +4965,13 @@ impl Muxer for MkvMuxer {
         // Emit a Cues element after the last Cluster. The prior clusters are
         // left with unknown size (their EBML parser stops when it meets the
         // top-level Cues element id, which is outside the cluster subtree).
-        let cues_offset_rel = self.write_cues()?;
+        // The live-streaming layout (§25.3.4) writes no Cues at all — a
+        // live stream has no known end to index.
+        let cues_offset_rel = if self.live_streaming {
+            None
+        } else {
+            self.write_cues()?
+        };
         // Patch the Cues entry in the SeekHead. If we did emit Cues, write
         // its offset (relative to the Segment payload start). If not, replace
         // the 21-byte Seek slot with a Void so the SeekHead stays self-
@@ -5329,7 +5391,14 @@ impl MkvMuxer {
         // note that keeps `Timestamp` first.
         if self.cluster_position_hints {
             let mut hints = Vec::new();
-            write_uint_element(&mut hints, ids::POSITION, self.cluster_offset_rel);
+            // §5.1.3.2: Position is "0 in live streams" — the Cluster
+            // offset is not determined ahead of time on a live path.
+            let pos_value = if self.live_streaming {
+                0
+            } else {
+                self.cluster_offset_rel
+            };
+            write_uint_element(&mut hints, ids::POSITION, pos_value);
             if let Some(prev) = self.prev_cluster_start_abs {
                 write_uint_element(&mut hints, ids::PREV_SIZE, cluster_abs.saturating_sub(prev));
             }
