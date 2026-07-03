@@ -21,6 +21,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: damage-resilient open — `demux::open_resilient` /
+  `demux::open_resilient_typed`. RFC 9559 §26 leaves error handling to the
+  Reader; this Reader recovers instead of failing: a known-size Segment
+  whose declared size runs past the input end is clamped (truncated-file
+  recovery), a damaged Top-Level master before the first Cluster (`Tags`,
+  `Chapters`, `Cues`, ...) is skipped keeping whatever parsed before the
+  error, garbage between Top-Level elements is stepped over by scanning
+  for the next well-formed 4-byte Top-Level element ID, and a corrupt
+  element inside the Cluster stream makes `next_packet` resynchronise on
+  the next plausible Cluster (the §5.1.3.2 damaged-stream
+  resynchronisation unit — a candidate must parse and its first child must
+  carry a legal Cluster-child ID per the §5.1.3.1 usage note) rather than
+  ending the stream. A truncated final Cluster yields the packets that
+  physically fit, then a clean `Error::Eof`. Every recovery is recorded as
+  a typed `DamageEvent` (`DamagedMaster(id)` / `GarbageData` /
+  `ClusterStream` / `SegmentTruncated` / `UnrecoverableTail`, each with
+  the damage offset, resume offset, and bytes skipped) surfaced through
+  `MkvDemuxer::damage_events()` — empty exactly when the file needed no
+  recovery, so strict-minded callers can still reject after the fact. The
+  strict `open` / `open_typed` behaviour is unchanged byte-for-byte;
+  `tests/damage_resilience.rs` pins both paths, including an
+  every-truncation-point packet-prefix property sweep.
+
 - Demuxer + Muxer: three reclaimed DivX-font `AttachedFile` children
   (RFC 9559 Appendix A.40..A.42) on the typed `demux::Attachment` and
   `mux::MkvAttachment` — `FileReferral` (A.40, `0x4675`, binary),

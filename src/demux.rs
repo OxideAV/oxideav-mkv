@@ -29,7 +29,57 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<
 /// the [`Demuxer`] trait does not expose. Same parsing contract as
 /// [`open`] — the trait-returning wrapper is implemented in terms of
 /// this one.
-pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<MkvDemuxer> {
+pub fn open_typed(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<MkvDemuxer> {
+    open_typed_impl(input, codecs, false)
+}
+
+/// Damage-tolerant variant of [`open`]. RFC 9559 §26 leaves error handling
+/// to the Reader ("Matroska Readers decide how to handle the errors whether
+/// or not they are recoverable in their code") — where the strict [`open`]
+/// fails on the first malformed byte, this path *recovers*:
+///
+/// * a known-size Segment whose declared size runs past the end of the
+///   input is clamped to the actual input length;
+/// * a Top-Level master that fails to parse before the first `Cluster`
+///   (damaged `Tags`, `Chapters`, `Cues`, ...) is skipped — whatever the
+///   parser lifted before the error is kept;
+/// * garbage between Top-Level elements is skipped by scanning for the
+///   next well-formed Top-Level element ID;
+/// * a corrupt element inside the Cluster stream makes `next_packet`
+///   resynchronise on the next `Cluster` (RFC 9559 §5.1.3.2 explicitly
+///   anticipates resynchronising the offset on damaged streams at the
+///   Cluster level) instead of failing the stream;
+/// * a truncated final Cluster yields the packets that physically fit and
+///   then a clean `Error::Eof`.
+///
+/// Every recovery is recorded as a [`DamageEvent`] and surfaced through
+/// [`MkvDemuxer::damage_events`] (reachable via [`open_resilient_typed`]),
+/// so a strict-minded caller can still reject a file that needed recovery.
+/// Structural failures that leave nothing to demux — a broken EBML header,
+/// an unsupported `DocType`, no parseable `TrackEntry`, no `Cluster` at
+/// all — still fail the open.
+pub fn open_resilient(
+    input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    open_resilient_typed(input, codecs).map(|d| Box::new(d) as Box<dyn Demuxer>)
+}
+
+/// Concrete-typed variant of [`open_resilient`] returning [`MkvDemuxer`]
+/// directly, so callers can inspect [`MkvDemuxer::damage_events`] after
+/// the open and between `next_packet` calls.
+pub fn open_resilient_typed(
+    input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+) -> Result<MkvDemuxer> {
+    open_typed_impl(input, codecs, true)
+}
+
+fn open_typed_impl(
+    mut input: Box<dyn ReadSeek>,
+    codecs: &dyn CodecResolver,
+    resilient: bool,
+) -> Result<MkvDemuxer> {
     // Validate EBML header.
     let hdr = read_element_header(&mut *input)?;
     if hdr.id != ids::EBML_HEADER {
@@ -113,6 +163,10 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         )));
     }
     let segment_data_start = input.stream_position()?;
+    // Damage events recorded during a resilient open (empty in strict
+    // mode), handed to the demuxer so `damage_events()` reports open-time
+    // recoveries alongside the stream-time ones.
+    let mut damage_events: Vec<DamageEvent> = Vec::new();
     let segment_data_end = if seg.size == VINT_UNKNOWN_SIZE {
         // Unknown segment size — use file end.
         let cur = input.stream_position()?;
@@ -120,7 +174,28 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         input.seek(SeekFrom::Start(cur))?;
         end
     } else {
-        segment_data_start + seg.size
+        let declared_end = segment_data_start.saturating_add(seg.size);
+        if resilient {
+            // A truncated file often keeps its original Segment size —
+            // clamp the walk to the bytes that physically exist so the
+            // recoverable prefix still demuxes.
+            let cur = input.stream_position()?;
+            let file_end = input.seek(SeekFrom::End(0))?;
+            input.seek(SeekFrom::Start(cur))?;
+            if declared_end > file_end {
+                damage_events.push(DamageEvent {
+                    kind: DamageKind::SegmentTruncated,
+                    offset: file_end,
+                    resumed_at: None,
+                    bytes_skipped: declared_end - file_end,
+                });
+                file_end
+            } else {
+                declared_end
+            }
+        } else {
+            declared_end
+        }
     };
 
     // Walk segment children, recording where Tracks/Info/Cluster live.
@@ -172,89 +247,170 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
     let mut crc_status: Vec<CrcStatus> = Vec::new();
 
     while input.stream_position()? < segment_data_end {
-        let e = read_element_header(&mut *input)?;
+        let walk_pos = input.stream_position()?;
+        let e = match read_element_header(&mut *input) {
+            Ok(e) => e,
+            Err(err) => {
+                if !resilient {
+                    return Err(err);
+                }
+                // Garbage where a Top-Level element header should be —
+                // scan forward for the next recognisable Top-Level element
+                // ID and resume the walk there (RFC 9559 §26 leaves the
+                // recovery strategy to the Reader).
+                match scan_top_level_element(
+                    &mut *input,
+                    walk_pos.saturating_add(1),
+                    segment_data_end,
+                )? {
+                    Some(off) => {
+                        damage_events.push(DamageEvent {
+                            kind: DamageKind::GarbageData,
+                            offset: walk_pos,
+                            resumed_at: Some(off),
+                            bytes_skipped: off - walk_pos,
+                        });
+                        input.seek(SeekFrom::Start(off))?;
+                        continue;
+                    }
+                    None => {
+                        damage_events.push(DamageEvent {
+                            kind: DamageKind::UnrecoverableTail,
+                            offset: walk_pos,
+                            resumed_at: None,
+                            bytes_skipped: segment_data_end.saturating_sub(walk_pos),
+                        });
+                        break;
+                    }
+                }
+            }
+        };
         let body_start = input.stream_position()?;
         let body_end_known = if e.size == VINT_UNKNOWN_SIZE {
             None
         } else {
             Some(body_start.saturating_add(e.size))
         };
-        // Validate a leading CRC-32 child against the rest of the element
-        // when the element size is known (CRC needs a bounded body). The
-        // helper rewinds the reader to `body_start` so the parse below is
-        // unaffected.
-        if let Some(end) = body_end_known {
-            if matches!(
-                e.id,
-                ids::INFO
-                    | ids::TRACKS
-                    | ids::TAGS
-                    | ids::CUES
-                    | ids::CHAPTERS
-                    | ids::ATTACHMENTS
-                    | ids::SEEK_HEAD
-            ) {
-                if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
-                    crc_status.push(s);
-                }
+        if e.id == ids::CLUSTER {
+            if first_cluster_offset.is_none() {
+                first_cluster_offset = Some(body_start - e.header_len as u64);
             }
+            input.seek(SeekFrom::Start(body_start - e.header_len as u64))?;
+            break;
         }
-        match e.id {
-            ids::INFO => {
-                let end = body_end_known.unwrap_or(segment_data_end);
-                parse_info(&mut *input, end, &mut info, &mut metadata)?;
-            }
-            ids::TRACKS => {
-                let end = body_end_known.unwrap_or(segment_data_end);
-                parse_tracks(&mut *input, end, &mut tracks)?;
-            }
-            ids::TAGS => {
-                let end = body_end_known.unwrap_or(segment_data_end);
-                parse_tags(&mut *input, end, &mut pending_tags)?;
-            }
-            ids::CUES => {
-                let end = body_end_known.unwrap_or(segment_data_end);
-                parse_cues(&mut *input, end, &mut cues, &mut cue_points)?;
-            }
-            ids::CHAPTERS => {
-                let end = body_end_known.unwrap_or(segment_data_end);
-                parse_chapters_typed(
-                    &mut *input,
-                    end,
-                    &mut metadata,
-                    &mut chapter_uid_to_index,
-                    &mut edition_uid_to_index,
-                    &mut editions,
-                )?;
-            }
-            ids::ATTACHMENTS => {
-                let end = body_end_known.unwrap_or(segment_data_end);
-                parse_attachments(
-                    &mut *input,
-                    end,
-                    &mut metadata,
-                    &mut attachment_uid_to_index,
-                    &mut attachments,
-                )?;
-            }
-            ids::SEEK_HEAD => {
-                let end = body_end_known.unwrap_or(segment_data_end);
-                parse_seek_head(&mut *input, end, &mut seek_entries)?;
-            }
-            ids::CLUSTER => {
-                if first_cluster_offset.is_none() {
-                    first_cluster_offset = Some(body_start - e.header_len as u64);
+        // Parse the Top-Level master. In resilient mode the whole parse is
+        // fallible-but-recoverable: whatever the parser lifted before an
+        // error is kept, the rest of the element is skipped, and the walk
+        // resumes at the next Top-Level element.
+        let parse_result: Result<()> = (|| {
+            // Validate a leading CRC-32 child against the rest of the
+            // element when the element size is known (CRC needs a bounded
+            // body). The helper rewinds the reader to `body_start` so the
+            // parse below is unaffected.
+            if let Some(end) = body_end_known {
+                if matches!(
+                    e.id,
+                    ids::INFO
+                        | ids::TRACKS
+                        | ids::TAGS
+                        | ids::CUES
+                        | ids::CHAPTERS
+                        | ids::ATTACHMENTS
+                        | ids::SEEK_HEAD
+                ) {
+                    if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
+                        crc_status.push(s);
+                    }
                 }
-                input.seek(SeekFrom::Start(body_start - e.header_len as u64))?;
-                break;
             }
-            _ => {
-                if let Some(end) = body_end_known {
-                    input.seek(SeekFrom::Start(end))?;
-                } else {
-                    return Err(Error::unsupported(
-                        "MKV: unknown-size element other than Cluster",
-                    ));
+            match e.id {
+                ids::INFO => {
+                    let end = body_end_known.unwrap_or(segment_data_end);
+                    parse_info(&mut *input, end, &mut info, &mut metadata)?;
+                }
+                ids::TRACKS => {
+                    let end = body_end_known.unwrap_or(segment_data_end);
+                    parse_tracks(&mut *input, end, &mut tracks)?;
+                }
+                ids::TAGS => {
+                    let end = body_end_known.unwrap_or(segment_data_end);
+                    parse_tags(&mut *input, end, &mut pending_tags)?;
+                }
+                ids::CUES => {
+                    let end = body_end_known.unwrap_or(segment_data_end);
+                    parse_cues(&mut *input, end, &mut cues, &mut cue_points)?;
+                }
+                ids::CHAPTERS => {
+                    let end = body_end_known.unwrap_or(segment_data_end);
+                    parse_chapters_typed(
+                        &mut *input,
+                        end,
+                        &mut metadata,
+                        &mut chapter_uid_to_index,
+                        &mut edition_uid_to_index,
+                        &mut editions,
+                    )?;
+                }
+                ids::ATTACHMENTS => {
+                    let end = body_end_known.unwrap_or(segment_data_end);
+                    parse_attachments(
+                        &mut *input,
+                        end,
+                        &mut metadata,
+                        &mut attachment_uid_to_index,
+                        &mut attachments,
+                    )?;
+                }
+                ids::SEEK_HEAD => {
+                    let end = body_end_known.unwrap_or(segment_data_end);
+                    parse_seek_head(&mut *input, end, &mut seek_entries)?;
+                }
+                _ => {
+                    if let Some(end) = body_end_known {
+                        input.seek(SeekFrom::Start(end))?;
+                    } else {
+                        return Err(Error::unsupported(
+                            "MKV: unknown-size element other than Cluster",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = parse_result {
+            if !resilient {
+                return Err(err);
+            }
+            // The master is damaged. Keep whatever was lifted before the
+            // error, then resume the walk: at the element's declared end
+            // when it is sane, otherwise at the next Top-Level element ID
+            // the scanner can find.
+            let resume = match body_end_known {
+                Some(end) if end <= segment_data_end => Some(end),
+                _ => scan_top_level_element(
+                    &mut *input,
+                    body_start.saturating_add(1),
+                    segment_data_end,
+                )?,
+            };
+            match resume {
+                Some(off) => {
+                    damage_events.push(DamageEvent {
+                        kind: DamageKind::DamagedMaster(e.id),
+                        offset: walk_pos,
+                        resumed_at: Some(off),
+                        bytes_skipped: off.saturating_sub(walk_pos),
+                    });
+                    input.seek(SeekFrom::Start(off))?;
+                }
+                None => {
+                    damage_events.push(DamageEvent {
+                        kind: DamageKind::UnrecoverableTail,
+                        offset: walk_pos,
+                        resumed_at: None,
+                        bytes_skipped: segment_data_end.saturating_sub(walk_pos),
+                    });
+                    break;
                 }
             }
         }
@@ -853,7 +1009,217 @@ pub fn open_typed(mut input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> R
         track_identity,
         cluster_records: Vec::new(),
         cluster_record_by_offset: std::collections::HashMap::new(),
+        resilient,
+        damage_events,
+        resync_floor: 0,
     })
+}
+
+/// What kind of damage a resilient demux recovered from — see
+/// [`DamageEvent`] and [`MkvDemuxer::damage_events`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DamageKind {
+    /// A Top-Level master element (id given) failed to parse during the
+    /// open-time Segment walk. Whatever the parser lifted before the
+    /// error was kept; the rest of the element was skipped.
+    DamagedMaster(u32),
+    /// Bytes that should have held an element could not be parsed at all
+    /// — the walk scanned forward and resumed at the next recognisable
+    /// Top-Level element ID.
+    GarbageData,
+    /// A corrupt element inside the Cluster stream made `next_packet`
+    /// resynchronise on a later Top-Level element (usually the next
+    /// `Cluster` — the resynchronisation unit RFC 9559 §5.1.3.2
+    /// anticipates for damaged streams). Packets between the damage and
+    /// the resume offset are lost.
+    ClusterStream,
+    /// The Segment's declared size ran past the physical end of the
+    /// input (a truncated file that kept its original headers). The walk
+    /// was clamped to the bytes that exist; `bytes_skipped` is the
+    /// number of declared-but-missing bytes.
+    SegmentTruncated,
+    /// Damage with no recovery point after it: no further Top-Level
+    /// element could be found between the damage and the Segment end.
+    /// The tail is dropped and the stream ends cleanly.
+    UnrecoverableTail,
+}
+
+/// One recovery performed by a resilient demux ([`open_resilient`] /
+/// [`open_resilient_typed`]).
+///
+/// RFC 9559 §26 deliberately leaves error handling to the Reader; this
+/// record is how our Reader reports what it decided. `offset` is the
+/// absolute input offset where the damage was detected, `resumed_at` the
+/// offset parsing resumed at (`None` when the tail was unrecoverable),
+/// and `bytes_skipped` how much input the recovery gave up on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DamageEvent {
+    kind: DamageKind,
+    offset: u64,
+    resumed_at: Option<u64>,
+    bytes_skipped: u64,
+}
+
+impl DamageEvent {
+    /// What kind of damage was recovered from.
+    pub fn kind(&self) -> DamageKind {
+        self.kind
+    }
+
+    /// Absolute input offset where the damage was detected.
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Absolute input offset where parsing resumed — `None` when no
+    /// recovery point existed and the rest of the Segment was dropped.
+    pub fn resumed_at(&self) -> Option<u64> {
+        self.resumed_at
+    }
+
+    /// Number of input bytes the recovery skipped over (or dropped, for
+    /// an unrecoverable tail / truncated Segment).
+    pub fn bytes_skipped(&self) -> u64 {
+        self.bytes_skipped
+    }
+}
+
+/// The 4-byte Top-Level element IDs a resync scan re-anchors on. Every
+/// direct child of `Segment` defined by RFC 9559 uses a 4-byte ID, which
+/// is what makes byte-level scanning viable: a single flags byte can't
+/// fake one.
+const TOP_LEVEL_IDS: [u32; 8] = [
+    ids::CLUSTER,
+    ids::CUES,
+    ids::TRACKS,
+    ids::INFO,
+    ids::TAGS,
+    ids::CHAPTERS,
+    ids::ATTACHMENTS,
+    ids::SEEK_HEAD,
+];
+
+/// Child-element IDs that legitimately start a `Cluster` body. Used to
+/// validate a scanned `Cluster` candidate: after the id+size header, the
+/// first child must itself parse and carry one of these IDs (RFC 9559
+/// §5.1.3.1 usage note — `Timestamp` SHOULD be the first child, or the
+/// second after a `CRC-32`; the rest covers writers that put `Position` /
+/// `PrevSize` / a block first anyway).
+const CLUSTER_FIRST_CHILD_IDS: [u32; 8] = [
+    ids::TIMECODE,
+    ids::CRC32,
+    ids::POSITION,
+    ids::PREV_SIZE,
+    ids::SILENT_TRACKS,
+    ids::SIMPLE_BLOCK,
+    ids::BLOCK_GROUP,
+    ids::ENCRYPTED_BLOCK,
+];
+
+/// Scan `[from, end)` for the next plausible Top-Level element and return
+/// the absolute offset of its ID byte, or `None` when the range holds no
+/// recovery point.
+///
+/// This is the damaged-stream resynchronisation primitive: all RFC 9559
+/// Top-Level elements carry 4-byte EBML IDs (class-D), so scanning for
+/// the ID byte pattern and then vetting the candidate is reliable in
+/// practice. A candidate is accepted when:
+///
+/// * its element header parses,
+/// * its size is bounded and its body ends inside `end` — or, for
+///   `Cluster` only, the size is the unknown-size VINT (RFC 9559 permits
+///   `unknownsizeallowed` on Segment and Cluster alone) or the bounded
+///   body overruns `end` (a truncated final Cluster still yields its
+///   parseable prefix; the caller clamps),
+/// * for `Cluster`, the first child element also parses and carries a
+///   known Cluster-child ID (see [`CLUSTER_FIRST_CHILD_IDS`]) — this
+///   rejects most payload bytes that coincidentally spell the Cluster ID.
+///
+/// The reader position on return is unspecified; the caller seeks.
+fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<Option<u64>> {
+    const CHUNK: usize = 64 * 1024;
+    if from >= end {
+        return Ok(None);
+    }
+    let mut base = from;
+    let mut buf = vec![0u8; CHUNK];
+    // 3-byte carry so a candidate ID straddling two chunks is still seen.
+    let mut carry: Vec<u8> = Vec::new();
+    while base < end {
+        let want = ((end - base) as usize).min(CHUNK - carry.len());
+        r.seek(SeekFrom::Start(base))?;
+        let mut filled = 0usize;
+        while filled < want {
+            match r.read(&mut buf[carry.len() + filled..carry.len() + want]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if filled == 0 {
+            return Ok(None);
+        }
+        // The chunk was read into `buf[carry.len()..]`; lay the carry from
+        // the previous chunk in front of it so a 4-byte ID straddling the
+        // boundary is still matched.
+        let window_start = base - carry.len() as u64;
+        for (i, b) in carry.iter().enumerate() {
+            buf[i] = *b;
+        }
+        let window_len = carry.len() + filled;
+        for i in 0..window_len.saturating_sub(3) {
+            let id = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+            if !TOP_LEVEL_IDS.contains(&id) {
+                continue;
+            }
+            let candidate = window_start + i as u64;
+            if let Some(hit) = vet_top_level_candidate(r, candidate, end)? {
+                return Ok(Some(hit));
+            }
+        }
+        // Next chunk; keep the last 3 bytes as carry.
+        let keep = window_len.min(3);
+        carry = buf[window_len - keep..window_len].to_vec();
+        base = window_start + window_len as u64;
+    }
+    Ok(None)
+}
+
+/// Vet one scanned Top-Level candidate at `candidate` (see
+/// [`scan_top_level_element`] for the acceptance rules). Returns
+/// `Some(candidate)` on acceptance.
+fn vet_top_level_candidate(r: &mut dyn ReadSeek, candidate: u64, end: u64) -> Result<Option<u64>> {
+    r.seek(SeekFrom::Start(candidate))?;
+    let hdr = match read_element_header(&mut *r) {
+        Ok(h) => h,
+        Err(_) => return Ok(None),
+    };
+    let body_start = match r.stream_position() {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    if hdr.id == ids::CLUSTER {
+        // Unknown-size is legal on Cluster; a bounded body overrunning
+        // `end` is accepted too (truncated final Cluster — the caller
+        // clamps the walk). Vet the first child.
+        let first_child = match read_element_header(&mut *r) {
+            Ok(c) => c,
+            Err(_) => return Ok(None),
+        };
+        if CLUSTER_FIRST_CHILD_IDS.contains(&first_child.id) {
+            return Ok(Some(candidate));
+        }
+        return Ok(None);
+    }
+    // Non-Cluster masters must be bounded and fit.
+    if hdr.size == VINT_UNKNOWN_SIZE {
+        return Ok(None);
+    }
+    if body_start.saturating_add(hdr.size) > end {
+        return Ok(None);
+    }
+    Ok(Some(candidate))
 }
 
 #[derive(Default)]
@@ -7365,6 +7731,19 @@ pub struct MkvDemuxer {
     /// open finds the record already present and reuses it instead of
     /// pushing a duplicate row).
     cluster_record_by_offset: std::collections::HashMap<u64, usize>,
+    /// `true` when constructed via [`open_resilient`] /
+    /// [`open_resilient_typed`] — a parse error in the Cluster stream
+    /// triggers a resynchronisation scan instead of failing
+    /// [`Demuxer::next_packet`]. See [`MkvDemuxer::is_resilient`].
+    resilient: bool,
+    /// Every recovery performed so far — open-time master skips first,
+    /// then stream-time resyncs in the order they happened. See
+    /// [`MkvDemuxer::damage_events`].
+    damage_events: Vec<DamageEvent>,
+    /// Progress guard for the resync scanner: the next scan starts at or
+    /// after this offset, so repeated failures can never re-match the
+    /// same bytes and loop.
+    resync_floor: u64,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -7388,7 +7767,26 @@ impl Demuxer for MkvDemuxer {
                 self.last_block_group_meta = meta;
                 return Ok(p);
             }
-            self.advance()?;
+            let before = self
+                .input
+                .stream_position()
+                .unwrap_or(self.segment_data_end);
+            match self.advance() {
+                Ok(()) => {}
+                // `Error::Eof` is `advance`'s clean end-of-Segment signal,
+                // not damage — always propagate.
+                Err(Error::Eof) => return Err(Error::Eof),
+                Err(e) => {
+                    if !self.resilient {
+                        return Err(e);
+                    }
+                    // Damaged Cluster stream — resynchronise on the next
+                    // Top-Level element (RFC 9559 §5.1.3.2 anticipates
+                    // Cluster-level resynchronisation of damaged streams)
+                    // and keep going. Unrecoverable → clean Eof.
+                    self.resync_cluster_stream(before)?;
+                }
+            }
         }
     }
 
@@ -7586,6 +7984,26 @@ impl MkvDemuxer {
     /// order it was first opened by `next_packet` / `seek_to`.
     pub fn crc_status(&self) -> &[CrcStatus] {
         &self.crc_status
+    }
+
+    /// `true` when this demuxer was constructed via [`open_resilient`] /
+    /// [`open_resilient_typed`] and will resynchronise on damaged input
+    /// instead of failing `next_packet`.
+    pub fn is_resilient(&self) -> bool {
+        self.resilient
+    }
+
+    /// Every recovery a resilient demux has performed so far — open-time
+    /// master skips first, then Cluster-stream resyncs in the order they
+    /// happened (the slice grows as `next_packet` walks the file).
+    ///
+    /// Always empty for a strict [`open`] / [`open_typed`] demuxer, and
+    /// empty for a resilient demuxer over an undamaged file — so
+    /// `!damage_events().is_empty()` is exactly "this file needed
+    /// recovery," which strict-minded callers can use to reject it after
+    /// the fact.
+    pub fn damage_events(&self) -> &[DamageEvent] {
+        &self.damage_events
     }
 
     /// Per-Cluster typed records (RFC 9559 §5.1.3.2 — `Position`,
@@ -8714,6 +9132,49 @@ impl MkvDemuxer {
         Ok(())
     }
 
+    /// Resynchronise the Cluster stream after a parse error at (or after)
+    /// `failed_at`: scan forward for the next plausible Top-Level element,
+    /// record a [`DamageEvent`], and leave the reader positioned on it so
+    /// the regular [`Self::advance`] loop dispatches it. When no recovery
+    /// point exists, the tail is dropped and the reader parks at the
+    /// Segment end so the next `advance` reports a clean `Error::Eof`.
+    ///
+    /// Progress guarantee: the scan never starts below `resync_floor`
+    /// (one past the last accepted recovery point), so a candidate that
+    /// keeps failing to parse cannot be re-matched forever.
+    fn resync_cluster_stream(&mut self, failed_at: u64) -> Result<()> {
+        self.cluster_state = ClusterState::Idle;
+        let from = failed_at.saturating_add(1).max(self.resync_floor);
+        let found =
+            scan_top_level_element(&mut *self.input, from, self.segment_data_end).unwrap_or(None);
+        match found {
+            Some(off) => {
+                self.resync_floor = off.saturating_add(1);
+                self.damage_events.push(DamageEvent {
+                    kind: DamageKind::ClusterStream,
+                    offset: failed_at,
+                    resumed_at: Some(off),
+                    bytes_skipped: off.saturating_sub(failed_at),
+                });
+                self.input.seek(SeekFrom::Start(off))?;
+                Ok(())
+            }
+            None => {
+                self.damage_events.push(DamageEvent {
+                    kind: DamageKind::UnrecoverableTail,
+                    offset: failed_at,
+                    resumed_at: None,
+                    bytes_skipped: self.segment_data_end.saturating_sub(failed_at),
+                });
+                // Park at the Segment end; the seek target always exists
+                // because segment_data_end is clamped to the input length
+                // in resilient mode.
+                self.input.seek(SeekFrom::Start(self.segment_data_end))?;
+                Ok(())
+            }
+        }
+    }
+
     fn advance(&mut self) -> Result<()> {
         match self.cluster_state {
             ClusterState::Idle => {
@@ -8728,6 +9189,12 @@ impl MkvDemuxer {
                         let is_unknown_size = e.size == VINT_UNKNOWN_SIZE;
                         let body_end = if is_unknown_size {
                             self.segment_data_end
+                        } else if self.resilient {
+                            // A bounded final Cluster on a truncated file
+                            // declares a body past the input end — clamp so
+                            // the parseable prefix still demuxes and the
+                            // walk ends cleanly instead of erroring.
+                            body_start.saturating_add(e.size).min(self.segment_data_end)
                         } else {
                             body_start.saturating_add(e.size)
                         };
