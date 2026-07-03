@@ -21,6 +21,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer + Muxer: RFC 9559 §23.2 live tagging — mid-stream `Tags`. The
+  demuxer now parses a `Tags` element it crosses during the Cluster walk
+  and applies the §23.2 MUST-reset ("the new Tags element MUST reset the
+  previously encountered Tags elements and use the new values instead"):
+  the typed `tags()` slice is replaced wholesale and the tag-derived
+  flat-metadata entries are swapped in place, leaving Info- / Chapters- /
+  Attachments-derived metadata untouched; UID scopes resolve against the
+  same maps the open-time walk built, and a leading `CRC-32` on the
+  element validates onto `crc_status()` like every other Top-Level
+  master. The same read path surfaces a *trailing* `Tags` element placed
+  after the last Cluster — a common Writer layout the single-pass open
+  walk never reached before (previously skipped silently). A malformed
+  mid-stream `Tags` is skipped without resetting anything. On the write
+  side, `MkvMuxer::write_live_tags(&[MkvTag])` (livestreaming muxers
+  only) emits a `Tags` element between Clusters with the same queue-time
+  validation as `add_tag`, flushing in-flight laces and ending the open
+  unknown-size Cluster (the top-level element terminates it on read).
+
 - Muxer: livestreaming layout (RFC 9559 §25.3.4 + §23.2) —
   `MkvMuxer::with_live_streaming()` omits the up-front `SeekHead` and
   writes no `Cues` in `write_trailer` ("SeekHead and Cues are useless" in

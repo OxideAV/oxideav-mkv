@@ -589,6 +589,7 @@ fn open_typed_impl(
         .map(|(i, t)| (t.uid, i as u32))
         .collect();
     let mut typed_tags: Vec<Tag> = Vec::new();
+    let metadata_len_before_tags = metadata.len();
     resolve_tags(
         pending_tags,
         &track_uid_to_index,
@@ -598,6 +599,12 @@ fn open_typed_impl(
         &mut metadata,
         &mut typed_tags,
     );
+    // Remember exactly which flat-metadata entries the Tags element
+    // contributed, so a mid-stream `Tags` (RFC 9559 §23.2 live tagging:
+    // "the new Tags element MUST reset the previously encountered Tags
+    // elements and use the new values instead") can swap them without
+    // touching Info- / Chapters- / Attachments-derived entries.
+    let tag_metadata_entries: Vec<(String, String)> = metadata[metadata_len_before_tags..].to_vec();
 
     // Resolve each track's `TrackOperation` (RFC 9559 §5.1.4.1.30): map the
     // raw `TrackPlaneUID` / `TrackJoinUID` references onto stream indices via
@@ -1013,6 +1020,11 @@ fn open_typed_impl(
         damage_events,
         resync_floor: 0,
         first_cluster_offset: cluster_pos,
+        track_uid_to_index,
+        chapter_uid_to_index,
+        attachment_uid_to_index,
+        edition_uid_to_index,
+        tag_metadata_entries,
     })
 }
 
@@ -7749,6 +7761,20 @@ pub struct MkvDemuxer {
     /// for the resilient Cues-less seek fallback
     /// ([`MkvDemuxer::seek_by_cluster_scan`]).
     first_cluster_offset: u64,
+    /// `TrackUID` → stream-index map, kept from the open-time walk so a
+    /// mid-stream `Tags` element (RFC 9559 §23.2 live tagging) resolves
+    /// its `TagTrackUID` scopes exactly like the open-time one.
+    track_uid_to_index: std::collections::HashMap<u64, u32>,
+    /// `ChapterUID` → 1-based chapter-index map (see above).
+    chapter_uid_to_index: std::collections::HashMap<u64, u32>,
+    /// `FileUID` → 1-based attachment-index map (see above).
+    attachment_uid_to_index: std::collections::HashMap<u64, u32>,
+    /// `EditionUID` → 1-based edition-index map (see above).
+    edition_uid_to_index: std::collections::HashMap<u64, u32>,
+    /// The flat-metadata entries contributed by the most recent `Tags`
+    /// element — removed and re-added when a mid-stream `Tags` resets
+    /// the tag state per RFC 9559 §23.2.
+    tag_metadata_entries: Vec<(String, String)>,
 }
 
 impl Demuxer for MkvDemuxer {
@@ -9328,6 +9354,68 @@ impl MkvDemuxer {
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
+    /// Parse a `Tags` element encountered during the Cluster walk and
+    /// apply the RFC 9559 §23.2 reset semantics: the new element replaces
+    /// the previously-encountered tag state — the typed [`Self::tags`]
+    /// slice is swapped wholesale and the flat-metadata entries the old
+    /// Tags contributed are removed before the new ones are added
+    /// (Info- / Chapters- / Attachments-derived metadata is untouched).
+    ///
+    /// UID scopes resolve against the same maps the open-time walk built,
+    /// so `tag:track:N:*` / `tag:chapter:N:*` keys keep their meaning.
+    /// Best-effort by design: an unknown-size or malformed `Tags` element
+    /// is skipped without resetting anything (the reader is repositioned
+    /// past it when the size is known; a parse error inside an
+    /// unknown-size element surfaces to the caller like any other
+    /// stream-walk error, where resilient mode resynchronises).
+    fn apply_mid_stream_tags(&mut self, size: u64) -> Result<()> {
+        if size == VINT_UNKNOWN_SIZE {
+            // A `Tags` master may not use the unknown-size VINT (RFC 8794
+            // §6.2 — only Segment / Cluster declare unknownsizeallowed).
+            // Preserve the legacy skip behaviour.
+            skip(&mut *self.input, size)?;
+            return Ok(());
+        }
+        let body_start = self.input.stream_position()?;
+        let end = body_start.saturating_add(size);
+        // Validate a leading CRC-32 child like the open-time walk does
+        // for Top-Level masters (RFC 9559 §6.2); informational.
+        if let Ok(Some(status)) =
+            validate_top_level_crc(&mut *self.input, ids::TAGS, body_start, end)
+        {
+            self.crc_status.push(status);
+        }
+        let mut pending: Vec<RawTag> = Vec::new();
+        if parse_tags(&mut *self.input, end, &mut pending).is_err() {
+            // Malformed mid-stream Tags: skip it whole, reset nothing.
+            self.input.seek(SeekFrom::Start(end))?;
+            return Ok(());
+        }
+        let mut new_typed: Vec<Tag> = Vec::new();
+        let mut new_entries: Vec<(String, String)> = Vec::new();
+        resolve_tags(
+            pending,
+            &self.track_uid_to_index,
+            &self.chapter_uid_to_index,
+            &self.attachment_uid_to_index,
+            &self.edition_uid_to_index,
+            &mut new_entries,
+            &mut new_typed,
+        );
+        // §23.2 reset: drop exactly the entries the previous Tags element
+        // contributed (one occurrence each, so an identical Info-derived
+        // pair survives), then append the new ones.
+        for old_entry in self.tag_metadata_entries.drain(..) {
+            if let Some(pos) = self.metadata.iter().position(|e| *e == old_entry) {
+                self.metadata.remove(pos);
+            }
+        }
+        self.metadata.extend(new_entries.iter().cloned());
+        self.tag_metadata_entries = new_entries;
+        self.tags = new_typed;
+        Ok(())
+    }
+
     fn advance(&mut self) -> Result<()> {
         match self.cluster_state {
             ClusterState::Idle => {
@@ -9364,7 +9452,21 @@ impl MkvDemuxer {
                         };
                         Ok(())
                     }
-                    ids::CUES | ids::ATTACHMENTS | ids::CHAPTERS | ids::TAGS => {
+                    ids::TAGS => {
+                        // RFC 9559 §23.2 live tagging: "The Tags element
+                        // can be placed between Clusters each time it is
+                        // necessary. In that case, the new Tags element
+                        // MUST reset the previously encountered Tags
+                        // elements and use the new values instead." Parse
+                        // and apply it — this also surfaces the trailing
+                        // Tags element some Writers place after the last
+                        // Cluster, which the single-pass open walk never
+                        // reaches. Best-effort: a malformed mid-stream
+                        // Tags is skipped without resetting anything.
+                        self.apply_mid_stream_tags(e.size)?;
+                        Ok(())
+                    }
+                    ids::CUES | ids::ATTACHMENTS | ids::CHAPTERS => {
                         // Skip — not packet data.
                         skip(&mut *self.input, e.size)?;
                         Ok(())

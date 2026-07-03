@@ -3789,6 +3789,68 @@ impl MkvMuxer {
         &self.tags
     }
 
+    /// Emit a `Tags` element *between Clusters* on a livestreaming muxer
+    /// (RFC 9559 §23.2: "In the context of live radio or web TV, it is
+    /// possible to \"tag\" the content while it is playing. The Tags
+    /// element can be placed between Clusters each time it is necessary.
+    /// In that case, the new Tags element MUST reset the previously
+    /// encountered Tags elements and use the new values instead.").
+    ///
+    /// Requires [`MkvMuxer::with_live_streaming`] — the between-Clusters
+    /// `Tags` placement is the §23.2 live-tagging mechanism, and the
+    /// non-live layout keeps its single up-front `Tags` master
+    /// (§5.1.8 `maxOccurs: 1` per Segment walk) — and a written header.
+    /// Any in-flight lace is flushed and the open Cluster is ended (the
+    /// unknown-size Cluster is terminated by the `Tags` element itself on
+    /// read; the next packet opens a fresh Cluster). Each `Tag` gets the
+    /// same queue-time validation as [`MkvMuxer::add_tag`]. The element
+    /// carries a leading `CRC-32` like every Top-Level master this muxer
+    /// writes. The in-tree demuxer applies the reset: its `tags()` /
+    /// tag-derived metadata are replaced when the walk crosses this
+    /// element.
+    pub fn write_live_tags(&mut self, tags: &[MkvTag]) -> Result<()> {
+        if !self.header_written {
+            return Err(Error::other(
+                "MKV muxer: write_live_tags called before write_header",
+            ));
+        }
+        if !self.live_streaming {
+            return Err(Error::other(
+                "MKV muxer: write_live_tags requires with_live_streaming (RFC 9559 §23.2)",
+            ));
+        }
+        for tag in tags {
+            if tag.simple_tags.is_empty() {
+                return Err(Error::invalid(
+                    "MKV muxer: Tag requires at least one SimpleTag (RFC 9559 §5.1.8.1.2, minOccurs=1)",
+                ));
+            }
+            if tag.targets.target_type_value == Some(0) {
+                return Err(Error::invalid(
+                    "MKV muxer: TargetTypeValue range: not 0 (RFC 9559 §5.1.8.1.1.1)",
+                ));
+            }
+            validate_simple_tags(&tag.simple_tags)?;
+        }
+        // Flush in-flight laces — their frames belong to the Cluster the
+        // Tags element is about to terminate.
+        if self.lacing_mode != LacingMode::None {
+            for i in 0..self.lace_pending.len() {
+                if !self.lace_pending[i].frames.is_empty() {
+                    self.flush_lace(i)?;
+                }
+            }
+        }
+        // The top-level Tags element ends the open unknown-size Cluster
+        // on read; mirror that in the writer state so the next packet
+        // starts a fresh Cluster instead of appending Blocks after a
+        // sibling element.
+        self.cluster_open = false;
+        let bytes = build_tags_element(tags);
+        self.output.write_all(&bytes)?;
+        Ok(())
+    }
+
     /// Queue the Linked-Segment `Info` metadata (RFC 9559 §5.1.2.1..§5.1.2.8 +
     /// Section 17) the muxer writes into the `Info` master, right after
     /// `WritingApp`. The mux-side mirror of the demux-side
