@@ -372,6 +372,19 @@ pub struct MkvMuxer {
     /// element position" inside the Cluster, the anchor `CueRelativePosition`
     /// (RFC 9559 §5.1.5.1.2.3) is measured against.
     cluster_body_start_abs: u64,
+    /// When `true` (see [`MkvMuxer::with_cluster_position_hints`]), every
+    /// Cluster is written with a `Position` child (RFC 9559 §5.1.3.2 — the
+    /// Cluster's own Segment Position, "It might help to resynchronize the
+    /// offset on damaged streams") and, from the second Cluster on, a
+    /// `PrevSize` child (§5.1.3.3 — "Size of the previous Cluster, in
+    /// octets. Can be useful for backward playing").
+    cluster_position_hints: bool,
+    /// Absolute file offset of the previous Cluster's element ID — the
+    /// minuend for the `PrevSize` value. `None` before the first Cluster.
+    /// The muxer writes Clusters back-to-back, so the distance between two
+    /// consecutive Cluster starts is exactly the previous Cluster's full
+    /// element size (ID + size header + body).
+    prev_cluster_start_abs: Option<u64>,
     /// Absolute file offset of the Segment payload start (first byte after
     /// the Segment element header). `CueClusterPosition` values are stored
     /// relative to this position, per the Matroska spec.
@@ -1972,6 +1985,8 @@ impl MkvMuxer {
             cluster_timecode_ms: 0,
             cluster_offset_rel: 0,
             cluster_body_start_abs: 0,
+            cluster_position_hints: false,
+            prev_cluster_start_abs: None,
             segment_data_start: 0,
             cues: Vec::new(),
             cue_seen_in_cluster: vec![false; n],
@@ -2042,6 +2057,35 @@ impl MkvMuxer {
     /// (no-lacing) state. Useful for tests + diagnostics.
     pub fn block_lacing_mode(&self) -> LacingMode {
         self.lacing_mode
+    }
+
+    /// Opt in to per-Cluster damage-recovery / backward-play hints: every
+    /// Cluster the muxer opens gains a `Position` child (RFC 9559
+    /// §5.1.3.2 — the Cluster's own Segment Position; the spec notes "It
+    /// might help to resynchronize the offset on damaged streams") right
+    /// after its `Timestamp`, and every Cluster from the second on gains
+    /// a `PrevSize` child (§5.1.3.3 — the previous Cluster's full element
+    /// size in octets, "useful for backward playing": subtracting it from
+    /// a Cluster's own start offset lands on the previous Cluster's ID).
+    ///
+    /// Off by default — the two elements are optional and byte-identical
+    /// output with prior releases is preserved unless the caller opts in.
+    /// Must be called before [`Muxer::write_header`]. The demux side reads
+    /// both onto [`crate::demux::ClusterRecord`].
+    pub fn with_cluster_position_hints(&mut self) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_cluster_position_hints called after write_header",
+            ));
+        }
+        self.cluster_position_hints = true;
+        Ok(self)
+    }
+
+    /// Read-only accessor: `true` when
+    /// [`MkvMuxer::with_cluster_position_hints`] was called.
+    pub fn cluster_position_hints(&self) -> bool {
+        self.cluster_position_hints
     }
 
     /// Set the per-track `Video > FlagInterlaced` (RFC 9559 §5.1.4.1.28.1)
@@ -5275,6 +5319,23 @@ impl MkvMuxer {
         let mut tc = Vec::new();
         write_uint_element(&mut tc, ids::TIMECODE, timecode_ms.max(0) as u64);
         self.output.write_all(&tc)?;
+        // Damage-recovery / backward-play hints (opt-in via
+        // `with_cluster_position_hints`): `Position` (RFC 9559 §5.1.3.2,
+        // the Cluster's Segment Position — same value space as
+        // `CueClusterPosition`) and `PrevSize` (§5.1.3.3, the previous
+        // Cluster's full element size in octets — Clusters are written
+        // back-to-back, so it is the distance between consecutive Cluster
+        // starts). Emitted right after `Timestamp` per the §5.1.3.1 usage
+        // note that keeps `Timestamp` first.
+        if self.cluster_position_hints {
+            let mut hints = Vec::new();
+            write_uint_element(&mut hints, ids::POSITION, self.cluster_offset_rel);
+            if let Some(prev) = self.prev_cluster_start_abs {
+                write_uint_element(&mut hints, ids::PREV_SIZE, cluster_abs.saturating_sub(prev));
+            }
+            self.output.write_all(&hints)?;
+        }
+        self.prev_cluster_start_abs = Some(cluster_abs);
         // SilentTracks (RFC 9559 Appendix A.1) — emitted once per Cluster
         // when the caller queued track numbers for this Cluster via
         // `set_next_cluster_silent_tracks`. The list is drained so it

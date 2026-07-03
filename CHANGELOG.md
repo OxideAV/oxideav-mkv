@@ -21,6 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: opt-in per-Cluster damage-recovery / backward-play hints —
+  `MkvMuxer::with_cluster_position_hints()` writes a `Position` child
+  (RFC 9559 §5.1.3.2, the Cluster's own Segment Position — "It might help
+  to resynchronize the offset on damaged streams") right after every
+  Cluster's `Timestamp`, plus a `PrevSize` child (§5.1.3.3, the previous
+  Cluster's full element size in octets — "useful for backward playing")
+  from the second Cluster on. Off by default so output stays
+  byte-identical with prior releases. Round-trip tests verify the
+  semantics exactly (each `Position` + Segment payload start + header
+  length lands on the Cluster's on-disk ID; each Cluster start minus its
+  `PrevSize` lands on the previous Cluster's ID), including after a
+  damage resync; black-box validated (hinted file probes and fully
+  decodes cleanly under a widely-deployed reader). Ships with the
+  `gen_position_hints` example used for that validation.
+
 - Demuxer: resilient Cues-less seek fallback — on an [`open_resilient`]
   demuxer, `seek_to` on a file with no usable `Cues` index (absent, or the
   master was damaged and skipped at open) linearly scans Cluster
