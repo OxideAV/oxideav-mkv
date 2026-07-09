@@ -267,8 +267,13 @@ the unified `oxideav` aggregator to wire decoding automatically.
   the on-disk presence (a re-muxer can avoid emitting an element the source
   omitted). `TrackCodecTiming::is_empty()` reports the both-absent state — a
   track that emitted an explicit `0` for either element is *not* empty. The
-  mux side already writes both on the Opus path (`CodecDelay` = `OpusHead`
-  pre-skip in ns, `SeekPreRoll` = 80 ms).
+  mux side is now fully symmetric:
+  `MkvMuxer::set_track_codec_timing(stream_index, MkvTrackCodecTiming)` writes
+  both elements on **any** track (each `Some(v)` field explicit, each `None`
+  off-disk), and an explicit hint overrides the auto-derived Opus values
+  (`CodecDelay` = `OpusHead` pre-skip in ns, `SeekPreRoll` = 80 ms) per field —
+  so a re-mux preserves a source's `CodecDelay` / `SeekPreRoll` verbatim rather
+  than being limited to the Opus recommendation.
 - **Typed `TrackTranslate` accessor** (RFC 9559 §5.1.4.1.27):
   `MkvDemuxer::track_translates(stream_index) -> &[TrackTranslate]` (and the
   per-stream `all_track_translates()` slice) returns each

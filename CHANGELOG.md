@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Muxer: `MkvMuxer::set_track_codec_timing(stream_index, MkvTrackCodecTiming)`
+  writes the `TrackEntry`-level `CodecDelay` (RFC 9559 §5.1.4.1.25) and
+  `SeekPreRoll` (§5.1.4.1.26) elements on **any** track. Each field is an
+  `Option<u64>` nanosecond value — a `Some(v)` writes the element explicitly
+  (an explicit `0` round-trips distinctly from omission, since neither element
+  has a "not 0" range), a `None` leaves it off-disk. For an Opus track the
+  muxer still auto-derives `CodecDelay` from the `OpusHead` pre-skip and an
+  80 ms `SeekPreRoll`; an explicit hint now overrides either auto value per
+  field, closing the last demux-reads-but-mux-can't-write asymmetry on the
+  codec-timing surface. Fully symmetric with the demux-side
+  `MkvDemuxer::track_codec_timing`. Round-trips pinned in
+  `tests/mux_track_codec_timing.rs` (7 cases).
+
 ### Fixed
 
 - Demuxer: fuzz-found add-overflow (debug-build panic) when a nested master

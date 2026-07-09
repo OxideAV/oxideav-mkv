@@ -261,6 +261,49 @@ impl MkvTrackTiming {
     }
 }
 
+/// A queued `TrackEntry` codec-timing hint (RFC 9559 §5.1.4.1.25 /
+/// §5.1.4.1.26) installed via [`MkvMuxer::set_track_codec_timing`]. Both
+/// fields are `Option<u64>` nanosecond values; a `Some(v)` writes the
+/// element explicitly (an explicit `0` is legal and distinct from omission),
+/// a `None` leaves it off-disk so the demuxer materialises the spec default
+/// `0`.
+///
+/// The muxer auto-derives `CodecDelay` (from the Opus pre-skip) and a
+/// recommended `SeekPreRoll` of 80 ms for an Opus track; an explicit hint
+/// installed here overrides either auto-derived value **per field** (a
+/// `Some` field wins, a `None` field falls back to the auto-derived value on
+/// an Opus track, or to omission on any other track).
+///
+/// Pairs symmetrically with the demux-side
+/// [`crate::demux::MkvDemuxer::track_codec_timing`] /
+/// [`crate::demux::TrackCodecTiming`] typed accessor — a mux→demux pipeline
+/// preserves every supplied child bit-exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MkvTrackCodecTiming {
+    /// `CodecDelay` (RFC 9559 §5.1.4.1.25), the codec's built-in delay in
+    /// nanoseconds. Range unrestricted; spec default `0`. `None` omits the
+    /// element (or, for an Opus track, keeps the auto-derived pre-skip
+    /// delay); `Some(v)` writes it explicitly and overrides any auto value.
+    pub codec_delay: Option<u64>,
+    /// `SeekPreRoll` (RFC 9559 §5.1.4.1.26), the number of nanoseconds that
+    /// must be discarded after a seek before the output is correct. Range
+    /// unrestricted; spec default `0`. `None` omits the element (or, for an
+    /// Opus track, keeps the auto-derived 80 ms recommendation); `Some(v)`
+    /// writes it explicitly and overrides any auto value.
+    pub seek_pre_roll: Option<u64>,
+}
+
+impl MkvTrackCodecTiming {
+    /// Convenience constructor from the two nanosecond values, either of
+    /// which may be `None` to leave that element off-disk.
+    pub fn new(codec_delay: Option<u64>, seek_pre_roll: Option<u64>) -> Self {
+        Self {
+            codec_delay,
+            seek_pre_roll,
+        }
+    }
+}
+
 /// A queued `TrackEntry` identity / selection hint (RFC 9559 §5.1.4.1.18 /
 /// .19 / .20 / .23 / .4 / .5 / .12 / .24) installed via
 /// [`MkvMuxer::set_track_identity`]. Each field is `Option`; a `Some(v)`
@@ -638,6 +681,13 @@ pub struct MkvMuxer {
     /// default `1.0`. `Some(_)` writes each populated child explicitly. The
     /// slice is sized to `streams.len()`.
     track_timing: Vec<Option<MkvTrackTiming>>,
+    /// Per-stream `TrackEntry` codec-timing hints queued via
+    /// [`MkvMuxer::set_track_codec_timing`] (RFC 9559 §5.1.4.1.25 /
+    /// §5.1.4.1.26 — `CodecDelay` / `SeekPreRoll`). `None` (the default)
+    /// means the muxer omits both elements unless it auto-derives them for
+    /// an Opus track; `Some(_)` overrides the auto-derived value per field.
+    /// The slice is sized to `streams.len()`.
+    track_codec_timing: Vec<Option<MkvTrackCodecTiming>>,
     /// Per-stream `TrackEntry` identity / selection hints queued via
     /// [`MkvMuxer::set_track_identity`] (RFC 9559 §5.1.4.1.18 / .19 / .20 /
     /// .23 / .4 / .5 / .12 / .24). `None` (the default) means the muxer omits
@@ -2025,6 +2075,7 @@ impl MkvMuxer {
             max_block_addition_ids: vec![None; n],
             track_audio: vec![None; n],
             track_timing: vec![None; n],
+            track_codec_timing: vec![None; n],
             track_identity: vec![None; n],
             last_block_pts_ms: vec![None; n],
             track_operations: vec![None; n],
@@ -3510,6 +3561,66 @@ impl MkvMuxer {
         *self.track_timing.get(stream_index)?
     }
 
+    /// Set the per-track codec-timing elements (RFC 9559 §5.1.4.1.25 /
+    /// §5.1.4.1.26) for one stream — `CodecDelay` and `SeekPreRoll`. Must be
+    /// called before [`Muxer::write_header`]; the elements live in the
+    /// `TrackEntry`, which is written exactly once at header time.
+    ///
+    /// Per-field omission rule: each `Some(v)` writes the element explicitly
+    /// (an explicit `0` is legal and round-trips distinctly from omission),
+    /// each `None` stays off-disk. There is **no track-type restriction** —
+    /// the spec carries both on every `TrackEntry`, though they are chiefly
+    /// meaningful for audio codecs with a built-in encoder delay / pre-roll
+    /// (Opus, AAC).
+    ///
+    /// Interaction with the Opus auto-derivation: for an Opus track the muxer
+    /// auto-derives `CodecDelay` from the pre-skip and a recommended
+    /// `SeekPreRoll` of 80 ms. An explicit hint installed here overrides
+    /// either auto value **per field** — a `Some` field replaces the
+    /// auto-derived value, a `None` field keeps it. On any non-Opus track a
+    /// `None` field simply omits the element.
+    ///
+    /// Both values are ranged `>= 0` by their `uint` type; no additional
+    /// spec range check applies, so this method only validates the muxer
+    /// state and the stream index.
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` out of range.
+    ///
+    /// Calling this twice on the same `stream_index` overwrites the
+    /// previously queued value (last-write-wins). Returns a mutable
+    /// reference back so calls can chain builder-style. Pairs symmetrically
+    /// with the demux-side
+    /// [`crate::demux::MkvDemuxer::track_codec_timing`].
+    pub fn set_track_codec_timing(
+        &mut self,
+        stream_index: usize,
+        timing: MkvTrackCodecTiming,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_track_codec_timing called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_codec_timing stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        self.track_codec_timing[stream_index] = Some(timing);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream codec-timing hint
+    /// installed via [`MkvMuxer::set_track_codec_timing`]. Returns `None` for
+    /// any stream that didn't have the API called. Mostly useful for tests.
+    pub fn track_codec_timing(&self, stream_index: usize) -> Option<MkvTrackCodecTiming> {
+        *self.track_codec_timing.get(stream_index)?
+    }
+
     /// Set the per-track identity / selection elements (RFC 9559 §5.1.4.1.18 /
     /// .19 / .20 / .23 / .4 / .5 / .12 / .24) for one stream — `Name`,
     /// `CodecName`, the `Language` / `LanguageBCP47` pair, the three selection
@@ -4330,13 +4441,30 @@ impl Muxer for MkvMuxer {
             if let Some(link) = identity.and_then(|id| id.attachment_link) {
                 write_uint_element(&mut t, ids::ATTACHMENT_LINK, link);
             }
-            // Codec-specific timing fields (Opus uses CodecDelay = pre_skip in ns
-            // and a recommended SeekPreRoll of 80 ms).
-            if s.params.codec_id.as_str() == "opus" {
+            // Codec-specific timing fields (RFC 9559 §5.1.4.1.25 /
+            // §5.1.4.1.26). An Opus track auto-derives CodecDelay = pre_skip
+            // in ns and a recommended SeekPreRoll of 80 ms; an explicit
+            // `set_track_codec_timing` hint overrides either value per field.
+            let (mut codec_delay, mut seek_pre_roll) = if s.params.codec_id.as_str() == "opus" {
                 let pre_skip_samples = parse_opus_pre_skip(&s.params.extradata);
                 let codec_delay_ns = pre_skip_samples as u64 * 1_000_000_000 / 48_000;
-                write_uint_element(&mut t, ids::CODEC_DELAY, codec_delay_ns);
-                write_uint_element(&mut t, ids::SEEK_PRE_ROLL, 80_000_000);
+                (Some(codec_delay_ns), Some(80_000_000u64))
+            } else {
+                (None, None)
+            };
+            if let Some(hint) = self.track_codec_timing[i] {
+                if let Some(v) = hint.codec_delay {
+                    codec_delay = Some(v);
+                }
+                if let Some(v) = hint.seek_pre_roll {
+                    seek_pre_roll = Some(v);
+                }
+            }
+            if let Some(v) = codec_delay {
+                write_uint_element(&mut t, ids::CODEC_DELAY, v);
+            }
+            if let Some(v) = seek_pre_roll {
+                write_uint_element(&mut t, ids::SEEK_PRE_ROLL, v);
             }
             if s.params.media_type == MediaType::Audio {
                 let mut audio = Vec::new();
