@@ -1431,6 +1431,17 @@ the unified `oxideav` aggregator to wire decoding automatically.
   round-trip onto the demuxer's flat metadata view under the `"title"` /
   `"date"` keys (the latter formatted back to ISO-8601). All three setters
   reject post-`write_header` use; omitting them writes neither element.
+  `MkvMuxer::set_duration(std::time::Duration)` writes the Segment `Duration`
+  (§5.1.2.10, id `0x4489`) — the total Segment length as a `float` in
+  `TimestampScale` ticks (= ms at the muxer's fixed 1 ms scale) — into the
+  `Info` body between `TimestampScale` and `DateUTC`, inside the CRC-validated
+  master. The muxer never auto-derives it: `Cluster`s stream with the
+  unknown-size VINT and the `Info` master is sealed with its `CRC-32` at
+  header time, so a trailer patch would invalidate that CRC — a caller that
+  knows the total length ahead of time supplies it, and it round-trips through
+  the demuxer's `duration_micros()`. The §5.1.2.10 `> 0x0p+0` range is
+  enforced (a zero or non-finite length is rejected); omitting the call keeps
+  `Duration` off-disk (the demuxer surfaces `None`).
 - **`ContentEncodings` on write** (RFC 9559 §5.1.4.1.31):
   `MkvMuxer::set_track_content_encodings(stream_index, ContentEncodings)`
   queues a per-track transformation chain that lands as a

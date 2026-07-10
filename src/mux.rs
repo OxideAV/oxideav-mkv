@@ -523,6 +523,17 @@ pub struct MkvMuxer {
     /// omits the element. Written into the `Info` master right after
     /// `Duration`, in §5.1.2 element order.
     info_date_utc_ns: Option<i64>,
+    /// `Duration` (RFC 9559 §5.1.2.10, id `0x4489`) — the total Segment
+    /// length expressed in `TimestampScale` ticks (the muxer's scale is
+    /// 1 ms), queued via [`MkvMuxer::set_duration`]. `None` (the default)
+    /// omits the element: the muxer streams `Cluster`s with the unknown-size
+    /// VINT and the `Info` master is written up front with a leading `CRC-32`,
+    /// so the total length is not known at header time and cannot be patched
+    /// later without invalidating that CRC. A caller that knows the total
+    /// length ahead of time queues it here and the muxer writes it into the
+    /// `Info` master before `DateUTC`, in §5.1.2 element order — inside the
+    /// CRC-validated body.
+    info_duration_ticks: Option<f64>,
     /// Opt-in block lacing mode (RFC 9559 §10.3). Default is
     /// [`LacingMode::None`] which preserves the legacy
     /// one-SimpleBlock-per-packet behaviour. Anything else causes
@@ -2060,6 +2071,7 @@ impl MkvMuxer {
             segment_linking: None,
             info_title: None,
             info_date_utc_ns: None,
+            info_duration_ticks: None,
             lacing_mode: LacingMode::None,
             lace_pending: vec![LaceBuffer::default(); n],
             video_interlacings: vec![None; n],
@@ -4082,6 +4094,56 @@ impl MkvMuxer {
         Ok(self)
     }
 
+    /// Queue the Segment `Duration` (RFC 9559 §5.1.2.10, id `0x4489`) — the
+    /// total length of the Segment — for the `Info` master. Written between
+    /// `TimestampScale` and `DateUTC` in §5.1.2 element order, inside the
+    /// CRC-validated `Info` body.
+    ///
+    /// The muxer streams `Cluster`s with the unknown-size VINT and seals the
+    /// `Info` master (with a leading `CRC-32`) at header time, so it never
+    /// auto-derives `Duration` from the written packets — doing so would need
+    /// a trailer patch that invalidates the `Info` CRC. A caller that knows
+    /// the total length ahead of time supplies it here; the value round-trips
+    /// through the demuxer's [`duration_micros`](oxideav_core::Demuxer::duration_micros).
+    ///
+    /// The muxer's `TimestampScale` is fixed at 1 ms, so the on-disk
+    /// `Duration` float is the length in milliseconds; the argument is a
+    /// [`std::time::Duration`] and the conversion is exact for millisecond
+    /// multiples.
+    ///
+    /// Spec range enforced at queue time: §5.1.2.10 is ranged `> 0x0p+0`
+    /// (strictly positive), so a zero or otherwise non-positive length is
+    /// rejected. Must be called before [`MkvMuxer::write_header`];
+    /// last-write-wins.
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — the resulting length is not finite and `> 0`.
+    pub fn set_duration(&mut self, duration: std::time::Duration) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_duration called after write_header",
+            ));
+        }
+        let ticks = duration.as_secs_f64() * 1000.0;
+        if !(ticks.is_finite() && ticks > 0.0) {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_duration {ticks} ms out of range (RFC 9559 §5.1.2.10 range > 0x0p+0)"
+            )));
+        }
+        self.info_duration_ticks = Some(ticks);
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued Segment `Duration`, in
+    /// `TimestampScale` ticks (= milliseconds at the muxer's 1 ms scale).
+    /// Returns `None` when [`MkvMuxer::set_duration`] was not called. Mostly
+    /// useful for tests.
+    pub fn duration_ticks(&self) -> Option<f64> {
+        self.info_duration_ticks
+    }
+
     /// Queue the EBML-header `DocTypeExtension` declarations (RFC 8794 §11.2.9)
     /// to write into this file's header. Each [`DocTypeExtension`] adds an
     /// extra (name, version) tuple to the main `DocType` + `DocTypeVersion`,
@@ -4281,8 +4343,14 @@ impl Muxer for MkvMuxer {
             write_segment_linking(&mut info_body, linking);
         }
         write_uint_element(&mut info_body, ids::TIMECODE_SCALE, 1_000_000); // 1 ms
-                                                                            // RFC 9559 §5.1.2 element order: Duration (.10) — not emitted —, then
-                                                                            // DateUTC (.11), Title (.12), MuxingApp (.13), WritingApp (.14).
+                                                                            // RFC 9559 §5.1.2 element order: Duration (.10), DateUTC (.11),
+                                                                            // Title (.12), MuxingApp (.13), WritingApp (.14).
+                                                                            // Duration is emitted only when the caller queued a known total
+                                                                            // length via `set_duration`; a value in TimestampScale ticks
+                                                                            // (= ms at the muxer's 1 ms scale), stored as a `float`.
+        if let Some(ticks) = self.info_duration_ticks {
+            write_float_element(&mut info_body, ids::DURATION, ticks);
+        }
         if let Some(ns) = self.info_date_utc_ns {
             // §5.1.2.11 `date`: signed nanoseconds since the 2001-01-01 epoch.
             write_date_element(&mut info_body, ids::DATE_UTC, ns);

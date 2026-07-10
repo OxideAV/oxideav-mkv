@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: `MkvMuxer::set_duration(std::time::Duration)` writes the Segment
+  `Duration` (RFC 9559 §5.1.2.10, id `0x4489`) — the total Segment length as a
+  `float` in `TimestampScale` ticks (= ms at the muxer's fixed 1 ms scale) —
+  into the CRC-validated `Info` body between `TimestampScale` and `DateUTC`.
+  The muxer never auto-derives it (Clusters stream with the unknown-size VINT
+  and the `Info` `CRC-32` is sealed at header time, so a trailer patch would
+  invalidate that CRC); a caller supplies the known total length and it
+  round-trips through the demuxer's `duration_micros()`. The §5.1.2.10
+  `> 0x0p+0` range is enforced. Closes the last `Info`-master
+  demux-reads-but-mux-can't-write gap. Round-trips pinned in
+  `tests/mux_duration.rs` (5 cases, incl. Info-CRC-still-validates).
 - Muxer: `MkvMuxer::set_track_codec_timing(stream_index, MkvTrackCodecTiming)`
   writes the `TrackEntry`-level `CodecDelay` (RFC 9559 §5.1.4.1.25) and
   `SeekPreRoll` (§5.1.4.1.26) elements on **any** track. Each field is an
