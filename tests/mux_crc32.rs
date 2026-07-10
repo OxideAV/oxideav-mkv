@@ -147,6 +147,7 @@ fn chapters_master_carries_valid_crc_when_present() {
             title: "Intro".into(),
             language: "eng".into(),
             country: None,
+            language_bcp47: None,
         }],
         ..Default::default()
     };

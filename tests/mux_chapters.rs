@@ -143,6 +143,7 @@ fn chapters_round_trip_through_demuxer() {
                 title: "Intro".into(),
                 language: "eng".into(),
                 country: None,
+                language_bcp47: None,
             }],
             ..Default::default()
         },
@@ -153,6 +154,7 @@ fn chapters_round_trip_through_demuxer() {
                 title: "Verse".into(),
                 language: "eng".into(),
                 country: Some("us".into()),
+                language_bcp47: None,
             }],
             ..Default::default()
         },
@@ -163,6 +165,7 @@ fn chapters_round_trip_through_demuxer() {
                 title: "Outro".into(),
                 language: "eng".into(),
                 country: None,
+                language_bcp47: None,
             }],
             ..Default::default()
         },
@@ -269,6 +272,7 @@ fn chapters_element_sits_before_first_cluster() {
             title: "Only".into(),
             language: "eng".into(),
             country: None,
+            language_bcp47: None,
         }],
         ..Default::default()
     }];
@@ -293,6 +297,7 @@ fn seek_head_chapters_entry_points_at_chapters_when_present() {
             title: "First".into(),
             language: "eng".into(),
             country: None,
+            language_bcp47: None,
         }],
         ..Default::default()
     }];
@@ -400,6 +405,7 @@ fn chapter_times_are_written_as_literal_nanoseconds() {
             title: "NsLiteral".into(),
             language: "eng".into(),
             country: None,
+            language_bcp47: None,
         }],
         ..Default::default()
     }];

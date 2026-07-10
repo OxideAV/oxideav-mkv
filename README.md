@@ -837,7 +837,10 @@ the unified `oxideav` aggregator to wire decoding automatically.
   end_ns, title)` queues a single English-language `ChapterAtom`;
   `add_chapter_full(MkvChapter)` takes a fully-specified record with
   multilingual `ChapterDisplay` rows (`ChapString` + `ChapLanguage`
-  + optional `ChapCountry`) plus the complete `ChapterAtom` field set —
+  + optional `ChapCountry` + optional `ChapLanguageBCP47`, §5.1.7.1.4.11 —
+  when the BCP-47 tag is set the muxer writes it in place of `ChapLanguage`,
+  which the spec says MUST be ignored when the BCP-47 form is present) plus
+  the complete `ChapterAtom` field set —
   `ChapterUID` (§5.1.7.1.4.1, auto-derived non-zero when `None`),
   `ChapterStringUID` (.2), `ChapterFlagHidden` (.5), `ChapterFlagEnabled`
   (default `1`, written only when cleared), `ChapterSegmentUUID` (.6,

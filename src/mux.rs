@@ -1022,25 +1022,39 @@ pub struct MkvChapProcessCommand {
 /// default `ChapLanguage` value when the element is omitted entirely.
 /// `country`, when set, follows RFC 9559 §5.1.7.4.2 (`ChapCountry`,
 /// IETF BCP 47 region subtag, e.g. `"us"`, `"jp"`).
-#[derive(Clone, Debug)]
+///
+/// `language_bcp47`, when set, writes the modern `ChapLanguageBCP47`
+/// element (RFC 9559 §5.1.7.1.4.11, id `0x437D`) — a full IETF BCP 47
+/// language tag (e.g. `"en-US"`, `"pt-BR"`). Per the spec, when
+/// `ChapLanguageBCP47` is present any `ChapLanguage` element MUST be
+/// ignored, so the muxer writes **only** `ChapLanguageBCP47` in that case
+/// (mirroring how `LanguageBCP47` / `TagLanguageBCP47` are handled).
+#[derive(Clone, Debug, Default)]
 pub struct ChapterDisplay {
     /// `ChapString` — UTF-8 title text.
     pub title: String,
     /// `ChapLanguage` — ISO-639-2 alpha-3 code (e.g. `"eng"`). Pass
-    /// `"und"` if no specific language applies.
+    /// `"und"` if no specific language applies. Ignored (not written) when
+    /// `language_bcp47` is `Some`.
     pub language: String,
     /// Optional `ChapCountry` — BCP 47 region subtag (e.g. `"us"`).
     /// Skipped when `None`.
     pub country: Option<String>,
+    /// Optional `ChapLanguageBCP47` (RFC 9559 §5.1.7.1.4.11) — a full IETF
+    /// BCP 47 language tag. When `Some`, the muxer writes this element and
+    /// suppresses `ChapLanguage`. Skipped when `None`.
+    pub language_bcp47: Option<String>,
 }
 
 impl ChapterDisplay {
-    /// Convenience constructor: `language` is `"und"`, `country` is `None`.
+    /// Convenience constructor: `language` is `"und"`, `country` and
+    /// `language_bcp47` are `None`.
     pub fn untitled_in(language: impl Into<String>) -> Self {
         Self {
             title: String::new(),
             language: language.into(),
             country: None,
+            language_bcp47: None,
         }
     }
 }
@@ -3826,6 +3840,7 @@ impl MkvMuxer {
                 title: title.into(),
                 language: "eng".into(),
                 country: None,
+                language_bcp47: None,
             }],
             ..Default::default()
         })
@@ -6744,7 +6759,14 @@ fn build_chapter_atom(default_uid: u64, ch: &MkvChapter) -> Vec<u8> {
     for disp in &ch.display {
         let mut display_body = Vec::new();
         write_string_element(&mut display_body, ids::CHAP_STRING, &disp.title);
-        write_string_element(&mut display_body, ids::CHAP_LANGUAGE, &disp.language);
+        // RFC 9559 §5.1.7.1.4.11: when ChapLanguageBCP47 is present the
+        // legacy ChapLanguage MUST be ignored, so write only the BCP-47 tag
+        // in that case; otherwise write the ISO-639-2 ChapLanguage.
+        if let Some(bcp47) = &disp.language_bcp47 {
+            write_string_element(&mut display_body, ids::CHAP_LANGUAGE_BCP47, bcp47);
+        } else {
+            write_string_element(&mut display_body, ids::CHAP_LANGUAGE, &disp.language);
+        }
         if let Some(country) = &disp.country {
             write_string_element(&mut display_body, ids::CHAP_COUNTRY, country);
         }

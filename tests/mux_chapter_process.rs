@@ -90,6 +90,7 @@ fn full_atom_fields_round_trip() {
             title: "Scene".into(),
             language: "eng".into(),
             country: None,
+            language_bcp47: None,
         }],
         chap_processes: Vec::new(),
     }]);
@@ -119,6 +120,7 @@ fn chap_process_tree_round_trips() {
             title: "Menu".into(),
             language: "und".into(),
             country: None,
+            language_bcp47: None,
         }],
         chap_processes: vec![
             // DVD-menu codec with private data and two timed commands.
@@ -176,6 +178,7 @@ fn default_chapter_enabled_and_no_optional_fields() {
             title: "Plain".into(),
             language: "eng".into(),
             country: None,
+            language_bcp47: None,
         }],
         ..Default::default()
     }]);

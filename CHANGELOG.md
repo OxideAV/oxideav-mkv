@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: `ChapterDisplay` gained a `language_bcp47: Option<String>` field
+  writing `ChapLanguageBCP47` (RFC 9559 §5.1.7.1.4.11, id `0x437D`). When set,
+  the muxer writes the BCP-47 tag in place of `ChapLanguage` (which the spec
+  says MUST be ignored when the BCP-47 form is present), mirroring the
+  `LanguageBCP47` / `TagLanguageBCP47` handling. Closes the last
+  `ChapterDisplay` demux-reads-but-mux-can't-write gap. 2 round-trip cases in
+  `tests/mux_chapter_language_bcp47.rs`. (Adds a field to the public
+  `mux::ChapterDisplay`; it now derives `Default`.)
 - Muxer: `MkvMuxer::set_block_addition_mappings(stream_index, Vec<BlockAdditionMapping>)`
   writes the track-level `BlockAdditionMapping` masters (RFC 9559 §5.1.4.1.17
   — `BlockAddIDValue` / `BlockAddIDName` / `BlockAddIDType` /
