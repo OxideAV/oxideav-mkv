@@ -568,7 +568,15 @@ the unified `oxideav` aggregator to wire decoding automatically.
   of the side channel; the per-frame `BlockAdditional` payload bytes
   themselves surface through the per-packet `block_additions()`
   accessor below, and payload semantics stay with the codec /
-  track-format extension that owns each `BlockAddIDType` value.
+  track-format extension that owns each `BlockAddIDType` value. The mux
+  side is symmetric: `MkvMuxer::set_block_addition_mappings(stream_index,
+  Vec<BlockAdditionMapping>)` takes the **same** demux-side records and
+  writes each `BlockAdditionMapping` master into the carrying `TrackEntry`
+  in slice order, so a mux→demux pipeline round-trips every mapping
+  element-for-element. Per-field omission mirrors the decode: `value` /
+  `name` / `extra_data` emit their child only when `Some`, and
+  `BlockAddIDType` is emitted only when non-zero (the §5.1.4.1.17.3
+  default `0` stays off-disk and still round-trips as `0`).
 - **Per-Block `BlockAdditions` typed decode** (RFC 9559 §5.1.3.5.2,
   including §5.1.3.5.2.1..§5.1.3.5.2.3) **+ `MaxBlockAdditionID`**
   (§5.1.4.1.16): `MkvDemuxer::block_additions() -> &[BlockAddition]`

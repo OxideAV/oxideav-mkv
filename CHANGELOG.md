@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: `MkvMuxer::set_block_addition_mappings(stream_index, Vec<BlockAdditionMapping>)`
+  writes the track-level `BlockAdditionMapping` masters (RFC 9559 §5.1.4.1.17
+  — `BlockAddIDValue` / `BlockAddIDName` / `BlockAddIDType` /
+  `BlockAddIDExtraData`) into the carrying `TrackEntry`, in slice order. Takes
+  the same demux-side `BlockAdditionMapping` records the reader surfaces, so a
+  mux→demux pipeline round-trips every mapping element-for-element. Per-field
+  omission mirrors the decode (`value`/`name`/`extra_data` write only when
+  `Some`; `BlockAddIDType` only when non-zero, the §5.1.4.1.17.3 `0` default
+  staying off-disk yet round-tripping as `0`). Closes the last `TrackEntry`
+  side-channel-declaration demux-reads-but-mux-can't-write gap. 6 round-trip
+  cases in `tests/mux_block_addition_mapping.rs`.
 - Muxer: `MkvMuxer::set_duration(std::time::Duration)` writes the Segment
   `Duration` (RFC 9559 §5.1.2.10, id `0x4489`) — the total Segment length as a
   `float` in `TimestampScale` ticks (= ms at the muxer's fixed 1 ms scale) —

@@ -674,6 +674,14 @@ pub struct MkvMuxer {
     /// explicit producer-override path, byte-distinct from omission but
     /// decoding identically).
     max_block_addition_ids: Vec<Option<u64>>,
+    /// Per-stream `BlockAdditionMapping` masters queued via
+    /// [`MkvMuxer::set_block_addition_mappings`] (RFC 9559 §5.1.4.1.17).
+    /// Each entry is written as a `BlockAdditionMapping` master directly
+    /// inside the carrying `TrackEntry` at `write_header` time, in slice
+    /// order. The default (an empty `Vec`) omits the element for that
+    /// stream, so the demuxer surfaces an empty slice from
+    /// `block_addition_mappings`. Sized to `streams.len()`.
+    block_addition_mappings: Vec<Vec<crate::demux::BlockAdditionMapping>>,
     /// Per-stream `Audio` master hints queued via
     /// [`MkvMuxer::set_track_audio`] (RFC 9559 §5.1.4.1.29). `None` (the
     /// default) means the muxer derives the `Audio` master's children
@@ -2085,6 +2093,7 @@ impl MkvMuxer {
             video_projections: vec![None; n],
             track_audience_flags: vec![None; n],
             max_block_addition_ids: vec![None; n],
+            block_addition_mappings: vec![Vec::new(); n],
             track_audio: vec![None; n],
             track_timing: vec![None; n],
             track_codec_timing: vec![None; n],
@@ -3393,6 +3402,73 @@ impl MkvMuxer {
         *self.max_block_addition_ids.get(stream_index)?
     }
 
+    /// Set the per-track `BlockAdditionMapping` masters (RFC 9559
+    /// §5.1.4.1.17) for one stream — the declarations describing how each
+    /// non-default `BlockAddID` (§5.1.3.5.2.3) side channel a track emits is
+    /// to be interpreted (WebM alpha, HDR dynamic metadata, ITU-T T.35, …).
+    /// A track can carry any number of mappings (the spec sets no
+    /// `maxOccurs`); they are written in slice order directly inside the
+    /// carrying `TrackEntry` at `write_header` time.
+    ///
+    /// The setter takes the **same** demux-side
+    /// [`crate::demux::BlockAdditionMapping`] records
+    /// [`crate::demux::MkvDemuxer::block_addition_mappings`] surfaces, so a
+    /// mux→demux pipeline round-trips every mapping element-for-element.
+    /// Per-field omission mirrors the demux projection: `value` / `name` /
+    /// `extra_data` write their `BlockAddIDValue` / `BlockAddIDName` /
+    /// `BlockAddIDExtraData` child only when `Some`; `addid_type` writes its
+    /// `BlockAddIDType` child only when non-zero (the §5.1.4.1.17.3 default
+    /// `0` = codec-defined is materialised by the demuxer from an absent
+    /// element, so a `0` stays off-disk and still round-trips as `0`).
+    ///
+    /// Must be called before [`Muxer::write_header`]. Passing an empty slice
+    /// clears any previously-queued mappings; repeated calls are
+    /// last-write-wins.
+    ///
+    /// Errors:
+    ///
+    /// * `Error::other` — called after `write_header`.
+    /// * `Error::invalid` — `stream_index` out of range.
+    ///
+    /// Note that a `BlockAdditionMapping` only *declares* a side channel;
+    /// the per-frame `BlockAdditional` bytes are written separately via
+    /// [`MkvMuxer::write_packet_with_additions`], which the track's
+    /// `MaxBlockAdditionID` (see [`MkvMuxer::set_max_block_addition_id`])
+    /// gates. Returns a mutable reference back so calls can chain.
+    pub fn set_block_addition_mappings(
+        &mut self,
+        stream_index: usize,
+        mappings: Vec<crate::demux::BlockAdditionMapping>,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_block_addition_mappings called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_block_addition_mappings stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        self.block_addition_mappings[stream_index] = mappings;
+        Ok(self)
+    }
+
+    /// Read-only accessor for the queued per-stream `BlockAdditionMapping`
+    /// list installed via [`MkvMuxer::set_block_addition_mappings`]. Returns
+    /// an empty slice for any stream that didn't have the API called (or was
+    /// cleared). Mostly useful for tests.
+    pub fn block_addition_mappings(
+        &self,
+        stream_index: usize,
+    ) -> &[crate::demux::BlockAdditionMapping] {
+        self.block_addition_mappings
+            .get(stream_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Set the per-track `Audio` master children (RFC 9559 §5.1.4.1.29)
     /// for one stream. Must be called before [`Muxer::write_header`];
     /// returns [`Error::other`] otherwise.
@@ -4445,6 +4521,13 @@ impl Muxer for MkvMuxer {
             // `write_packet_with_additions` for the stream.
             if let Some(m) = self.max_block_addition_ids[i] {
                 write_uint_element(&mut t, ids::MAX_BLOCK_ADDITION_ID, m);
+            }
+            // BlockAdditionMapping (RFC 9559 §5.1.4.1.17) masters queued via
+            // `set_block_addition_mappings`, in slice order. Each declares
+            // the shape of one non-default `BlockAddID` side channel; the
+            // per-frame `BlockAdditional` bytes ride the Block path.
+            for mapping in &self.block_addition_mappings[i] {
+                write_block_addition_mapping(&mut t, mapping);
             }
             // Track timing (RFC 9559 §5.1.4.1.13..§5.1.4.1.15) queued via
             // `set_track_timing`. Per-field omission rule: each `Some(v)` is
@@ -6292,6 +6375,30 @@ fn encode_codec_private(codec_id: &oxideav_core::CodecId, extradata: &[u8]) -> V
         }
         _ => extradata.to_vec(),
     }
+}
+
+/// Write one `BlockAdditionMapping` master (RFC 9559 §5.1.4.1.17) into
+/// `out`, mirroring the demux-side [`crate::demux::BlockAdditionMapping`]
+/// projection. `BlockAddIDValue` / `BlockAddIDName` / `BlockAddIDExtraData`
+/// are written only when their `Option` is `Some`; `BlockAddIDType` is
+/// written only when non-zero, since the §5.1.4.1.17.3 default `0`
+/// (codec-defined) is materialised by the demuxer from an absent element —
+/// so a `0` stays off-disk and still round-trips as `0`.
+fn write_block_addition_mapping(out: &mut Vec<u8>, mapping: &crate::demux::BlockAdditionMapping) {
+    let mut body = Vec::new();
+    if let Some(v) = mapping.value {
+        write_uint_element(&mut body, ids::BLOCK_ADD_ID_VALUE, v);
+    }
+    if let Some(name) = &mapping.name {
+        write_string_element(&mut body, ids::BLOCK_ADD_ID_NAME, name);
+    }
+    if mapping.addid_type != 0 {
+        write_uint_element(&mut body, ids::BLOCK_ADD_ID_TYPE, mapping.addid_type);
+    }
+    if let Some(extra) = &mapping.extra_data {
+        write_bytes_element(&mut body, ids::BLOCK_ADD_ID_EXTRA_DATA, extra);
+    }
+    write_master_element(out, ids::BLOCK_ADDITION_MAPPING, &body);
 }
 
 // --- Element-writing helpers ----------------------------------------------
