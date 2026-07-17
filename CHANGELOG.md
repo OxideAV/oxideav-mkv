@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: front-`Cues` layout (`MkvMuxer::with_front_cues(reserved_bytes)`,
+  RFC 9559 §25.3.3). `write_header` reserves a `Void` before the first
+  Cluster; `write_trailer` writes the finished `Cues` into it (remainder
+  covered by a filler `Void`; a 1-byte remainder absorbed by widening
+  the `Cues` size VINT) and patches the SeekHead. A too-small
+  reservation falls back to the ordinary end placement. Conflicts with
+  `with_live_streaming` both ways; in-profile under strict WebM. 4
+  integration tests in `tests/mux_front_cues.rs`;
+  `examples/gen_webm_profile.rs` gained `--front-cues`.
 - Demuxer: SeekHead-directed recovery of post-Cluster Top-Level masters
   (RFC 9559 §6.3). The open path follows `SeekHead > Seek` entries that
   reference a `Tags` / `Chapters` / `Attachments` / `Cues` master stored

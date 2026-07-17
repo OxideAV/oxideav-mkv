@@ -933,6 +933,20 @@ the unified `oxideav` aggregator to wire decoding automatically.
   byte-identical with prior releases. Round-trip tests verify the exact
   offset semantics (including on the surviving Clusters after a damage
   resync); black-box validated against a widely-deployed reader.
+- **Front-`Cues` layout** (RFC 9559 §25.3.3 "Optimum Layout with Cues
+  at the Front"): opt-in via `MkvMuxer::with_front_cues(reserved_bytes)`.
+  `write_header` reserves a caller-sized `Void` between the last
+  pre-Cluster master and the first Cluster; `write_trailer` writes the
+  finished `Cues` into the slot (filler `Void` over the remainder; a
+  1-byte remainder is absorbed by widening the `Cues` size VINT) and
+  patches the SeekHead `Cues` entry to it — so seek-aware players get
+  the whole index without first seeking to the end of the file. If the
+  finished index doesn't fit the reservation, the muxer falls back to
+  the ordinary end placement (the `Void` stays, the file stays valid,
+  the SeekHead points at the end `Cues`). Conflicts with
+  `with_live_streaming` in both directions (§25.3.4: a live stream
+  writes no Cues). Works in strict WebM mode (Cues + Void are both
+  in-profile). Black-box validated with a widely-deployed prober.
 - **Two-pass `Duration` finalization** (RFC 9559 §5.1.2.10): opt-in via
   `MkvMuxer::with_duration_finalization()`. `write_header` reserves a
   `Duration`-sized `Void` inside `Info` (at the §5.1.2 element-order

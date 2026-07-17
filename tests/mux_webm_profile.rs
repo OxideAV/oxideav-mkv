@@ -118,8 +118,10 @@ fn strict_webm_output_scans_conformant() {
     let streams = vec![vp9_stream(0), opus_stream(1)];
     let (mut mx, tmp) = webm_muxer("conformant", &streams);
     assert!(mx.webm_strict());
-    // In-profile extras.
+    // In-profile extras (front-Cues reservation writes only Cues + Void,
+    // both in-profile, so the §25.3.3 layout must stay scan-conformant).
     mx.with_cluster_position_hints().expect("hints");
+    mx.with_front_cues(4096).expect("front cues");
     mx.set_video_colour(0, MkvVideoColour::bt709())
         .expect("colour");
     mx.set_video_geometry(0, MkvVideoGeometry::cropped(2, 2, 0, 0))

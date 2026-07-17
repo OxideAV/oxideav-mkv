@@ -1,8 +1,10 @@
 //! Dev helper: write a strict-profile WebM file for black-box validation
 //! (`cargo run --example gen_webm_profile <out.webm> [--lenient]
-//! [--finalize]`). With `--finalize` the Segment `Duration` is measured
-//! and patched by `write_trailer` (two-pass finalization) instead of
-//! being declared up front.
+//! [--finalize] [--front-cues]`). With `--finalize` the Segment
+//! `Duration` is measured and patched by `write_trailer` (two-pass
+//! finalization) instead of being declared up front; with
+//! `--front-cues` the RFC 9559 §25.3.3 front-`Cues` layout is emitted
+//! (4 KiB reservation before the first Cluster).
 //! Emits a VP9-shaped video track with chapters, tags, colour metadata,
 //! and cluster hints; with `--lenient` the full Matroska surface is
 //! restored under the `webm` DocType (CRC-32 children, EditionUID,
@@ -17,6 +19,7 @@ fn main() {
         .expect("usage: gen_webm_profile <out.webm> [--lenient]");
     let lenient = std::env::args().any(|a| a == "--lenient");
     let finalize = std::env::args().any(|a| a == "--finalize");
+    let front_cues = std::env::args().any(|a| a == "--front-cues");
     let mut vp = CodecParameters::video(CodecId::new("vp9"));
     vp.width = Some(320);
     vp.height = Some(240);
@@ -43,6 +46,9 @@ fn main() {
         simple_tags: vec![MkvSimpleTag::new("ENCODER_SETTINGS", "none")],
     })
     .unwrap();
+    if front_cues {
+        mux.with_front_cues(4096).unwrap();
+    }
     if finalize {
         mux.with_duration_finalization().unwrap();
     } else {

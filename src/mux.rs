@@ -463,6 +463,11 @@ pub struct MkvMuxer {
     /// Content bytes (Blocks) written into the currently open Cluster —
     /// drives the §25.1 byte budget.
     cluster_bytes: u64,
+    /// Opt-in via [`MkvMuxer::with_front_cues`]: number of bytes reserved
+    /// before the first Cluster for the §25.3.3 front-`Cues` layout.
+    front_cues_reserved: Option<u64>,
+    /// Absolute file offset of the reserved front-`Cues` Void slot.
+    front_cues_slot_abs: Option<u64>,
     /// Per-Cluster duration budget (ms). Defaults to the §25.1
     /// recommendation; configurable via [`MkvMuxer::with_cluster_limits`].
     cluster_max_ms: i64,
@@ -2128,6 +2133,8 @@ impl MkvMuxer {
             info_body_cache: Vec::new(),
             duration_patch_in_body: 0,
             cluster_bytes: 0,
+            front_cues_reserved: None,
+            front_cues_slot_abs: None,
             cluster_max_ms: CLUSTER_DURATION_MS,
             cluster_max_bytes: CLUSTER_MAX_BYTES,
             prev_cluster_start_abs: None,
@@ -2289,6 +2296,58 @@ impl MkvMuxer {
         (self.cluster_max_ms as u32, self.cluster_max_bytes)
     }
 
+    /// Opt in to the RFC 9559 §25.3.3 "Cues at the Front" layout:
+    /// `write_header` reserves `reserved_bytes` as a `Void` between the
+    /// last pre-Cluster master and the first Cluster, and `write_trailer`
+    /// writes the `Cues` element into that slot (plus a filler `Void`
+    /// over the remainder) instead of after the last Cluster — so players
+    /// that seek get the whole index without first seeking to the end of
+    /// the file. The SeekHead `Cues` entry is patched to the slot.
+    ///
+    /// §25.3.3 notes why this layout is rare: "Because the Cues reference
+    /// locations further in the file, it's often complicated to allocate
+    /// the proper space for that element before all the locations are
+    /// known." The reservation is therefore caller-sized. Budgeting rule
+    /// of thumb for this muxer's index: one cue per video keyframe /
+    /// audio Cluster / subtitle frame, at roughly 30-40 bytes each. If
+    /// the finished index does not fit the reservation, the muxer falls
+    /// back to the ordinary end placement — the file stays valid, the
+    /// reserved `Void` simply remains, and the SeekHead points at the
+    /// end-placed `Cues`. A 1-byte remainder (too small for a `Void`) is
+    /// absorbed by widening the `Cues` size VINT by one byte.
+    ///
+    /// Must be called before [`Muxer::write_header`]. `reserved_bytes`
+    /// must be at least 32. Conflicts with
+    /// [`MkvMuxer::with_live_streaming`] in both directions (a live
+    /// stream writes no Cues at all).
+    pub fn with_front_cues(&mut self, reserved_bytes: u32) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_front_cues called after write_header",
+            ));
+        }
+        if self.live_streaming {
+            return Err(Error::other(
+                "MKV muxer: with_front_cues conflicts with with_live_streaming \
+                 (a live stream writes no Cues at all, RFC 9559 §25.3.4)",
+            ));
+        }
+        if reserved_bytes < 32 {
+            return Err(Error::invalid(format!(
+                "MKV muxer: with_front_cues reserved_bytes {reserved_bytes} out of range (>= 32)"
+            )));
+        }
+        self.front_cues_reserved = Some(reserved_bytes as u64);
+        Ok(self)
+    }
+
+    /// Read-only accessor: the front-`Cues` reservation installed via
+    /// [`MkvMuxer::with_front_cues`], `None` when the default end
+    /// placement is in effect.
+    pub fn front_cues_reserved(&self) -> Option<u64> {
+        self.front_cues_reserved
+    }
+
     /// Opt a WebM muxer out of strict profile gating.
     ///
     /// By default a WebM muxer ([`crate::mux::open_webm`] /
@@ -2387,6 +2446,12 @@ impl MkvMuxer {
             return Err(Error::other(
                 "MKV muxer: with_live_streaming conflicts with with_duration_finalization \
                  (a live stream is emitted forward-only and has no known end to patch)",
+            ));
+        }
+        if self.front_cues_reserved.is_some() {
+            return Err(Error::other(
+                "MKV muxer: with_live_streaming conflicts with with_front_cues \
+                 (a live stream writes no Cues at all, RFC 9559 §25.3.4)",
             ));
         }
         self.live_streaming = true;
@@ -5555,6 +5620,17 @@ impl Muxer for MkvMuxer {
             Some(tags_offset_in_buf)
         };
 
+        // Front-Cues reservation (RFC 9559 §25.3.3): a Void between the
+        // last pre-Cluster master and the first Cluster, sized by the
+        // caller, that `write_trailer` overwrites with the finished Cues
+        // (or leaves in place when the index doesn't fit / no packet was
+        // written).
+        if let Some(reserved) = self.front_cues_reserved {
+            let slot_in_buf = all.len() as u64;
+            all.extend_from_slice(&make_void(reserved as usize));
+            self.front_cues_slot_abs = Some(base_pos + slot_in_buf);
+        }
+
         // Patch the Info / Tracks SeekPositions in the SeekHead now that we
         // know where each element landed inside `all`. Cues stays as zero
         // and is patched in `write_trailer`. In the live-streaming layout
@@ -5658,6 +5734,8 @@ impl Muxer for MkvMuxer {
         // live stream has no known end to index.
         let cues_offset_rel = if self.live_streaming {
             None
+        } else if let Some(slot_abs) = self.front_cues_slot_abs {
+            self.write_front_cues(slot_abs)?
         } else {
             self.write_cues()?
         };
@@ -6176,8 +6254,61 @@ impl MkvMuxer {
     /// Segment payload start, or `None` if the muxer had no cues to emit.
     /// Called from `write_trailer`.
     fn write_cues(&mut self) -> Result<Option<u64>> {
-        if self.cues.is_empty() {
+        let Some(out) = self.build_cues_bytes(0) else {
             return Ok(None);
+        };
+        let cues_abs = self.output.stream_position().unwrap_or(0);
+        self.output.write_all(&out)?;
+        Ok(Some(cues_abs.saturating_sub(self.segment_data_start)))
+    }
+
+    /// Write the `Cues` element into the front reservation made by
+    /// [`MkvMuxer::with_front_cues`] (RFC 9559 §25.3.3), covering the
+    /// remainder with a filler `Void`. Falls back to the ordinary end
+    /// placement when the finished index does not fit the reservation. A
+    /// 1-byte remainder is absorbed by widening the `Cues` size VINT.
+    fn write_front_cues(&mut self, slot_abs: u64) -> Result<Option<u64>> {
+        use std::io::SeekFrom;
+        let reserved = self.front_cues_reserved.unwrap_or(0);
+        let Some(mut out) = self.build_cues_bytes(0) else {
+            // No cues recorded: the reservation stays a Void and the
+            // caller voids the SeekHead Cues entry.
+            return Ok(None);
+        };
+        if out.len() as u64 + 1 == reserved {
+            // The remainder would be exactly 1 byte — too small for a
+            // Void (2-byte minimum). Rebuild with the size VINT one byte
+            // wider so the element fills the slot exactly.
+            let minimal_width = write_vint(cues_inner_len(&out), 0).len() as u8;
+            if let Some(padded) = self.build_cues_bytes(minimal_width + 1) {
+                out = padded;
+            }
+        }
+        if out.len() as u64 > reserved {
+            // Doesn't fit — fall back to end placement; the reserved
+            // Void stays where it is (a legal, if wasteful, layout).
+            return self.write_cues();
+        }
+        let resume = self.output.stream_position().unwrap_or(0);
+        self.output.seek(SeekFrom::Start(slot_abs))?;
+        self.output.write_all(&out)?;
+        let remainder = reserved - out.len() as u64;
+        debug_assert_ne!(remainder, 1, "the padded rebuild removes the 1-byte case");
+        if remainder >= 2 {
+            self.output.write_all(&make_void(remainder as usize))?;
+        }
+        self.output.seek(SeekFrom::Start(resume))?;
+        Ok(Some(slot_abs.saturating_sub(self.segment_data_start)))
+    }
+
+    /// Serialise the whole `Cues` element (RFC 9559 §5.1.5) from the
+    /// recorded cue index, or `None` when no cue was recorded.
+    /// `size_vint_min_width` pads the element's size VINT (0 = minimal) —
+    /// the §25.3.3 exact-fit path uses it to grow the element by one
+    /// byte.
+    fn build_cues_bytes(&self, size_vint_min_width: u8) -> Option<Vec<u8>> {
+        if self.cues.is_empty() {
+            return None;
         }
         // Group cues by time, combining the per-track entries of a
         // single cluster into one CuePoint. Per the EBML spec
@@ -6236,14 +6367,19 @@ impl MkvMuxer {
             write_master_element(&mut body, ids::CUE_POINT, &cp);
         }
         let mut out = Vec::with_capacity(body.len() + 8 + CRC32_CHILD_LEN);
+        out.extend_from_slice(&write_element_id(ids::CUES));
         if self.webm_strict {
-            write_master_element(&mut out, ids::CUES, &body);
+            // The guidelines list CRC-32 as unsupported.
+            out.extend_from_slice(&write_vint(body.len() as u64, size_vint_min_width));
+            out.extend_from_slice(&body);
         } else {
-            write_master_element_with_crc(&mut out, ids::CUES, &body);
+            let crc = build_crc32_child(&body);
+            let inner_len = CRC32_CHILD_LEN + body.len();
+            out.extend_from_slice(&write_vint(inner_len as u64, size_vint_min_width));
+            out.extend_from_slice(&crc);
+            out.extend_from_slice(&body);
         }
-        let cues_abs = self.output.stream_position().unwrap_or(0);
-        self.output.write_all(&out)?;
-        Ok(Some(cues_abs.saturating_sub(self.segment_data_start)))
+        Some(out)
     }
 
     /// Append one frame to the lace buffer for `stream_idx`.
@@ -7075,6 +7211,43 @@ fn seek_entry(target_id: u32, position: u64) -> Vec<u8> {
     write_master_element(&mut entry, ids::SEEK, &body);
     debug_assert_eq!(entry.len(), SEEK_ENTRY_LEN);
     entry
+}
+
+/// Build a `Void` element (RFC 8794 §11.3.2) of exactly `total` bytes —
+/// 1-byte id + size VINT + zero padding. `total` must be at least 2 (the
+/// smallest possible Void). Used for the §25.3.3 front-`Cues`
+/// reservation and its remainder filler.
+fn make_void(total: usize) -> Vec<u8> {
+    debug_assert!(total >= 2);
+    for w in 1..=8usize {
+        if total < 1 + w {
+            break;
+        }
+        let payload = (total - 1 - w) as u64;
+        let vint = write_vint(payload, w as u8);
+        if vint.len() == w {
+            let mut out = Vec::with_capacity(total);
+            out.push(ids::VOID as u8);
+            out.extend_from_slice(&vint);
+            out.resize(total, 0);
+            return out;
+        }
+    }
+    // Unreachable for total >= 2 (a 1-byte size VINT covers payloads up
+    // to 126; wider VINTs cover everything a usize can ask for), but a
+    // minimal Void keeps the function total.
+    vec![ids::VOID as u8, 0x80]
+}
+
+/// Decode the size-VINT value of a serialised `Cues` element (the 4-byte
+/// element id followed by its size VINT). Used by the §25.3.3 exact-fit
+/// path to learn the minimal size-VINT width before rebuilding with a
+/// wider one.
+fn cues_inner_len(elem: &[u8]) -> u64 {
+    let mut cur = std::io::Cursor::new(&elem[4..]);
+    crate::ebml::read_vint(&mut cur, false)
+        .map(|(v, _)| v)
+        .unwrap_or(0)
 }
 
 /// Build a Void element exactly the size of a Seek entry. Used in the
