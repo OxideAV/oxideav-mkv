@@ -351,11 +351,20 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - **Typed `SeekHead` accessor** (RFC 9559 §5.1.1, including
   §5.1.1.1..§5.1.1.1.2): `MkvDemuxer::seek_entries() -> &[SeekEntry]`
   surfaces the MetaSeek index — the `SeekHead > Seek` rows that point each
-  Top-Level Element to its Segment Position — in document order. The
-  demuxer doesn't *navigate* by the SeekHead (it walks Segment children
-  directly and seeks via `Cues`), so this is a pure inspection / re-mux
-  surface: the one Top-Level master that was CRC-validated but never read
-  back. Each `SeekEntry` pairs a `SeekID` (§5.1.1.1.1, the 4-byte binary
+  Top-Level Element to its Segment Position — in document order. Besides
+  inspection / re-mux, the open path now *navigates* by it (RFC 9559
+  §6.3): a SeekHead entry referencing a `Tags` / `Chapters` /
+  `Attachments` / `Cues` master stored **after** the Cluster run (the
+  common single-pass-mux layout) is followed at open time, so late
+  masters surface through their typed accessors, the flat metadata view,
+  and the seek index — including on-demand `attachment_data` reads —
+  without draining the stream. Trust-but-verify: the target must carry
+  exactly the promised element ID with a bounded body inside the
+  Segment, the parse lands in temporaries merged only on success (a
+  hostile or stale `SeekPosition` can never leave partial state), and
+  masters the pre-Cluster walk already parsed are never chased again. A
+  leading `CRC-32` on a followed master validates onto `crc_status()`
+  like every other Top-Level master. Each `SeekEntry` pairs a `SeekID` (§5.1.1.1.1, the 4-byte binary
   EBML ID of the referenced element) with a `SeekPosition` (§5.1.1.1.2, a
   Segment Position per Section 16 — relative to the first Segment-data
   byte, *not* an absolute file offset). `seek_id() -> Option<u32>` decodes

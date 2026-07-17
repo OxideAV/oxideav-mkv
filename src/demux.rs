@@ -235,11 +235,11 @@ fn open_typed_impl(
     // them at open time.
     let mut attachments: Vec<Attachment> = Vec::new();
     // Typed `SeekHead\Seek` index (RFC 9559 §5.1.1), surfaced via
-    // `MkvDemuxer::seek_entries`. The demuxer doesn't navigate by the
-    // SeekHead (it walks Segment children directly and seeks via Cues),
-    // but a caller can inspect or re-mux the MetaSeek index. `maxOccurs:
-    // 2` SeekHeads accumulate their entries onto this one list in
-    // document order.
+    // `MkvDemuxer::seek_entries`. Besides the inspection / re-mux
+    // surface, the open path follows these entries (§6.3) to Top-Level
+    // masters stored after the Cluster run — see the chase block below.
+    // `maxOccurs: 2` SeekHeads accumulate their entries onto this one
+    // list in document order.
     let mut seek_entries: Vec<SeekEntry> = Vec::new();
     // Per-element CRC-32 validation results (RFC 8794 §11.3.1, RFC 9559
     // §6.2). Populated as each Top-Level master with a leading CRC-32
@@ -414,6 +414,61 @@ fn open_typed_impl(
                 }
             }
         }
+    }
+
+    // RFC 9559 §6.3: "It is possible to walk through all Top-Level
+    // Elements" via the SeekHead — the common single-pass-mux layout
+    // stores Tags / Chapters / Attachments / Cues *after* the Cluster
+    // run, where the pre-Cluster walk above never reaches them. Follow
+    // each SeekHead entry that references a not-yet-parsed master at a
+    // position past the walk-break point, parse it with the normal
+    // parser, and restore the reader. Best-effort and trust-but-verify:
+    // a SeekPosition whose target doesn't carry the promised element ID
+    // (or whose parse fails) is ignored wholesale — nothing partial is
+    // merged, so a hostile SeekHead can't corrupt the surfaced state.
+    if first_cluster_offset.is_some() {
+        let resume_pos = input.stream_position()?;
+        let mut chase: Vec<(u32, u64)> = Vec::new();
+        for se in &seek_entries {
+            let Some(id) = se.seek_id() else { continue };
+            if !se.has_position() {
+                continue;
+            }
+            let wanted = match id {
+                ids::CUES => cues.is_empty(),
+                ids::TAGS => pending_tags.is_empty(),
+                ids::CHAPTERS => editions.is_empty(),
+                ids::ATTACHMENTS => attachments.is_empty(),
+                _ => false,
+            };
+            let abs = segment_data_start.saturating_add(se.seek_position());
+            if wanted
+                && abs >= resume_pos
+                && abs < segment_data_end
+                && !chase.iter().any(|(i, _)| *i == id)
+            {
+                chase.push((id, abs));
+            }
+        }
+        for (id, abs) in chase {
+            let _ = follow_seek_target(
+                &mut *input,
+                id,
+                abs,
+                segment_data_end,
+                &mut crc_status,
+                &mut cues,
+                &mut cue_points,
+                &mut pending_tags,
+                &mut metadata,
+                &mut chapter_uid_to_index,
+                &mut edition_uid_to_index,
+                &mut editions,
+                &mut attachment_uid_to_index,
+                &mut attachments,
+            );
+        }
+        input.seek(SeekFrom::Start(resume_pos))?;
     }
 
     // Cues are often written after the final Cluster — if we haven't seen
@@ -6508,6 +6563,100 @@ fn parse_cue_reference(r: &mut dyn ReadSeek, end: u64) -> Result<CueReference> {
 /// Unknown-size Clusters are walked element-by-element until a sibling
 /// top-level element terminates them, so Cues that sit after an
 /// unknown-size final Cluster are still found.
+/// Follow one SeekHead entry (RFC 9559 §6.3) to a Top-Level master the
+/// pre-Cluster walk never reached (the single-pass-mux layout stores
+/// `Tags` / `Chapters` / `Attachments` / `Cues` after the Cluster run).
+///
+/// Trust-but-verify: the element header at the target must carry exactly
+/// the ID the `SeekID` promised and a bounded body inside the Segment,
+/// or the entry is ignored. The parse lands in *temporary* collections
+/// that are merged only when the whole parse succeeds — a hostile or
+/// stale SeekPosition can never leave partially-parsed state behind.
+/// The caller restores the reader position afterwards.
+#[allow(clippy::too_many_arguments)]
+fn follow_seek_target(
+    r: &mut dyn ReadSeek,
+    id: u32,
+    abs: u64,
+    segment_data_end: u64,
+    crc_status: &mut Vec<CrcStatus>,
+    cues: &mut Vec<CueEntry>,
+    cue_points: &mut Vec<CuePoint>,
+    pending_tags: &mut Vec<RawTag>,
+    metadata: &mut Vec<(String, String)>,
+    chapter_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    edition_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    editions: &mut Vec<Edition>,
+    attachment_uid_to_index: &mut std::collections::HashMap<u64, u32>,
+    attachments: &mut Vec<Attachment>,
+) -> Result<()> {
+    r.seek(SeekFrom::Start(abs))?;
+    let e = read_element_header(r)?;
+    if e.id != id || e.size == VINT_UNKNOWN_SIZE {
+        // The SeekID promise doesn't hold at the target (stale or hostile
+        // index), or the body is unbounded and can't be safely parsed
+        // out-of-line.
+        return Ok(());
+    }
+    let body_start = r.stream_position()?;
+    let end = body_start.saturating_add(e.size);
+    if end > segment_data_end {
+        return Ok(());
+    }
+    // Validate a leading CRC-32 like the in-line walk does, but merge the
+    // status only when the parse below succeeds.
+    let crc = validate_top_level_crc(r, e.id, body_start, end)?;
+    match e.id {
+        ids::CUES => {
+            let mut tmp_cues = Vec::new();
+            let mut tmp_points = Vec::new();
+            parse_cues(r, end, &mut tmp_cues, &mut tmp_points)?;
+            cues.extend(tmp_cues);
+            cue_points.extend(tmp_points);
+        }
+        ids::TAGS => {
+            let mut tmp = Vec::new();
+            parse_tags(r, end, &mut tmp)?;
+            pending_tags.extend(tmp);
+        }
+        ids::CHAPTERS => {
+            // The chase only runs when no `Chapters` was parsed yet, so
+            // fresh maps number editions / chapters from 1 exactly like
+            // the in-line walk would have.
+            let mut tmp_meta = Vec::new();
+            let mut tmp_chap_map = std::collections::HashMap::new();
+            let mut tmp_ed_map = std::collections::HashMap::new();
+            let mut tmp_editions = Vec::new();
+            parse_chapters_typed(
+                r,
+                end,
+                &mut tmp_meta,
+                &mut tmp_chap_map,
+                &mut tmp_ed_map,
+                &mut tmp_editions,
+            )?;
+            metadata.extend(tmp_meta);
+            chapter_uid_to_index.extend(tmp_chap_map);
+            edition_uid_to_index.extend(tmp_ed_map);
+            editions.extend(tmp_editions);
+        }
+        ids::ATTACHMENTS => {
+            let mut tmp_meta = Vec::new();
+            let mut tmp_att_map = std::collections::HashMap::new();
+            let mut tmp_atts = Vec::new();
+            parse_attachments(r, end, &mut tmp_meta, &mut tmp_att_map, &mut tmp_atts)?;
+            metadata.extend(tmp_meta);
+            attachment_uid_to_index.extend(tmp_att_map);
+            attachments.extend(tmp_atts);
+        }
+        _ => return Ok(()),
+    }
+    if let Some(status) = crc {
+        crc_status.push(status);
+    }
+    Ok(())
+}
+
 fn scan_cues_from(
     r: &mut dyn ReadSeek,
     start: u64,

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: SeekHead-directed recovery of post-Cluster Top-Level masters
+  (RFC 9559 §6.3). The open path follows `SeekHead > Seek` entries that
+  reference a `Tags` / `Chapters` / `Attachments` / `Cues` master stored
+  after the Cluster run — the common single-pass-mux layout — so late
+  masters now surface at open time through the typed accessors, the flat
+  metadata view, and the seek index (previously late Chapters /
+  Attachments never surfaced and late Tags only after draining the
+  stream). Trust-but-verify: the target must carry the promised element
+  ID with a bounded body inside the Segment; parses land in temporaries
+  merged only on success; already-parsed masters are never chased. 4
+  integration tests in `tests/seek_head_directed_recovery.rs`.
 - Muxer: RFC 9559 §25.1 Cluster **byte** budget. Clusters were already
   rotated at ~5 s; they now also rotate once the open Cluster's Block
   content reaches 5 MB (the other half of the §25.1 recommendation), so
