@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: two-pass Segment `Duration` finalization
+  (`MkvMuxer::with_duration_finalization()`, RFC 9559 §5.1.2.10).
+  `write_header` reserves an 11-byte `Void` inside `Info`;
+  `write_trailer` patches the measured duration (max packet end time
+  across streams, ms ticks) in place and rewrites the Info `CRC-32` the
+  patch invalidates (RFC 8794 §11.3.1). A crashed producer or
+  zero-packet mux truthfully leaves the `Void`. Conflicts rejected both
+  ways with `set_duration` and `with_live_streaming`; works in strict
+  WebM mode (no CRC child to rewrite, output stays scan-conformant).
+  6 integration tests in `tests/mux_duration_finalization.rs`;
+  `examples/gen_webm_profile.rs` gained `--finalize` for black-box
+  validation.
 - WebM muxer: strict profile gating by default. A `mux::open_webm` /
   `MkvMuxer::new_webm` muxer now emits only elements the WebM guidelines
   list as supported: off-profile queue-time setters return

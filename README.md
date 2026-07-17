@@ -914,6 +914,19 @@ the unified `oxideav` aggregator to wire decoding automatically.
   byte-identical with prior releases. Round-trip tests verify the exact
   offset semantics (including on the surviving Clusters after a damage
   resync); black-box validated against a widely-deployed reader.
+- **Two-pass `Duration` finalization** (RFC 9559 §5.1.2.10): opt-in via
+  `MkvMuxer::with_duration_finalization()`. `write_header` reserves a
+  `Duration`-sized `Void` inside `Info` (at the §5.1.2 element-order
+  position) and `write_trailer` patches it in place with the *measured*
+  duration — the maximum packet end time (`pts + duration`) across all
+  streams — then rewrites the Info `CRC-32` payload over the patched
+  body (RFC 8794 §11.3.1; skipped in strict WebM mode where no CRC
+  child exists). Failure modes are truthful: a crashed producer (no
+  trailer) or a zero-packet mux leaves a harmless `Void`, never a bogus
+  duration. Conflicts are rejected in both directions with
+  `set_duration` (explicit vs measured) and `with_live_streaming`
+  (forward-only output has no known end to patch). Black-box validated:
+  a widely-deployed prober reads the patched duration.
 - **Livestreaming layout** (RFC 9559 §25.3.4 + §23.2): opt-in via
   `MkvMuxer::with_live_streaming()`. Omits the up-front `SeekHead` and
   writes no `Cues` in `write_trailer` ("SeekHead and Cues are useless" in

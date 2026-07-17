@@ -1,5 +1,8 @@
 //! Dev helper: write a strict-profile WebM file for black-box validation
-//! (`cargo run --example gen_webm_profile <out.webm> [--lenient]`).
+//! (`cargo run --example gen_webm_profile <out.webm> [--lenient]
+//! [--finalize]`). With `--finalize` the Segment `Duration` is measured
+//! and patched by `write_trailer` (two-pass finalization) instead of
+//! being declared up front.
 //! Emits a VP9-shaped video track with chapters, tags, colour metadata,
 //! and cluster hints; with `--lenient` the full Matroska surface is
 //! restored under the `webm` DocType (CRC-32 children, EditionUID,
@@ -13,6 +16,7 @@ fn main() {
         .nth(1)
         .expect("usage: gen_webm_profile <out.webm> [--lenient]");
     let lenient = std::env::args().any(|a| a == "--lenient");
+    let finalize = std::env::args().any(|a| a == "--finalize");
     let mut vp = CodecParameters::video(CodecId::new("vp9"));
     vp.width = Some(320);
     vp.height = Some(240);
@@ -39,8 +43,12 @@ fn main() {
         simple_tags: vec![MkvSimpleTag::new("ENCODER_SETTINGS", "none")],
     })
     .unwrap();
-    mux.set_duration(std::time::Duration::from_secs(12))
-        .unwrap();
+    if finalize {
+        mux.with_duration_finalization().unwrap();
+    } else {
+        mux.set_duration(std::time::Duration::from_secs(12))
+            .unwrap();
+    }
     mux.write_header().unwrap();
     for i in 0..300i64 {
         let mut pkt = Packet::new(0, TimeBase::new(1, 1000), vec![0xC5; 64]);

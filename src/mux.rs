@@ -433,6 +433,24 @@ pub struct MkvMuxer {
     /// WebM guidelines' supported subset (see the `webm` module). Always
     /// `false` on a Matroska muxer.
     webm_strict: bool,
+    /// Opt-in via [`MkvMuxer::with_duration_finalization`]: an 11-byte
+    /// Void is reserved inside `Info` where `Duration` belongs, and
+    /// `write_trailer` patches the measured duration (plus the Info
+    /// `CRC-32` the patch invalidates) in place.
+    duration_finalization: bool,
+    /// Maximum packet end time (ms) observed across all streams; `None`
+    /// until the first packet lands.
+    max_end_ms: Option<i64>,
+    /// Absolute file offset of the reserved 11-byte `Duration` slot.
+    duration_patch_abs: Option<u64>,
+    /// Absolute file offset of the Info `CRC-32` element's 4-byte payload,
+    /// when a CRC child was written (not in strict WebM mode).
+    info_crc_payload_abs: Option<u64>,
+    /// Copy of the emitted Info body (excluding the CRC child) kept for
+    /// the CRC recompute after the Duration patch.
+    info_body_cache: Vec<u8>,
+    /// Offset of the reserved `Duration` slot within `info_body_cache`.
+    duration_patch_in_body: usize,
     /// Absolute file offset of the previous Cluster's element ID — the
     /// minuend for the `PrevSize` value. `None` before the first Cluster.
     /// The muxer writes Clusters back-to-back, so the distance between two
@@ -2085,6 +2103,12 @@ impl MkvMuxer {
             cluster_body_start_abs: 0,
             cluster_position_hints: false,
             webm_strict: doc_type == DocType::Webm,
+            duration_finalization: false,
+            max_end_ms: None,
+            duration_patch_abs: None,
+            info_crc_payload_abs: None,
+            info_body_cache: Vec::new(),
+            duration_patch_in_body: 0,
             prev_cluster_start_abs: None,
             live_streaming: false,
             segment_data_start: 0,
@@ -2283,6 +2307,12 @@ impl MkvMuxer {
         if self.header_written {
             return Err(Error::other(
                 "MKV muxer: with_live_streaming called after write_header",
+            ));
+        }
+        if self.duration_finalization {
+            return Err(Error::other(
+                "MKV muxer: with_live_streaming conflicts with with_duration_finalization \
+                 (a live stream is emitted forward-only and has no known end to patch)",
             ));
         }
         self.live_streaming = true;
@@ -4345,6 +4375,12 @@ impl MkvMuxer {
                 "MKV muxer: set_duration called after write_header",
             ));
         }
+        if self.duration_finalization {
+            return Err(Error::other(
+                "MKV muxer: set_duration conflicts with with_duration_finalization \
+                 (pick the explicit value or the measured one, not both)",
+            ));
+        }
         let ticks = duration.as_secs_f64() * 1000.0;
         if !(ticks.is_finite() && ticks > 0.0) {
             return Err(Error::invalid(format!(
@@ -4361,6 +4397,57 @@ impl MkvMuxer {
     /// useful for tests.
     pub fn duration_ticks(&self) -> Option<f64> {
         self.info_duration_ticks
+    }
+
+    /// Opt in to two-pass `Duration` finalization (RFC 9559 §5.1.2.10):
+    /// `write_header` reserves a `Duration`-sized `Void` inside `Info` (at
+    /// the §5.1.2 element-order position), and `write_trailer` patches it
+    /// in place with the **measured** duration — the maximum packet end
+    /// time (`pts + duration`, in TimestampScale ticks = ms at this
+    /// muxer's 1 ms scale) across all streams — then rewrites the Info
+    /// `CRC-32` payload over the patched body (RFC 8794 §11.3.1: the CRC
+    /// covers the element's data, so the patch would otherwise invalidate
+    /// it; in strict WebM mode no CRC child exists and no rewrite
+    /// happens). Players read the total duration without scanning the
+    /// Cluster stream — the reason §5.1.2.10 exists.
+    ///
+    /// Failure modes are truthful: if `write_trailer` never runs (a
+    /// crashed producer) or no packet was ever written, the file carries a
+    /// harmless `Void` instead of a bogus duration, and the demuxer
+    /// surfaces "no known duration" exactly as if the element were never
+    /// reserved.
+    ///
+    /// Must be called before [`Muxer::write_header`]. Conflicts are
+    /// rejected in both directions with [`MkvMuxer::set_duration`] (pick
+    /// the explicit value or the measured one) and
+    /// [`MkvMuxer::with_live_streaming`] (a live stream is emitted
+    /// forward-only — §23.2 — and has no known end to patch).
+    pub fn with_duration_finalization(&mut self) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_duration_finalization called after write_header",
+            ));
+        }
+        if self.info_duration_ticks.is_some() {
+            return Err(Error::other(
+                "MKV muxer: with_duration_finalization conflicts with set_duration \
+                 (pick the explicit value or the measured one, not both)",
+            ));
+        }
+        if self.live_streaming {
+            return Err(Error::other(
+                "MKV muxer: with_duration_finalization conflicts with with_live_streaming \
+                 (a live stream is emitted forward-only and has no known end to patch)",
+            ));
+        }
+        self.duration_finalization = true;
+        Ok(self)
+    }
+
+    /// Read-only accessor: `true` when
+    /// [`MkvMuxer::with_duration_finalization`] was called.
+    pub fn duration_finalization(&self) -> bool {
+        self.duration_finalization
     }
 
     /// Queue the EBML-header `DocTypeExtension` declarations (RFC 8794 §11.2.9)
@@ -4562,11 +4649,25 @@ impl Muxer for MkvMuxer {
             write_segment_linking(&mut info_body, linking);
         }
         write_uint_element(&mut info_body, ids::TIMECODE_SCALE, 1_000_000); // 1 ms
-                                                                            // RFC 9559 §5.1.2 element order: Duration (.10), DateUTC (.11),
-                                                                            // Title (.12), MuxingApp (.13), WritingApp (.14).
-                                                                            // Duration is emitted only when the caller queued a known total
-                                                                            // length via `set_duration`; a value in TimestampScale ticks
-                                                                            // (= ms at the muxer's 1 ms scale), stored as a `float`.
+                                                                            // Duration finalization (§5.1.2.10): reserve a Duration-sized Void
+                                                                            // at the position where `Duration` belongs in the §5.1.2 element
+                                                                            // order, so `write_trailer` can patch the measured value in place.
+                                                                            // If the trailer never runs (a crashed producer), the file carries
+                                                                            // a harmless Void instead of a bogus duration.
+        let duration_slot_in_info_body = if self.duration_finalization {
+            let off = info_body.len();
+            info_body.push(ids::VOID as u8);
+            info_body.push(0x89); // size VINT: 9 padding bytes follow
+            info_body.extend_from_slice(&[0u8; DURATION_SLOT_LEN - 2]);
+            Some(off)
+        } else {
+            None
+        };
+        // RFC 9559 §5.1.2 element order: Duration (.10), DateUTC (.11),
+        // Title (.12), MuxingApp (.13), WritingApp (.14).
+        // Duration is emitted only when the caller queued a known total
+        // length via `set_duration`; a value in TimestampScale ticks
+        // (= ms at the muxer's 1 ms scale), stored as a `float`.
         if let Some(ticks) = self.info_duration_ticks {
             write_float_element(&mut info_body, ids::DURATION, ticks);
         }
@@ -4584,6 +4685,27 @@ impl Muxer for MkvMuxer {
             write_master_element(&mut all, ids::INFO, &info_body);
         } else {
             write_master_element_with_crc(&mut all, ids::INFO, &info_body);
+        }
+        if let Some(slot) = duration_slot_in_info_body {
+            // Resolve the reserved slot (and the Info CRC payload) to
+            // absolute file offsets for the `write_trailer` patch.
+            let info_elem_start = segment_data_start_in_buf + info_offset_in_buf;
+            let crc_len = if self.webm_strict {
+                0
+            } else {
+                CRC32_CHILD_LEN as u64
+            };
+            let inner_len = crc_len + info_body.len() as u64;
+            let header_len =
+                write_element_id(ids::INFO).len() as u64 + write_vint(inner_len, 0).len() as u64;
+            let body_start_abs = base_pos + info_elem_start + header_len;
+            if !self.webm_strict {
+                // CRC child layout: 1-byte id + 1-byte size + 4 payload.
+                self.info_crc_payload_abs = Some(body_start_abs + 2);
+            }
+            self.duration_patch_abs = Some(body_start_abs + crc_len + slot as u64);
+            self.duration_patch_in_body = slot;
+            self.info_body_cache = info_body.clone();
         }
 
         // Tracks element.
@@ -5473,6 +5595,13 @@ impl Muxer for MkvMuxer {
         if self.seek_head_written {
             self.patch_cues_seek_entry(cues_offset_rel)?;
         }
+        // Duration finalization: patch the reserved Info slot with the
+        // measured duration and refresh the Info CRC-32 the patch
+        // invalidates. A zero-packet mux leaves the Void in place — an
+        // absent Duration is the truthful signal.
+        if let (Some(patch_abs), Some(end_ms)) = (self.duration_patch_abs, self.max_end_ms) {
+            self.patch_info_duration(patch_abs, end_ms)?;
+        }
         self.output.flush()?;
         self.trailer_written = true;
         Ok(())
@@ -5528,6 +5657,21 @@ impl MkvMuxer {
         }
 
         let pts_ms = pts_to_ms(effective_pts, stream_time_base);
+        // Track the maximum packet end time for
+        // `with_duration_finalization` (§5.1.2.10: Duration is the
+        // Segment's duration in TimestampScale ticks — ms at this muxer's
+        // 1 ms scale).
+        {
+            let dur_ms = derived_duration
+                .map(|d| pts_to_ms(d, stream_time_base))
+                .filter(|d| *d > 0)
+                .unwrap_or(0);
+            let end_ms = pts_ms.saturating_add(dur_ms);
+            match self.max_end_ms {
+                Some(m) if end_ms <= m => {}
+                _ => self.max_end_ms = Some(end_ms),
+            }
+        }
 
         // Flush any pending lace on a different track than this packet,
         // and flush the current track's lace before any cluster
@@ -6159,6 +6303,31 @@ impl MkvMuxer {
         self.output.seek(SeekFrom::Start(resume_pos))?;
         Ok(())
     }
+
+    /// Overwrite the reserved Info `Duration` Void with the measured
+    /// duration (RFC 9559 §5.1.2.10, in TimestampScale ticks = ms) and
+    /// rewrite the Info `CRC-32` payload over the patched body (RFC 8794
+    /// §11.3.1 — the CRC covers the element's data, so the patch would
+    /// otherwise invalidate it).
+    fn patch_info_duration(&mut self, patch_abs: u64, end_ms: i64) -> Result<()> {
+        use std::io::SeekFrom;
+        let resume_pos = self.output.stream_position().unwrap_or(0);
+        let mut elem = write_element_id(ids::DURATION);
+        elem.push(0x88); // size VINT: 8-byte float payload
+        elem.extend_from_slice(&(end_ms.max(0) as f64).to_be_bytes());
+        debug_assert_eq!(elem.len(), DURATION_SLOT_LEN);
+        self.output.seek(SeekFrom::Start(patch_abs))?;
+        self.output.write_all(&elem)?;
+        let off = self.duration_patch_in_body;
+        self.info_body_cache[off..off + DURATION_SLOT_LEN].copy_from_slice(&elem);
+        if let Some(crc_abs) = self.info_crc_payload_abs {
+            let crc = crc32_ieee(&self.info_body_cache);
+            self.output.seek(SeekFrom::Start(crc_abs))?;
+            self.output.write_all(&crc.to_le_bytes())?;
+        }
+        self.output.seek(SeekFrom::Start(resume_pos))?;
+        Ok(())
+    }
 }
 
 /// Build a SimpleBlock element (RFC 9559 §10.2). `frames` is the
@@ -6708,6 +6877,13 @@ fn write_master_element(buf: &mut Vec<u8>, id: u32, body: &[u8]) {
 /// §11.3.1 fixes the `CRC-32` element to exactly 4 payload bytes and
 /// its id encodes in one byte.
 const CRC32_CHILD_LEN: usize = 6;
+
+/// On-disk length of the `Info > Duration` element the muxer reserves /
+/// patches for [`MkvMuxer::with_duration_finalization`]: 2-byte id
+/// (`0x4489`) + 1-byte size VINT (`0x88`) + 8-byte float payload. The
+/// place-holder Void filling the identical span is id `0xEC` + size VINT
+/// `0x89` + 9 padding bytes.
+const DURATION_SLOT_LEN: usize = 11;
 
 /// Serialise a `CRC-32` element (RFC 8794 §11.3.1) whose 4-byte
 /// payload is the IEEE CRC-32 of `data`, stored little-endian. The
