@@ -815,8 +815,18 @@ the unified `oxideav` aggregator to wire decoding automatically.
   SeekHead (mpv, Chromium) jump straight to Cues without scanning. The
   Cues `SeekPosition` is patched in `write_trailer`; if no packets were
   written, the Cues entry is rewritten as a Void filler.
-- `Info` (1 ms `TimecodeScale`), `Tracks`, rolling ~5 s `Cluster`s with
-  `SimpleBlock` payload.
+- `Info` (1 ms `TimecodeScale`), `Tracks`, rolling `Cluster`s with
+  `SimpleBlock` payload, budgeted per RFC 9559 §25.1 ("no more than
+  five seconds or five megabytes of content"): a new Cluster starts
+  when the open one would pass 5 s **or** once its Block content
+  reaches 5 MB (so a high-bitrate stream rotates on bytes long before
+  the duration budget; a Cluster exceeds the byte budget by at most
+  one Block). `MkvMuxer::with_cluster_limits(max_duration_ms,
+  max_bytes)` tunes both budgets (duration capped at `i16::MAX` ms —
+  the Section 10 signed-16-bit Block-timestamp bound; bytes floored at
+  1024); `cluster_limits()` reads them back. Smaller budgets buy finer
+  seek granularity and a smaller damage blast radius per broken
+  Cluster at the cost of per-Cluster overhead.
 - `Cues` element emitted in `write_trailer` - index entries for every
   video keyframe and every audio cluster-start, so the resulting file
   is seekable without a second pass. Each entry carries the full

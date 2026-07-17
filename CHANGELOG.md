@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: RFC 9559 §25.1 Cluster **byte** budget. Clusters were already
+  rotated at ~5 s; they now also rotate once the open Cluster's Block
+  content reaches 5 MB (the other half of the §25.1 recommendation), so
+  a high-bitrate stream no longer produces arbitrarily large Clusters.
+  A Cluster exceeds the budget by at most one Block. New
+  `MkvMuxer::with_cluster_limits(max_duration_ms, max_bytes)` tunes both
+  budgets (duration validated against the Section 10 signed-16-bit
+  Block-timestamp bound, bytes floored at 1024) and `cluster_limits()`
+  reads them back. 5 integration tests in `tests/mux_cluster_limits.rs`.
 - Fuzz harness: a fourth pass drives `webm::scan` over every input,
   asserting the per-status counters sum to `elements_scanned` and the
   findings-cap bookkeeping is consistent; the seed corpus also replays

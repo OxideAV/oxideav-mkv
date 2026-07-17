@@ -40,8 +40,17 @@ use crate::demux::{
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
 
-/// Cluster every ~5 seconds (in MKV ms timecode units).
+/// Cluster every ~5 seconds (in MKV ms timecode units) — the RFC 9559
+/// §25.1 recommendation ("no more than five seconds or five megabytes
+/// of content").
 const CLUSTER_DURATION_MS: i64 = 5_000;
+
+/// Per-Cluster content-byte budget — the other half of the RFC 9559
+/// §25.1 recommendation. Counted over the Block / SimpleBlock /
+/// BlockGroup bytes written into the open Cluster; when the budget is
+/// reached the next packet opens a fresh Cluster, so a Cluster exceeds
+/// it by at most one Block.
+const CLUSTER_MAX_BYTES: u64 = 5_000_000;
 
 /// Open a general Matroska muxer. Writes `DocType="matroska"` and accepts
 /// any codec the `codec_id` module maps to a known Matroska ID.
@@ -451,6 +460,15 @@ pub struct MkvMuxer {
     info_body_cache: Vec<u8>,
     /// Offset of the reserved `Duration` slot within `info_body_cache`.
     duration_patch_in_body: usize,
+    /// Content bytes (Blocks) written into the currently open Cluster —
+    /// drives the §25.1 byte budget.
+    cluster_bytes: u64,
+    /// Per-Cluster duration budget (ms). Defaults to the §25.1
+    /// recommendation; configurable via [`MkvMuxer::with_cluster_limits`].
+    cluster_max_ms: i64,
+    /// Per-Cluster content-byte budget. Defaults to the §25.1
+    /// recommendation; configurable via [`MkvMuxer::with_cluster_limits`].
+    cluster_max_bytes: u64,
     /// Absolute file offset of the previous Cluster's element ID — the
     /// minuend for the `PrevSize` value. `None` before the first Cluster.
     /// The muxer writes Clusters back-to-back, so the distance between two
@@ -2109,6 +2127,9 @@ impl MkvMuxer {
             info_crc_payload_abs: None,
             info_body_cache: Vec::new(),
             duration_patch_in_body: 0,
+            cluster_bytes: 0,
+            cluster_max_ms: CLUSTER_DURATION_MS,
+            cluster_max_bytes: CLUSTER_MAX_BYTES,
             prev_cluster_start_abs: None,
             live_streaming: false,
             segment_data_start: 0,
@@ -2213,6 +2234,59 @@ impl MkvMuxer {
     /// [`MkvMuxer::with_cluster_position_hints`] was called.
     pub fn cluster_position_hints(&self) -> bool {
         self.cluster_position_hints
+    }
+
+    /// Configure the per-Cluster budgets that decide when the muxer
+    /// rotates to a fresh `Cluster` (RFC 9559 §25.1: "It is RECOMMENDED
+    /// that each individual Cluster element contain no more than five
+    /// seconds or five megabytes of content" — the defaults). A new
+    /// Cluster starts when the next packet's timestamp exceeds the open
+    /// Cluster's `Timestamp` by more than `max_duration_ms`, or once the
+    /// open Cluster's Block content has reached `max_bytes` (so a Cluster
+    /// exceeds the byte budget by at most one Block; a single Block larger
+    /// than the budget is written whole).
+    ///
+    /// `max_duration_ms` is capped at `i16::MAX` (32 767): Block
+    /// timestamps are signed 16-bit offsets from the Cluster `Timestamp`
+    /// (Section 10), so a longer budget could not be expressed on disk —
+    /// the muxer would rotate at the bound anyway. `max_bytes` must be at
+    /// least 1024 (a smaller budget would degenerate to one Cluster per
+    /// Block with more header overhead than content).
+    ///
+    /// Must be called before [`Muxer::write_header`]. Smaller budgets give
+    /// finer seek granularity and smaller damage blast radius per broken
+    /// Cluster, at the cost of per-Cluster header overhead.
+    pub fn with_cluster_limits(
+        &mut self,
+        max_duration_ms: u32,
+        max_bytes: u64,
+    ) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_cluster_limits called after write_header",
+            ));
+        }
+        if max_duration_ms == 0 || max_duration_ms > i16::MAX as u32 {
+            return Err(Error::invalid(format!(
+                "MKV muxer: with_cluster_limits max_duration_ms {max_duration_ms} out of range \
+                 (1..=32767 — Block timestamps are signed 16-bit Cluster offsets, RFC 9559 §10)"
+            )));
+        }
+        if max_bytes < 1024 {
+            return Err(Error::invalid(format!(
+                "MKV muxer: with_cluster_limits max_bytes {max_bytes} out of range (>= 1024)"
+            )));
+        }
+        self.cluster_max_ms = max_duration_ms as i64;
+        self.cluster_max_bytes = max_bytes;
+        Ok(self)
+    }
+
+    /// Read-only accessor: the `(max_duration_ms, max_bytes)` Cluster
+    /// budgets in effect (the RFC 9559 §25.1 recommended `(5000,
+    /// 5_000_000)` unless [`MkvMuxer::with_cluster_limits`] changed them).
+    pub fn cluster_limits(&self) -> (u32, u64) {
+        (self.cluster_max_ms as u32, self.cluster_max_bytes)
     }
 
     /// Opt a WebM muxer out of strict profile gating.
@@ -5694,11 +5768,15 @@ impl MkvMuxer {
             }
         }
 
-        // Decide whether to start a new cluster.
+        // Decide whether to start a new cluster: the RFC 9559 §25.1
+        // duration + byte budgets, the signed-16-bit Block-timestamp
+        // relative bound, and a backward pts (which cannot be expressed
+        // as a positive offset from the open Cluster's Timestamp).
         let needs_new_cluster = !self.cluster_open
-            || pts_ms - self.cluster_timecode_ms > CLUSTER_DURATION_MS
+            || pts_ms - self.cluster_timecode_ms > self.cluster_max_ms
             || pts_ms - self.cluster_timecode_ms > i16::MAX as i64
-            || pts_ms - self.cluster_timecode_ms < 0;
+            || pts_ms - self.cluster_timecode_ms < 0
+            || self.cluster_bytes >= self.cluster_max_bytes;
         if needs_new_cluster {
             // Flush the in-flight lace on the SAME track before
             // moving to a new cluster — its frames belong to the
@@ -5823,6 +5901,7 @@ impl MkvMuxer {
                 opts.reference_frame.as_ref(),
             );
             self.output.write_all(&bytes)?;
+            self.cluster_bytes += bytes.len() as u64;
             // One Block written to the open Cluster — advances the 1-based
             // `CueBlockNumber` counter (RFC 9559 §5.1.5.1.2.5).
             self.cluster_block_count += 1;
@@ -5838,6 +5917,7 @@ impl MkvMuxer {
                 std::slice::from_ref(&packet.data),
             );
             self.output.write_all(&block_bytes)?;
+            self.cluster_bytes += block_bytes.len() as u64;
             // One SimpleBlock written to the open Cluster — advances the
             // 1-based `CueBlockNumber` counter (RFC 9559 §5.1.5.1.2.5).
             self.cluster_block_count += 1;
@@ -6087,6 +6167,7 @@ impl MkvMuxer {
             *s = false;
         }
         self.cluster_block_count = 0;
+        self.cluster_bytes = 0;
         Ok(())
     }
 
@@ -6268,6 +6349,7 @@ impl MkvMuxer {
         }
         let block_bytes = build_simple_block(track_number, tc_offset, keyframe, mode, &frames);
         self.output.write_all(&block_bytes)?;
+        self.cluster_bytes += block_bytes.len() as u64;
         // One SimpleBlock (possibly laced) written to the open Cluster —
         // advances the 1-based `CueBlockNumber` counter (§5.1.5.1.2.5).
         self.cluster_block_count += 1;
