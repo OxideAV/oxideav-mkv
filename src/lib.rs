@@ -16,6 +16,9 @@
 pub mod avc;
 pub mod codec_id;
 pub mod demux;
+// Internal EBML walker plumbing (VINT/element primitives) — exposed for the
+// in-crate property tests only; not part of the supported container API.
+#[doc(hidden)]
 pub mod ebml;
 pub mod ids;
 pub mod mux;

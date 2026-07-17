@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- Marked the internal `ebml` module (raw VINT/element walker plumbing used by
+  the in-crate property tests) `#[doc(hidden)]` so semver tooling tracks only
+  the supported container API; no behavioural or signature changes.
+
 ### Added
 
 - Muxer: `ChapterDisplay` gained a `language_bcp47: Option<String>` field
