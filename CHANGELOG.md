@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `webm` module: WebM-profile conformance. `webm_element_support(id)`
+  transcribes the staged WebM container guidelines' per-element support
+  table by Element ID (239 rows: 137 Supported / 98 Unsupported / 4
+  Deprecated; post-table elements → `Unlisted`), and `webm::scan(reader)`
+  walks a whole EBML document classifying every element occurrence into a
+  `WebmConformanceReport` — `DocType`, per-status counts, every
+  Unsupported/Deprecated occurrence with absolute offset (capped at
+  4096), distinct Unlisted IDs, damage stop-offset, and the
+  `is_conformant()` headline verdict. Bounded and panic-free on hostile
+  input (depth cap 64, findings cap, no leaf-body allocation); 12
+  integration tests in `tests/webm_conformance.rs` + 4 unit tests.
 - `tests/rfc9559_element_census.rs`: a full transcription of the RFC 9559
   Table 53 "Matroska Element IDs" registry (250 named entries, 43 of them
   Reclaimed, the 4 all-ones Reserved placeholders excluded) cross-checked

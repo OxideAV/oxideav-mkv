@@ -1494,6 +1494,37 @@ the unified `oxideav` aggregator to wire decoding automatically.
   surfaces `None` from `content_encodings`. Pairs symmetrically with the
   existing `MkvDemuxer::content_encodings` typed accessor.
 
+### WebM-profile conformance (`webm` module)
+
+- **Guidelines support table** (`webm::webm_element_support(id) ->
+  WebmSupport`): the staged WebM container guidelines tabulate, element
+  by element, whether a WebM reader supports it. The table is
+  transcribed by Element ID — 239 rows: 137 `Supported`, 98
+  `Unsupported`, 4 `Deprecated` (`BlockVirtual` / `TimeSlice` /
+  `LaceNumber` / `FrameRate`). Elements newer than the table (e.g. the
+  `Projection` master, `LanguageBCP47`, `BlockAdditionMapping`) return
+  `Unlisted`; 11 guideline rows name elements whose IDs appear in
+  neither staged document (the old signature family, `EditionFlagHidden`,
+  `ChapterTrack`, `ChapterTrackNumber`) and classify as `Unlisted` too.
+- **Whole-file conformance scan** (`webm::scan(reader) ->
+  WebmConformanceReport`): a pure structural EBML walk (headers +
+  master descent, leaf bodies skipped — O(file) time, O(depth) memory,
+  allocation bounded on hostile input) that classifies every element
+  occurrence, capturing the `DocType`, per-status occurrence counts,
+  every `Unsupported` / `Deprecated` occurrence with its absolute
+  offset (capped at 4096 findings), the distinct `Unlisted` IDs, and
+  the offset of the first structurally-unwalkable byte if the document
+  is damaged (unknown-size on a non-Segment/Cluster master, a child
+  overrunning its parent, a torn header). `is_conformant()` gives the
+  headline verdict: `DocType == "webm"`, zero `Unsupported` /
+  `Deprecated` occurrences, clean walk — `Unlisted` is informational
+  only. Unknown-size Segment and Cluster walk with the same
+  sibling-termination rule the demuxer uses, so live-streaming layouts
+  scan fine. `tests/webm_conformance.rs` pins the table shape, the
+  conformant / off-profile verdicts with exact finding offsets, and the
+  hostile shapes (every-truncation-point sweep, 4000-deep nesting,
+  findings flood, arbitrary-byte soup).
+
 ### Codec ID mapping (`codec_id` module)
 
 Matroska `CodecID` string <-> oxideav `CodecId`. Both directions are

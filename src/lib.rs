@@ -22,6 +22,7 @@ pub mod demux;
 pub mod ebml;
 pub mod ids;
 pub mod mux;
+pub mod webm;
 
 use oxideav_core::ContainerRegistry;
 
