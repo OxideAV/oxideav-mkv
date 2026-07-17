@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.9...v0.0.10) - 2026-07-17
+
+### Other
+
+- front-Cues layout (RFC 9559 §25.3.3) via with_front_cues
+- SeekHead-directed recovery of post-Cluster Top-Level masters (RFC 9559 §6.3)
+- RFC 9559 §25.1 Cluster byte budget + with_cluster_limits knob
+- fuzz the WebM conformance scanner; corpus replay + census README
+- two-pass Segment Duration finalization (RFC 9559 §5.1.2.10)
+- strict WebM element gating on the WebM muxer (default) + lenient opt-out
+- WebM-profile conformance — guidelines support table + whole-file scanner
+- RFC 9559 Table 53 element-ID census pinned in CI + 0x4598 attribution fix
+- doc(hidden) the internal ebml walker module
+- ChapLanguageBCP47 on ChapterDisplay mux write (RFC 9559 §5.1.7.1.4.11)
+- track-level BlockAdditionMapping mux API (RFC 9559 §5.1.4.1.17)
+- Segment Duration mux API (Info>Duration, RFC 9559 §5.1.2.10)
+- general set_track_codec_timing mux API (CodecDelay/SeekPreRoll)
+- add CI / crates.io / docs.rs / MIT-license badges
+- README — §23.2 live-tagging surface
+- §23.2 live tagging — mid-stream Tags write + MUST-reset on read
+- document damage resilience, position hints, live layout in README
+- livestreaming muxer layout (§25.3.4/§23.2) — with_live_streaming
+- fix temp-file race in mux_cluster_position_hints tests
+- fuzz the resilient demux path — Eof-only contract + corpus replay
+- opt-in Cluster Position/PrevSize hints on write (§5.1.3.2/§5.1.3.3)
+- resilient Cues-less seek — linear Cluster-Timestamp scan fallback
+- damage-resilient demux — open_resilient + Cluster-stream resync
+- fix fuzz-found add-overflow on unknown-size nested masters
+- document reclaimed AttachedFile/EncryptedBlock surfaces + TagDefaultBogus
+- modern RFC 9559 element-name aliases for renamed id constants
+- surface reclaimed Cluster-level EncryptedBlock payloads on demux
+- reclaimed DivX-font AttachedFile children + TagDefaultBogus read
+- add reclaimed Video/Audio legacy elements GammaValue/FrameRate/ChannelPositions (RFC 9559 A.25..A.27)
+- write reclaimed BlockGroup children (RFC 9559 A.3..A.14) for mux symmetry
+- add reclaimed MinCache/MaxCache/TrackOffset TrackEntry elements (RFC 9559 A.16..A.18)
+- surface reclaimed DivX trick-track BlockGroup children (RFC 9559 A.3..A.14)
+- round out EbmlHeader with the RFC 8794 §11.2.2..§11.2.5 version/length quartet
+- EBML-header DocTypeExtension demux + mux (RFC 8794 §11.2.9..§11.2.11)
+- OldStereoMode demux + mux — last RFC 9559 element-registry entry
+- document TrackLegacy demux accessor + mux write path (RFC 9559 App. A.19..A.23 + A.28..A.32)
+- TrackLegacy write path for reclaimed Appendix-A TrackEntry elements (RFC 9559 App. A.19..A.23 + A.28..A.32)
+- typed TrackLegacy accessor for reclaimed Appendix-A TrackEntry elements (RFC 9559 App. A.19..A.23 + A.28..A.32)
+- Segment Info Title + DateUTC write surface (RFC 9559 §5.1.2.11/.12)
+- Linked-Segment Info write surface (RFC 9559 §5.1.2.1..§5.1.2.8 + §17)
+- TrackEntry identity/selection mux write path (RFC 9559 §5.1.4.1.18/.19/.20/.23/.4/.5/.12/.24)
+- typed TrackIdentity demux accessor (RFC 9559 §5.1.4.1.18/.19/.20/.23/.4/.5/.12/.24)
+- nested-SimpleTag robustness + depth-cap coverage
+- nested SimpleTag parsing (RFC 9559 §5.1.8.1.2 recursive)
+- Tags writing (RFC 9559 §5.1.8) — Targets + recursive SimpleTag
+- document completed Cues write surface + CueBlockNumber seek fallback
+- CueBlockNumber seek fallback (RFC 9559 §5.1.5.1.2.5)
+- per-frame subtitle cue emission with CueDuration (RFC 9559 §22.1)
+- complete Cues write surface — CueBlockNumber + CueDuration (RFC 9559 §5.1.5.1.2.4/.5)
+- document BlockGroup meta / SilentTracks / full Chapters / EBML property tests
+- exercise typed BlockGroup-meta / SilentTracks / Chapters accessors
+- Property-style coverage for the EBML element walker (RFC 8794)
+- Complete ChapterAtom write surface + ChapProcess tree (RFC 9559 §5.1.7.1.4)
+- SilentTracks (RFC 9559 Appendix A.1/A.2) Cluster-level read+write
+- Full BlockGroup meta surface (RFC 9559 §5.1.3.5.4..§5.1.3.5.7) read+write
+- typed SeekHead accessor (RFC 9559 §5.1.1)
+- TrackTranslate decode + write (RFC 9559 §5.1.4.1.27)
+- decode + write the reclaimed ContentSignature quartet (RFC 9559 App. A.33..A.36)
+- ContentEncodings write path (RFC 9559 §5.1.4.1.31)
+- demux Linked-Segment Info metadata (RFC 9559 §5.1.2.1..§5.1.2.8)
+- TrackOperation on write (RFC 9559 §5.1.4.1.30)
+
 ### Added
 
 - Muxer: front-`Cues` layout (`MkvMuxer::with_front_cues(reserved_bytes)`,
