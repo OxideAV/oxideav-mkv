@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WebM muxer: strict profile gating by default. A `mux::open_webm` /
+  `MkvMuxer::new_webm` muxer now emits only elements the WebM guidelines
+  list as supported: off-profile queue-time setters return
+  `Error::Unsupported` (Attachments, TrackOperation, TrackTranslate,
+  legacy TrackEntry elements, Linked-Segment Info metadata,
+  MaxBlockAdditionID, DefaultDecodedFieldDuration / TrackTimestampScale,
+  AttachmentLink, ContentCompression + the signing quartet, off-profile
+  chapter fields, edition/chapter/attachment Tag scopes), Top-Level
+  masters carry no `CRC-32` child, the Cluster `Position` hint is
+  suppressed (`PrevSize` survives), the chapters `EditionEntry` omits
+  `EditionUID`, off-profile `BlockGroupOptions` fields are rejected, and
+  a queued `SilentTracks` list errors at the next Cluster open — so
+  `webm::scan(output).is_conformant()` holds. New
+  `MkvMuxer::with_webm_lenient()` restores the previous full-surface
+  behaviour under the `webm` DocType (rejected on a Matroska muxer);
+  `MkvMuxer::webm_strict()` reports the mode. Matroska muxers are
+  byte-identical with prior releases. 5 integration tests in
+  `tests/mux_webm_profile.rs`.
 - New `webm` module: WebM-profile conformance. `webm_element_support(id)`
   transcribes the staged WebM container guidelines' per-element support
   table by Element ID (239 rows: 137 Supported / 98 Unsupported / 4

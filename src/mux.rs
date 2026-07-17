@@ -428,6 +428,11 @@ pub struct MkvMuxer {
     /// `PrevSize` child (§5.1.3.3 — "Size of the previous Cluster, in
     /// octets. Can be useful for backward playing").
     cluster_position_hints: bool,
+    /// `true` on a WebM muxer that has not opted out via
+    /// [`MkvMuxer::with_webm_lenient`]: element emission is gated to the
+    /// WebM guidelines' supported subset (see the `webm` module). Always
+    /// `false` on a Matroska muxer.
+    webm_strict: bool,
     /// Absolute file offset of the previous Cluster's element ID — the
     /// minuend for the `PrevSize` value. `None` before the first Cluster.
     /// The muxer writes Clusters back-to-back, so the distance between two
@@ -2079,6 +2084,7 @@ impl MkvMuxer {
             cluster_offset_rel: 0,
             cluster_body_start_abs: 0,
             cluster_position_hints: false,
+            webm_strict: doc_type == DocType::Webm,
             prev_cluster_start_abs: None,
             live_streaming: false,
             segment_data_start: 0,
@@ -2183,6 +2189,72 @@ impl MkvMuxer {
     /// [`MkvMuxer::with_cluster_position_hints`] was called.
     pub fn cluster_position_hints(&self) -> bool {
         self.cluster_position_hints
+    }
+
+    /// Opt a WebM muxer out of strict profile gating.
+    ///
+    /// By default a WebM muxer ([`crate::mux::open_webm`] /
+    /// [`MkvMuxer::new_webm`]) emits only elements the WebM guidelines
+    /// list as supported (see [`crate::webm`]): the queue-time setters
+    /// whose elements are guidelines-`Unsupported` return
+    /// [`Error::Unsupported`], Top-Level masters carry no `CRC-32` child,
+    /// per-Cluster `Position` hints are suppressed (`PrevSize` stays —
+    /// it is in-profile), and the chapters `EditionEntry` omits its
+    /// off-profile `EditionUID` child — so
+    /// [`crate::webm::scan`] reports the output conformant.
+    ///
+    /// Calling this restores the full Matroska element surface under the
+    /// `webm` DocType — useful for ecosystem files that knowingly carry
+    /// Matroska-only elements. Must be called before
+    /// [`Muxer::write_header`]; returns [`Error::other`] on a Matroska
+    /// muxer (the flag only exists on WebM).
+    pub fn with_webm_lenient(&mut self) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_webm_lenient called after write_header",
+            ));
+        }
+        if self.doc_type != DocType::Webm {
+            return Err(Error::other(
+                "MKV muxer: with_webm_lenient is only meaningful on a WebM muxer",
+            ));
+        }
+        self.webm_strict = false;
+        Ok(self)
+    }
+
+    /// Read-only accessor: `true` when this is a WebM muxer under strict
+    /// profile gating (the default; see [`MkvMuxer::with_webm_lenient`]).
+    pub fn webm_strict(&self) -> bool {
+        self.webm_strict
+    }
+
+    /// Strict-WebM check for a Tag's `Targets`: the guidelines keep
+    /// `TagTrackUID` but list the edition / chapter / attachment UID
+    /// scopes as unsupported.
+    fn webm_tag_targets_guard(&self, targets: &MkvTagTargets) -> Result<()> {
+        if !targets.edition_uids.is_empty() {
+            self.webm_profile_guard("TagEditionUID")?;
+        }
+        if !targets.chapter_uids.is_empty() {
+            self.webm_profile_guard("TagChapterUID")?;
+        }
+        if !targets.attachment_uids.is_empty() {
+            self.webm_profile_guard("TagAttachmentUID")?;
+        }
+        Ok(())
+    }
+
+    /// Queue-time rejection for guidelines-`Unsupported` elements on a
+    /// strict WebM muxer.
+    fn webm_profile_guard(&self, element: &str) -> Result<()> {
+        if self.webm_strict {
+            return Err(Error::unsupported(format!(
+                "WebM muxer: {element} is outside the WebM supported-element subset; \
+                 write Matroska instead, or opt out via with_webm_lenient()"
+            )));
+        }
+        Ok(())
     }
 
     /// Opt in to the RFC 9559 §25.3.4 livestreaming layout: "In
@@ -2549,6 +2621,7 @@ impl MkvMuxer {
                 "MKV muxer: set_track_operation called after write_header",
             ));
         }
+        self.webm_profile_guard("TrackOperation")?;
         if stream_index >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV muxer: set_track_operation stream_index {stream_index} out of range ({} streams)",
@@ -2623,6 +2696,7 @@ impl MkvMuxer {
                 "MKV muxer: set_track_translates called after write_header",
             ));
         }
+        self.webm_profile_guard("TrackTranslate")?;
         if stream_index >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV muxer: set_track_translates stream_index {stream_index} out of range ({} streams)",
@@ -2695,6 +2769,7 @@ impl MkvMuxer {
                 "MKV muxer: set_track_legacy called after write_header",
             ));
         }
+        self.webm_profile_guard("the reclaimed legacy TrackEntry elements")?;
         if stream_index >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV muxer: set_track_legacy stream_index {stream_index} out of range ({} streams)",
@@ -2830,6 +2905,20 @@ impl MkvMuxer {
                 "MKV muxer: set_track_content_encodings given an empty ContentEncodings \
                  (ContentEncoding is minOccurs: 1 inside the master, RFC 9559 §5.1.4.1.31.1)",
             ));
+        }
+        for e in &encodings.encodings {
+            match &e.transform {
+                ContentEncodingTransform::Compression { .. } => {
+                    self.webm_profile_guard("ContentCompression")?;
+                }
+                ContentEncodingTransform::Encryption { signing, .. } => {
+                    if !signing.is_empty() {
+                        self.webm_profile_guard(
+                            "the content-signing quartet (ContentSignature / ContentSigKeyID / ContentSigAlgo / ContentSigHashAlgo)",
+                        )?;
+                    }
+                }
+            }
         }
         let mut seen_orders: Vec<u64> = Vec::with_capacity(encodings.encodings.len());
         for e in &encodings.encodings {
@@ -3369,6 +3458,7 @@ impl MkvMuxer {
                 "MKV muxer: set_max_block_addition_id called after write_header",
             ));
         }
+        self.webm_profile_guard("MaxBlockAdditionID")?;
         if stream_index >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV muxer: set_max_block_addition_id stream_index {stream_index} out of range ({} streams)",
@@ -3627,6 +3717,12 @@ impl MkvMuxer {
                 "MKV muxer: set_track_timing called after write_header",
             ));
         }
+        if timing.default_decoded_field_duration.is_some() {
+            self.webm_profile_guard("DefaultDecodedFieldDuration")?;
+        }
+        if timing.track_timestamp_scale.is_some() {
+            self.webm_profile_guard("TrackTimestampScale")?;
+        }
         if stream_index >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV muxer: set_track_timing stream_index {stream_index} out of range ({} streams)",
@@ -3769,6 +3865,9 @@ impl MkvMuxer {
                 "MKV muxer: set_track_identity called after write_header",
             ));
         }
+        if identity.attachment_link.is_some() {
+            self.webm_profile_guard("AttachmentLink")?;
+        }
         if stream_index >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV muxer: set_track_identity stream_index {stream_index} out of range ({} streams)",
@@ -3891,6 +3990,27 @@ impl MkvMuxer {
                 )));
             }
         }
+        // WebM strict mode: the guidelines keep ChapterAtom but list the
+        // hidden/enabled flags, the Medium-Linking pair, the physical
+        // mapping, and the whole ChapProcess tree as unsupported.
+        if chapter.hidden {
+            self.webm_profile_guard("ChapterFlagHidden")?;
+        }
+        if !chapter.enabled {
+            self.webm_profile_guard("ChapterFlagEnabled")?;
+        }
+        if chapter.segment_uuid.is_some() {
+            self.webm_profile_guard("ChapterSegmentUUID")?;
+        }
+        if chapter.segment_edition_uid.is_some() {
+            self.webm_profile_guard("ChapterSegmentEditionUID")?;
+        }
+        if chapter.physical_equiv.is_some() {
+            self.webm_profile_guard("ChapterPhysicalEquiv")?;
+        }
+        if !chapter.chap_processes.is_empty() {
+            self.webm_profile_guard("ChapProcess")?;
+        }
         self.chapters.push(chapter);
         Ok(())
     }
@@ -3930,6 +4050,7 @@ impl MkvMuxer {
                 "MKV muxer: add_attachment called after write_header",
             ));
         }
+        self.webm_profile_guard("Attachments")?;
         if attachment.filename.is_empty() {
             return Err(Error::invalid(
                 "MKV muxer: attachment FileName is mandatory (RFC 9559 §5.1.6.1.2, minOccurs=1)",
@@ -3995,6 +4116,7 @@ impl MkvMuxer {
                 "MKV muxer: TargetTypeValue range: not 0 (RFC 9559 §5.1.8.1.1.1)",
             ));
         }
+        self.webm_tag_targets_guard(&tag.targets)?;
         validate_simple_tags(&tag.simple_tags)?;
         self.tags.push(tag);
         Ok(())
@@ -4048,6 +4170,7 @@ impl MkvMuxer {
                     "MKV muxer: TargetTypeValue range: not 0 (RFC 9559 §5.1.8.1.1.1)",
                 ));
             }
+            self.webm_tag_targets_guard(&tag.targets)?;
             validate_simple_tags(&tag.simple_tags)?;
         }
         // Flush in-flight laces — their frames belong to the Cluster the
@@ -4064,7 +4187,7 @@ impl MkvMuxer {
         // starts a fresh Cluster instead of appending Blocks after a
         // sibling element.
         self.cluster_open = false;
-        let bytes = build_tags_element(tags);
+        let bytes = build_tags_element(tags, self.webm_strict);
         self.output.write_all(&bytes)?;
         Ok(())
     }
@@ -4104,6 +4227,7 @@ impl MkvMuxer {
                 "MKV muxer: set_segment_linking called after write_header",
             ));
         }
+        self.webm_profile_guard("the Linked-Segment Info elements (SegmentUUID / PrevUUID / NextUUID / SegmentFamily / ChapterTranslate)")?;
         // RFC 9559 §5.1.2.1 / .3 / .5 / .7: the 128-bit UID elements are
         // `length: 16`. Reject any off-length UID rather than emit a
         // spec-violating element.
@@ -4455,7 +4579,12 @@ impl Muxer for MkvMuxer {
         }
         write_string_element(&mut info_body, ids::MUXING_APP, "oxideav");
         write_string_element(&mut info_body, ids::WRITING_APP, "oxideav");
-        write_master_element_with_crc(&mut all, ids::INFO, &info_body);
+        if self.webm_strict {
+            // The guidelines list CRC-32 as unsupported.
+            write_master_element(&mut all, ids::INFO, &info_body);
+        } else {
+            write_master_element_with_crc(&mut all, ids::INFO, &info_body);
+        }
 
         // Tracks element.
         let tracks_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
@@ -5174,7 +5303,11 @@ impl Muxer for MkvMuxer {
             }
             write_master_element(&mut tracks_body, ids::TRACK_ENTRY, &t);
         }
-        write_master_element_with_crc(&mut all, ids::TRACKS, &tracks_body);
+        if self.webm_strict {
+            write_master_element(&mut all, ids::TRACKS, &tracks_body);
+        } else {
+            write_master_element_with_crc(&mut all, ids::TRACKS, &tracks_body);
+        }
 
         // Chapters (optional). If `add_chapter` calls were made before
         // `write_header`, materialise them now as a single EditionEntry
@@ -5188,7 +5321,7 @@ impl Muxer for MkvMuxer {
             None
         } else {
             let chapters_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
-            let chapters_bytes = build_chapters_element(&self.chapters);
+            let chapters_bytes = build_chapters_element(&self.chapters, self.webm_strict);
             all.extend_from_slice(&chapters_bytes);
             Some(chapters_offset_in_buf)
         };
@@ -5221,7 +5354,7 @@ impl Muxer for MkvMuxer {
             None
         } else {
             let tags_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
-            let tags_bytes = build_tags_element(&self.tags);
+            let tags_bytes = build_tags_element(&self.tags, self.webm_strict);
             all.extend_from_slice(&tags_bytes);
             Some(tags_offset_in_buf)
         };
@@ -5662,6 +5795,24 @@ impl MkvMuxer {
         if !self.header_written {
             return Err(Error::other("MKV muxer: write_header not called"));
         }
+        if opts.reference_priority != 0 {
+            self.webm_profile_guard("ReferencePriority")?;
+        }
+        if opts.codec_state.is_some() {
+            self.webm_profile_guard("CodecState")?;
+        }
+        if opts.block_virtual.is_some() {
+            self.webm_profile_guard("BlockVirtual")?;
+        }
+        if opts.reference_virtual.is_some() {
+            self.webm_profile_guard("ReferenceVirtual")?;
+        }
+        if !opts.slices.is_empty() {
+            self.webm_profile_guard("Slices")?;
+        }
+        if opts.reference_frame.is_some() {
+            self.webm_profile_guard("ReferenceFrame")?;
+        }
         if !opts.additions.is_empty() {
             self.validate_additions(packet, &opts.additions)?;
         } else {
@@ -5758,7 +5909,11 @@ impl MkvMuxer {
             } else {
                 self.cluster_offset_rel
             };
-            write_uint_element(&mut hints, ids::POSITION, pos_value);
+            // WebM lists `Position` as unsupported while `PrevSize` is
+            // in-profile, so strict WebM keeps only the latter.
+            if !self.webm_strict {
+                write_uint_element(&mut hints, ids::POSITION, pos_value);
+            }
             if let Some(prev) = self.prev_cluster_start_abs {
                 write_uint_element(&mut hints, ids::PREV_SIZE, cluster_abs.saturating_sub(prev));
             }
@@ -5771,6 +5926,7 @@ impl MkvMuxer {
         // applies to exactly this one Cluster (A.2: a track silent here MAY
         // be active again later).
         if !self.pending_silent_tracks.is_empty() {
+            self.webm_profile_guard("SilentTracks (queued via set_next_cluster_silent_tracks)")?;
             let mut st_body = Vec::new();
             for n in self.pending_silent_tracks.drain(..) {
                 write_uint_element(&mut st_body, ids::SILENT_TRACK_NUMBER, n);
@@ -5855,7 +6011,11 @@ impl MkvMuxer {
             write_master_element(&mut body, ids::CUE_POINT, &cp);
         }
         let mut out = Vec::with_capacity(body.len() + 8 + CRC32_CHILD_LEN);
-        write_master_element_with_crc(&mut out, ids::CUES, &body);
+        if self.webm_strict {
+            write_master_element(&mut out, ids::CUES, &body);
+        } else {
+            write_master_element_with_crc(&mut out, ids::CUES, &body);
+        }
         let cues_abs = self.output.stream_position().unwrap_or(0);
         self.output.write_all(&out)?;
         Ok(Some(cues_abs.saturating_sub(self.segment_data_start)))
@@ -6711,9 +6871,13 @@ const EDITION_UID_DEFAULT: u64 = 1;
 /// Build the bytes of a complete `Chapters` master element from the
 /// queued chapter list. Caller appends the returned slice into the
 /// muxer's outgoing buffer.
-fn build_chapters_element(chapters: &[MkvChapter]) -> Vec<u8> {
+fn build_chapters_element(chapters: &[MkvChapter], webm_strict: bool) -> Vec<u8> {
     let mut edition_body = Vec::new();
-    write_uint_element(&mut edition_body, ids::EDITION_UID, EDITION_UID_DEFAULT);
+    // The WebM guidelines keep `EditionEntry` but list `EditionUID` (and
+    // the edition flags) as unsupported, so strict WebM omits the child.
+    if !webm_strict {
+        write_uint_element(&mut edition_body, ids::EDITION_UID, EDITION_UID_DEFAULT);
+    }
     for (i, ch) in chapters.iter().enumerate() {
         let atom = build_chapter_atom(i as u64 + 1, ch);
         write_master_element(&mut edition_body, ids::CHAPTER_ATOM, &atom);
@@ -6721,7 +6885,11 @@ fn build_chapters_element(chapters: &[MkvChapter]) -> Vec<u8> {
     let mut chapters_body = Vec::new();
     write_master_element(&mut chapters_body, ids::EDITION_ENTRY, &edition_body);
     let mut out = Vec::with_capacity(chapters_body.len() + 8 + CRC32_CHILD_LEN);
-    write_master_element_with_crc(&mut out, ids::CHAPTERS, &chapters_body);
+    if webm_strict {
+        write_master_element(&mut out, ids::CHAPTERS, &chapters_body);
+    } else {
+        write_master_element_with_crc(&mut out, ids::CHAPTERS, &chapters_body);
+    }
     out
 }
 
@@ -6911,14 +7079,19 @@ fn validate_simple_tags(simple_tags: &[MkvSimpleTag]) -> Result<()> {
 /// queued tag list. Caller appends the returned slice into the muxer's
 /// outgoing buffer. The master carries a leading `CRC-32` child like the
 /// other Top-Level masters (RFC 9559 §6.2).
-fn build_tags_element(tags: &[MkvTag]) -> Vec<u8> {
+fn build_tags_element(tags: &[MkvTag], webm_strict: bool) -> Vec<u8> {
     let mut tags_body = Vec::new();
     for tag in tags {
         let tag_body = build_tag(tag);
         write_master_element(&mut tags_body, ids::TAG, &tag_body);
     }
     let mut out = Vec::with_capacity(tags_body.len() + 8 + CRC32_CHILD_LEN);
-    write_master_element_with_crc(&mut out, ids::TAGS, &tags_body);
+    if webm_strict {
+        // The guidelines list CRC-32 as unsupported.
+        write_master_element(&mut out, ids::TAGS, &tags_body);
+    } else {
+        write_master_element_with_crc(&mut out, ids::TAGS, &tags_body);
+    }
     out
 }
 

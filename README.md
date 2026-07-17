@@ -942,6 +942,27 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - WebM profile: `mux::open_webm` pins `DocType="webm"` and rejects any
   stream whose codec isn't VP8/VP9/AV1 video or Vorbis/Opus audio with
   `Error::Unsupported`.
+- **Strict WebM element gating** (default on a WebM muxer): emission is
+  gated to the WebM guidelines' supported subset (the same table the
+  `webm` module scans against), so `webm::scan(output).is_conformant()`
+  holds. Queue-time setters whose elements are guidelines-`Unsupported`
+  return `Error::Unsupported` naming the element and the opt-out —
+  `Attachments`, `TrackOperation`, `TrackTranslate`, the legacy
+  `TrackEntry` set, Linked-Segment Info metadata, `MaxBlockAdditionID`,
+  `DefaultDecodedFieldDuration` / `TrackTimestampScale`,
+  `AttachmentLink`, `ContentCompression` (encryption stays in-profile;
+  the signing quartet doesn't), off-profile chapter fields
+  (`ChapterFlagHidden` / legacy enabled flag / Medium-Linking pair /
+  `ChapterPhysicalEquiv` / `ChapProcess`), and edition / chapter /
+  attachment Tag scopes (track + global scopes stay). Emission-level
+  gates: Top-Level masters carry no `CRC-32` child (guidelines-
+  unsupported), the per-Cluster `Position` hint is suppressed while
+  `PrevSize` survives, the chapters `EditionEntry` omits `EditionUID`,
+  `BlockGroup` extras (`ReferencePriority` / `CodecState` / reclaimed
+  children) are rejected per call, and a queued `SilentTracks` list
+  errors at the next Cluster open. `MkvMuxer::with_webm_lenient()`
+  restores the full Matroska surface under the `webm` DocType;
+  `webm_strict()` reports the mode. Matroska muxers are unaffected.
 - **CRC-32 on Top-Level masters** (RFC 8794 §11.3.1, RFC 9559 §6.2):
   the muxer prepends a 6-byte `CRC-32` child (id `0xBF`, fixed size 4,
   little-endian IEEE CRC-32 of the rest of the element's data) to every
