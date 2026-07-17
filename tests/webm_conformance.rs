@@ -475,3 +475,28 @@ fn arbitrary_bytes_never_panic() {
         let _ = case;
     }
 }
+
+#[test]
+fn fuzz_corpus_seeds_replay_through_scan() {
+    // Every seed in the fuzz corpus must scan without panicking, with
+    // counters that sum to elements_scanned — the same invariant the
+    // fuzz harness asserts, pinned as a deterministic test.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/demux");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(&dir).expect("corpus dir") {
+        let path = entry.expect("dir entry").path();
+        if !path.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect("read seed");
+        let report = scan(&mut Cursor::new(&bytes)).expect("scan never errors");
+        assert_eq!(
+            report.supported + report.unsupported + report.deprecated + report.unlisted,
+            report.elements_scanned,
+            "counter sum mismatch on {}",
+            path.display()
+        );
+        seen += 1;
+    }
+    assert!(seen >= 8, "expected the seed corpus, found {seen} files");
+}

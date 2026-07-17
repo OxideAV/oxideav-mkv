@@ -148,4 +148,22 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
+
+    // Fourth pass: the WebM conformance scanner (`webm::scan`) — a pure
+    // structural walk with its own depth cap, findings cap, and
+    // unknown-size sibling-termination rules. Contract: it never panics,
+    // never allocates beyond what the input backs (it skips leaf bodies),
+    // always terminates (offsets grow strictly monotonically), and its
+    // per-status counters always sum to `elements_scanned`.
+    let mut cur4 = Cursor::new(data.to_vec());
+    if let Ok(report) = oxideav_mkv::webm::scan(&mut cur4) {
+        assert_eq!(
+            report.supported + report.unsupported + report.deprecated + report.unlisted,
+            report.elements_scanned,
+            "webm::scan counters must sum to elements_scanned"
+        );
+        if report.findings_truncated {
+            assert!(report.unsupported + report.deprecated > report.findings.len() as u64);
+        }
+    }
 });

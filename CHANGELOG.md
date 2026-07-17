@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fuzz harness: a fourth pass drives `webm::scan` over every input,
+  asserting the per-status counters sum to `elements_scanned` and the
+  findings-cap bookkeeping is consistent; the seed corpus also replays
+  through the scanner as a deterministic `cargo test`
+  (`webm_conformance::fuzz_corpus_seeds_replay_through_scan`).
 - Muxer: two-pass Segment `Duration` finalization
   (`MkvMuxer::with_duration_finalization()`, RFC 9559 §5.1.2.10).
   `write_header` reserves an 11-byte `Void` inside `Info`;

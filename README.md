@@ -1683,6 +1683,21 @@ so the demuxer never hides an unrecognised track.
   written. The `Video` sub-element set is now fully symmetric — every
   element the demux side reads, the mux side can write.
 
+## Conformance census
+
+`tests/rfc9559_element_census.rs` transcribes the full RFC 9559 Table 53
+"Matroska Element IDs" registry — 250 named entries (43 of them
+`Reclaimed`), the 4 all-ones `Reserved` placeholders excluded — and
+cross-checks `src/ids.rs` in CI, both directions: every registry element
+has a const, and every numeric const is a registry entry, one of the 13
+RFC 8794 EBML-header / EBML-global IDs, or the single documented legacy
+exception (`ChapterFlagEnabled`, `0x4598`, which RFC 9559 dropped but
+historical files still carry). Const names must agree with the
+registry's Element Names, no `Reserved` ID may be defined, and every ID
+must sit inside the Section 27.1 valid VINT ID classes. The census is
+what backs the "every element in the RFC 9559 element-ID registry is
+read and written" claim.
+
 ## Robustness
 
 `tests/injection_robustness.rs` pins eighteen attacker-shaped byte
@@ -1738,7 +1753,10 @@ build), or attempts an attacker-controlled allocation that exceeds what
 the input can back. A second pass through `open_typed` additionally
 fuzzes the typed-accessor surface — the per-Block `block_additions` /
 `block_group_meta` side channels, the `ClusterRecord` `SilentTrackNumber`
-lists, and the Chapters / SeekHead trees. A third pass drives
+lists, and the Chapters / SeekHead trees. A fourth pass runs the
+`webm::scan` conformance walker over the same bytes, asserting its
+per-status counters always sum to `elements_scanned` (the seed corpus
+also replays through it as a plain `cargo test`). A third pass drives
 `open_resilient_typed` with a contract stronger than no-panic: a
 resilient `next_packet` may only fail with the clean `Error::Eof` (any
 other error class panics the harness), damage-event bookkeeping must
