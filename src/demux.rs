@@ -5638,11 +5638,16 @@ pub struct Chapter {
     pub time_end_ns: Option<u64>,
     /// `ChapterFlagHidden` (RFC 9559 §5.1.7.1.4.5). Defaults to `false`.
     pub hidden: bool,
-    /// `ChapterFlagEnabled` (RFC 9559 §5.1.7.1.4.5a / 5.1.7.1.4 enabled
-    /// flag). The spec defaults to `1` (enabled); when the element is
-    /// absent we materialise that default as `true` so consumers don't
-    /// special-case the missing element. A `false` value means the
-    /// chapter should NOT be available for playback (Section 20.2.5).
+    /// `ChapterFlagEnabled` (id `0x4598`) — a legacy pre-RFC Matroska
+    /// schema element. RFC 9559 dropped it (Table 53 leaves `0x4598`
+    /// unassigned and the ChapterAtom sections jump from
+    /// ChapterFlagHidden §5.1.7.1.4.5 to ChapterSegmentUUID
+    /// §5.1.7.1.4.6), but historical files still carry it, so it is
+    /// read as an ecosystem element. Its historical default is `1`
+    /// (enabled); when the element is absent we materialise that
+    /// default as `true` so consumers don't special-case the missing
+    /// element. A `false` value means the chapter should NOT be
+    /// available for playback.
     pub enabled: bool,
     /// `ChapterSegmentUUID` (RFC 9559 §5.1.7.1.4.6) — the 16-byte
     /// SegmentUUID of another Segment to play during this chapter, used
@@ -5677,7 +5682,8 @@ impl Default for Chapter {
             time_start_ns: 0,
             time_end_ns: None,
             hidden: false,
-            // RFC 9559 §5.1.7.1.4: ChapterFlagEnabled has spec default 1.
+            // Legacy ChapterFlagEnabled (0x4598, outside the RFC 9559
+            // registry): historical default 1.
             enabled: true,
             segment_uuid: None,
             segment_edition_uid: None,

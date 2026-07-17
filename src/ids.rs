@@ -542,6 +542,11 @@ pub const CHAPTER_STRING_UID: u32 = 0x5654;
 pub const CHAPTER_TIME_START: u32 = 0x91;
 pub const CHAPTER_TIME_END: u32 = 0x92;
 pub const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+// Legacy pre-RFC Matroska schema element: RFC 9559 dropped
+// ChapterFlagEnabled (Table 53 leaves 0x4598 unassigned; the ChapterAtom
+// sections jump from ChapterFlagHidden to ChapterSegmentUUID). Historical
+// files still carry it, so it is read and round-tripped as an ecosystem
+// element (historical default 1 = enabled).
 pub const CHAPTER_FLAG_ENABLED: u32 = 0x4598;
 pub const CHAPTER_SEGMENT_UUID: u32 = 0x6E67;
 pub const CHAPTER_SEGMENT_EDITION_UID: u32 = 0x6EBC;

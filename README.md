@@ -402,7 +402,9 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `EditionFlagOrdered` flags; every `ChapterAtom` keeps its
   `ChapterUID`, `ChapterStringUID` (e.g. WebVTT cue id), full-precision
   `ChapterTimeStart` / `ChapterTimeEnd` nanoseconds, `ChapterFlagHidden`,
-  `ChapterFlagEnabled` (spec default `1` materialised as `true`),
+  `ChapterFlagEnabled` (id `0x4598` — a legacy pre-RFC element the RFC
+  9559 registry leaves unassigned; historical default `1` materialised
+  as `true`),
   Medium-Linking fields `ChapterSegmentUUID` (raw 16 B) +
   `ChapterSegmentEditionUID` (zero suppressed per spec "range: not 0"),
   `ChapterPhysicalEquiv` (DVD/SIDE physical mapping per §20.4),

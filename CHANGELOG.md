@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tests/rfc9559_element_census.rs`: a full transcription of the RFC 9559
+  Table 53 "Matroska Element IDs" registry (250 named entries, 43 of them
+  Reclaimed, the 4 all-ones Reserved placeholders excluded) cross-checked
+  against `src/ids.rs` in both directions — every registry element has a
+  const, every numeric const is registry / RFC 8794 EBML-header set / the
+  one documented legacy exception, const names agree with the registry
+  Element Names, no Reserved ID is defined, and every ID sits inside the
+  Section 27.1 valid VINT ID classes. Pins the "every element in the
+  RFC 9559 element-ID registry is read and written" claim in CI.
+
+### Fixed
+
+- Attribution hygiene for `ChapterFlagEnabled` (id `0x4598`): the crate's
+  docs cited RFC 9559 chapter sections for it, but RFC 9559 dropped the
+  element (Table 53 leaves `0x4598` unassigned; the ChapterAtom sections
+  jump from ChapterFlagHidden §5.1.7.1.4.5 to ChapterSegmentUUID
+  §5.1.7.1.4.6). It is now documented as the legacy pre-RFC ecosystem
+  element it is — behaviour unchanged (read + round-tripped, historical
+  default `1` materialised).
+
 ### Other
 
 - Marked the internal `ebml` module (raw VINT/element walker plumbing used by

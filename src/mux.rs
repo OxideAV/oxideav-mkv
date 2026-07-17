@@ -939,8 +939,11 @@ pub struct MkvChapter {
     /// `ChapterFlagHidden` (RFC 9559 §5.1.7.1.4.5, default `0`). Written
     /// only when `true` (the spec default may stay off-disk).
     pub hidden: bool,
-    /// `ChapterFlagEnabled` (RFC 9559 §5.1.7.1.4, default `1`). Written
-    /// only when `false` — the default `1` stays off-disk and the demuxer
+    /// `ChapterFlagEnabled` (id `0x4598`) — a legacy pre-RFC Matroska
+    /// schema element RFC 9559 dropped (Table 53 leaves `0x4598`
+    /// unassigned); kept write-side so a re-mux of a historical file
+    /// round-trips its cleared flag. Written only when `false` — the
+    /// historical default `1` stays off-disk and the demuxer
     /// materialises it. Defaults to `true` via [`MkvChapter::default`].
     pub enabled: bool,
     /// `ChapterSegmentUUID` (RFC 9559 §5.1.7.1.4.6) — the 16-byte
@@ -972,7 +975,8 @@ impl Default for MkvChapter {
             uid: None,
             string_uid: None,
             hidden: false,
-            // RFC 9559 §5.1.7.1.4: ChapterFlagEnabled has spec default 1.
+            // Legacy ChapterFlagEnabled (0x4598, outside the RFC 9559
+            // registry): historical default 1.
             enabled: true,
             segment_uuid: None,
             segment_edition_uid: None,
@@ -6738,9 +6742,10 @@ fn build_chapter_atom(default_uid: u64, ch: &MkvChapter) -> Vec<u8> {
     if let Some(end) = ch.time_end_ns {
         write_uint_element(&mut body, ids::CHAPTER_TIME_END, end);
     }
-    // ChapterFlagHidden / ChapterFlagEnabled: write only the non-default
-    // value (§5.1.7.1.4.5 default 0, enabled default 1), so a plain chapter
-    // stays byte-compatible with the prior writer.
+    // ChapterFlagHidden / legacy ChapterFlagEnabled (0x4598, outside the
+    // RFC 9559 registry): write only the non-default value (§5.1.7.1.4.5
+    // default 0, historical enabled default 1), so a plain chapter stays
+    // byte-compatible with the prior writer.
     if ch.hidden {
         write_uint_element(&mut body, ids::CHAPTER_FLAG_HIDDEN, 1);
     }
