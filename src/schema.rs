@@ -610,3 +610,548 @@ pub fn element_def(id: u32) -> Option<&'static ElementDef> {
             .map(|i| &EBML_SUPPLEMENT[i]),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Whole-document schema validation.
+
+use std::io::{Read, Seek, SeekFrom};
+
+use oxideav_core::Result;
+
+use crate::{ebml, ids};
+
+/// Why [`validate`] flagged an element occurrence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaFindingKind {
+    /// The element ID appears in neither [`SCHEMA`] nor
+    /// [`EBML_SUPPLEMENT`]. Informational: RFC 8794 §11.1.1 lets a
+    /// Reader skip elements it does not know, and the ID may belong to
+    /// a `DocTypeExtension` or a newer schema (the removed legacy
+    /// Signature family also lands here — the schema dropped it).
+    UnknownId,
+    /// The element occurs under a master the schema does not name as
+    /// its parent (recursion and the `Void` / `CRC-32` globals are
+    /// exempt). Violation.
+    WrongParent {
+        /// The schema parent (`None` for a root-level element).
+        expected: Option<u32>,
+        /// The master it actually occurred in (`None` = document root).
+        actual: Option<u32>,
+    },
+    /// The element body violates its type's size shape (uinteger /
+    /// integer over 8 octets, float not 0/4/8, date not 0/8) or its
+    /// schema `length` attribute. Violation.
+    BadLength,
+    /// The decoded value falls outside the schema `range`. Violation.
+    OutOfRange,
+    /// More occurrences in one parent instance than `maxOccurs`
+    /// permits (flagged on each excess occurrence). Violation.
+    TooManyOccurrences,
+    /// A cleanly-walked master instance is missing a child with
+    /// `minOccurs >= 1` and no declared default (a defaulted mandatory
+    /// element may legally stay off-disk, RFC 8794 §11.1.6.2). Flagged
+    /// at the parent's offset with the *missing child's* ID. Violation.
+    MissingMandatory,
+    /// The element is deprecated (`maxver` below the staged schema
+    /// version — the RFC 9559 Reclaimed rows and the `maxver` 2/3
+    /// stragglers). Informational.
+    Deprecated,
+    /// The element's `minver` postdates the document's declared
+    /// `DocTypeVersion`. Informational.
+    VersionMismatch,
+    /// The unknown-size VINT on an element whose schema row does not
+    /// carry `unknownsizeallowed` — the walk cannot continue past it.
+    /// Violation.
+    UnknownSizeNotAllowed,
+    /// A `CRC-32` element that is not the first child of its parent
+    /// (RFC 8794 §11.3.1: "the CRC-32 Element MUST be the first
+    /// ordered EBML Element within its Parent Element"). Violation.
+    MisplacedCrc32,
+}
+
+impl SchemaFindingKind {
+    /// `true` for the kinds that fail [`SchemaReport::is_valid`];
+    /// `false` for the informational ones (`UnknownId`, `Deprecated`,
+    /// `VersionMismatch`).
+    pub fn is_violation(&self) -> bool {
+        !matches!(
+            self,
+            SchemaFindingKind::UnknownId
+                | SchemaFindingKind::Deprecated
+                | SchemaFindingKind::VersionMismatch
+        )
+    }
+}
+
+/// One flagged occurrence from [`validate`].
+#[derive(Clone, Copy, Debug)]
+pub struct SchemaFinding {
+    /// Absolute file offset of the element's ID byte (for
+    /// [`SchemaFindingKind::MissingMandatory`], the *parent's* ID
+    /// byte).
+    pub offset: u64,
+    /// The element ID the finding is about (for `MissingMandatory`,
+    /// the missing child's ID).
+    pub id: u32,
+    /// Why it was flagged.
+    pub kind: SchemaFindingKind,
+}
+
+/// Maximum number of findings recorded before the report switches to
+/// counting only.
+const MAX_SCHEMA_FINDINGS: usize = 4096;
+
+/// Maximum master-nesting depth descended (recursive `ChapterAtom` /
+/// `SimpleTag` chains are capped like the other in-crate walkers).
+const MAX_SCHEMA_DEPTH: usize = 64;
+
+/// The result of a [`validate`] walk.
+#[derive(Clone, Debug, Default)]
+pub struct SchemaReport {
+    /// The EBML header's `DocType` string, when one was found.
+    pub doc_type: Option<String>,
+    /// The EBML header's `DocTypeVersion` (spec default `1`
+    /// materialised once the header has been walked).
+    pub doc_type_version: Option<u64>,
+    /// Total element headers parsed, masters included.
+    pub elements_scanned: u64,
+    /// Total violation findings (capped list below; this counter is
+    /// exact).
+    pub violations: u64,
+    /// Total informational findings (`UnknownId` / `Deprecated` /
+    /// `VersionMismatch`).
+    pub informational: u64,
+    /// Every finding in document order, capped at 4096 entries.
+    pub findings: Vec<SchemaFinding>,
+    /// `true` when more findings occurred than [`findings`]
+    /// (SchemaReport::findings) records.
+    pub findings_truncated: bool,
+    /// First structurally-unwalkable byte (torn header, child
+    /// overrunning its parent, unknown-size where not allowed); `None`
+    /// when the whole document walked.
+    pub scan_stopped_at: Option<u64>,
+}
+
+impl SchemaReport {
+    /// The headline verdict: zero violation findings and a clean walk.
+    /// Informational findings (unknown IDs, deprecated elements,
+    /// version mismatches) do not fail validation.
+    pub fn is_valid(&self) -> bool {
+        self.violations == 0 && self.scan_stopped_at.is_none()
+    }
+}
+
+/// Parse a schema value literal: a decimal integer or a C hex-float
+/// (`0x1.f4p+12`, `-0xB4p+0`, `0x0p+0`). Returns the value as `f64`
+/// (exact for every literal the schema carries).
+fn parse_schema_number(s: &str) -> Option<f64> {
+    let s = s.trim();
+    let (neg, body) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let magnitude = if let Some(hex) = body.strip_prefix("0x") {
+        // mantissa[.frac]p±exp
+        let (mantissa, exp) = hex.split_once(['p', 'P'])?;
+        let exp: i32 = exp.parse().ok()?;
+        let (int_part, frac_part) = match mantissa.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (mantissa, ""),
+        };
+        let mut value = if int_part.is_empty() {
+            0.0
+        } else {
+            u64::from_str_radix(int_part, 16).ok()? as f64
+        };
+        let mut scale = 1.0 / 16.0;
+        for c in frac_part.chars() {
+            value += c.to_digit(16)? as f64 * scale;
+            scale /= 16.0;
+        }
+        value * (exp as f64).exp2()
+    } else {
+        body.parse::<f64>().ok()?
+    };
+    Some(if neg { -magnitude } else { magnitude })
+}
+
+/// A parsed schema `range` constraint.
+enum RangeCheck {
+    NotZero,
+    /// Inclusive `lo..=hi`.
+    Between(f64, f64),
+    /// Exact value.
+    Exactly(f64),
+    /// `value >(=) bound` and/or `value <(=) bound` terms.
+    Comparative(Vec<(std::cmp::Ordering, bool, f64)>),
+}
+
+/// Parse the schema's `range` grammar (the full vocabulary the staged
+/// schema uses — pinned by the census test; an unknown spelling
+/// returns `None` and the value check is skipped).
+fn parse_range(range: &str) -> Option<RangeCheck> {
+    let range = range.trim();
+    if range == "not 0" {
+        return Some(RangeCheck::NotZero);
+    }
+    if range.contains(['<', '>']) {
+        // One or two comparative terms, comma-separated.
+        let mut terms = Vec::new();
+        for term in range.split(',') {
+            let term = term.trim();
+            let (op, ge, rest) = if let Some(r) = term.strip_prefix(">=") {
+                (std::cmp::Ordering::Greater, true, r)
+            } else if let Some(r) = term.strip_prefix('>') {
+                (std::cmp::Ordering::Greater, false, r)
+            } else if let Some(r) = term.strip_prefix("<=") {
+                (std::cmp::Ordering::Less, true, r)
+            } else if let Some(r) = term.strip_prefix('<') {
+                (std::cmp::Ordering::Less, false, r)
+            } else {
+                return None;
+            };
+            terms.push((op, ge, parse_schema_number(rest)?));
+        }
+        return Some(RangeCheck::Comparative(terms));
+    }
+    // `a-b` inclusive range or a single exact value. The endpoints in
+    // the dash form are non-negative (negative bounds only occur in the
+    // comparative form), so the split dash is the one *after* the first
+    // character that is not part of a `p+`/`p-` exponent.
+    let bytes = range.as_bytes();
+    for i in 1..bytes.len() {
+        if bytes[i] == b'-' && bytes[i - 1] != b'p' && bytes[i - 1] != b'P' {
+            let lo = parse_schema_number(&range[..i])?;
+            let hi = parse_schema_number(&range[i + 1..])?;
+            return Some(RangeCheck::Between(lo, hi));
+        }
+    }
+    Some(RangeCheck::Exactly(parse_schema_number(range)?))
+}
+
+fn range_permits(check: &RangeCheck, value: f64) -> bool {
+    match check {
+        RangeCheck::NotZero => value != 0.0,
+        RangeCheck::Between(lo, hi) => value >= *lo && value <= *hi,
+        RangeCheck::Exactly(v) => value == *v,
+        RangeCheck::Comparative(terms) => terms.iter().all(|(op, or_eq, bound)| {
+            let cmp = value.partial_cmp(bound);
+            match cmp {
+                Some(c) if c == *op => true,
+                Some(std::cmp::Ordering::Equal) => *or_eq,
+                _ => false,
+            }
+        }),
+    }
+}
+
+/// Validate a whole EBML document against the schema tables: element
+/// identity, parent paths, occurrence constraints, type shapes, value
+/// ranges, deprecation / version windows, and the RFC 8794 `CRC-32`
+/// placement rule. Pure structural walk — O(file) time, O(depth)
+/// memory; leaf bodies are read only for the (bounded, <= 8-byte)
+/// value checks. Damage stops the walk at the first unwalkable byte
+/// and reports it via [`SchemaReport::scan_stopped_at`] rather than
+/// erroring.
+///
+/// The reader is left at an unspecified position.
+pub fn validate<R: Read + Seek>(r: &mut R) -> Result<SchemaReport> {
+    let mut report = SchemaReport::default();
+    r.seek(SeekFrom::Start(0))?;
+    let end = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(0))?;
+    walk_master(r, 0, end, None, None, 0, &mut report)?;
+    if report.doc_type_version.is_none() && report.doc_type.is_some() {
+        // Spec default 1 (RFC 8794 §11.2.6) once a header was seen.
+        report.doc_type_version = Some(1);
+    }
+    Ok(report)
+}
+
+fn push_finding(report: &mut SchemaReport, offset: u64, id: u32, kind: SchemaFindingKind) {
+    if kind.is_violation() {
+        report.violations += 1;
+    } else {
+        report.informational += 1;
+    }
+    if report.findings.len() < MAX_SCHEMA_FINDINGS {
+        report.findings.push(SchemaFinding { offset, id, kind });
+    } else {
+        report.findings_truncated = true;
+    }
+}
+
+/// IDs that terminate an unknown-size master: any element that is a
+/// legal child of an *ancestor* (RFC 8794 §6.2). We approximate with
+/// the Top-Level set + Segment, which covers the two
+/// `unknownsizeallowed` masters the schema defines.
+fn ends_unknown_size(parent: u32, id: u32) -> bool {
+    match parent {
+        id_ if id_ == ids::SEGMENT => id == ids::SEGMENT,
+        id_ if id_ == ids::CLUSTER => {
+            id == ids::SEGMENT
+                || matches!(element_def(id), Some(d) if d.parent_id == Some(ids::SEGMENT))
+        }
+        _ => false,
+    }
+}
+
+/// Walk one master's children over `start..end`.
+///
+/// `parent` is the enclosing master's def (`None` at document root);
+/// `terminate_parent` carries the unknown-size master's ID when the
+/// extent is open (children then end where a sibling-of-ancestor ID
+/// appears). Returns the offset where walking stopped.
+#[allow(clippy::too_many_arguments)]
+fn walk_master<R: Read + Seek>(
+    r: &mut R,
+    start: u64,
+    end: u64,
+    parent: Option<&'static ElementDef>,
+    terminate_parent: Option<u32>,
+    depth: usize,
+    report: &mut SchemaReport,
+) -> Result<u64> {
+    let mut pos = start;
+    // Per-child-ID occurrence counts within THIS master instance.
+    let mut counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut children_seen: u64 = 0;
+    let mut clean = true;
+    let parent_id = parent.map(|p| p.id);
+    while pos < end {
+        r.seek(SeekFrom::Start(pos))?;
+        let header = match ebml::read_element_header(r) {
+            Ok(h) => h,
+            Err(_) => {
+                if report.scan_stopped_at.is_none() {
+                    report.scan_stopped_at = Some(pos);
+                }
+                clean = false;
+                pos = end;
+                break;
+            }
+        };
+        if let Some(tp) = terminate_parent {
+            if ends_unknown_size(tp, header.id) {
+                r.seek(SeekFrom::Start(pos))?;
+                break;
+            }
+        }
+        report.elements_scanned += 1;
+        let body = pos + header.header_len as u64;
+        let def = element_def(header.id);
+
+        // --- identity + placement ------------------------------------
+        match def {
+            None => push_finding(report, pos, header.id, SchemaFindingKind::UnknownId),
+            Some(d) => {
+                let is_global = d.parent_id.is_none() && d.element_type != ElementType::Master
+                    || d.id == ids::VOID
+                    || d.id == ids::CRC32;
+                let legal_here = is_global
+                    || d.parent_id == parent_id
+                    || (d.recursive && parent_id == Some(d.id))
+                    || (parent_id.is_none() && d.parent_id.is_none());
+                if !legal_here {
+                    push_finding(
+                        report,
+                        pos,
+                        header.id,
+                        SchemaFindingKind::WrongParent {
+                            expected: d.parent_id,
+                            actual: parent_id,
+                        },
+                    );
+                }
+                if d.id == ids::CRC32 && children_seen > 0 {
+                    push_finding(report, pos, header.id, SchemaFindingKind::MisplacedCrc32);
+                }
+                if d.is_deprecated() {
+                    push_finding(report, pos, header.id, SchemaFindingKind::Deprecated);
+                }
+                if let Some(ver) = report.doc_type_version {
+                    if u64::from(d.min_ver) > ver && d.min_ver != 0 {
+                        push_finding(report, pos, header.id, SchemaFindingKind::VersionMismatch);
+                    }
+                }
+                let n = counts.entry(d.id).or_insert(0);
+                *n += 1;
+                if let Some(max) = d.max_occurs {
+                    if *n > max {
+                        push_finding(
+                            report,
+                            pos,
+                            header.id,
+                            SchemaFindingKind::TooManyOccurrences,
+                        );
+                    }
+                }
+            }
+        }
+        children_seen += 1;
+
+        // --- extent ---------------------------------------------------
+        if header.size == ebml::VINT_UNKNOWN_SIZE {
+            match def {
+                Some(d) if d.unknown_size_allowed => {
+                    pos = walk_master(r, body, end, Some(d), Some(d.id), depth + 1, report)?;
+                    continue;
+                }
+                _ => {
+                    push_finding(
+                        report,
+                        pos,
+                        header.id,
+                        SchemaFindingKind::UnknownSizeNotAllowed,
+                    );
+                    if report.scan_stopped_at.is_none() {
+                        report.scan_stopped_at = Some(pos);
+                    }
+                    clean = false;
+                    pos = end;
+                    break;
+                }
+            }
+        }
+        let Some(next) = body.checked_add(header.size) else {
+            if report.scan_stopped_at.is_none() {
+                report.scan_stopped_at = Some(pos);
+            }
+            clean = false;
+            pos = end;
+            break;
+        };
+        if next > end {
+            if report.scan_stopped_at.is_none() {
+                report.scan_stopped_at = Some(pos);
+            }
+            clean = false;
+            pos = end;
+            break;
+        }
+
+        // --- value / descent -----------------------------------------
+        match def {
+            Some(d) if d.element_type == ElementType::Master && depth < MAX_SCHEMA_DEPTH => {
+                walk_master(r, body, next, Some(d), None, depth + 1, report)?;
+            }
+            Some(d) if d.element_type == ElementType::Master => {}
+            Some(d) => check_leaf(r, d, pos, body, header.size, report)?,
+            None => {}
+        }
+        pos = next;
+    }
+
+    // --- close: mandatory children --------------------------------------
+    if clean {
+        if let Some(p) = parent {
+            for child in SCHEMA.iter().chain(EBML_SUPPLEMENT.iter()) {
+                if child.parent_id == Some(p.id)
+                    && child.min_occurs >= 1
+                    && child.default.is_none()
+                    && !counts.contains_key(&child.id)
+                {
+                    push_finding(report, start, child.id, SchemaFindingKind::MissingMandatory);
+                }
+            }
+        }
+    }
+    Ok(pos)
+}
+
+/// Type-shape, `length`, and `range` checks for one non-master leaf.
+/// Reads at most 8 bytes (plus the DocType / DocTypeVersion captures).
+fn check_leaf<R: Read + Seek>(
+    r: &mut R,
+    d: &'static ElementDef,
+    offset: u64,
+    body: u64,
+    size: u64,
+    report: &mut SchemaReport,
+) -> Result<()> {
+    // Fixed `length` attribute ("16", "4", ">0").
+    if let Some(len) = d.length {
+        let ok = match len.strip_prefix('>') {
+            Some(min) => size > min.trim().parse::<u64>().unwrap_or(0),
+            None => len.parse::<u64>().map(|l| size == l).unwrap_or(true),
+        };
+        if !ok {
+            push_finding(report, offset, d.id, SchemaFindingKind::BadLength);
+            return Ok(());
+        }
+    }
+    let mut value: Option<f64> = None;
+    match d.element_type {
+        ElementType::Uinteger => {
+            if size > 8 {
+                push_finding(report, offset, d.id, SchemaFindingKind::BadLength);
+                return Ok(());
+            }
+            r.seek(SeekFrom::Start(body))?;
+            let v = ebml::read_uint(r, size as usize)?;
+            value = Some(v as f64);
+            if d.id == crate::ids::EBML_DOC_TYPE_VERSION {
+                report.doc_type_version = Some(v);
+            }
+        }
+        ElementType::Integer => {
+            if size > 8 {
+                push_finding(report, offset, d.id, SchemaFindingKind::BadLength);
+                return Ok(());
+            }
+            r.seek(SeekFrom::Start(body))?;
+            let raw = ebml::read_uint(r, size as usize)?;
+            // Sign-extend from the encoded width.
+            let v = if size == 0 {
+                0
+            } else {
+                let shift = 64 - 8 * size as u32;
+                ((raw << shift) as i64) >> shift
+            };
+            value = Some(v as f64);
+        }
+        ElementType::Float => {
+            if !matches!(size, 0 | 4 | 8) {
+                push_finding(report, offset, d.id, SchemaFindingKind::BadLength);
+                return Ok(());
+            }
+            r.seek(SeekFrom::Start(body))?;
+            if size == 4 {
+                let mut b = [0u8; 4];
+                r.read_exact(&mut b)?;
+                value = Some(f32::from_be_bytes(b) as f64);
+            } else if size == 8 {
+                let mut b = [0u8; 8];
+                r.read_exact(&mut b)?;
+                value = Some(f64::from_be_bytes(b));
+            } else {
+                value = Some(0.0);
+            }
+        }
+        ElementType::Date if !matches!(size, 0 | 8) => {
+            push_finding(report, offset, d.id, SchemaFindingKind::BadLength);
+            return Ok(());
+        }
+        ElementType::AsciiString
+            if d.id == crate::ids::EBML_DOC_TYPE && size <= 64 && report.doc_type.is_none() =>
+        {
+            r.seek(SeekFrom::Start(body))?;
+            if let Ok(s) = ebml::read_string(r, size as usize) {
+                report.doc_type = Some(s);
+            }
+        }
+        _ => {}
+    }
+    if let (Some(v), Some(range)) = (value, d.range) {
+        // An absent body (size 0) decodes to the type's zero value; the
+        // schema default, not the zero, is what a reader materialises —
+        // but on-disk zero-length bodies are still legal encodings of 0
+        // and are range-checked as such.
+        if let Some(check) = parse_range(range) {
+            if !range_permits(&check, v) {
+                push_finding(report, offset, d.id, SchemaFindingKind::OutOfRange);
+            }
+        }
+    }
+    Ok(())
+}

@@ -1658,6 +1658,27 @@ the unified `oxideav` aggregator to wire decoding automatically.
   cross-census, and the corroboration between schema `webm` markers
   and the guidelines support table (zero marker-vs-Unsupported
   conflicts; exactly three explainable Supported-without-marker rows).
+- **Whole-document validator** (`schema::validate(reader) ->
+  SchemaReport`): a pure structural walk (O(file) time, O(depth)
+  memory, leaf reads bounded at 8 bytes) that checks every element
+  occurrence against the table — identity (`UnknownId`,
+  informational), placement (`WrongParent`, with recursion and the
+  `Void` / `CRC-32` globals exempt), type shape + `length` attributes
+  (`BadLength`: uint/int over 8 octets, float not 0/4/8, date not
+  0/8, `SeekID` 4, UUIDs 16), decoded-value `range` constraints
+  (`OutOfRange`, full schema range grammar incl. C hex-floats),
+  occurrence counts per parent instance (`TooManyOccurrences`, and
+  `MissingMandatory` for `minOccurs >= 1` children with no declared
+  default on cleanly-walked masters), the RFC 8794 first-child rule
+  for `CRC-32` (`MisplacedCrc32`), `unknownsizeallowed` gating
+  (`UnknownSizeNotAllowed`), and the version window (`Deprecated` +
+  `VersionMismatch` against the header's `DocTypeVersion`,
+  informational). `is_valid()` = zero violations + clean walk;
+  findings carry absolute offsets, capped at 4096 with exact
+  counters. The in-tree muxer's own output validates with zero
+  violations and zero informational findings — pinned in CI
+  (`tests/schema_validate.rs`, 10 tests, including a no-panic sweep
+  over byte soup and every truncation prefix).
 
 ### Codec ID mapping (`codec_id` module)
 
