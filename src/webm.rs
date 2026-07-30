@@ -20,11 +20,15 @@
 //! table is the only staged authority on the subset, so anything it does
 //! not list is left to the caller's judgement.
 //!
-//! A few guideline rows name elements whose Element IDs appear in neither
-//! RFC 9559 Table 53 nor the staged WebM document itself (the old EBML
-//! signature family, `EditionFlagHidden`, `ChapterTrack`,
-//! `ChapterTrackNumber` — all `Unsupported` rows); with no ID to key on,
-//! occurrences of those classify as `Unlisted`.
+//! Every guideline row is keyed to a concrete Element ID. Eleven rows name
+//! legacy elements RFC 9559 dropped without carrying their IDs forward
+//! (the old Signature family, `EditionFlagHidden`, `ChapterTrack`,
+//! `ChapterTrackNumber`); the staged mapping doc
+//! `docs/container/matroska/legacy-element-ids.md` resolves their IDs, so
+//! occurrences classify as `Unsupported` exactly as the guidelines table
+//! says. Note the guidelines' `ChapterTrackNumber` row is the element the
+//! current schema names `ChapterTrackUID` — same ID `0x89`, renamed
+//! because its payload has always been a TrackUID.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -48,248 +52,260 @@ pub enum WebmSupport {
 }
 
 /// The WebM guidelines support table, transcribed by Element ID and sorted
-/// by ID for binary search. 239 rows: 137 `Supported`, 98 `Unsupported`,
-/// 4 `Deprecated`.
+/// by ID for binary search. 250 rows: 137 `Supported`, 109 `Unsupported`,
+/// 4 `Deprecated` (11 of the `Unsupported` rows are the legacy elements
+/// keyed via `legacy-element-ids.md`).
 const WEBM_SUPPORT_TABLE: &[(u32, WebmSupport)] = &[
     (0x80, WebmSupport::Supported),         // ChapterDisplay
     (0x83, WebmSupport::Supported),         // TrackType
     (0x85, WebmSupport::Supported),         // ChapString
     (0x86, WebmSupport::Supported),         // CodecID
     (0x88, WebmSupport::Supported),         // FlagDefault
-    (0x8E, WebmSupport::Unsupported),       // Slices
-    (0x91, WebmSupport::Supported),         // ChapterTimeStart
-    (0x92, WebmSupport::Supported),         // ChapterTimeEnd
-    (0x96, WebmSupport::Unsupported),       // CueRefTime
-    (0x97, WebmSupport::Unsupported),       // CueRefCluster
-    (0x98, WebmSupport::Unsupported),       // ChapterFlagHidden
-    (0x9A, WebmSupport::Supported),         // FlagInterlaced
-    (0x9B, WebmSupport::Supported),         // BlockDuration
-    (0x9C, WebmSupport::Supported),         // FlagLacing
-    (0x9F, WebmSupport::Supported),         // Channels
-    (0xA0, WebmSupport::Supported),         // BlockGroup
-    (0xA1, WebmSupport::Supported),         // Block
-    (0xA2, WebmSupport::Deprecated),        // BlockVirtual
-    (0xA3, WebmSupport::Supported),         // SimpleBlock
-    (0xA4, WebmSupport::Unsupported),       // CodecState
-    (0xA5, WebmSupport::Supported),         // BlockAdditional
-    (0xA6, WebmSupport::Supported),         // BlockMore
-    (0xA7, WebmSupport::Unsupported),       // Position
-    (0xAA, WebmSupport::Unsupported),       // CodecDecodeAll
-    (0xAB, WebmSupport::Supported),         // PrevSize
-    (0xAE, WebmSupport::Supported),         // TrackEntry
-    (0xAF, WebmSupport::Unsupported),       // EncryptedBlock
-    (0xB0, WebmSupport::Supported),         // PixelWidth
-    (0xB2, WebmSupport::Supported),         // CueDuration
-    (0xB3, WebmSupport::Supported),         // CueTime
-    (0xB5, WebmSupport::Supported),         // SamplingFrequency
-    (0xB6, WebmSupport::Supported),         // ChapterAtom
-    (0xB7, WebmSupport::Supported),         // CueTrackPositions
-    (0xB9, WebmSupport::Supported),         // FlagEnabled
-    (0xBA, WebmSupport::Supported),         // PixelHeight
-    (0xBB, WebmSupport::Supported),         // CuePoint
-    (0xBF, WebmSupport::Unsupported),       // CRC-32
-    (0xC0, WebmSupport::Unsupported),       // TrickTrackUID
-    (0xC1, WebmSupport::Unsupported),       // TrickTrackSegmentUID
-    (0xC4, WebmSupport::Unsupported),       // TrickMasterTrackSegmentUID
-    (0xC6, WebmSupport::Unsupported),       // TrickTrackFlag
-    (0xC7, WebmSupport::Unsupported),       // TrickMasterTrackUID
-    (0xC8, WebmSupport::Unsupported),       // ReferenceFrame
-    (0xC9, WebmSupport::Unsupported),       // ReferenceOffset
-    (0xCA, WebmSupport::Unsupported),       // ReferenceTimeCode
-    (0xCB, WebmSupport::Unsupported),       // BlockAdditionID
-    (0xCC, WebmSupport::Deprecated),        // LaceNumber
-    (0xCD, WebmSupport::Unsupported),       // FrameNumber
-    (0xCE, WebmSupport::Unsupported),       // Delay
-    (0xCF, WebmSupport::Unsupported),       // SliceDuration
-    (0xD7, WebmSupport::Supported),         // TrackNumber
-    (0xDB, WebmSupport::Unsupported),       // CueReference
-    (0xE0, WebmSupport::Supported),         // Video
-    (0xE1, WebmSupport::Supported),         // Audio
-    (0xE2, WebmSupport::Unsupported),       // TrackOperation
-    (0xE3, WebmSupport::Unsupported),       // TrackCombinePlanes
-    (0xE4, WebmSupport::Unsupported),       // TrackPlane
-    (0xE5, WebmSupport::Unsupported),       // TrackPlaneUID
-    (0xE6, WebmSupport::Unsupported),       // TrackPlaneType
-    (0xE7, WebmSupport::Supported),         // Timecode
-    (0xE8, WebmSupport::Deprecated),        // TimeSlice
-    (0xE9, WebmSupport::Unsupported),       // TrackJoinBlocks
-    (0xEA, WebmSupport::Unsupported),       // CueCodecState
-    (0xEB, WebmSupport::Unsupported),       // CueRefCodecState
-    (0xEC, WebmSupport::Supported),         // Void
-    (0xED, WebmSupport::Unsupported),       // TrackJoinUID
-    (0xEE, WebmSupport::Supported),         // BlockAddID
-    (0xF0, WebmSupport::Supported),         // CueRelativePosition
-    (0xF1, WebmSupport::Supported),         // CueClusterPosition
-    (0xF7, WebmSupport::Supported),         // CueTrack
-    (0xFA, WebmSupport::Unsupported),       // ReferencePriority
-    (0xFB, WebmSupport::Supported),         // ReferenceBlock
-    (0xFD, WebmSupport::Unsupported),       // ReferenceVirtual
-    (0x4254, WebmSupport::Unsupported),     // ContentCompAlgo
-    (0x4255, WebmSupport::Unsupported),     // ContentCompSettings
-    (0x4282, WebmSupport::Supported),       // DocType
-    (0x4285, WebmSupport::Supported),       // DocTypeReadVersion
-    (0x4286, WebmSupport::Supported),       // EBMLVersion
-    (0x4287, WebmSupport::Supported),       // DocTypeVersion
-    (0x42F2, WebmSupport::Supported),       // EBMLMaxIDLength
-    (0x42F3, WebmSupport::Supported),       // EBMLMaxSizeLength
-    (0x42F7, WebmSupport::Supported),       // EBMLReadVersion
-    (0x437C, WebmSupport::Supported),       // ChapLanguage
-    (0x437E, WebmSupport::Supported),       // ChapCountry
-    (0x4444, WebmSupport::Unsupported),     // SegmentFamily
-    (0x4461, WebmSupport::Supported),       // DateUTC
-    (0x447A, WebmSupport::Supported),       // TagLanguage
-    (0x4484, WebmSupport::Supported),       // TagDefault
-    (0x4485, WebmSupport::Supported),       // TagBinary
-    (0x4487, WebmSupport::Supported),       // TagString
-    (0x4489, WebmSupport::Supported),       // Duration
-    (0x450D, WebmSupport::Unsupported),     // ChapProcessPrivate
-    (0x4598, WebmSupport::Unsupported),     // ChapterFlagEnabled
-    (0x45A3, WebmSupport::Supported),       // TagName
-    (0x45B9, WebmSupport::Supported),       // EditionEntry
-    (0x45BC, WebmSupport::Unsupported),     // EditionUID
-    (0x45DB, WebmSupport::Unsupported),     // EditionFlagDefault
-    (0x45DD, WebmSupport::Unsupported),     // EditionFlagOrdered
-    (0x465C, WebmSupport::Unsupported),     // FileData
-    (0x4660, WebmSupport::Unsupported),     // FileMimeType
-    (0x4661, WebmSupport::Unsupported),     // FileUsedStartTime
-    (0x4662, WebmSupport::Unsupported),     // FileUsedEndTime
-    (0x466E, WebmSupport::Unsupported),     // FileName
-    (0x4675, WebmSupport::Unsupported),     // FileReferral
-    (0x467E, WebmSupport::Unsupported),     // FileDescription
-    (0x46AE, WebmSupport::Unsupported),     // FileUID
-    (0x47E1, WebmSupport::Supported),       // ContentEncAlgo
-    (0x47E2, WebmSupport::Supported),       // ContentEncKeyID
-    (0x47E3, WebmSupport::Unsupported),     // ContentSignature
-    (0x47E4, WebmSupport::Unsupported),     // ContentSigKeyID
-    (0x47E5, WebmSupport::Unsupported),     // ContentSigAlgo
-    (0x47E6, WebmSupport::Unsupported),     // ContentSigHashAlgo
-    (0x47E7, WebmSupport::Supported),       // ContentEncAESSettings
-    (0x47E8, WebmSupport::Supported),       // AESSettingsCipherMode
-    (0x4D80, WebmSupport::Supported),       // MuxingApp
-    (0x4DBB, WebmSupport::Supported),       // Seek
-    (0x5031, WebmSupport::Supported),       // ContentEncodingOrder
-    (0x5032, WebmSupport::Supported),       // ContentEncodingScope
-    (0x5033, WebmSupport::Supported),       // ContentEncodingType
-    (0x5034, WebmSupport::Unsupported),     // ContentCompression
-    (0x5035, WebmSupport::Supported),       // ContentEncryption
-    (0x535F, WebmSupport::Unsupported),     // CueRefNumber
-    (0x536E, WebmSupport::Supported),       // Name
-    (0x5378, WebmSupport::Supported),       // CueBlockNumber
-    (0x537F, WebmSupport::Unsupported),     // TrackOffset
-    (0x53AB, WebmSupport::Supported),       // SeekID
-    (0x53AC, WebmSupport::Supported),       // SeekPosition
-    (0x53B8, WebmSupport::Supported),       // StereoMode
-    (0x53C0, WebmSupport::Supported),       // AlphaMode
-    (0x54AA, WebmSupport::Supported),       // PixelCropBottom
-    (0x54B0, WebmSupport::Supported),       // DisplayWidth
-    (0x54B2, WebmSupport::Supported),       // DisplayUnit
-    (0x54B3, WebmSupport::Supported),       // AspectRatioType
-    (0x54BA, WebmSupport::Supported),       // DisplayHeight
-    (0x54BB, WebmSupport::Supported),       // PixelCropTop
-    (0x54CC, WebmSupport::Supported),       // PixelCropLeft
-    (0x54DD, WebmSupport::Supported),       // PixelCropRight
-    (0x55AA, WebmSupport::Supported),       // FlagForced
-    (0x55B0, WebmSupport::Supported),       // Colour
-    (0x55B1, WebmSupport::Supported),       // MatrixCoefficients
-    (0x55B2, WebmSupport::Supported),       // BitsPerChannel
-    (0x55B3, WebmSupport::Supported),       // ChromaSubsamplingHorz
-    (0x55B4, WebmSupport::Supported),       // ChromaSubsamplingVert
-    (0x55B5, WebmSupport::Supported),       // CbSubsamplingHorz
-    (0x55B6, WebmSupport::Supported),       // CbSubsamplingVert
-    (0x55B7, WebmSupport::Supported),       // ChromaSitingHorz
-    (0x55B8, WebmSupport::Supported),       // ChromaSitingVert
-    (0x55B9, WebmSupport::Supported),       // Range
-    (0x55BA, WebmSupport::Supported),       // TransferCharacteristics
-    (0x55BB, WebmSupport::Supported),       // Primaries
-    (0x55BC, WebmSupport::Supported),       // MaxCLL
-    (0x55BD, WebmSupport::Supported),       // MaxFALL
-    (0x55D0, WebmSupport::Supported),       // MasteringMetadata
-    (0x55D1, WebmSupport::Supported),       // PrimaryRChromaticityX
-    (0x55D2, WebmSupport::Supported),       // PrimaryRChromaticityY
-    (0x55D3, WebmSupport::Supported),       // PrimaryGChromaticityX
-    (0x55D4, WebmSupport::Supported),       // PrimaryGChromaticityY
-    (0x55D5, WebmSupport::Supported),       // PrimaryBChromaticityX
-    (0x55D6, WebmSupport::Supported),       // PrimaryBChromaticityY
-    (0x55D7, WebmSupport::Supported),       // WhitePointChromaticityX
-    (0x55D8, WebmSupport::Supported),       // WhitePointChromaticityY
-    (0x55D9, WebmSupport::Supported),       // LuminanceMax
-    (0x55DA, WebmSupport::Supported),       // LuminanceMin
-    (0x55EE, WebmSupport::Unsupported),     // MaxBlockAdditionID
-    (0x5654, WebmSupport::Supported),       // ChapterStringUID
-    (0x56AA, WebmSupport::Supported),       // CodecDelay
-    (0x56BB, WebmSupport::Supported),       // SeekPreRoll
-    (0x5741, WebmSupport::Supported),       // WritingApp
-    (0x5854, WebmSupport::Unsupported),     // SilentTracks
-    (0x58D7, WebmSupport::Unsupported),     // SilentTrackNumber
-    (0x61A7, WebmSupport::Unsupported),     // AttachedFile
-    (0x6240, WebmSupport::Supported),       // ContentEncoding
-    (0x6264, WebmSupport::Supported),       // BitDepth
-    (0x63A2, WebmSupport::Supported),       // CodecPrivate
-    (0x63C0, WebmSupport::Supported),       // Targets
-    (0x63C3, WebmSupport::Unsupported),     // ChapterPhysicalEquiv
-    (0x63C4, WebmSupport::Unsupported),     // TagChapterUID
-    (0x63C5, WebmSupport::Supported),       // TagTrackUID
-    (0x63C6, WebmSupport::Unsupported),     // TagAttachmentUID
-    (0x63C9, WebmSupport::Unsupported),     // TagEditionUID
-    (0x63CA, WebmSupport::Supported),       // TargetType
-    (0x6624, WebmSupport::Unsupported),     // TrackTranslate
-    (0x66A5, WebmSupport::Unsupported),     // TrackTranslateTrackID
-    (0x66BF, WebmSupport::Unsupported),     // TrackTranslateCodec
-    (0x66FC, WebmSupport::Unsupported),     // TrackTranslateEditionUID
-    (0x67C8, WebmSupport::Supported),       // SimpleTag
-    (0x68CA, WebmSupport::Supported),       // TargetTypeValue
-    (0x6911, WebmSupport::Unsupported),     // ChapProcessCommand
-    (0x6922, WebmSupport::Unsupported),     // ChapProcessTime
-    (0x6924, WebmSupport::Unsupported),     // ChapterTranslate
-    (0x6933, WebmSupport::Unsupported),     // ChapProcessData
-    (0x6944, WebmSupport::Unsupported),     // ChapProcess
-    (0x6955, WebmSupport::Unsupported),     // ChapProcessCodecID
-    (0x69A5, WebmSupport::Unsupported),     // ChapterTranslateID
-    (0x69BF, WebmSupport::Unsupported),     // ChapterTranslateCodec
-    (0x69FC, WebmSupport::Unsupported),     // ChapterTranslateEditionUID
-    (0x6D80, WebmSupport::Supported),       // ContentEncodings
-    (0x6DE7, WebmSupport::Unsupported),     // MinCache
-    (0x6DF8, WebmSupport::Unsupported),     // MaxCache
-    (0x6E67, WebmSupport::Unsupported),     // ChapterSegmentUID
-    (0x6EBC, WebmSupport::Unsupported),     // ChapterSegmentEditionUID
-    (0x6FAB, WebmSupport::Unsupported),     // TrackOverlay
-    (0x7373, WebmSupport::Supported),       // Tag
-    (0x7384, WebmSupport::Unsupported),     // SegmentFilename
-    (0x73A4, WebmSupport::Unsupported),     // SegmentUID
-    (0x73C4, WebmSupport::Supported),       // ChapterUID
-    (0x73C5, WebmSupport::Supported),       // TrackUID
-    (0x7446, WebmSupport::Unsupported),     // AttachmentLink
-    (0x75A1, WebmSupport::Supported),       // BlockAdditions
-    (0x75A2, WebmSupport::Supported),       // DiscardPadding
-    (0x78B5, WebmSupport::Supported),       // OutputSamplingFrequency
-    (0x7BA9, WebmSupport::Supported),       // Title
-    (0x7D7B, WebmSupport::Unsupported),     // ChannelPositions
-    (0x22B59C, WebmSupport::Supported),     // Language
-    (0x23314F, WebmSupport::Unsupported),   // TrackTimecodeScale
-    (0x234E7A, WebmSupport::Unsupported),   // DefaultDecodedFieldDuration
-    (0x2383E3, WebmSupport::Deprecated),    // FrameRate
-    (0x23E383, WebmSupport::Supported),     // DefaultDuration
-    (0x258688, WebmSupport::Supported),     // CodecName
-    (0x26B240, WebmSupport::Unsupported),   // CodecDownloadURL
-    (0x2AD7B1, WebmSupport::Supported),     // TimecodeScale
-    (0x2EB524, WebmSupport::Unsupported),   // ColourSpace
-    (0x2FB523, WebmSupport::Unsupported),   // GammaValue
-    (0x3A9697, WebmSupport::Unsupported),   // CodecSettings
-    (0x3B4040, WebmSupport::Unsupported),   // CodecInfoURL
-    (0x3C83AB, WebmSupport::Unsupported),   // PrevFilename
-    (0x3CB923, WebmSupport::Unsupported),   // PrevUID
-    (0x3E83BB, WebmSupport::Unsupported),   // NextFilename
-    (0x3EB923, WebmSupport::Unsupported),   // NextUID
-    (0x1043A770, WebmSupport::Supported),   // Chapters
-    (0x114D9B74, WebmSupport::Supported),   // SeekHead
-    (0x1254C367, WebmSupport::Supported),   // Tags
-    (0x1549A966, WebmSupport::Supported),   // Info
-    (0x1654AE6B, WebmSupport::Supported),   // Tracks
-    (0x18538067, WebmSupport::Supported),   // Segment
+    (0x89, WebmSupport::Unsupported), // ChapterTrackUID (guidelines row "ChapterTrackNumber" — legacy)
+    (0x8E, WebmSupport::Unsupported), // Slices
+    (0x8F, WebmSupport::Unsupported), // ChapterTrack (legacy)
+    (0x91, WebmSupport::Supported),   // ChapterTimeStart
+    (0x92, WebmSupport::Supported),   // ChapterTimeEnd
+    (0x96, WebmSupport::Unsupported), // CueRefTime
+    (0x97, WebmSupport::Unsupported), // CueRefCluster
+    (0x98, WebmSupport::Unsupported), // ChapterFlagHidden
+    (0x9A, WebmSupport::Supported),   // FlagInterlaced
+    (0x9B, WebmSupport::Supported),   // BlockDuration
+    (0x9C, WebmSupport::Supported),   // FlagLacing
+    (0x9F, WebmSupport::Supported),   // Channels
+    (0xA0, WebmSupport::Supported),   // BlockGroup
+    (0xA1, WebmSupport::Supported),   // Block
+    (0xA2, WebmSupport::Deprecated),  // BlockVirtual
+    (0xA3, WebmSupport::Supported),   // SimpleBlock
+    (0xA4, WebmSupport::Unsupported), // CodecState
+    (0xA5, WebmSupport::Supported),   // BlockAdditional
+    (0xA6, WebmSupport::Supported),   // BlockMore
+    (0xA7, WebmSupport::Unsupported), // Position
+    (0xAA, WebmSupport::Unsupported), // CodecDecodeAll
+    (0xAB, WebmSupport::Supported),   // PrevSize
+    (0xAE, WebmSupport::Supported),   // TrackEntry
+    (0xAF, WebmSupport::Unsupported), // EncryptedBlock
+    (0xB0, WebmSupport::Supported),   // PixelWidth
+    (0xB2, WebmSupport::Supported),   // CueDuration
+    (0xB3, WebmSupport::Supported),   // CueTime
+    (0xB5, WebmSupport::Supported),   // SamplingFrequency
+    (0xB6, WebmSupport::Supported),   // ChapterAtom
+    (0xB7, WebmSupport::Supported),   // CueTrackPositions
+    (0xB9, WebmSupport::Supported),   // FlagEnabled
+    (0xBA, WebmSupport::Supported),   // PixelHeight
+    (0xBB, WebmSupport::Supported),   // CuePoint
+    (0xBF, WebmSupport::Unsupported), // CRC-32
+    (0xC0, WebmSupport::Unsupported), // TrickTrackUID
+    (0xC1, WebmSupport::Unsupported), // TrickTrackSegmentUID
+    (0xC4, WebmSupport::Unsupported), // TrickMasterTrackSegmentUID
+    (0xC6, WebmSupport::Unsupported), // TrickTrackFlag
+    (0xC7, WebmSupport::Unsupported), // TrickMasterTrackUID
+    (0xC8, WebmSupport::Unsupported), // ReferenceFrame
+    (0xC9, WebmSupport::Unsupported), // ReferenceOffset
+    (0xCA, WebmSupport::Unsupported), // ReferenceTimeCode
+    (0xCB, WebmSupport::Unsupported), // BlockAdditionID
+    (0xCC, WebmSupport::Deprecated),  // LaceNumber
+    (0xCD, WebmSupport::Unsupported), // FrameNumber
+    (0xCE, WebmSupport::Unsupported), // Delay
+    (0xCF, WebmSupport::Unsupported), // SliceDuration
+    (0xD7, WebmSupport::Supported),   // TrackNumber
+    (0xDB, WebmSupport::Unsupported), // CueReference
+    (0xE0, WebmSupport::Supported),   // Video
+    (0xE1, WebmSupport::Supported),   // Audio
+    (0xE2, WebmSupport::Unsupported), // TrackOperation
+    (0xE3, WebmSupport::Unsupported), // TrackCombinePlanes
+    (0xE4, WebmSupport::Unsupported), // TrackPlane
+    (0xE5, WebmSupport::Unsupported), // TrackPlaneUID
+    (0xE6, WebmSupport::Unsupported), // TrackPlaneType
+    (0xE7, WebmSupport::Supported),   // Timecode
+    (0xE8, WebmSupport::Deprecated),  // TimeSlice
+    (0xE9, WebmSupport::Unsupported), // TrackJoinBlocks
+    (0xEA, WebmSupport::Unsupported), // CueCodecState
+    (0xEB, WebmSupport::Unsupported), // CueRefCodecState
+    (0xEC, WebmSupport::Supported),   // Void
+    (0xED, WebmSupport::Unsupported), // TrackJoinUID
+    (0xEE, WebmSupport::Supported),   // BlockAddID
+    (0xF0, WebmSupport::Supported),   // CueRelativePosition
+    (0xF1, WebmSupport::Supported),   // CueClusterPosition
+    (0xF7, WebmSupport::Supported),   // CueTrack
+    (0xFA, WebmSupport::Unsupported), // ReferencePriority
+    (0xFB, WebmSupport::Supported),   // ReferenceBlock
+    (0xFD, WebmSupport::Unsupported), // ReferenceVirtual
+    (0x4254, WebmSupport::Unsupported), // ContentCompAlgo
+    (0x4255, WebmSupport::Unsupported), // ContentCompSettings
+    (0x4282, WebmSupport::Supported), // DocType
+    (0x4285, WebmSupport::Supported), // DocTypeReadVersion
+    (0x4286, WebmSupport::Supported), // EBMLVersion
+    (0x4287, WebmSupport::Supported), // DocTypeVersion
+    (0x42F2, WebmSupport::Supported), // EBMLMaxIDLength
+    (0x42F3, WebmSupport::Supported), // EBMLMaxSizeLength
+    (0x42F7, WebmSupport::Supported), // EBMLReadVersion
+    (0x437C, WebmSupport::Supported), // ChapLanguage
+    (0x437E, WebmSupport::Supported), // ChapCountry
+    (0x4444, WebmSupport::Unsupported), // SegmentFamily
+    (0x4461, WebmSupport::Supported), // DateUTC
+    (0x447A, WebmSupport::Supported), // TagLanguage
+    (0x4484, WebmSupport::Supported), // TagDefault
+    (0x4485, WebmSupport::Supported), // TagBinary
+    (0x4487, WebmSupport::Supported), // TagString
+    (0x4489, WebmSupport::Supported), // Duration
+    (0x450D, WebmSupport::Unsupported), // ChapProcessPrivate
+    (0x4598, WebmSupport::Unsupported), // ChapterFlagEnabled
+    (0x45A3, WebmSupport::Supported), // TagName
+    (0x45B9, WebmSupport::Supported), // EditionEntry
+    (0x45BC, WebmSupport::Unsupported), // EditionUID
+    (0x45BD, WebmSupport::Unsupported), // EditionFlagHidden (legacy)
+    (0x45DB, WebmSupport::Unsupported), // EditionFlagDefault
+    (0x45DD, WebmSupport::Unsupported), // EditionFlagOrdered
+    (0x465C, WebmSupport::Unsupported), // FileData
+    (0x4660, WebmSupport::Unsupported), // FileMimeType
+    (0x4661, WebmSupport::Unsupported), // FileUsedStartTime
+    (0x4662, WebmSupport::Unsupported), // FileUsedEndTime
+    (0x466E, WebmSupport::Unsupported), // FileName
+    (0x4675, WebmSupport::Unsupported), // FileReferral
+    (0x467E, WebmSupport::Unsupported), // FileDescription
+    (0x46AE, WebmSupport::Unsupported), // FileUID
+    (0x47E1, WebmSupport::Supported), // ContentEncAlgo
+    (0x47E2, WebmSupport::Supported), // ContentEncKeyID
+    (0x47E3, WebmSupport::Unsupported), // ContentSignature
+    (0x47E4, WebmSupport::Unsupported), // ContentSigKeyID
+    (0x47E5, WebmSupport::Unsupported), // ContentSigAlgo
+    (0x47E6, WebmSupport::Unsupported), // ContentSigHashAlgo
+    (0x47E7, WebmSupport::Supported), // ContentEncAESSettings
+    (0x47E8, WebmSupport::Supported), // AESSettingsCipherMode
+    (0x4D80, WebmSupport::Supported), // MuxingApp
+    (0x4DBB, WebmSupport::Supported), // Seek
+    (0x5031, WebmSupport::Supported), // ContentEncodingOrder
+    (0x5032, WebmSupport::Supported), // ContentEncodingScope
+    (0x5033, WebmSupport::Supported), // ContentEncodingType
+    (0x5034, WebmSupport::Unsupported), // ContentCompression
+    (0x5035, WebmSupport::Supported), // ContentEncryption
+    (0x535F, WebmSupport::Unsupported), // CueRefNumber
+    (0x536E, WebmSupport::Supported), // Name
+    (0x5378, WebmSupport::Supported), // CueBlockNumber
+    (0x537F, WebmSupport::Unsupported), // TrackOffset
+    (0x53AB, WebmSupport::Supported), // SeekID
+    (0x53AC, WebmSupport::Supported), // SeekPosition
+    (0x53B8, WebmSupport::Supported), // StereoMode
+    (0x53C0, WebmSupport::Supported), // AlphaMode
+    (0x54AA, WebmSupport::Supported), // PixelCropBottom
+    (0x54B0, WebmSupport::Supported), // DisplayWidth
+    (0x54B2, WebmSupport::Supported), // DisplayUnit
+    (0x54B3, WebmSupport::Supported), // AspectRatioType
+    (0x54BA, WebmSupport::Supported), // DisplayHeight
+    (0x54BB, WebmSupport::Supported), // PixelCropTop
+    (0x54CC, WebmSupport::Supported), // PixelCropLeft
+    (0x54DD, WebmSupport::Supported), // PixelCropRight
+    (0x55AA, WebmSupport::Supported), // FlagForced
+    (0x55B0, WebmSupport::Supported), // Colour
+    (0x55B1, WebmSupport::Supported), // MatrixCoefficients
+    (0x55B2, WebmSupport::Supported), // BitsPerChannel
+    (0x55B3, WebmSupport::Supported), // ChromaSubsamplingHorz
+    (0x55B4, WebmSupport::Supported), // ChromaSubsamplingVert
+    (0x55B5, WebmSupport::Supported), // CbSubsamplingHorz
+    (0x55B6, WebmSupport::Supported), // CbSubsamplingVert
+    (0x55B7, WebmSupport::Supported), // ChromaSitingHorz
+    (0x55B8, WebmSupport::Supported), // ChromaSitingVert
+    (0x55B9, WebmSupport::Supported), // Range
+    (0x55BA, WebmSupport::Supported), // TransferCharacteristics
+    (0x55BB, WebmSupport::Supported), // Primaries
+    (0x55BC, WebmSupport::Supported), // MaxCLL
+    (0x55BD, WebmSupport::Supported), // MaxFALL
+    (0x55D0, WebmSupport::Supported), // MasteringMetadata
+    (0x55D1, WebmSupport::Supported), // PrimaryRChromaticityX
+    (0x55D2, WebmSupport::Supported), // PrimaryRChromaticityY
+    (0x55D3, WebmSupport::Supported), // PrimaryGChromaticityX
+    (0x55D4, WebmSupport::Supported), // PrimaryGChromaticityY
+    (0x55D5, WebmSupport::Supported), // PrimaryBChromaticityX
+    (0x55D6, WebmSupport::Supported), // PrimaryBChromaticityY
+    (0x55D7, WebmSupport::Supported), // WhitePointChromaticityX
+    (0x55D8, WebmSupport::Supported), // WhitePointChromaticityY
+    (0x55D9, WebmSupport::Supported), // LuminanceMax
+    (0x55DA, WebmSupport::Supported), // LuminanceMin
+    (0x55EE, WebmSupport::Unsupported), // MaxBlockAdditionID
+    (0x5654, WebmSupport::Supported), // ChapterStringUID
+    (0x56AA, WebmSupport::Supported), // CodecDelay
+    (0x56BB, WebmSupport::Supported), // SeekPreRoll
+    (0x5741, WebmSupport::Supported), // WritingApp
+    (0x5854, WebmSupport::Unsupported), // SilentTracks
+    (0x58D7, WebmSupport::Unsupported), // SilentTrackNumber
+    (0x61A7, WebmSupport::Unsupported), // AttachedFile
+    (0x6240, WebmSupport::Supported), // ContentEncoding
+    (0x6264, WebmSupport::Supported), // BitDepth
+    (0x63A2, WebmSupport::Supported), // CodecPrivate
+    (0x63C0, WebmSupport::Supported), // Targets
+    (0x63C3, WebmSupport::Unsupported), // ChapterPhysicalEquiv
+    (0x63C4, WebmSupport::Unsupported), // TagChapterUID
+    (0x63C5, WebmSupport::Supported), // TagTrackUID
+    (0x63C6, WebmSupport::Unsupported), // TagAttachmentUID
+    (0x63C9, WebmSupport::Unsupported), // TagEditionUID
+    (0x63CA, WebmSupport::Supported), // TargetType
+    (0x6532, WebmSupport::Unsupported), // SignedElement (legacy)
+    (0x6624, WebmSupport::Unsupported), // TrackTranslate
+    (0x66A5, WebmSupport::Unsupported), // TrackTranslateTrackID
+    (0x66BF, WebmSupport::Unsupported), // TrackTranslateCodec
+    (0x66FC, WebmSupport::Unsupported), // TrackTranslateEditionUID
+    (0x67C8, WebmSupport::Supported), // SimpleTag
+    (0x68CA, WebmSupport::Supported), // TargetTypeValue
+    (0x6911, WebmSupport::Unsupported), // ChapProcessCommand
+    (0x6922, WebmSupport::Unsupported), // ChapProcessTime
+    (0x6924, WebmSupport::Unsupported), // ChapterTranslate
+    (0x6933, WebmSupport::Unsupported), // ChapProcessData
+    (0x6944, WebmSupport::Unsupported), // ChapProcess
+    (0x6955, WebmSupport::Unsupported), // ChapProcessCodecID
+    (0x69A5, WebmSupport::Unsupported), // ChapterTranslateID
+    (0x69BF, WebmSupport::Unsupported), // ChapterTranslateCodec
+    (0x69FC, WebmSupport::Unsupported), // ChapterTranslateEditionUID
+    (0x6D80, WebmSupport::Supported), // ContentEncodings
+    (0x6DE7, WebmSupport::Unsupported), // MinCache
+    (0x6DF8, WebmSupport::Unsupported), // MaxCache
+    (0x6E67, WebmSupport::Unsupported), // ChapterSegmentUID
+    (0x6EBC, WebmSupport::Unsupported), // ChapterSegmentEditionUID
+    (0x6FAB, WebmSupport::Unsupported), // TrackOverlay
+    (0x7373, WebmSupport::Supported), // Tag
+    (0x7384, WebmSupport::Unsupported), // SegmentFilename
+    (0x73A4, WebmSupport::Unsupported), // SegmentUID
+    (0x73C4, WebmSupport::Supported), // ChapterUID
+    (0x73C5, WebmSupport::Supported), // TrackUID
+    (0x7446, WebmSupport::Unsupported), // AttachmentLink
+    (0x75A1, WebmSupport::Supported), // BlockAdditions
+    (0x75A2, WebmSupport::Supported), // DiscardPadding
+    (0x78B5, WebmSupport::Supported), // OutputSamplingFrequency
+    (0x7BA9, WebmSupport::Supported), // Title
+    (0x7D7B, WebmSupport::Unsupported), // ChannelPositions
+    (0x7E5B, WebmSupport::Unsupported), // SignatureElements (legacy)
+    (0x7E7B, WebmSupport::Unsupported), // SignatureElementList (legacy)
+    (0x7E8A, WebmSupport::Unsupported), // SignatureAlgo (legacy)
+    (0x7E9A, WebmSupport::Unsupported), // SignatureHash (legacy)
+    (0x7EA5, WebmSupport::Unsupported), // SignaturePublicKey (legacy)
+    (0x7EB5, WebmSupport::Unsupported), // Signature (legacy)
+    (0x22B59C, WebmSupport::Supported), // Language
+    (0x23314F, WebmSupport::Unsupported), // TrackTimecodeScale
+    (0x234E7A, WebmSupport::Unsupported), // DefaultDecodedFieldDuration
+    (0x2383E3, WebmSupport::Deprecated), // FrameRate
+    (0x23E383, WebmSupport::Supported), // DefaultDuration
+    (0x258688, WebmSupport::Supported), // CodecName
+    (0x26B240, WebmSupport::Unsupported), // CodecDownloadURL
+    (0x2AD7B1, WebmSupport::Supported), // TimecodeScale
+    (0x2EB524, WebmSupport::Unsupported), // ColourSpace
+    (0x2FB523, WebmSupport::Unsupported), // GammaValue
+    (0x3A9697, WebmSupport::Unsupported), // CodecSettings
+    (0x3B4040, WebmSupport::Unsupported), // CodecInfoURL
+    (0x3C83AB, WebmSupport::Unsupported), // PrevFilename
+    (0x3CB923, WebmSupport::Unsupported), // PrevUID
+    (0x3E83BB, WebmSupport::Unsupported), // NextFilename
+    (0x3EB923, WebmSupport::Unsupported), // NextUID
+    (0x1043A770, WebmSupport::Supported), // Chapters
+    (0x114D9B74, WebmSupport::Supported), // SeekHead
+    (0x1254C367, WebmSupport::Supported), // Tags
+    (0x1549A966, WebmSupport::Supported), // Info
+    (0x1654AE6B, WebmSupport::Supported), // Tracks
+    (0x18538067, WebmSupport::Supported), // Segment
     (0x1941A469, WebmSupport::Unsupported), // Attachments
-    (0x1A45DFA3, WebmSupport::Supported),   // EBML
-    (0x1C53BB6B, WebmSupport::Supported),   // Cues
-    (0x1F43B675, WebmSupport::Supported),   // Cluster
+    (0x1A45DFA3, WebmSupport::Supported), // EBML
+    (0x1B538667, WebmSupport::Unsupported), // SignatureSlot (legacy)
+    (0x1C53BB6B, WebmSupport::Supported), // Cues
+    (0x1F43B675, WebmSupport::Supported), // Cluster
 ];
 
 /// Look up the WebM-guidelines support status for an Element ID.
@@ -304,12 +320,17 @@ pub fn webm_element_support(id: u32) -> WebmSupport {
 }
 
 /// Every Master element of the document schema — the 47 `type: master`
-/// entries of RFC 9559 plus the two RFC 8794 EBML-header masters
-/// (`EBML`, `DocTypeExtension`). The scanner descends into these and
-/// skips the body of everything else. Sorted for binary search.
+/// entries of RFC 9559, the two RFC 8794 EBML-header masters
+/// (`EBML`, `DocTypeExtension`), and the four legacy masters from the
+/// staged `legacy-element-ids.md` mapping (`ChapterTrack`,
+/// `SignatureSlot`, `SignatureElements`, `SignatureElementList`) so a
+/// legacy file's children classify individually. The scanner descends
+/// into these and skips the body of everything else. Sorted for binary
+/// search.
 const MASTERS: &[u32] = &[
     ids::CHAPTER_DISPLAY,          // 0x80
     ids::SLICES,                   // 0x8E
+    ids::CHAPTER_TRACK,            // 0x8F (legacy)
     ids::BLOCK_GROUP,              // 0xA0
     ids::BLOCK_MORE,               // 0xA6
     ids::TRACK_ENTRY,              // 0xAE
@@ -347,6 +368,8 @@ const MASTERS: &[u32] = &[
     ids::TAG,                      // 0x7373
     ids::BLOCK_ADDITIONS,          // 0x75A1
     ids::PROJECTION,               // 0x7670
+    ids::SIGNATURE_ELEMENTS,       // 0x7E5B (legacy)
+    ids::SIGNATURE_ELEMENT_LIST,   // 0x7E7B (legacy)
     ids::CHAPTERS,                 // 0x1043A770
     ids::SEEK_HEAD,                // 0x114D9B74
     ids::TAGS,                     // 0x1254C367
@@ -355,6 +378,7 @@ const MASTERS: &[u32] = &[
     ids::SEGMENT,                  // 0x18538067
     ids::ATTACHMENTS,              // 0x1941A469
     ids::EBML_HEADER,              // 0x1A45DFA3
+    ids::SIGNATURE_SLOT,           // 0x1B538667 (legacy)
     ids::CUES,                     // 0x1C53BB6B
     ids::CLUSTER,                  // 0x1F43B675
 ];
@@ -611,13 +635,15 @@ mod tests {
 
     #[test]
     fn support_table_row_counts() {
-        // 239 guideline rows mapped to Element IDs: 137 Supported,
-        // 98 Unsupported, 4 Deprecated (see the module docs for the 11
-        // name-only rows that could not be keyed to an ID).
-        assert_eq!(WEBM_SUPPORT_TABLE.len(), 239);
+        // 250 guideline rows mapped to Element IDs: 137 Supported,
+        // 109 Unsupported, 4 Deprecated. The 11 legacy rows (Signature
+        // family, EditionFlagHidden, ChapterTrack, ChapterTrackNumber =
+        // ChapterTrackUID) are keyed via the staged
+        // `legacy-element-ids.md` mapping — all Unsupported.
+        assert_eq!(WEBM_SUPPORT_TABLE.len(), 250);
         let count = |s: WebmSupport| WEBM_SUPPORT_TABLE.iter().filter(|(_, x)| *x == s).count();
         assert_eq!(count(WebmSupport::Supported), 137);
-        assert_eq!(count(WebmSupport::Unsupported), 98);
+        assert_eq!(count(WebmSupport::Unsupported), 109);
         assert_eq!(count(WebmSupport::Deprecated), 4);
     }
 
@@ -631,7 +657,7 @@ mod tests {
                 w[1]
             );
         }
-        assert_eq!(MASTERS.len(), 49);
+        assert_eq!(MASTERS.len(), 53);
     }
 
     #[test]

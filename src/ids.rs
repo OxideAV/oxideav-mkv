@@ -605,6 +605,46 @@ pub const FILE_USED_START_TIME: u32 = 0x4661;
 /// timestamp at which an optimized font attachment goes out of context.
 pub const FILE_USED_END_TIME: u32 = 0x4662;
 
+// Legacy pre-registry elements (staged mapping doc
+// `docs/container/matroska/legacy-element-ids.md`): Matroska dropped these
+// three element groups from the specification before the IETF work began,
+// so RFC 9559 Table 53 carries no row for them — not even a "Reclaimed"
+// one — and the IANA registry leaves the IDs formally unassigned. A Reader
+// recognises them so legacy files skip cleanly instead of surfacing as
+// unknown/corrupt data; a Writer never emits them (an unassigned ID could
+// collide with a future registry assignment).
+//
+// Signature family (Matroska v1–v4 global elements, removed): nesting is
+// SignatureSlot > { SignatureAlgo, SignatureHash, SignaturePublicKey,
+// Signature, SignatureElements > SignatureElementList+ > SignedElement+ }.
+// `SignatureSlot` is a four-octet ID — the same ID class as the Top-Level
+// elements — so top-level dispatch must be prepared to see and skip it.
+pub const SIGNATURE_SLOT: u32 = 0x1B538667;
+/// `SignatureAlgo` (legacy, uinteger): 1 = RSA, 2 = elliptic.
+pub const SIGNATURE_ALGO: u32 = 0x7E8A;
+/// `SignatureHash` (legacy, uinteger): 1 = SHA1-160, 2 = MD5.
+pub const SIGNATURE_HASH: u32 = 0x7E9A;
+pub const SIGNATURE_PUBLIC_KEY: u32 = 0x7EA5;
+pub const SIGNATURE: u32 = 0x7EB5;
+pub const SIGNATURE_ELEMENTS: u32 = 0x7E5B;
+pub const SIGNATURE_ELEMENT_LIST: u32 = 0x7E7B;
+pub const SIGNED_ELEMENT: u32 = 0x6532;
+// EditionFlagHidden (legacy, uinteger 0-1, default 0): "Set to 1 if an
+// edition is hidden." Sibling of the RFC 9559 EditionUID /
+// EditionFlagDefault / EditionFlagOrdered — only the Hidden flag was
+// dropped (its semantics depend on the Control Track mechanism specified
+// outside RFC 9559).
+pub const EDITION_FLAG_HIDDEN: u32 = 0x45BD;
+// ChapterTrack (legacy master, maxOccurs 1): "List of tracks on which the
+// chapter applies. If this element is not present, all tracks apply."
+pub const CHAPTER_TRACK: u32 = 0x8F;
+// ChapterTrackUID (legacy, uinteger, range "not 0", mandatory within
+// ChapterTrack, unbounded): the UID of a Track this chapter applies to.
+// The pre-2016 schema (and the WebM guidelines table) spelled this
+// element `ChapterTrackNumber`, but its payload has always been a
+// TrackUID — same element, same ID 0x89; match on the ID, not the name.
+pub const CHAPTER_TRACK_UID: u32 = 0x89;
+
 // TrackType values.
 pub const TRACK_TYPE_VIDEO: u64 = 1;
 pub const TRACK_TYPE_AUDIO: u64 = 2;

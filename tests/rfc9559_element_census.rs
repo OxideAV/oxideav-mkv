@@ -11,9 +11,11 @@
 //!   one of the 13 RFC 8794 EBML-header / EBML-global IDs (which the
 //!   registry text explicitly keeps out: "EBML Element IDs defined for
 //!   the EBML Header ... MUST NOT be used as Matroska Element IDs"),
-//!   or the single documented out-of-registry legacy element
-//!   `ChapterFlagEnabled` (`0x4598`) that RFC 9559 dropped from the
-//!   schema but historical files still carry;
+//!   or one of the documented out-of-registry legacy elements
+//!   (`ChapterFlagEnabled` plus the `legacy-element-ids.md` set:
+//!   `EditionFlagHidden`, `ChapterTrack` / `ChapterTrackUID`, and the
+//!   old Signature family) that Matroska dropped before the IETF work
+//!   but historical files still carry;
 //! * const names agree with the registry's Element Names (modulo the
 //!   crate's two deliberate disambiguation prefixes);
 //! * no `Reserved` all-ones ID is defined as an element;
@@ -305,13 +307,30 @@ const EBML_RFC8794: &[(u32, &str)] = &[
     (0xBF, "CRC-32"),
 ];
 
-/// The one out-of-registry element the crate knowingly keeps: the legacy
-/// `ChapterFlagEnabled` (`0x4598`) from the pre-RFC Matroska schema.
-/// RFC 9559 dropped it (the ChapterAtom sections jump from
-/// ChapterFlagHidden §5.1.7.1.4.5 to ChapterSegmentUUID §5.1.7.1.4.6 and
-/// Table 53 does not assign `0x4598`), but historical files carry it, so
-/// the crate reads and round-trips it as an ecosystem element.
-const OUT_OF_REGISTRY_LEGACY: &[(u32, &str)] = &[(0x4598, "ChapterFlagEnabled")];
+/// The out-of-registry elements the crate knowingly keeps — legacy
+/// pre-RFC Matroska schema elements that RFC 9559 dropped without even a
+/// "Reclaimed" registry row, so Table 53 and the IANA registry leave
+/// their IDs formally unassigned. Historical files still carry them, so
+/// the crate recognises the IDs (reads `ChapterFlagEnabled` /
+/// `EditionFlagHidden` / `ChapterTrack(UID)`, skips the signature family
+/// as known-legacy); the muxer never emits any of them. Documented in
+/// the staged mapping doc `docs/container/matroska/legacy-element-ids.md`
+/// (`ChapterFlagEnabled` predates it and is documented inline in
+/// `ids.rs`).
+const OUT_OF_REGISTRY_LEGACY: &[(u32, &str)] = &[
+    (0x4598, "ChapterFlagEnabled"),
+    (0x45BD, "EditionFlagHidden"),
+    (0x8F, "ChapterTrack"),
+    (0x89, "ChapterTrackUID"),
+    (0x1B538667, "SignatureSlot"),
+    (0x7E8A, "SignatureAlgo"),
+    (0x7E9A, "SignatureHash"),
+    (0x7EA5, "SignaturePublicKey"),
+    (0x7EB5, "Signature"),
+    (0x7E5B, "SignatureElements"),
+    (0x7E7B, "SignatureElementList"),
+    (0x6532, "SignedElement"),
+];
 
 /// Crate const names that deliberately differ from the registry Element
 /// Name (disambiguation prefixes for name collisions inside `ids.rs`).
@@ -499,12 +518,23 @@ fn registry_ids_sit_in_valid_vint_classes() {
             "registry id 0x{id:X} ({name}) outside every valid ID class"
         );
     }
-    // The legacy out-of-registry element still has to be a well-formed
-    // two-octet ID — it is simply unassigned in Table 53.
+    // The legacy out-of-registry elements still have to be well-formed
+    // VINT IDs — they are simply unassigned in Table 53 (and in the IANA
+    // registry). They span three classes: one-octet (`ChapterTrack` 0x8F,
+    // `ChapterTrackUID` 0x89), two-octet (the flags + the Signature
+    // children), and four-octet (`SignatureSlot`).
     for (id, name) in OUT_OF_REGISTRY_LEGACY {
+        let ok = (0x80..=0xFE).contains(id)
+            || (0x407F..=0x7FFE).contains(id)
+            || (0x20_3FFF..=0x3F_FFFE).contains(id)
+            || (0x101F_FFFF..=0x1FFF_FFFE).contains(id);
+        assert!(ok, "legacy id 0x{id:X} ({name}) outside every ID class");
+        // And none of them may collide with a registry assignment — the
+        // whole point of the legacy list is that the registry does NOT
+        // assign these IDs.
         assert!(
-            (0x407F..=0x7FFE).contains(id),
-            "legacy id 0x{id:X} ({name}) outside the two-octet ID class"
+            !REGISTRY.iter().any(|(rid, _, _)| rid == id),
+            "legacy id 0x{id:X} ({name}) collides with a registry row"
         );
     }
 }

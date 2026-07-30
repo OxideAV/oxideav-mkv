@@ -199,6 +199,73 @@ fn support_table_spot_checks() {
     }
 }
 
+/// The eleven guideline rows naming legacy elements RFC 9559 dropped
+/// entirely (no registry row, not even Reclaimed) are keyed to their
+/// concrete IDs via the staged `legacy-element-ids.md` mapping — all
+/// `Unsupported`, exactly as the guidelines table says. The guidelines'
+/// `ChapterTrackNumber` row is the element the current schema names
+/// `ChapterTrackUID` (same ID 0x89 — renamed, not reassigned).
+#[test]
+fn legacy_row_groups_are_keyed_and_unsupported() {
+    use WebmSupport::*;
+    for id in [
+        ids::SIGNATURE_SLOT,         // 0x1B538667
+        ids::SIGNATURE_ALGO,         // 0x7E8A
+        ids::SIGNATURE_HASH,         // 0x7E9A
+        ids::SIGNATURE_PUBLIC_KEY,   // 0x7EA5
+        ids::SIGNATURE,              // 0x7EB5
+        ids::SIGNATURE_ELEMENTS,     // 0x7E5B
+        ids::SIGNATURE_ELEMENT_LIST, // 0x7E7B
+        ids::SIGNED_ELEMENT,         // 0x6532
+        ids::EDITION_FLAG_HIDDEN,    // 0x45BD
+        ids::CHAPTER_TRACK,          // 0x8F
+        ids::CHAPTER_TRACK_UID,      // 0x89 (= guidelines "ChapterTrackNumber")
+    ] {
+        assert_eq!(webm_element_support(id), Unsupported, "id 0x{id:X}");
+    }
+}
+
+/// A legacy `SignatureSlot` occurrence is a *classified* finding, not
+/// `Unlisted` noise: the scanner descends the master (it is in the legacy
+/// masters set) and flags every child individually.
+#[test]
+fn signature_slot_scan_findings() {
+    let mut sig_elements = Vec::new();
+    sig_elements.extend_from_slice(&element(
+        ids::SIGNATURE_ELEMENT_LIST,
+        &element(ids::SIGNED_ELEMENT, &[0xA3]),
+    ));
+    let mut slot = Vec::new();
+    slot.extend_from_slice(&uint_element(ids::SIGNATURE_ALGO, 1));
+    slot.extend_from_slice(&uint_element(ids::SIGNATURE_HASH, 1));
+    slot.extend_from_slice(&element(ids::SIGNATURE, &[0xDE, 0xAD]));
+    slot.extend_from_slice(&element(ids::SIGNATURE_ELEMENTS, &sig_elements));
+    let mut seg = minimal_segment_body();
+    seg.extend_from_slice(&element(ids::SIGNATURE_SLOT, &slot));
+
+    let mut doc = ebml_header("webm");
+    doc.extend_from_slice(&element(ids::SEGMENT, &seg));
+    let report = scan(&mut Cursor::new(&doc)).expect("scan");
+    assert!(report.scan_stopped_at.is_none());
+    assert!(!report.is_conformant());
+    assert_eq!(report.unlisted, 0, "legacy IDs must not classify Unlisted");
+    // SignatureSlot + SignatureAlgo + SignatureHash + Signature +
+    // SignatureElements + SignatureElementList + SignedElement = 7.
+    assert_eq!(report.unsupported, 7);
+    let flagged: Vec<u32> = report.findings.iter().map(|f| f.id).collect();
+    for id in [
+        ids::SIGNATURE_SLOT,
+        ids::SIGNATURE_ALGO,
+        ids::SIGNATURE_HASH,
+        ids::SIGNATURE,
+        ids::SIGNATURE_ELEMENTS,
+        ids::SIGNATURE_ELEMENT_LIST,
+        ids::SIGNED_ELEMENT,
+    ] {
+        assert!(flagged.contains(&id), "missing finding for 0x{id:X}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scanner: conformant + off-profile documents.
 

@@ -1566,13 +1566,18 @@ the unified `oxideav` aggregator to wire decoding automatically.
 - **Guidelines support table** (`webm::webm_element_support(id) ->
   WebmSupport`): the staged WebM container guidelines tabulate, element
   by element, whether a WebM reader supports it. The table is
-  transcribed by Element ID — 239 rows: 137 `Supported`, 98
+  transcribed by Element ID — 250 rows: 137 `Supported`, 109
   `Unsupported`, 4 `Deprecated` (`BlockVirtual` / `TimeSlice` /
   `LaceNumber` / `FrameRate`). Elements newer than the table (e.g. the
   `Projection` master, `LanguageBCP47`, `BlockAdditionMapping`) return
-  `Unlisted`; 11 guideline rows name elements whose IDs appear in
-  neither staged document (the old signature family, `EditionFlagHidden`,
-  `ChapterTrack`, `ChapterTrackNumber`) and classify as `Unlisted` too.
+  `Unlisted`. Every guideline row is keyed to a concrete ID: the 11
+  rows naming elements RFC 9559 dropped without a registry entry (the
+  old Signature family, `EditionFlagHidden`, `ChapterTrack`,
+  `ChapterTrackNumber`) are keyed via the staged legacy-element-ID
+  mapping and classify `Unsupported` exactly as the guidelines say —
+  the guidelines' `ChapterTrackNumber` row is the schema's
+  `ChapterTrackUID` (same ID `0x89`; its payload has always been a
+  TrackUID, so the schema renamed it without reassigning the ID).
 - **Whole-file conformance scan** (`webm::scan(reader) ->
   WebmConformanceReport`): a pure structural EBML walk (headers +
   master descent, leaf bodies skipped — O(file) time, O(depth) memory,
@@ -1723,9 +1728,13 @@ so the demuxer never hides an unrecognised track.
 `Reclaimed`), the 4 all-ones `Reserved` placeholders excluded — and
 cross-checks `src/ids.rs` in CI, both directions: every registry element
 has a const, and every numeric const is a registry entry, one of the 13
-RFC 8794 EBML-header / EBML-global IDs, or the single documented legacy
-exception (`ChapterFlagEnabled`, `0x4598`, which RFC 9559 dropped but
-historical files still carry). Const names must agree with the
+RFC 8794 EBML-header / EBML-global IDs, or one of the 12 documented
+legacy exceptions — `ChapterFlagEnabled` (`0x4598`) plus the
+legacy-element-ID mapping set (`EditionFlagHidden` `0x45BD`,
+`ChapterTrack` `0x8F`, `ChapterTrackUID` `0x89`, and the eight-element
+Signature family under `SignatureSlot` `0x1B538667`), all of which
+Matroska dropped before RFC 9559 without carrying the IDs forward but
+historical files still carry. Const names must agree with the
 registry's Element Names, no `Reserved` ID may be defined, and every ID
 must sit inside the Section 27.1 valid VINT ID classes. The census is
 what backs the "every element in the RFC 9559 element-ID registry is

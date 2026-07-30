@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- WebM conformance: the eleven guideline rows that previously could not
+  be keyed to an Element ID (the legacy Signature family under
+  `SignatureSlot` `0x1B538667`, `EditionFlagHidden` `0x45BD`,
+  `ChapterTrack` `0x8F`, and `ChapterTrackNumber` — the schema's
+  `ChapterTrackUID`, same ID `0x89`) are now mapped via the staged
+  legacy-element-ID doc and classify `Unsupported` exactly as the
+  guidelines table says, instead of falling through to `Unlisted`. The
+  support table grows 239 → 250 rows (98 → 109 `Unsupported`); the
+  `webm::scan` walker descends the four legacy masters so each child
+  occurrence is flagged individually with its offset. `ids.rs` gains the
+  eleven constants (never emitted by the muxer — the IDs are formally
+  unassigned in the IANA registry, so writing them could collide with a
+  future assignment) and the RFC 9559 census pins them as documented
+  out-of-registry legacy exceptions.
 - Muxer: front-`Cues` layout (`MkvMuxer::with_front_cues(reserved_bytes)`,
   RFC 9559 §25.3.3). `write_header` reserves a `Void` before the first
   Cluster; `write_trailer` writes the finished `Cues` into it (remainder
