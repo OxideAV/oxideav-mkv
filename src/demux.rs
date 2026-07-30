@@ -1022,9 +1022,15 @@ fn open_typed_impl(
         })
         .collect();
 
-    // Position at the first Cluster.
-    let cluster_pos = first_cluster_offset.ok_or_else(|| Error::invalid("MKV: no clusters"))?;
-    input.seek(SeekFrom::Start(cluster_pos))?;
+    // Position at the first Cluster. The schema gives `Cluster` no
+    // `minOccurs`, so a Segment with zero Clusters — a metadata-only
+    // file carrying just Info / Tracks / Chapters / Tags / Attachments —
+    // is legal: open succeeds, `next_packet` reports a clean `Error::Eof`
+    // (the reader is parked at the Segment end), and `seek_to` fails
+    // with `Error::Unsupported` since there is nothing to land on.
+    input.seek(SeekFrom::Start(
+        first_cluster_offset.unwrap_or(segment_data_end),
+    ))?;
 
     // Segment\Info\Duration is in Matroska timecode ticks (timecode_scale ns
     // per tick), stored as a float. Translate to microseconds.
@@ -1091,7 +1097,7 @@ fn open_typed_impl(
         resilient,
         damage_events,
         resync_floor: 0,
-        first_cluster_offset: cluster_pos,
+        first_cluster_offset,
         track_uid_to_index,
         chapter_uid_to_index,
         attachment_uid_to_index,
@@ -7980,8 +7986,11 @@ pub struct MkvDemuxer {
     resync_floor: u64,
     /// Absolute offset of the first `Cluster` element header — the anchor
     /// for the resilient Cues-less seek fallback
-    /// ([`MkvDemuxer::seek_by_cluster_scan`]).
-    first_cluster_offset: u64,
+    /// ([`MkvDemuxer::seek_by_cluster_scan`]). `None` for a legal
+    /// zero-Cluster (metadata-only) Segment — the schema gives `Cluster`
+    /// no `minOccurs` — in which case `next_packet` reports a clean
+    /// `Error::Eof` and both seek paths return `Error::Unsupported`.
+    first_cluster_offset: Option<u64>,
     /// `TrackUID` → stream-index map, kept from the open-time walk so a
     /// mid-stream `Tags` element (RFC 9559 §23.2 live tagging) resolves
     /// its `TagTrackUID` scopes exactly like the open-time one.
@@ -9484,7 +9493,13 @@ impl MkvDemuxer {
     /// recorded — the scan is navigation, not packet loss).
     fn seek_by_cluster_scan(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         let target_ticks = self.stream_pts_to_ticks(stream_index, pts);
-        let mut pos = self.first_cluster_offset;
+        // A zero-Cluster Segment has nothing to scan — same signal the
+        // strict path gives when it has no Cues to seek by.
+        let Some(mut pos) = self.first_cluster_offset else {
+            return Err(Error::unsupported(
+                "MKV: no Clusters in Segment — cannot seek",
+            ));
+        };
         // (cluster header offset, cluster timestamp) of the best-so-far
         // candidate; the first parseable Cluster seeds it so a target
         // before the first Cluster lands there (mirroring the Cues path's

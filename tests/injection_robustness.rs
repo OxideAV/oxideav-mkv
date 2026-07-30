@@ -720,9 +720,21 @@ fn open_survives_unknown_size_mastering_metadata_and_chapter_translate() {
 fn fuzz_found_colour_unknown_size_crash_bytes_open_without_panic() {
     // Verbatim fuzz-found crash input (2026-07-03 scheduled cycle) —
     // preserved as fuzz/corpus/demux/regression_colour_unknown_size.bin.
+    // The pinned contract is the fuzz harness's: no panic and no
+    // add-overflow, whatever the open's verdict. (The input carries no
+    // Cluster; when zero-Cluster Segments became legal the strict open
+    // started accepting its recoverable prefix, so the outcome is Ok —
+    // asserting `is_err` was pinning the old zero-Cluster rejection, not
+    // the crash fix.) If it opens, draining must end in a clean error,
+    // not a panic.
     let bytes: &[u8] = include_bytes!("../fuzz/corpus/demux/regression_colour_unknown_size.bin");
-    let r = open(bytes.to_vec());
-    assert!(r.is_err(), "fuzz crash bytes unexpectedly opened cleanly");
+    if let Ok(mut dmx) = open(bytes.to_vec()) {
+        for _ in 0..64 {
+            if dmx.next_packet().is_err() {
+                break;
+            }
+        }
+    }
 }
 
 // =====================================================================

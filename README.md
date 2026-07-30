@@ -478,6 +478,15 @@ the unified `oxideav` aggregator to wire decoding automatically.
   still returns `Error::Unsupported` — the RFC 9559 §23.2 "neither
   SeekHead nor Cues at the start SHOULD be considered non-seekable"
   signal stays observable.
+- **Zero-Cluster (metadata-only) Segments open** — the schema gives
+  `Cluster` no `minOccurs`, so a Segment carrying only Info / Tracks /
+  Chapters / Tags / Attachments (a chapters-only sidecar, or the
+  in-tree muxer's own zero-packet output) is legal: strict and
+  resilient opens both succeed with zero `DamageEvent`s, every
+  non-Cluster master surfaces through its usual accessor,
+  `next_packet` reports a clean `Error::Eof` from the first call, and
+  `seek_to` returns `Error::Unsupported` (nothing to land on) in both
+  modes.
 - Duration: `Segment\Info\Duration` translated to microseconds.
 - **Linked-Segment `Info` metadata** (RFC 9559 §5.1.2.1..§5.1.2.8 +
   Section 17) via `MkvDemuxer::segment_linking()` → [`SegmentLinking`]:

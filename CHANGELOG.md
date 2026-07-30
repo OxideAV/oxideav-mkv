@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: zero-Cluster (metadata-only) Segments open. The schema gives
+  `Cluster` no `minOccurs`, so a Segment with only Info / Tracks /
+  Chapters / Tags / Attachments is legal; previously both open paths
+  rejected it with "no clusters". Strict and resilient opens now
+  succeed (zero `DamageEvent`s), non-Cluster masters surface through
+  their usual accessors, `next_packet` reports a clean `Error::Eof`
+  from the first call, and `seek_to` returns `Error::Unsupported` in
+  both modes (the Cues path already did; the resilient Cues-less
+  cluster-scan fallback now does too instead of scanning nothing). The
+  in-tree muxer's zero-packet output round-trips. 5 integration tests
+  in `tests/zero_cluster.rs`; the fuzz-regression pin in
+  `tests/injection_robustness.rs` re-anchored on the no-panic contract
+  it was actually protecting (its `is_err` assertion had been pinning
+  the old zero-Cluster rejection).
 - Demuxer: legacy pre-registry element handling per the staged
   legacy-element-ID mapping. `Edition::hidden` surfaces the legacy
   `EditionFlagHidden` (`0x45BD`, historical default `0` materialised);

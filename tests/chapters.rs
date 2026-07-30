@@ -146,7 +146,8 @@ fn build_mkv_with_chapters() -> Vec<u8> {
     let edition = elem_master(ids::EDITION_ENTRY, &edition_body);
     let chapters = elem_master(ids::CHAPTERS, &edition);
 
-    // One cluster so the demuxer is happy (no clusters → "no clusters" error).
+    // One cluster so the file exercises the ordinary stream path too
+    // (zero-Cluster files are legal and covered by tests/zero_cluster.rs).
     let mut cluster_body = Vec::new();
     cluster_body.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
     cluster_body.extend_from_slice(&simple_block(1, 0, true, 0xAA));
