@@ -28,8 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   elements legally stay off-disk per RFC 8794 §11.1.6.2), `CRC-32`
   first-child placement (`MisplacedCrc32`), and `unknownsizeallowed`
   (`UnknownSizeNotAllowed`) violations, plus informational
-  `UnknownId` / `Deprecated` / `VersionMismatch` findings that do not
-  fail `is_valid()`. O(file)/O(depth) structural walk, findings with
+  `UnknownId` / `KnownLegacy` (the removed Signature family,
+  recognised and descended per the staged mapping doc) / `Deprecated`
+  / `VersionMismatch` findings that do not fail `is_valid()`. O(file)/O(depth) structural walk, findings with
   absolute offsets capped at 4096, exact counters, damage surfaces as
   `scan_stopped_at`. The in-tree muxer's output validates with zero
   findings of any kind — pinned in CI. 10 tests in

@@ -336,11 +336,14 @@ fn unknown_size_where_not_allowed_stops_walk() {
 
 #[test]
 fn informational_kinds_do_not_fail_validation() {
-    // UnknownId: a legacy Signature element (absent from the schema);
+    // KnownLegacy: a legacy Signature element (absent from the schema
+    // by design, recognised per legacy-element-ids.md);
+    // UnknownId: a genuinely unassigned two-octet ID;
     // Deprecated: a SilentTracks master (maxver 0);
     // VersionMismatch: LanguageBCP47 (minver 4) in a DocTypeVersion-2
     // document.
     let sig = elem_bin(ids::SIGNATURE, &[0xDE, 0xAD]);
+    let unknown = elem_bin(0x7EEE, &[0x01]);
     let mut c = Vec::new();
     c.extend_from_slice(&elem_uint(ids::TIMECODE, 0));
     c.extend_from_slice(&elem_master(
@@ -356,6 +359,7 @@ fn informational_kinds_do_not_fail_validation() {
     seg.extend_from_slice(&info());
     seg.extend_from_slice(&tracks);
     seg.extend_from_slice(&sig);
+    seg.extend_from_slice(&unknown);
     seg.extend_from_slice(&cl);
     let mut bytes = ebml_header("matroska", 2);
     bytes.extend_from_slice(&elem_master(ids::SEGMENT, &seg));
@@ -367,12 +371,56 @@ fn informational_kinds_do_not_fail_validation() {
         report.findings
     );
     assert_eq!(report.violations, 0);
-    assert!(report.informational >= 4, "{:?}", report.findings);
+    assert!(report.informational >= 5, "{:?}", report.findings);
     let ks = kinds(&report);
+    assert!(ks.contains(&SchemaFindingKind::KnownLegacy));
     assert!(ks.contains(&SchemaFindingKind::UnknownId));
     assert!(ks.contains(&SchemaFindingKind::Deprecated));
     assert!(ks.contains(&SchemaFindingKind::VersionMismatch));
     assert!(ks.iter().all(|k| !k.is_violation()));
+}
+
+/// A full legacy `SignatureSlot` (per the mapping doc's nesting) is
+/// descended: the slot and every child classify `KnownLegacy` — never
+/// `UnknownId` — and the document stays valid.
+#[test]
+fn signature_slot_classifies_known_legacy_with_descent() {
+    let list = elem_master(
+        ids::SIGNATURE_ELEMENT_LIST,
+        &elem_bin(ids::SIGNED_ELEMENT, &[0xA3]),
+    );
+    let elements = elem_master(ids::SIGNATURE_ELEMENTS, &list);
+    let mut slot = Vec::new();
+    slot.extend_from_slice(&elem_uint(ids::SIGNATURE_ALGO, 1));
+    slot.extend_from_slice(&elem_uint(ids::SIGNATURE_HASH, 1));
+    slot.extend_from_slice(&elem_bin(ids::SIGNATURE_PUBLIC_KEY, &[0x01]));
+    slot.extend_from_slice(&elem_bin(ids::SIGNATURE, &[0xDE]));
+    slot.extend_from_slice(&elements);
+    let slot = elem_master(ids::SIGNATURE_SLOT, &slot);
+
+    let report = run(&doc(&[&info(), &tracks(), &slot, &cluster()]));
+    assert!(report.is_valid(), "{:?}", report.findings);
+    let legacy: Vec<u32> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == SchemaFindingKind::KnownLegacy)
+        .map(|f| f.id)
+        .collect();
+    // Slot + 7 descended family members.
+    assert_eq!(legacy.len(), 8, "{:?}", report.findings);
+    for id in [
+        ids::SIGNATURE_SLOT,
+        ids::SIGNATURE_ALGO,
+        ids::SIGNATURE_HASH,
+        ids::SIGNATURE_PUBLIC_KEY,
+        ids::SIGNATURE,
+        ids::SIGNATURE_ELEMENTS,
+        ids::SIGNATURE_ELEMENT_LIST,
+        ids::SIGNED_ELEMENT,
+    ] {
+        assert!(legacy.contains(&id), "missing KnownLegacy for 0x{id:X}");
+    }
+    assert!(!kinds(&report).contains(&SchemaFindingKind::UnknownId));
 }
 
 /// Every fuzz corpus seed (valid, malformed, and crash-regression

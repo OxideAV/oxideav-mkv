@@ -629,6 +629,13 @@ pub enum SchemaFindingKind {
     /// a `DocTypeExtension` or a newer schema (the removed legacy
     /// Signature family also lands here — the schema dropped it).
     UnknownId,
+    /// The element is one of the removed legacy Signature-family
+    /// globals (`SignatureSlot` + children, staged
+    /// `legacy-element-ids.md`) — absent from the schema by design but
+    /// recognised so a legacy file is not reported as carrying unknown
+    /// data. The validator descends the family's masters so children
+    /// classify individually. Informational.
+    KnownLegacy,
     /// The element occurs under a master the schema does not name as
     /// its parent (recursion and the `Void` / `CRC-32` globals are
     /// exempt). Violation.
@@ -671,12 +678,13 @@ pub enum SchemaFindingKind {
 
 impl SchemaFindingKind {
     /// `true` for the kinds that fail [`SchemaReport::is_valid`];
-    /// `false` for the informational ones (`UnknownId`, `Deprecated`,
-    /// `VersionMismatch`).
+    /// `false` for the informational ones (`UnknownId`, `KnownLegacy`,
+    /// `Deprecated`, `VersionMismatch`).
     pub fn is_violation(&self) -> bool {
         !matches!(
             self,
             SchemaFindingKind::UnknownId
+                | SchemaFindingKind::KnownLegacy
                 | SchemaFindingKind::Deprecated
                 | SchemaFindingKind::VersionMismatch
         )
@@ -881,6 +889,28 @@ fn push_finding(report: &mut SchemaReport, offset: u64, id: u32, kind: SchemaFin
     }
 }
 
+/// The removed legacy Signature-family element IDs (staged
+/// `legacy-element-ids.md`) — absent from the schema by design;
+/// classified [`SchemaFindingKind::KnownLegacy`] instead of
+/// [`SchemaFindingKind::UnknownId`].
+const LEGACY_SIGNATURE_IDS: [u32; 8] = [
+    ids::SIGNATURE_SLOT,
+    ids::SIGNATURE_ALGO,
+    ids::SIGNATURE_HASH,
+    ids::SIGNATURE_PUBLIC_KEY,
+    ids::SIGNATURE,
+    ids::SIGNATURE_ELEMENTS,
+    ids::SIGNATURE_ELEMENT_LIST,
+    ids::SIGNED_ELEMENT,
+];
+
+/// The Signature-family masters the validator descends.
+const LEGACY_SIGNATURE_MASTERS: [u32; 3] = [
+    ids::SIGNATURE_SLOT,
+    ids::SIGNATURE_ELEMENTS,
+    ids::SIGNATURE_ELEMENT_LIST,
+];
+
 /// IDs that terminate an unknown-size master: any element that is a
 /// legal child of an *ancestor* (RFC 8794 §6.2). We approximate with
 /// the Top-Level set + Segment, which covers the two
@@ -943,6 +973,11 @@ fn walk_master<R: Read + Seek>(
 
         // --- identity + placement ------------------------------------
         match def {
+            None if LEGACY_SIGNATURE_IDS.contains(&header.id) => {
+                // Removed legacy Signature family (legacy-element-ids.md):
+                // recognised, never reported as unknown data.
+                push_finding(report, pos, header.id, SchemaFindingKind::KnownLegacy);
+            }
             None => push_finding(report, pos, header.id, SchemaFindingKind::UnknownId),
             Some(d) => {
                 let is_global = d.parent_id.is_none() && d.element_type != ElementType::Master
@@ -1037,6 +1072,13 @@ fn walk_master<R: Read + Seek>(
             }
             Some(d) if d.element_type == ElementType::Master => {}
             Some(d) => check_leaf(r, d, pos, body, header.size, report)?,
+            None if LEGACY_SIGNATURE_MASTERS.contains(&header.id) && depth < MAX_SCHEMA_DEPTH => {
+                // Descend the legacy Signature masters so each child
+                // classifies individually (as KnownLegacy). No schema
+                // parent context — legacy children carry no schema rows
+                // to check placement against.
+                walk_master(r, body, next, None, None, depth + 1, report)?;
+            }
             None => {}
         }
         pos = next;

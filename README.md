@@ -1673,7 +1673,10 @@ the unified `oxideav` aggregator to wire decoding automatically.
   for `CRC-32` (`MisplacedCrc32`), `unknownsizeallowed` gating
   (`UnknownSizeNotAllowed`), and the version window (`Deprecated` +
   `VersionMismatch` against the header's `DocTypeVersion`,
-  informational). `is_valid()` = zero violations + clean walk;
+  informational). The removed legacy Signature family classifies
+  `KnownLegacy` (informational, masters descended) rather than
+  `UnknownId`, per the staged mapping doc's recognise-and-skip
+  recommendation. `is_valid()` = zero violations + clean walk;
   findings carry absolute offsets, capped at 4096 with exact
   counters. The in-tree muxer's own output validates with zero
   violations and zero informational findings — pinned in CI
