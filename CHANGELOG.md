@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: legacy pre-registry element handling per the staged
+  legacy-element-ID mapping. `Edition::hidden` surfaces the legacy
+  `EditionFlagHidden` (`0x45BD`, historical default `0` materialised);
+  `Chapter::track_uids` surfaces the legacy `ChapterTrack` (`0x8F`) >
+  `ChapterTrackUID` (`0x89`) TrackUID list in on-disk order (zeros
+  dropped per the "not 0" range; empty = "all tracks apply"); and the
+  removed global Signature family (`SignatureSlot` `0x1B538667` +
+  children) is recognised and skipped as known-legacy — strict opens
+  step over it, resilient opens record no `DamageEvent`, and the
+  damaged-stream resync scanner can re-anchor on its four-octet ID.
+  Read-side only; the muxer never emits any of the eleven elements. 6
+  integration tests in `tests/legacy_elements.rs`.
 - WebM conformance: the eleven guideline rows that previously could not
   be keyed to an Element ID (the legacy Signature family under
   `SignatureSlot` `0x1B538667`, `EditionFlagHidden` `0x45BD`,

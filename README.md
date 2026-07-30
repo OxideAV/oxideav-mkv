@@ -428,6 +428,21 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `chapter:N:*` keys and `TagChapterUID`-resolved tags use, now extended
   to nested chapters. Returns an empty slice when the file has no
   `Chapters` element.
+- **Legacy pre-registry elements** (staged `legacy-element-ids.md`
+  mapping — three groups Matroska dropped before RFC 9559 without
+  registry rows, their IDs formally unassigned in the IANA registry):
+  `Edition::hidden` reads the legacy `EditionFlagHidden` (id `0x45BD`,
+  historical default `0` materialised); `Chapter::track_uids` reads the
+  legacy `ChapterTrack` (id `0x8F`) > `ChapterTrackUID` (id `0x89` —
+  the element old schemas spell `ChapterTrackNumber`) list in on-disk
+  order with spec-illegal zeros dropped, empty = "all tracks apply";
+  and the removed *global* Signature family (`SignatureSlot`
+  `0x1B538667` + seven children) is recognised and skipped as
+  known-legacy — a strict open steps over it, a resilient open records
+  no `DamageEvent` for it, and the resync scanner can re-anchor on its
+  four-octet ID. All three groups are read-side only: the muxer never
+  emits them (an unassigned ID could collide with a future registry
+  assignment).
 - **Damage-resilient open** (`demux::open_resilient` /
   `demux::open_resilient_typed`): RFC 9559 §26 leaves error handling to
   the Reader ("Matroska Readers decide how to handle the errors whether

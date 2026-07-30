@@ -365,6 +365,23 @@ fn open_typed_impl(
                     let end = body_end_known.unwrap_or(segment_data_end);
                     parse_seek_head(&mut *input, end, &mut seek_entries)?;
                 }
+                // Legacy SignatureSlot (0x1B538667, staged
+                // legacy-element-ids.md): a removed *global* element
+                // whose 4-byte ID sits in the Top-Level ID class, so a
+                // top-level dispatcher must be prepared to see it.
+                // Recognised and skipped as known-legacy — never parsed
+                // (the container assigns it no semantics) and never
+                // emitted (its ID is formally unassigned in the IANA
+                // registry).
+                ids::SIGNATURE_SLOT => {
+                    if let Some(end) = body_end_known {
+                        input.seek(SeekFrom::Start(end))?;
+                    } else {
+                        return Err(Error::unsupported(
+                            "MKV: unknown-size element other than Cluster",
+                        ));
+                    }
+                }
                 _ => {
                     if let Some(end) = body_end_known {
                         input.seek(SeekFrom::Start(end))?;
@@ -1155,8 +1172,11 @@ impl DamageEvent {
 /// The 4-byte Top-Level element IDs a resync scan re-anchors on. Every
 /// direct child of `Segment` defined by RFC 9559 uses a 4-byte ID, which
 /// is what makes byte-level scanning viable: a single flags byte can't
-/// fake one.
-const TOP_LEVEL_IDS: [u32; 8] = [
+/// fake one. The legacy `SignatureSlot` (staged `legacy-element-ids.md`;
+/// a removed *global* element whose 4-byte ID sits in the same class) is
+/// a valid re-anchor too: the walk recognises and skips it, so anchoring
+/// on one recovers more bytes than scanning past it.
+const TOP_LEVEL_IDS: [u32; 9] = [
     ids::CLUSTER,
     ids::CUES,
     ids::TRACKS,
@@ -1165,6 +1185,7 @@ const TOP_LEVEL_IDS: [u32; 8] = [
     ids::CHAPTERS,
     ids::ATTACHMENTS,
     ids::SEEK_HEAD,
+    ids::SIGNATURE_SLOT,
 ];
 
 /// Child-element IDs that legitimately start a `Cluster` body. Used to
@@ -5660,6 +5681,15 @@ pub struct Edition {
     /// `EditionFlagOrdered` (RFC 9559 §5.1.7.1.3). `true` for an ordered
     /// edition (chapter playback order is enforced). Defaults to `false`.
     pub ordered: bool,
+    /// `EditionFlagHidden` (id `0x45BD`) — a legacy pre-RFC element RFC
+    /// 9559 dropped without a registry row (see the staged
+    /// `legacy-element-ids.md` mapping): "Set to 1 if an edition is
+    /// hidden. Hidden editions SHOULD NOT be available to the user
+    /// interface." Historical default `0` materialised as `false` when
+    /// the element is absent, mirroring the sibling flags. Read-only:
+    /// the muxer never emits the element (the ID is formally unassigned
+    /// in the IANA registry).
+    pub hidden: bool,
     /// Top-level `ChapterAtom`s in on-disk order. Nested chapters live in
     /// each [`Chapter::children`].
     pub chapters: Vec<Chapter>,
@@ -5724,6 +5754,18 @@ pub struct Chapter {
     /// the chapter-codec commands (DVD-menu / Matroska-Script) attached to
     /// this atom. Empty when the atom carries no process commands.
     pub chap_processes: Vec<ChapProcess>,
+    /// TrackUIDs from the legacy `ChapterTrack` master (id `0x8F`) — the
+    /// "list of tracks on which the chapter applies; if this element is
+    /// not present, all tracks apply". RFC 9559 dropped the master and
+    /// its `ChapterTrackUID` child (id `0x89` — the element the pre-2016
+    /// schema and the WebM guidelines spell `ChapterTrackNumber`; the
+    /// payload has always been a TrackUID) without registry rows; see
+    /// the staged `legacy-element-ids.md` mapping. Values are surfaced
+    /// verbatim in on-disk order with spec-illegal zeros dropped (range
+    /// "not 0"); an empty list means "applies to all tracks". Read-only:
+    /// the muxer never emits the elements (the IDs are formally
+    /// unassigned in the IANA registry).
+    pub track_uids: Vec<u64>,
     /// Nested `ChapterAtom`s (RFC 9559 §5.1.7.1.4 is `recursive`).
     pub children: Vec<Chapter>,
 }
@@ -5745,6 +5787,7 @@ impl Default for Chapter {
             physical_equiv: None,
             displays: Vec::new(),
             chap_processes: Vec::new(),
+            track_uids: Vec::new(),
             children: Vec::new(),
         }
     }
@@ -5882,6 +5925,10 @@ fn parse_edition_entry(
             }
             ids::EDITION_FLAG_DEFAULT => edition.default = read_uint(r, e.size as usize)? != 0,
             ids::EDITION_FLAG_ORDERED => edition.ordered = read_uint(r, e.size as usize)? != 0,
+            // Legacy EditionFlagHidden (0x45BD, outside the RFC 9559
+            // registry — staged legacy-element-ids.md): historical
+            // default 0, uinteger 0-1.
+            ids::EDITION_FLAG_HIDDEN => edition.hidden = read_uint(r, e.size as usize)? != 0,
             ids::CHAPTER_ATOM => {
                 let ca_end = r.stream_position()?.saturating_add(e.size);
                 let atom = parse_chapter_atom(
@@ -5974,6 +6021,25 @@ fn parse_chapter_atom(
             ids::CHAP_PROCESS => {
                 let cp_end = r.stream_position()?.saturating_add(e.size);
                 atom.chap_processes.push(parse_chap_process(r, cp_end)?);
+            }
+            // Legacy ChapterTrack master (0x8F, outside the RFC 9559
+            // registry — staged legacy-element-ids.md): collect its
+            // ChapterTrackUID children (0x89, "not 0", unbounded) in
+            // on-disk order; zeros are spec-illegal and dropped.
+            ids::CHAPTER_TRACK => {
+                let ct_end = r.stream_position()?.saturating_add(e.size);
+                while r.stream_position()? < ct_end {
+                    let c = read_element_header(r)?;
+                    match c.id {
+                        ids::CHAPTER_TRACK_UID => {
+                            let v = read_uint(r, c.size as usize)?;
+                            if v != 0 {
+                                atom.track_uids.push(v);
+                            }
+                        }
+                        _ => skip(r, c.size)?,
+                    }
+                }
             }
             ids::CHAPTER_ATOM => {
                 let ca_end = r.stream_position()?.saturating_add(e.size);
