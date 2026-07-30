@@ -375,6 +375,39 @@ fn informational_kinds_do_not_fail_validation() {
     assert!(ks.iter().all(|k| !k.is_violation()));
 }
 
+/// Every fuzz corpus seed (valid, malformed, and crash-regression
+/// alike) replays through the validator without panicking, and the
+/// report invariants the fuzz harness asserts hold here too.
+#[test]
+fn fuzz_corpus_seeds_replay_through_validator() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/demux");
+    let mut seen = 0;
+    for entry in std::fs::read_dir(dir).expect("fuzz corpus dir") {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        seen += 1;
+        let data = std::fs::read(&path).unwrap();
+        if let Ok(report) = validate(&mut Cursor::new(&data)) {
+            if !report.findings_truncated {
+                let recorded_violations = report
+                    .findings
+                    .iter()
+                    .filter(|f| f.kind.is_violation())
+                    .count() as u64;
+                assert_eq!(report.violations, recorded_violations, "{path:?}");
+            }
+            assert_eq!(
+                report.is_valid(),
+                report.violations == 0 && report.scan_stopped_at.is_none(),
+                "{path:?}"
+            );
+        }
+    }
+    assert!(seen >= 8, "corpus dir unexpectedly small: {seen}");
+}
+
 #[test]
 fn arbitrary_bytes_never_panic_validator() {
     // Deterministic splitmix64-driven byte soup — the validator must

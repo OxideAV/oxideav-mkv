@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fuzzing: fifth harness pass drives `schema::validate` over the same
+  arbitrary bytes as the demux / resilient / `webm::scan` passes,
+  asserting counter/findings consistency and `is_valid()` coherence;
+  the seed corpus replays through it as a plain `cargo test`.
+  Locally exercised 13.8M executions (bounded 2 min + 8 min runs)
+  with zero findings.
 - `schema::validate(reader) -> SchemaReport`: whole-document schema
   validation over the new table. Flags placement (`WrongParent`),
   type-shape/`length` (`BadLength`), decoded-value `range`

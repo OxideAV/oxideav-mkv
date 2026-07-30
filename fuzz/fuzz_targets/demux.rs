@@ -166,4 +166,34 @@ fuzz_target!(|data: &[u8]| {
             assert!(report.unsupported + report.deprecated > report.findings.len() as u64);
         }
     }
+
+    // Fifth pass: the whole-document schema validator
+    // (`schema::validate`) — path/occurrence/range checks over the same
+    // structural walk shape. Contract: no panic, bounded allocation
+    // (leaf reads are <= 8 bytes), guaranteed termination, exact
+    // violation/informational counters consistent with the capped
+    // findings list, and `is_valid()` agreeing with the counters.
+    let mut cur5 = Cursor::new(data.to_vec());
+    if let Ok(report) = oxideav_mkv::schema::validate(&mut cur5) {
+        let recorded_violations = report
+            .findings
+            .iter()
+            .filter(|f| f.kind.is_violation())
+            .count() as u64;
+        let recorded_info = report.findings.len() as u64 - recorded_violations;
+        if report.findings_truncated {
+            assert!(
+                report.violations + report.informational > report.findings.len() as u64,
+                "truncation implies more findings than recorded"
+            );
+        } else {
+            assert_eq!(report.violations, recorded_violations);
+            assert_eq!(report.informational, recorded_info);
+        }
+        assert_eq!(
+            report.is_valid(),
+            report.violations == 0 && report.scan_stopped_at.is_none(),
+            "is_valid must agree with the counters"
+        );
+    }
 });

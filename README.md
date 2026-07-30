@@ -1881,7 +1881,11 @@ fuzzes the typed-accessor surface — the per-Block `block_additions` /
 lists, and the Chapters / SeekHead trees. A fourth pass runs the
 `webm::scan` conformance walker over the same bytes, asserting its
 per-status counters always sum to `elements_scanned` (the seed corpus
-also replays through it as a plain `cargo test`). A third pass drives
+also replays through it as a plain `cargo test`). A fifth pass runs
+the `schema::validate` whole-document validator, asserting its
+violation / informational counters stay consistent with the capped
+findings list and that `is_valid()` agrees with the counters (corpus
+replay as a plain `cargo test` too). A third pass drives
 `open_resilient_typed` with a contract stronger than no-panic: a
 resilient `next_packet` may only fail with the clean `Error::Eof` (any
 other error class panics the harness), damage-event bookkeeping must
