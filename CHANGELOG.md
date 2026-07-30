@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `examples/schema_validate.rs`: dev CLI printing a file's schema
+  verdict, per-class counters, and every finding with offset + element
+  name; exit 0 valid / 1 not valid / 2 usage. Black-box validated:
+  audio-only Matroska and VP9+Opus WebM files from a widely-deployed
+  muxer both report zero violations and zero informational findings.
 - Fuzzing: fifth harness pass drives `schema::validate` over the same
   arbitrary bytes as the demux / resilient / `webm::scan` passes,
   asserting counter/findings consistency and `is_valid()` coherence;
