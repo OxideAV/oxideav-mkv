@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxer: RFC 9559 §25.2 SeekHead-expansion reservation
+  (`MkvMuxer::with_seek_head_expansion_void(reserved_bytes)`).
+  `write_header` writes a `Void` of exactly the requested size (>= 2)
+  immediately after the SeekHead so a downstream editor can expand the
+  SeekHead in place to cover late-added Tags / Chapters / Attachments;
+  caller-sized per the §25.2 "size ... should be adjusted" note (one
+  extra fixed-width Seek entry = 21 bytes). SeekPositions still land on
+  their targets with the `Void` in between; conflicts with
+  `with_live_streaming` both ways (§25.3.4 writes no SeekHead);
+  in-profile under strict WebM. Read-back accessor
+  `seek_head_expansion_void()`. 5 integration tests in
+  `tests/mux_seek_head_expansion.rs`.
 - Demuxer: zero-Cluster (metadata-only) Segments open. The schema gives
   `Cluster` no `minOccurs`, so a Segment with only Info / Tracks /
   Chapters / Tags / Attachments is legal; previously both open paths

@@ -466,6 +466,12 @@ pub struct MkvMuxer {
     /// Opt-in via [`MkvMuxer::with_front_cues`]: number of bytes reserved
     /// before the first Cluster for the §25.3.3 front-`Cues` layout.
     front_cues_reserved: Option<u64>,
+    /// Opt-in via [`MkvMuxer::with_seek_head_expansion_void`]: number of
+    /// bytes of `Void` written immediately after the first `SeekHead`,
+    /// per the RFC 9559 §25.2 recommendation, so a later editor can
+    /// expand the SeekHead in place to cover Top-Level elements added
+    /// after the fact.
+    seek_head_expansion_void: Option<u64>,
     /// Absolute file offset of the reserved front-`Cues` Void slot.
     front_cues_slot_abs: Option<u64>,
     /// Per-Cluster duration budget (ms). Defaults to the §25.1
@@ -2134,6 +2140,7 @@ impl MkvMuxer {
             duration_patch_in_body: 0,
             cluster_bytes: 0,
             front_cues_reserved: None,
+            seek_head_expansion_void: None,
             front_cues_slot_abs: None,
             cluster_max_ms: CLUSTER_DURATION_MS,
             cluster_max_bytes: CLUSTER_MAX_BYTES,
@@ -2348,6 +2355,61 @@ impl MkvMuxer {
         self.front_cues_reserved
     }
 
+    /// Opt in to the RFC 9559 §25.2 SeekHead-expansion reservation: "It
+    /// is RECOMMENDED that the first SeekHead element be followed by a
+    /// Void element to allow for the SeekHead element to be expanded to
+    /// cover new Top-Level Elements that could be added to the Matroska
+    /// file, such as Tags, Chapters, and Attachments elements."
+    /// `write_header` writes a `Void` of exactly `reserved_bytes` bytes
+    /// immediately after the SeekHead, so a later editor can grow the
+    /// SeekHead in place (absorbing the Void) without rewriting the
+    /// whole file.
+    ///
+    /// §25.2 continues: "The size of this Void element should be
+    /// adjusted depending on the Tags, Chapters, and Attachments
+    /// elements in the Matroska file" — so the reservation is
+    /// caller-sized. Rule of thumb for this muxer's fixed-width
+    /// SeekHead: one additional Seek entry costs 21 bytes, so one
+    /// spare entry per Top-Level element an editor might add (plus the
+    /// 2-byte Void header) is a reasonable floor. The muxer itself
+    /// never grows its SeekHead — it reserves all six slots up front —
+    /// so the Void is purely for downstream editors and stays a Void
+    /// in this muxer's own output.
+    ///
+    /// Must be called before [`Muxer::write_header`]. `reserved_bytes`
+    /// must be at least 2 (the smallest encodable `Void`). Conflicts
+    /// with [`MkvMuxer::with_live_streaming`] (the §25.3.4 live layout
+    /// writes no SeekHead for the Void to expand into). In-profile
+    /// under strict WebM (`Void` is a guidelines-supported element).
+    pub fn with_seek_head_expansion_void(&mut self, reserved_bytes: u32) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: with_seek_head_expansion_void called after write_header",
+            ));
+        }
+        if self.live_streaming {
+            return Err(Error::other(
+                "MKV muxer: with_seek_head_expansion_void conflicts with with_live_streaming \
+                 (the RFC 9559 §25.3.4 live layout writes no SeekHead)",
+            ));
+        }
+        if reserved_bytes < 2 {
+            return Err(Error::invalid(format!(
+                "MKV muxer: with_seek_head_expansion_void reserved_bytes {reserved_bytes} \
+                 out of range (>= 2, the smallest encodable Void)"
+            )));
+        }
+        self.seek_head_expansion_void = Some(reserved_bytes as u64);
+        Ok(self)
+    }
+
+    /// Read-only accessor: the §25.2 SeekHead-expansion `Void` size
+    /// installed via [`MkvMuxer::with_seek_head_expansion_void`], `None`
+    /// when no reservation was requested (the default).
+    pub fn seek_head_expansion_void(&self) -> Option<u64> {
+        self.seek_head_expansion_void
+    }
+
     /// Opt a WebM muxer out of strict profile gating.
     ///
     /// By default a WebM muxer ([`crate::mux::open_webm`] /
@@ -2452,6 +2514,12 @@ impl MkvMuxer {
             return Err(Error::other(
                 "MKV muxer: with_live_streaming conflicts with with_front_cues \
                  (a live stream writes no Cues at all, RFC 9559 §25.3.4)",
+            ));
+        }
+        if self.seek_head_expansion_void.is_some() {
+            return Err(Error::other(
+                "MKV muxer: with_live_streaming conflicts with with_seek_head_expansion_void \
+                 (the RFC 9559 §25.3.4 live layout writes no SeekHead)",
             ));
         }
         self.live_streaming = true;
@@ -4774,6 +4842,15 @@ impl Muxer for MkvMuxer {
             // Sanity: SeekHead occupies a known total size; the next
             // element starts immediately after.
             debug_assert_eq!(seek_head_bytes.len(), SEEK_HEAD_TOTAL_LEN);
+            // RFC 9559 §25.2: "It is RECOMMENDED that the first SeekHead
+            // element be followed by a Void element to allow for the
+            // SeekHead element to be expanded" — opt-in, caller-sized
+            // reservation for downstream editors (this muxer reserves
+            // all six Seek slots up front and never grows its own
+            // SeekHead, so it leaves the Void untouched).
+            if let Some(n) = self.seek_head_expansion_void {
+                all.extend_from_slice(&make_void(n as usize));
+            }
             Some(start)
         };
 

@@ -971,6 +971,21 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `with_live_streaming` in both directions (§25.3.4: a live stream
   writes no Cues). Works in strict WebM mode (Cues + Void are both
   in-profile). Black-box validated with a widely-deployed prober.
+- **SeekHead-expansion `Void`** (RFC 9559 §25.2 "It is RECOMMENDED that
+  the first SeekHead element be followed by a Void element to allow for
+  the SeekHead element to be expanded"): opt-in via
+  `MkvMuxer::with_seek_head_expansion_void(reserved_bytes)`.
+  `write_header` writes a `Void` of exactly the requested size (>= 2,
+  the smallest encodable `Void`) immediately after the SeekHead, before
+  `Info`, so a downstream editor can grow the SeekHead in place —
+  §25.2 sizes the reservation "depending on the Tags, Chapters, and
+  Attachments elements", hence caller-sized (one extra fixed-width Seek
+  entry costs 21 bytes). The muxer itself never grows its SeekHead (all
+  six slots are reserved up front), so its own output keeps the `Void`
+  intact; the patched SeekPositions still land on their targets with
+  the `Void` in between. Conflicts with `with_live_streaming` in both
+  directions (§25.3.4 writes no SeekHead). In-profile under strict
+  WebM (`Void` is guidelines-Supported).
 - **Two-pass `Duration` finalization** (RFC 9559 §5.1.2.10): opt-in via
   `MkvMuxer::with_duration_finalization()`. `write_header` reserves a
   `Duration`-sized `Void` inside `Info` (at the §5.1.2 element-order
