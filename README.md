@@ -1636,6 +1636,29 @@ the unified `oxideav` aggregator to wire decoding automatically.
   hostile shapes (every-truncation-point sweep, 4000-deep nesting,
   findings flood, arbitrary-byte soup).
 
+### Machine-readable element schema (`schema` module)
+
+- **Full schema table** (`schema::SCHEMA`, `schema::element_def(id)`):
+  the staged IETF CELLAR EBML Schema for Matroska (`ebml_matroska.xml`)
+  transcribed as 262 `ElementDef` rows — per element: name, schema
+  path, derived parent ID, EBML type, `minOccurs` / `maxOccurs`,
+  verbatim `range` / `length` / `default` constraint strings, the
+  `minver` / `maxver` version window (the 43 `maxver: 0` rows are the
+  RFC 9559 "Reclaimed" set; `is_deprecated()` reads the window), the
+  `recursive` / `recurring` / `unknownsizeallowed` structural markers,
+  and the `webmproject.org` WebM-usability extension marker (133 rows
+  carry it). A superset of the RFC 9559 registry: the six post-RFC
+  `minver: 5` elements and the legacy chapter elements are present;
+  the removed Signature family is absent by design (its recognition
+  lives in `ids` + the demuxer). `schema::EBML_SUPPLEMENT` adds the
+  RFC 8794 EBML-header elements and the `Void` / `CRC-32` globals so
+  `element_def` resolves everything a well-formed document carries.
+  `tests/schema_census.rs` pins the table shape, every row's
+  path/parent consistency, both directions of the `ids.rs`
+  cross-census, and the corroboration between schema `webm` markers
+  and the guidelines support table (zero marker-vs-Unsupported
+  conflicts; exactly three explainable Supported-without-marker rows).
+
 ### Codec ID mapping (`codec_id` module)
 
 Matroska `CodecID` string <-> oxideav `CodecId`. Both directions are

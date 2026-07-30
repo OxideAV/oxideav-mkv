@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `schema` module: the staged IETF CELLAR EBML Schema for Matroska
+  (`ebml_matroska.xml`) wired in as a machine-readable validation
+  table. `schema::SCHEMA` holds all 262 elements (id / name / path /
+  parent / EBML type / minOccurs / maxOccurs / verbatim range-length-
+  default constraints / minver-maxver window / recursive / recurring /
+  unknownsizeallowed / WebM extension marker);
+  `schema::EBML_SUPPLEMENT` adds the RFC 8794 header elements and the
+  `Void` / `CRC-32` globals; `schema::element_def(id)` resolves across
+  both. 7 census tests pin the table shape, path/parent consistency,
+  the two-way `ids.rs` cross-census (post-RFC `minver: 5` and
+  absent-by-design Signature exceptions documented), and the schema
+  `webm` markers' corroboration of the guidelines support table.
 - Muxer: RFC 9559 §25.2 SeekHead-expansion reservation
   (`MkvMuxer::with_seek_head_expansion_void(reserved_bytes)`).
   `write_header` writes a `Void` of exactly the requested size (>= 2)
