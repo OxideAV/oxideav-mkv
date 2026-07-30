@@ -813,10 +813,10 @@ fn parse_range(range: &str) -> Option<RangeCheck> {
                 (std::cmp::Ordering::Greater, false, r)
             } else if let Some(r) = term.strip_prefix("<=") {
                 (std::cmp::Ordering::Less, true, r)
-            } else if let Some(r) = term.strip_prefix('<') {
-                (std::cmp::Ordering::Less, false, r)
             } else {
-                return None;
+                // Unknown spelling (no recognised operator) → skip the
+                // value check for this range.
+                (std::cmp::Ordering::Less, false, term.strip_prefix('<')?)
             };
             terms.push((op, ge, parse_schema_number(rest)?));
         }
