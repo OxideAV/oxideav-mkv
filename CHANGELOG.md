@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- TrackOperation application edge coverage: the resilient path keeps
+  synthesising across a Cluster-stream resync (damage recovered,
+  post-damage source Blocks still copied), and a Header-Stripping
+  source's synthesised copies carry the reconstructed (un-stripped)
+  frame bytes exactly like the source packets. 2 more tests in
+  `tests/track_operation_apply.rs`.
 - Mux→demux TrackOperation re-apply round-trip: the muxer's
   `set_track_operation` output is validated end-to-end against the new
   application surface — a muxed stereo-3D `TrackCombinePlanes` file

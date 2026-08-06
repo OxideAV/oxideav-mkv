@@ -830,3 +830,109 @@ fn virtual_track_with_own_cues_uses_them() {
     let virt: Vec<_> = pkts.iter().filter(|(p, _)| p.stream_index == 2).collect();
     assert_eq!(virt.len(), 2, "cluster 1's two source Blocks");
 }
+
+// --- Application under damage recovery + Header-Stripping ------------------
+
+fn elem_bytes(id: u32, body: &[u8]) -> Vec<u8> {
+    elem_master(id, body)
+}
+
+/// The resilient path applies TrackOperation across a Cluster-stream
+/// resync: damage between two Clusters is stepped over and synthesis
+/// continues for the post-damage Blocks.
+#[test]
+fn resilient_resync_keeps_synthesising() {
+    let ta = video_track(1, UID_A);
+    let virt = {
+        let mut t = video_track(2, UID_V);
+        t.extend_from_slice(&elem_master(ids::TRACK_OPERATION, &join_blocks(&[UID_A])));
+        t
+    };
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &ta));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &virt));
+    let tracks = elem_master(ids::TRACKS, &tracks_body);
+    let info = info();
+    let c0 = cluster(0, &[simple_block(1, 0, true, &[0x10])]);
+    let c1 = cluster(20, &[simple_block(1, 0, false, &[0x11])]);
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&info);
+    seg.extend_from_slice(&tracks);
+    seg.extend_from_slice(&c0);
+    // Garbage between the Clusters — zeroed bytes cannot parse as an
+    // element (an all-zero leading VINT octet is invalid), so the
+    // resilient walker must resync on the next well-formed Cluster
+    // header.
+    seg.extend_from_slice(&[0x00; 64]);
+    seg.extend_from_slice(&c1);
+    let segment = elem_master(ids::SEGMENT, &seg);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&ebml_header());
+    bytes.extend_from_slice(&segment);
+
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx = oxideav_mkv::demux::open_resilient_typed(rs, &oxideav_core::NullCodecResolver)
+        .expect("resilient open");
+    dmx.set_apply_track_operations(true);
+    let pkts = drain(&mut dmx);
+    let virt_payloads: Vec<Vec<u8>> = pkts
+        .iter()
+        .filter(|(p, _)| p.stream_index == 1)
+        .map(|(p, _)| p.data.clone())
+        .collect();
+    assert_eq!(
+        virt_payloads,
+        vec![vec![0x10], vec![0x11]],
+        "synthesis continues past the resynchronised damage"
+    );
+    assert!(
+        !dmx.damage_events().is_empty(),
+        "the garbage was recovered from (recorded as damage)"
+    );
+}
+
+/// A Header-Stripping source (RFC 9559 §5.1.4.1.31.6 algo 3): the
+/// synthesised copy carries the *reconstructed* (un-stripped) frame
+/// bytes, exactly like the source packet.
+#[test]
+fn stripped_source_copies_restored_bytes() {
+    // Track 1 declares Header Stripping with prefix [0xF0, 0x0D].
+    let ta = {
+        let mut t = video_track(1, UID_A);
+        let mut comp = Vec::new();
+        comp.extend_from_slice(&elem_uint(ids::CONTENT_COMP_ALGO, 3));
+        comp.extend_from_slice(&elem_bytes(ids::CONTENT_COMP_SETTINGS, &[0xF0, 0x0D]));
+        let enc = elem_master(
+            ids::CONTENT_ENCODING,
+            &elem_master(ids::CONTENT_COMPRESSION, &comp),
+        );
+        t.extend_from_slice(&elem_master(ids::CONTENT_ENCODINGS, &enc));
+        t
+    };
+    let virt = {
+        let mut t = video_track(2, UID_V);
+        t.extend_from_slice(&elem_master(ids::TRACK_OPERATION, &join_blocks(&[UID_A])));
+        t
+    };
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &ta));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &virt));
+    // The on-disk frame is stored stripped; the demuxer prepends the
+    // prefix back on read.
+    let c0 = cluster(0, &[simple_block(1, 0, true, &[0x55, 0x66])]);
+    let mut dmx = open(assemble(&tracks_body, &[c0]));
+    dmx.set_apply_track_operations(true);
+    let pkts = drain(&mut dmx);
+    assert_eq!(pkts.len(), 2);
+    assert_eq!(
+        pkts[0].0.data,
+        vec![0xF0, 0x0D, 0x55, 0x66],
+        "source packet is un-stripped"
+    );
+    assert_eq!(
+        pkts[1].0.data,
+        vec![0xF0, 0x0D, 0x55, 0x66],
+        "the copy carries the same reconstructed bytes"
+    );
+    assert_eq!(pkts[1].0.stream_index, 1);
+}
