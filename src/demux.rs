@@ -7737,6 +7737,24 @@ enum ClusterState {
     },
 }
 
+/// One de-laced packet waiting in the demuxer's output queue, paired with
+/// the per-Block side channels that must surface alongside it when it is
+/// returned by `next_packet`:
+///
+/// * `additions` — the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2).
+///   `None` for `SimpleBlock` packets (the element only exists on
+///   `BlockGroup`) and for Blocks that carried no additions. Shared via
+///   `Arc` because every frame de-laced from one Block shares the Block's
+///   single `BlockAdditions` master.
+/// * `meta` — the non-`Block` `BlockGroup` children (`ReferenceBlock` /
+///   `ReferencePriority` / `CodecState` / `DiscardPadding` plus the
+///   reclaimed Appendix-A children). Same sharing rule.
+struct QueuedPacket {
+    packet: Packet,
+    additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
+    meta: Option<std::sync::Arc<BlockGroupMeta>>,
+}
+
 /// Matroska / WebM demuxer.
 ///
 /// Constructed via [`open`] (returning a boxed [`Demuxer`] trait object,
@@ -7759,18 +7777,9 @@ pub struct MkvDemuxer {
     segment_data_end: u64,
     cluster_state: ClusterState,
     /// De-laced packets waiting to be returned by
-    /// [`Demuxer::next_packet`], each paired with the `BlockAdditions`
-    /// (RFC 9559 §5.1.3.5.2) of the Block it came from — `None` for
-    /// `SimpleBlock` packets (the element only exists on `BlockGroup`)
-    /// and for Blocks that carried no additions. The additions are
-    /// shared via `Arc` because every frame de-laced from one Block
-    /// shares the Block's single `BlockAdditions` master.
-    #[allow(clippy::type_complexity)]
-    out_queue: std::collections::VecDeque<(
-        Packet,
-        Option<std::sync::Arc<Vec<BlockAddition>>>,
-        Option<std::sync::Arc<BlockGroupMeta>>,
-    )>,
+    /// [`Demuxer::next_packet`], each carried as a [`QueuedPacket`]
+    /// record pairing the `Packet` with its per-Block side channels.
+    out_queue: std::collections::VecDeque<QueuedPacket>,
     time_base: TimeBase,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
@@ -8018,15 +8027,15 @@ impl Demuxer for MkvDemuxer {
 
     fn next_packet(&mut self) -> Result<Packet> {
         loop {
-            if let Some((p, additions, meta)) = self.out_queue.pop_front() {
+            if let Some(q) = self.out_queue.pop_front() {
                 // Keep the Block's `BlockAdditions` (RFC 9559 §5.1.3.5.2)
                 // and the `BlockGroup` meta children (§5.1.3.5.4..§5.1.3.5.7)
                 // reachable through `block_additions()` / `block_group_meta()`
                 // until the next packet is returned (or a seek invalidates
                 // them).
-                self.last_block_additions = additions;
-                self.last_block_group_meta = meta;
-                return Ok(p);
+                self.last_block_additions = q.additions;
+                self.last_block_group_meta = q.meta;
+                return Ok(q.packet);
             }
             let before = self
                 .input
@@ -9985,8 +9994,11 @@ impl MkvDemuxer {
             // children attach to the Block as a whole; every frame de-laced
             // from a laced Block shares the same additions / meta (the spec
             // gives no per-lace-frame split).
-            self.out_queue
-                .push_back((pkt, additions.clone(), meta.clone()));
+            self.out_queue.push_back(QueuedPacket {
+                packet: pkt,
+                additions: additions.clone(),
+                meta: meta.clone(),
+            });
         }
         Ok(())
     }
