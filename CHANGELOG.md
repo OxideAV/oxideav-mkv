@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- TrackCombinePlanes application (RFC 9559 §5.1.4.1.30.1 + §18.8 +
+  §18.10): the same `set_apply_track_operations(true)` synthesis now
+  covers stereo-3D plane combination — the virtual combined track's
+  packet stream is assembled from the source plane tracks' Blocks in the
+  writer's interleave, each synthesised packet tagged
+  `VirtualPacketRole::Plane(TrackPlaneType)` (left eye / right eye /
+  background / forward-compat `Other`) so a caller routes every packet
+  to its plane's decoder (§18.8: each "sub" track needs its own decoder
+  before the operation is applied — the container assembles the stream,
+  never the pixels). Within one `TrackOperation`, plane references queue
+  before join references, each in on-disk order. 2 more tests in
+  `tests/track_operation_apply.rs`.
 - TrackOperation *application* (RFC 9559 §5.1.4.1.30 + §18.8):
   `MkvDemuxer::set_apply_track_operations(true)` turns a virtual track's
   `TrackJoinBlocks` recipe into an actual packet stream — every source

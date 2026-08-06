@@ -3121,6 +3121,19 @@ fn build_virtual_consumers(
     for (virtual_idx, op) in track_operations.iter().enumerate() {
         let Some(op) = op else { continue };
         let virtual_stream = virtual_idx as u32;
+        for plane in &op.planes {
+            let Some(src) = plane.track.stream_index else {
+                continue;
+            };
+            if src == virtual_stream || (src as usize) >= track_operations.len() {
+                continue;
+            }
+            consumers[src as usize].push(VirtualPacketOrigin {
+                virtual_stream,
+                source_stream: src,
+                role: VirtualPacketRole::Plane(plane.plane_type),
+            });
+        }
         for join in &op.join_tracks {
             let Some(src) = join.stream_index else {
                 continue;

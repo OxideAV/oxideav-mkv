@@ -518,3 +518,137 @@ fn empty_operation_synthesises_nothing() {
     assert_eq!(pkts.len(), 1, "no synthesis from an empty operation");
     assert_eq!(pkts[0].0.stream_index, 0);
 }
+
+// --- TrackCombinePlanes application ---------------------------------------
+
+fn combine_planes(planes: &[(u64, u64)]) -> Vec<u8> {
+    let mut cp = Vec::new();
+    for &(uid, ty) in planes {
+        let mut plane = Vec::new();
+        plane.extend_from_slice(&elem_uint(ids::TRACK_PLANE_UID, uid));
+        plane.extend_from_slice(&elem_uint(ids::TRACK_PLANE_TYPE, ty));
+        cp.extend_from_slice(&elem_master(ids::TRACK_PLANE, &plane));
+    }
+    elem_master(ids::TRACK_COMBINE_PLANES, &cp)
+}
+
+/// Stereo 3D: tracks 1 (left eye) + 2 (right eye) combined into virtual
+/// track 3, one frame per eye per time instant, interleaved left-first in
+/// storage order.
+fn stereo_file() -> Vec<u8> {
+    let left = video_track(1, UID_A);
+    let right = video_track(2, UID_B);
+    let virt = {
+        let mut t = video_track(3, UID_V);
+        let op = combine_planes(&[
+            (UID_A, ids::TRACK_PLANE_TYPE_LEFT_EYE),
+            (UID_B, ids::TRACK_PLANE_TYPE_RIGHT_EYE),
+        ]);
+        t.extend_from_slice(&elem_master(ids::TRACK_OPERATION, &op));
+        t
+    };
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &left));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &right));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &virt));
+    // Two time instants; each stores the left-eye Block first, then the
+    // right-eye Block at the same timestamp (the writer's interleave).
+    let c0 = cluster(
+        0,
+        &[
+            simple_block(1, 0, true, &[0x4C]),
+            simple_block(2, 0, true, &[0x52]),
+            simple_block(1, 40, false, &[0x4D]),
+            simple_block(2, 40, false, &[0x53]),
+        ],
+    );
+    assemble(&tracks_body, &[c0])
+}
+
+/// TrackCombinePlanes application: the virtual 3D stream carries both
+/// planes' Blocks in the writer's interleave, each synthesised packet
+/// tagged with its plane role so the caller can route it to the right
+/// decoder (§18.8: each "sub" track needs its own decoder before the
+/// operation is applied).
+#[test]
+fn combine_planes_synthesises_the_stereo_stream() {
+    use oxideav_mkv::demux::TrackPlaneType;
+
+    let mut dmx = open(stereo_file());
+    dmx.set_apply_track_operations(true);
+    let pkts = drain(&mut dmx);
+    assert_eq!(pkts.len(), 8, "four real + four synthesised packets");
+
+    let virt: Vec<_> = pkts.iter().filter(|(p, _)| p.stream_index == 2).collect();
+    assert_eq!(virt.len(), 4, "one copy per plane Block");
+
+    // (pts, payload, plane role) in storage order — same-timestamp planes
+    // keep the writer's left-first interleave.
+    let expect = [
+        (0i64, 0x4Cu8, TrackPlaneType::LeftEye),
+        (0, 0x52, TrackPlaneType::RightEye),
+        (40, 0x4D, TrackPlaneType::LeftEye),
+        (40, 0x53, TrackPlaneType::RightEye),
+    ];
+    for (i, ((p, o), (pts, payload, plane))) in virt.iter().zip(expect.iter()).enumerate() {
+        assert_eq!(p.pts, Some(*pts), "plane packet {i} pts");
+        assert_eq!(p.data, vec![*payload], "plane packet {i} bytes");
+        let o = o.expect("synthesised packet has an origin");
+        assert_eq!(o.virtual_stream, 2);
+        assert_eq!(
+            o.role,
+            VirtualPacketRole::Plane(*plane),
+            "plane packet {i} role"
+        );
+    }
+    // Left-eye copies come from stream 0, right-eye from stream 1.
+    assert_eq!(virt[0].1.unwrap().source_stream, 0);
+    assert_eq!(virt[1].1.unwrap().source_stream, 1);
+}
+
+/// A background plane and a forward-compat `Other` plane type both apply,
+/// and a single `TrackOperation` carrying planes *and* joins queues the
+/// plane copies first (on-disk reference order within one operation).
+#[test]
+fn background_other_planes_and_mixed_operation_order() {
+    use oxideav_mkv::demux::TrackPlaneType;
+
+    let src = video_track(1, UID_A);
+    let virt = {
+        let mut t = video_track(2, UID_V);
+        // Planes: background + an unregistered type 7, both naming the
+        // same source; plus a TrackJoinBlocks naming it a third time.
+        let mut op = Vec::new();
+        op.extend_from_slice(&combine_planes(&[
+            (UID_A, ids::TRACK_PLANE_TYPE_BACKGROUND),
+            (UID_A, 7),
+        ]));
+        op.extend_from_slice(&join_blocks(&[UID_A]));
+        t.extend_from_slice(&elem_master(ids::TRACK_OPERATION, &op));
+        t
+    };
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &src));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &virt));
+    let c0 = cluster(0, &[simple_block(1, 0, true, &[0x99])]);
+    let mut dmx = open(assemble(&tracks_body, &[c0]));
+    dmx.set_apply_track_operations(true);
+    let pkts = drain(&mut dmx);
+
+    // One real packet + one copy per reference (2 planes + 1 join).
+    assert_eq!(pkts.len(), 4);
+    assert!(pkts[0].1.is_none());
+    let roles: Vec<VirtualPacketRole> = pkts[1..].iter().map(|(_, o)| o.unwrap().role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            VirtualPacketRole::Plane(TrackPlaneType::Background),
+            VirtualPacketRole::Plane(TrackPlaneType::Other(7)),
+            VirtualPacketRole::Joined,
+        ],
+        "planes before joins, each in on-disk order"
+    );
+    assert!(pkts[1..]
+        .iter()
+        .all(|(p, _)| p.stream_index == 1 && p.data == vec![0x99]));
+}
