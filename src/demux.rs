@@ -6342,9 +6342,13 @@ fn parse_attached_file(
                 }
             }
             ids::FILE_REFERRAL => {
-                let mut buf = vec![0u8; e.size as usize];
-                r.read_exact(&mut buf)?;
-                referral = Some(buf);
+                // Bounded allocation (`ebml::read_bytes` discipline): the
+                // size is attacker-controlled — a forged value (or the
+                // unknown-size sentinel, whose `as usize` cast exceeds
+                // `isize::MAX`) must not reach `vec![0u8; n]`, which would
+                // panic on capacity overflow before any read failed.
+                // Fuzz-found 2026-08.
+                referral = Some(crate::ebml::read_bytes(r, e.size as usize)?);
             }
             ids::FILE_USED_START_TIME => {
                 used_start_time = Some(read_uint(r, e.size as usize)?);

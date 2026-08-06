@@ -1953,10 +1953,11 @@ cluster-scan fallback) run post-drain — so the recovery loop's
 forward-progress guarantee is fuzz-checked. The seed corpus in
 `fuzz/corpus/demux/` covers a
 minimal valid Matroska file, a minimal valid WebM file, an EBML-header-
-only stream, four regression inputs (an EBML size-overflow, a
+only stream, five regression inputs (an EBML size-overflow, a
 zero-frame-size fixed-lacing `SimpleBlock`, the 2026-07 fuzz-found
 unknown-size-`Colour` add-overflow, and the 2026-08 fuzz-found
-hostile-`TimestampScale` seek-conversion overflow), and two
+hostile-`TimestampScale` seek-conversion overflow and forged
+`FileReferral`-size capacity overflow), and two
 corrupted-file seeds (mid-file zeroed bytes, 60% truncation). Every corpus seed also replays
 through the resilient path as a plain `cargo test`
 (`injection_robustness::fuzz_corpus_files_replay_through_resilient_path`).

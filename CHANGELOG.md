@@ -243,6 +243,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fuzz-found (2026-08, CI fuzz cycle): the reclaimed `FileReferral`
+  AttachedFile child (RFC 9559 Appendix A.40) was read with
+  `vec![0u8; size]` — a forged size (or the unknown-size sentinel, whose
+  `usize` cast exceeds `isize::MAX`) panicked on capacity overflow
+  before any read could fail. The read now follows the
+  `ebml::read_bytes` bounded-allocation discipline (`take(n)` +
+  `read_to_end`, allocation grows only as bytes arrive). Regression seed
+  `regression_referral_capacity_overflow.bin` + strict/resilient replay
+  test (`injection_robustness::forged_file_referral_size_never_panics`).
 - Fuzz-found (2026-08, bounded run after extending the typed harness
   pass with TrackOperation application): the pts↔Segment-Tick
   conversions used by `seek_to` and the resilient Cues-less cluster-scan

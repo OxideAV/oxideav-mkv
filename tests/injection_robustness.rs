@@ -824,3 +824,40 @@ fn hostile_timestamp_scale_seek_saturates() {
         let _ = dmx.seek_to(0, i64::MAX);
     }
 }
+
+// =====================================================================
+// 11. Forged `FileReferral` size — the reclaimed A.40 AttachedFile child
+//     was read with `vec![0u8; size]`, so a forged size (or the
+//     unknown-size sentinel, whose usize cast exceeds isize::MAX)
+//     panicked on capacity overflow before any read could fail
+//     (fuzz-found 2026-08, seed regression_referral_capacity_overflow
+//     .bin). The read now follows the `ebml::read_bytes` bounded-
+//     allocation discipline: open must fail cleanly or surface the
+//     attachment, never panic or over-allocate.
+// =====================================================================
+
+#[test]
+fn forged_file_referral_size_never_panics() {
+    let seed = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/corpus/demux/regression_referral_capacity_overflow.bin"
+    );
+    let data = std::fs::read(seed).expect("regression seed present");
+    // Strict open: clean error or clean open — no panic, no huge alloc.
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(data.clone()));
+    let _ = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver);
+    // Resilient open: same contract, plus the drain must stay Eof-clean.
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(data));
+    if let Ok(mut dmx) =
+        oxideav_mkv::demux::open_resilient_typed(rs, &oxideav_core::NullCodecResolver)
+    {
+        use oxideav_core::Demuxer as _;
+        for _ in 0..64 {
+            match dmx.next_packet() {
+                Ok(_) => {}
+                Err(oxideav_core::Error::Eof) => break,
+                Err(e) => panic!("resilient next_packet leaked non-Eof error {e}"),
+            }
+        }
+    }
+}
