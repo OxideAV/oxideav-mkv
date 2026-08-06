@@ -582,6 +582,44 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `TrackUID` and the matching 0-indexed stream index (`None` for a dangling
   reference, kept rather than dropped). A `TrackPlane` missing its mandatory
   `TrackPlaneUID` and a zero `TrackJoinUID` ("not 0" per spec) are dropped.
+- **`TrackOperation` application** (RFC 9559 §18.8):
+  `MkvDemuxer::set_apply_track_operations(true)` turns the decoded recipe
+  into an actual packet stream, so a reader opens the virtual track like
+  any real one. Every packet whose stream is referenced by a virtual
+  track's operation is followed by a synthesised copy re-tagged with the
+  virtual track's stream index — §18.8's "the Block elements (from
+  BlockGroup and SimpleBlock) of all the tracks SHOULD be used as if they
+  were defined for this new virtual Track", applied to both mechanisms:
+  a `TrackJoinBlocks` virtual stream is the merged source stream, and a
+  `TrackCombinePlanes` stereo-3D virtual stream carries every plane's
+  frames, each copy tagged with its plane role. Copies preserve the
+  source Block's bytes, timestamps, duration, flags, and per-Block side
+  channels (`BlockAdditions` / `BlockGroup` meta), and are queued
+  directly after their source frame so the virtual stream keeps the
+  writer's Block interleave — storage order is coding order (§10), which
+  a PTS re-sort would break; overlapping-timestamp joins forward both
+  Blocks (§18.8 leaves the handling "up to the underlying system").
+  `virtual_packet_origin()` reports each synthesised packet's provenance
+  (`VirtualPacketOrigin`: virtual stream, source stream,
+  `VirtualPacketRole::Plane(TrackPlaneType)` / `Joined`) under the same
+  read-after-`next_packet` discipline as `block_additions()`, so a
+  caller routes each plane packet to its own decoder — the virtual
+  track's own codec ID is meaningless per §18.8, and the container
+  assembles the packet stream, never the pixels. Dangling and
+  self-references synthesise nothing; source tracks keep emitting their
+  own packets; the toggle works on strict and resilient opens alike and
+  is off by default (the pre-application behaviour, byte-for-byte).
+  Seeking the virtual stream works too: a virtual track with no Cues
+  rows of its own resolves `seek_to` through the §18.8 Cues *union* of
+  its source tracks (per-source best cue, earliest cluster offset wins —
+  the conservative landing that cannot skip any source's Blocks at or
+  after the target; the landed Cluster is walked from its start). The
+  mux→demux round trip is validated end-to-end: our own muxed
+  `TrackOperation` files re-apply with correct per-packet roles and
+  seek through their own emitted Cues
+  (`tests/mux_track_operation_apply.rs`), and
+  `examples/gen_track_operation.rs` generates join / stereo files for
+  black-box cross-checks.
 - **`BlockAdditionMapping` typed decode** (RFC 9559 §5.1.4.1.17):
   `MkvDemuxer::block_addition_mappings(stream_index)` (and the per-stream
   `all_block_addition_mappings()` slice) returns each
@@ -1476,7 +1514,15 @@ the unified `oxideav` aggregator to wire decoding automatically.
   call keeps the master off-disk so the demuxer surfaces `None` from
   `track_operation`. Pairs symmetrically with the existing
   `MkvDemuxer::track_operation` typed accessor — a mux→demux pipeline
-  preserves every plane (with its type) and every join reference.
+  preserves every plane (with its type) and every join reference — and
+  the demuxer can now *re-apply* the written structures
+  (`set_apply_track_operations`, see the Demuxer section): a muxed
+  stereo-3D file synthesises its virtual stream with correct per-packet
+  plane roles, a muxed join synthesises the merged stream, and the muxed
+  virtual track seeks through the muxer's own emitted Cues via the §18.8
+  union (`tests/mux_track_operation_apply.rs`, including a
+  `schema::validate` zero-findings pin on TrackOperation-carrying
+  output).
 - **`TrackTranslate` on write** (RFC 9559 §5.1.4.1.27):
   `MkvMuxer::set_track_translates(stream_index, Vec<MkvTrackTranslate>)` queues
   zero or more chapter-codec track-mapping masters that land directly inside the
@@ -1734,12 +1780,19 @@ so the demuxer never hides an unrecognised track.
   sides (see the `ContentEncodings` entries below). The container surfaces and
   round-trips the four values verbatim; it never computes or verifies a
   signature (out of container scope).
-- `TrackOperation` is decoded and surfaced (left/right-eye plane combining,
-  block joining) and now written on the mux side
-  (`MkvMuxer::set_track_operation`, see the Muxer section) but the demuxer
-  does not yet *apply* it — virtual tracks are reported alongside their
-  source tracks rather than being synthesised into a single combined output
-  stream.
+- `TrackOperation` is decoded, written, and now *applied* (RFC 9559
+  §18.8): `MkvDemuxer::set_apply_track_operations(true)` synthesises the
+  virtual track's packet stream from its source tracks — both
+  `TrackCombinePlanes` (stereo 3D, per-packet plane roles) and
+  `TrackJoinBlocks` (block joining) — with virtual-track seek via the
+  §18.8 Cues union and a mux→demux re-apply round trip pinned in CI.
+  The remaining boundary is deliberate: combining the decoded *pictures*
+  of the planes into one 3D frame is a compositor/decoder concern (§18.8
+  makes the virtual track's codec ID meaningless — each sub track
+  decodes with its own decoder), so the container assembles the packet
+  stream, never the pixels. Application is a typed-surface feature
+  (`open_typed` / `open_resilient_typed`); the boxed trait `open` keeps
+  the default off behaviour.
 - `ContentEncodings` is decoded and surfaced (compression / encryption
   headers). The demuxer *undoes* a Block-scoped Header-Stripping chain
   (algo 3) on read — packets carry the original frame bytes — but the
