@@ -652,3 +652,181 @@ fn background_other_planes_and_mixed_operation_order() {
         .iter()
         .all(|(p, _)| p.stream_index == 1 && p.data == vec![0x99]));
 }
+
+// --- Virtual-track seek (Cues union, §18.8) -------------------------------
+
+fn cues(entries: &[(u64, u64, u64)]) -> Vec<u8> {
+    // entries: (track_number, time_ticks, cluster_offset)
+    let mut body = Vec::new();
+    for &(track, time, off) in entries {
+        let mut ctp = Vec::new();
+        ctp.extend_from_slice(&elem_uint(ids::CUE_TRACK, track));
+        ctp.extend_from_slice(&elem_uint(ids::CUE_CLUSTER_POSITION, off));
+        let mut cp = Vec::new();
+        cp.extend_from_slice(&elem_uint(ids::CUE_TIME, time));
+        cp.extend_from_slice(&elem_master(ids::CUE_TRACK_POSITIONS, &ctp));
+        body.extend_from_slice(&elem_master(ids::CUE_POINT, &cp));
+    }
+    elem_master(ids::CUES, &body)
+}
+
+/// `join_file` plus a trailing Cues element indexing only the two *source*
+/// tracks (the common layout — the virtual track has no Cues rows).
+fn join_file_with_cues() -> Vec<u8> {
+    let ta = video_track(1, UID_A);
+    let tb = video_track(2, UID_B);
+    let virt = {
+        let mut t = video_track(3, UID_V);
+        t.extend_from_slice(&elem_master(
+            ids::TRACK_OPERATION,
+            &join_blocks(&[UID_A, UID_B]),
+        ));
+        t
+    };
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &ta));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &tb));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &virt));
+    let tracks = elem_master(ids::TRACKS, &tracks_body);
+    let info = info();
+    let c0 = cluster(
+        0,
+        &[
+            simple_block(1, 0, true, &[0x10]),
+            simple_block(2, 5, true, &[0x20]),
+            simple_block(1, 10, false, &[0x11]),
+        ],
+    );
+    let c1 = cluster(
+        20,
+        &[
+            simple_block(2, 0, false, &[0x21]),
+            simple_block(1, 5, false, &[0x12]),
+        ],
+    );
+    // Segment-relative cluster offsets (Cues sit after the Clusters, so
+    // the offsets are known when the index is built).
+    let off_c0 = (info.len() + tracks.len()) as u64;
+    let off_c1 = off_c0 + c0.len() as u64;
+    let cues = cues(&[
+        (1, 0, off_c0),
+        (1, 25, off_c1),
+        (2, 5, off_c0),
+        (2, 20, off_c1),
+    ]);
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&info);
+    seg.extend_from_slice(&tracks);
+    seg.extend_from_slice(&c0);
+    seg.extend_from_slice(&c1);
+    seg.extend_from_slice(&cues);
+    let segment = elem_master(ids::SEGMENT, &seg);
+    let mut out = Vec::new();
+    out.extend_from_slice(&ebml_header());
+    out.extend_from_slice(&segment);
+    out
+}
+
+/// With application off, seeking the virtual stream keeps the historical
+/// behaviour: the file has no Cues rows for the virtual track's number, so
+/// the strict path reports Unsupported.
+#[test]
+fn virtual_seek_without_application_is_unsupported() {
+    let mut dmx = open(join_file_with_cues());
+    match dmx.seek_to(2, 20) {
+        Err(oxideav_core::Error::Unsupported { .. }) => {}
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+    // The source tracks seek fine either way.
+    assert_eq!(dmx.seek_to(0, 25).expect("source seek"), 25);
+}
+
+/// §18.8 Cues-union fallback: seeking the virtual stream resolves through
+/// the *source* tracks' Cues, landing conservatively on the earliest
+/// per-source best cluster so no source's Blocks at/after the target are
+/// skipped.
+#[test]
+fn virtual_seek_unions_the_source_cues() {
+    let mut dmx = open(join_file_with_cues());
+    dmx.set_apply_track_operations(true);
+
+    // Target 25: track 1's best cue is (25, c1), track 2's is (20, c1) —
+    // both in cluster 1; the seek lands there.
+    let landed = dmx.seek_to(2, 25).expect("virtual seek");
+    assert_eq!(landed, 25, "landed on the first candidate's cue time");
+    assert!(
+        dmx.virtual_packet_origin().is_none(),
+        "seek invalidates the last virtual origin"
+    );
+    let pkts = drain(&mut dmx);
+    let virt: Vec<_> = pkts.iter().filter(|(p, _)| p.stream_index == 2).collect();
+    assert_eq!(virt.len(), 2, "cluster 1 holds two source Blocks");
+    assert_eq!(virt[0].0.data, vec![0x21]);
+    assert_eq!(virt[0].0.pts, Some(20));
+    assert_eq!(virt[1].0.data, vec![0x12]);
+    assert_eq!(virt[1].0.pts, Some(25));
+
+    // Target 20: track 1's best cue is (0, c0) — earlier cluster than
+    // track 2's (20, c1). The union lands on c0 (the conservative pick):
+    // every source Block at/after the target is still reachable.
+    let landed = dmx.seek_to(2, 20).expect("virtual seek");
+    assert_eq!(landed, 0, "conservative landing on the earlier cluster");
+    let pkts = drain(&mut dmx);
+    let virt: Vec<_> = pkts.iter().filter(|(p, _)| p.stream_index == 2).collect();
+    assert_eq!(virt.len(), 5, "the whole merged stream from cluster 0 on");
+}
+
+/// A virtual track that *does* carry its own Cues rows seeks through them
+/// (the union fallback never engages).
+#[test]
+fn virtual_track_with_own_cues_uses_them() {
+    // Rebuild join_file_with_cues but with a track-3 cue row pointing at
+    // cluster 1.
+    let ta = video_track(1, UID_A);
+    let tb = video_track(2, UID_B);
+    let virt = {
+        let mut t = video_track(3, UID_V);
+        t.extend_from_slice(&elem_master(
+            ids::TRACK_OPERATION,
+            &join_blocks(&[UID_A, UID_B]),
+        ));
+        t
+    };
+    let mut tracks_body = Vec::new();
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &ta));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &tb));
+    tracks_body.extend_from_slice(&elem_master(ids::TRACK_ENTRY, &virt));
+    let tracks = elem_master(ids::TRACKS, &tracks_body);
+    let info = info();
+    let c0 = cluster(0, &[simple_block(1, 0, true, &[0x10])]);
+    let c1 = cluster(
+        20,
+        &[
+            simple_block(2, 0, false, &[0x21]),
+            simple_block(1, 5, false, &[0x12]),
+        ],
+    );
+    let off_c0 = (info.len() + tracks.len()) as u64;
+    let off_c1 = off_c0 + c0.len() as u64;
+    // §18.8: the virtual track's Cues SHOULD be the union of its sources'
+    // — this file indexes the virtual track directly.
+    let cues = cues(&[(1, 0, off_c0), (3, 20, off_c1)]);
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&info);
+    seg.extend_from_slice(&tracks);
+    seg.extend_from_slice(&c0);
+    seg.extend_from_slice(&c1);
+    seg.extend_from_slice(&cues);
+    let segment = elem_master(ids::SEGMENT, &seg);
+    let mut out = Vec::new();
+    out.extend_from_slice(&ebml_header());
+    out.extend_from_slice(&segment);
+
+    let mut dmx = open(out);
+    dmx.set_apply_track_operations(true);
+    let landed = dmx.seek_to(2, 30).expect("virtual seek via own cues");
+    assert_eq!(landed, 20, "landed on the virtual track's own cue");
+    let pkts = drain(&mut dmx);
+    let virt: Vec<_> = pkts.iter().filter(|(p, _)| p.stream_index == 2).collect();
+    assert_eq!(virt.len(), 2, "cluster 1's two source Blocks");
+}

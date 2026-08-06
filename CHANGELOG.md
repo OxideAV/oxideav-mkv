@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Virtual-track seek (RFC 9559 §18.8 Cues union): with application
+  enabled, `seek_to` on a virtual track whose number has no Cues rows of
+  its own resolves through the union of its source tracks' Cues — the
+  per-source best cue (last at or before the target) with the earliest
+  cluster offset wins, a conservative landing that cannot skip any
+  source's Blocks at or after the target; the landed Cluster is walked
+  from its start (a per-source `CueRelativePosition` / `CueBlockNumber`
+  jump would step over other sources' Blocks in the same Cluster). A
+  virtual track with its own Cues rows keeps using them; with
+  application disabled the historical `Unsupported` behaviour is
+  unchanged. 3 more tests in `tests/track_operation_apply.rs`.
 - TrackCombinePlanes application (RFC 9559 §5.1.4.1.30.1 + §18.8 +
   §18.10): the same `set_apply_track_operations(true)` synthesis now
   covers stereo-3D plane combination — the virtual combined track's

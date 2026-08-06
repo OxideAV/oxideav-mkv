@@ -8259,18 +8259,31 @@ impl Demuxer for MkvDemuxer {
         if best.is_none() {
             best = self.cues.iter().find(|c| c.track == track_number);
         }
-        let cue = best.ok_or_else(|| {
-            Error::unsupported(format!(
-                "MKV: no Cues entries for track {track_number} (stream {stream_index})"
-            ))
-        })?;
         // Copy the fields out so the immutable borrow of `self.cues` can
         // be released before we re-borrow `self` mutably to drive the
         // input reader.
-        let cue_time = cue.time;
-        let cue_cluster_offset = cue.cluster_offset;
-        let relative_position = cue.relative_position;
-        let block_number = cue.block_number;
+        let (cue_time, cue_cluster_offset, relative_position, block_number) = match best {
+            Some(cue) => (
+                cue.time,
+                cue.cluster_offset,
+                cue.relative_position,
+                cue.block_number,
+            ),
+            // Cues-union fallback for a virtual track (RFC 9559 §18.8:
+            // "The Cues elements corresponding to such a virtual track
+            // SHOULD be the union of the Cues elements for each of the
+            // tracks it's composed of") — files commonly index only the
+            // real tracks, so when application is enabled and the target
+            // stream is a virtual track with no Cues rows of its own,
+            // seek through its source tracks' Cues instead.
+            None => self
+                .virtual_seek_cue(stream_index, target_ticks)
+                .ok_or_else(|| {
+                    Error::unsupported(format!(
+                        "MKV: no Cues entries for track {track_number} (stream {stream_index})"
+                    ))
+                })?,
+        };
 
         let abs = self.segment_data_start + cue_cluster_offset;
         self.input.seek(SeekFrom::Start(abs))?;
@@ -8740,6 +8753,66 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::block_additions`].
     pub fn virtual_packet_origin(&self) -> Option<VirtualPacketOrigin> {
         self.last_virtual_origin
+    }
+
+    /// Cues-union seek fallback for a virtual track (RFC 9559 §18.8: the
+    /// Cues for a virtual track "SHOULD be the union of the Cues elements
+    /// for each of the tracks it's composed of" — but files commonly index
+    /// only the real tracks). Called by `seek_to` when TrackOperation
+    /// application is enabled, the target stream is a virtual track, and
+    /// the file carries no Cues rows for the virtual track's own number.
+    ///
+    /// Resolves the per-source best cue (last at or before the target,
+    /// else the source's first cue) for every applied source reference and
+    /// picks the candidate with the **smallest** cluster offset — the
+    /// conservative landing that can't skip any other source's Blocks at
+    /// or after the target. The returned tuple deliberately carries no
+    /// `CueRelativePosition` / `CueBlockNumber` (the cluster is walked
+    /// from its start): a per-source exact-block jump would step over the
+    /// other sources' Blocks stored earlier in the same Cluster.
+    ///
+    /// Returns `None` when application is disabled, the stream is not a
+    /// virtual track, or no source has any cue — the caller then reports
+    /// the same `Unsupported` error as an ordinary cue-less track.
+    fn virtual_seek_cue(
+        &self,
+        stream_index: u32,
+        target_ticks: u64,
+    ) -> Option<(u64, u64, Option<u64>, Option<u64>)> {
+        if !self.apply_track_operations {
+            return None;
+        }
+        let op = self.track_operations.get(stream_index as usize)?.as_ref()?;
+        let sources = op
+            .planes
+            .iter()
+            .map(|p| p.track.stream_index)
+            .chain(op.join_tracks.iter().map(|j| j.stream_index));
+        let mut best: Option<(u64, u64)> = None; // (time, cluster_offset)
+        for src in sources.flatten() {
+            if src == stream_index {
+                continue;
+            }
+            let Some(&tn) = self.track_number_by_index.get(src as usize) else {
+                continue;
+            };
+            let mut src_best: Option<&CueEntry> = None;
+            for c in self.cues.iter().filter(|c| c.track == tn) {
+                if c.time <= target_ticks {
+                    src_best = Some(c);
+                } else {
+                    break;
+                }
+            }
+            let src_best = src_best.or_else(|| self.cues.iter().find(|c| c.track == tn));
+            if let Some(c) = src_best {
+                match best {
+                    Some((_, off)) if off <= c.cluster_offset => {}
+                    _ => best = Some((c.time, c.cluster_offset)),
+                }
+            }
+        }
+        best.map(|(time, off)| (time, off, None, None))
     }
 
     /// `BlockAdditionMapping`s (RFC 9559 §5.1.4.1.17) for the stream at
