@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Mux→demux TrackOperation re-apply round-trip: the muxer's
+  `set_track_operation` output is validated end-to-end against the new
+  application surface — a muxed stereo-3D `TrackCombinePlanes` file
+  re-applies with the correct per-packet plane roles, a muxed
+  `TrackJoinBlocks` file re-applies as the timestamp-ordered merge of
+  its sources, and the muxed virtual track *seeks* through the §18.8
+  Cues union over the muxer's own emitted Cues. TrackOperation-carrying
+  muxer output stays schema-clean (`schema::validate`: zero violations,
+  zero informational findings — pinned). 3 tests in
+  `tests/mux_track_operation_apply.rs`.
 - Virtual-track seek (RFC 9559 §18.8 Cues union): with application
   enabled, `seek_to` on a virtual track whose number has no Cues rows of
   its own resolves through the union of its source tracks' Cues — the
