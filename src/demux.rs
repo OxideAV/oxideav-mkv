@@ -703,6 +703,11 @@ fn open_typed_impl(
         })
         .collect();
 
+    // Invert `track_operations` into the per-source consumer map that
+    // drives TrackOperation application (RFC 9559 §18.8) — computed up
+    // front so enabling application is a pure flag flip.
+    let virtual_consumers = build_virtual_consumers(&track_operations);
+
     // Per-stream `ContentEncodings` (RFC 9559 §5.1.4.1.31), indexed by
     // stream index. No UID resolution needed — encodings are self-contained.
     let content_encodings: Vec<Option<ContentEncodings>> =
@@ -1070,6 +1075,9 @@ fn open_typed_impl(
         crc_status,
         validated_cluster_starts: std::collections::HashSet::new(),
         track_operations,
+        apply_track_operations: false,
+        virtual_consumers,
+        last_virtual_origin: None,
         content_encodings,
         header_strip_prefixes,
         video_interlacings,
@@ -3045,6 +3053,89 @@ pub struct TrackRef {
     /// Resolved 0-indexed stream index, or `None` when no track in the
     /// Segment carries this `TrackUID`.
     pub stream_index: Option<u32>,
+}
+
+/// Provenance of a packet synthesised by TrackOperation application
+/// (RFC 9559 §5.1.4.1.30 + §18.8) — see
+/// [`MkvDemuxer::set_apply_track_operations`] and
+/// [`MkvDemuxer::virtual_packet_origin`].
+///
+/// When application is enabled, every packet whose track is referenced by a
+/// virtual track's `TrackOperation` is followed by a synthesised copy
+/// re-tagged with the virtual track's stream index — §18.8's "the Block
+/// elements ... of all the tracks SHOULD be used as if they were defined
+/// for this new virtual Track", generalised to both operation kinds. This
+/// record identifies, for such a synthesised packet, which source stream
+/// the bytes came from and which `TrackOperation` reference pulled it in —
+/// a caller feeding a stereoscopic `TrackCombinePlanes` track routes each
+/// packet to the decoder for its plane by matching `role`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VirtualPacketOrigin {
+    /// Stream index of the virtual track the packet was synthesised for
+    /// (always equal to the returned packet's `stream_index`).
+    pub virtual_stream: u32,
+    /// Stream index of the real track whose Block supplied the bytes.
+    pub source_stream: u32,
+    /// Which `TrackOperation` reference pulled the source in.
+    pub role: VirtualPacketRole,
+}
+
+/// The `TrackOperation` reference kind behind a synthesised virtual-track
+/// packet — see [`VirtualPacketOrigin::role`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VirtualPacketRole {
+    /// The source is a `TrackCombinePlanes > TrackPlane` reference (RFC
+    /// 9559 §5.1.4.1.30.2): the packet carries one plane of the combined
+    /// stereo-3D picture, in the role given by its `TrackPlaneType`
+    /// (§5.1.4.1.30.4 — left eye / right eye / background). Each plane
+    /// still decodes with its own decoder; the container only assembles
+    /// the virtual track's packet stream (§18.8: the codec ID of a
+    /// virtual track is meaningless).
+    Plane(TrackPlaneType),
+    /// The source is a `TrackJoinBlocks > TrackJoinUID` reference (RFC
+    /// 9559 §5.1.4.1.30.6): the packet is one of the joined tracks'
+    /// Blocks, used as if it were defined for the virtual track.
+    Joined,
+}
+
+/// Invert the per-stream `TrackOperation` table into a per-*source*-stream
+/// consumer map: `result[source]` lists every virtual-track reference that
+/// consumes `source`'s Blocks when TrackOperation application (RFC 9559
+/// §18.8) is enabled, as the [`VirtualPacketOrigin`] each synthesised copy
+/// will carry.
+///
+/// Order within one source's list: virtual tracks by ascending stream
+/// index; within one `TrackOperation`, `TrackCombinePlanes` references
+/// before `TrackJoinBlocks` references, each in on-disk order — so the
+/// synthesised copies queued after a source packet always land in a
+/// deterministic order.
+///
+/// References that cannot be applied contribute no consumer: a dangling
+/// `TrackJoinUID` / `TrackPlaneUID` (`stream_index == None` — there is no
+/// track to copy from) and a self-reference (the virtual track naming its
+/// own stream — the copy would duplicate the packet onto itself).
+fn build_virtual_consumers(
+    track_operations: &[Option<TrackOperation>],
+) -> Vec<Vec<VirtualPacketOrigin>> {
+    let mut consumers: Vec<Vec<VirtualPacketOrigin>> = vec![Vec::new(); track_operations.len()];
+    for (virtual_idx, op) in track_operations.iter().enumerate() {
+        let Some(op) = op else { continue };
+        let virtual_stream = virtual_idx as u32;
+        for join in &op.join_tracks {
+            let Some(src) = join.stream_index else {
+                continue;
+            };
+            if src == virtual_stream || (src as usize) >= track_operations.len() {
+                continue;
+            }
+            consumers[src as usize].push(VirtualPacketOrigin {
+                virtual_stream,
+                source_stream: src,
+                role: VirtualPacketRole::Joined,
+            });
+        }
+    }
+    consumers
 }
 
 /// One `BlockAdditionMapping` master (RFC 9559 §5.1.4.1.17) on a
@@ -7753,6 +7844,10 @@ struct QueuedPacket {
     packet: Packet,
     additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
     meta: Option<std::sync::Arc<BlockGroupMeta>>,
+    /// `Some` when the packet was synthesised by TrackOperation
+    /// application (RFC 9559 §18.8) rather than read from its own track's
+    /// Block — see [`MkvDemuxer::virtual_packet_origin`].
+    origin: Option<VirtualPacketOrigin>,
 }
 
 /// Matroska / WebM demuxer.
@@ -7839,6 +7934,26 @@ pub struct MkvDemuxer {
     /// stream index. `None` for tracks that aren't virtual tracks — see
     /// [`MkvDemuxer::track_operations`].
     track_operations: Vec<Option<TrackOperation>>,
+    /// Whether TrackOperation application (RFC 9559 §18.8) is enabled —
+    /// see [`MkvDemuxer::set_apply_track_operations`]. Off by default:
+    /// virtual tracks are then only *described* (via
+    /// [`MkvDemuxer::track_operations`]) and yield no synthesised packets.
+    apply_track_operations: bool,
+    /// Per-source-stream list of virtual-track references that consume the
+    /// source's Blocks when application is enabled, indexed by source
+    /// stream index and precomputed at open from `track_operations`. Each
+    /// entry is the [`VirtualPacketOrigin`] the synthesised copy will
+    /// carry. Order within a source's list: virtual tracks by ascending
+    /// stream index; within one `TrackOperation`, `TrackCombinePlanes`
+    /// references before `TrackJoinBlocks` references, each in on-disk
+    /// order. Unresolved (dangling-UID) and self-referential entries are
+    /// not consumers — there is nothing to copy from / no distinct stream
+    /// to copy to.
+    virtual_consumers: Vec<Vec<VirtualPacketOrigin>>,
+    /// The [`VirtualPacketOrigin`] of the most recently returned packet —
+    /// `Some` only when that packet was synthesised by TrackOperation
+    /// application. See [`MkvDemuxer::virtual_packet_origin`].
+    last_virtual_origin: Option<VirtualPacketOrigin>,
     /// Per-stream `ContentEncodings` (RFC 9559 §5.1.4.1.31), indexed by
     /// stream index. `None` for tracks with no encodings — see
     /// [`MkvDemuxer::content_encodings`].
@@ -8035,6 +8150,7 @@ impl Demuxer for MkvDemuxer {
                 // them).
                 self.last_block_additions = q.additions;
                 self.last_block_group_meta = q.meta;
+                self.last_virtual_origin = q.origin;
                 return Ok(q.packet);
             }
             let before = self
@@ -8152,6 +8268,7 @@ impl Demuxer for MkvDemuxer {
         self.out_queue.clear();
         self.last_block_additions = None;
         self.last_block_group_meta = None;
+        self.last_virtual_origin = None;
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -8541,6 +8658,75 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::track_operation`] for the semantics.
     pub fn track_operations(&self) -> &[Option<TrackOperation>] {
         &self.track_operations
+    }
+
+    /// Enable or disable TrackOperation *application* (RFC 9559 §18.8) —
+    /// the synthesis that lets a caller read a virtual track like any real
+    /// one. Off by default: virtual tracks are then only *described*
+    /// (via [`MkvDemuxer::track_operations`]) and never yield packets of
+    /// their own.
+    ///
+    /// While enabled, every packet whose stream is referenced by a virtual
+    /// track's `TrackOperation` is followed by a synthesised copy carrying
+    /// the virtual track's stream index and the source Block's bytes,
+    /// timestamps, duration, flags, and side channels (`BlockAdditions` /
+    /// `BlockGroup` meta) — §18.8's "the Block elements (from BlockGroup
+    /// and SimpleBlock) of all the tracks SHOULD be used as if they were
+    /// defined for this new virtual Track", applied to both
+    /// `TrackJoinBlocks` and `TrackCombinePlanes` references. Filtering
+    /// `next_packet` results on the virtual track's stream index therefore
+    /// reads the virtual track's merged stream;
+    /// [`MkvDemuxer::virtual_packet_origin`] identifies, per synthesised
+    /// packet, the source stream and the reference (plane role / join)
+    /// that pulled it in. Source tracks keep emitting their own packets
+    /// unchanged — a reader that only wants the sources ignores the
+    /// virtual index, and vice versa.
+    ///
+    /// Ordering: synthesised copies are queued immediately after their
+    /// source frame, so the virtual stream preserves the writer's Block
+    /// interleave. Storage order is coding order (§10 — "Frames using
+    /// references SHOULD be stored in 'coding order'"), which is exactly
+    /// the order a downstream decoder needs; the container never re-sorts
+    /// by PTS. Where two joined Blocks carry overlapping timestamps, §18.8
+    /// leaves the handling "up to the underlying system" — this Reader
+    /// forwards both in storage order. When one source frame feeds several
+    /// references, the copies land in a deterministic order: virtual
+    /// tracks by ascending stream index; within one `TrackOperation`,
+    /// `TrackCombinePlanes` references before `TrackJoinBlocks`
+    /// references, each in on-disk order.
+    ///
+    /// Non-appliable references synthesise nothing: a dangling
+    /// `TrackPlaneUID` / `TrackJoinUID` (no matching track in the Segment)
+    /// and a self-reference. A virtual track referencing another virtual
+    /// track receives only that track's *on-disk* Blocks (a virtual track
+    /// normally has none) — application is not cascaded, matching the
+    /// spec's silence on nested operations.
+    ///
+    /// The toggle may be flipped at any time; it affects Blocks de-laced
+    /// after the call (already-queued packets are unaffected). Works
+    /// identically on the strict and resilient open paths.
+    pub fn set_apply_track_operations(&mut self, enabled: bool) {
+        self.apply_track_operations = enabled;
+    }
+
+    /// Whether TrackOperation application (RFC 9559 §18.8) is currently
+    /// enabled — see [`MkvDemuxer::set_apply_track_operations`].
+    pub fn applies_track_operations(&self) -> bool {
+        self.apply_track_operations
+    }
+
+    /// Provenance of the most recently returned packet when that packet
+    /// was synthesised by TrackOperation application (RFC 9559 §18.8):
+    /// `Some` exactly when the packet's stream index names a virtual track
+    /// and the bytes came from one of its source tracks' Blocks. `None`
+    /// for every packet read from its own track's Block (the entire
+    /// stream when application is disabled), before the first
+    /// `next_packet`, and after a seek.
+    ///
+    /// Same read-after-`next_packet` call discipline as
+    /// [`MkvDemuxer::block_additions`].
+    pub fn virtual_packet_origin(&self) -> Option<VirtualPacketOrigin> {
+        self.last_virtual_origin
     }
 
     /// `BlockAdditionMapping`s (RFC 9559 §5.1.4.1.17) for the stream at
@@ -9596,6 +9782,7 @@ impl MkvDemuxer {
         self.out_queue.clear();
         self.last_block_additions = None;
         self.last_block_group_meta = None;
+        self.last_virtual_origin = None;
         Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
     }
 
@@ -9994,11 +10181,45 @@ impl MkvDemuxer {
             // children attach to the Block as a whole; every frame de-laced
             // from a laced Block shares the same additions / meta (the spec
             // gives no per-lace-frame split).
+            // TrackOperation application (RFC 9559 §18.8): when enabled and
+            // this stream is referenced by a virtual track's TrackOperation,
+            // follow the real packet with a synthesised copy re-tagged with
+            // the virtual track's stream index — "the Block elements (from
+            // BlockGroup and SimpleBlock) of all the tracks SHOULD be used
+            // as if they were defined for this new virtual Track". The
+            // copies are queued immediately after their source frame, so
+            // the virtual stream preserves the writer's Block interleave —
+            // storage order is coding order per §10 ("Frames using
+            // references SHOULD be stored in 'coding order'"), which a
+            // PTS re-sort would break. The Block's side channels attach to
+            // the Block itself, so each copy shares them.
+            let synth: Vec<QueuedPacket> = if self.apply_track_operations {
+                self.virtual_consumers
+                    .get(stream_idx as usize)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|&origin| {
+                        let mut vp = pkt.clone();
+                        vp.stream_index = origin.virtual_stream;
+                        QueuedPacket {
+                            packet: vp,
+                            additions: additions.clone(),
+                            meta: meta.clone(),
+                            origin: Some(origin),
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             self.out_queue.push_back(QueuedPacket {
                 packet: pkt,
                 additions: additions.clone(),
                 meta: meta.clone(),
+                origin: None,
             });
+            self.out_queue.extend(synth);
         }
         Ok(())
     }

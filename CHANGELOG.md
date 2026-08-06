@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- TrackOperation *application* (RFC 9559 §5.1.4.1.30 + §18.8):
+  `MkvDemuxer::set_apply_track_operations(true)` turns a virtual track's
+  `TrackJoinBlocks` recipe into an actual packet stream — every source
+  track's Block is followed by a synthesised copy re-tagged with the
+  virtual track's stream index (bytes / timestamps / duration / flags and
+  the per-Block `BlockAdditions` / `BlockGroup` meta side channels
+  preserved), so filtering `next_packet` on the virtual stream index
+  reads the joined track like any real one. Storage order is preserved
+  (§10 keeps Blocks in coding order; §18.8 leaves overlapping-timestamp
+  handling to the underlying system — both Blocks are forwarded).
+  `MkvDemuxer::virtual_packet_origin()` reports each synthesised
+  packet's provenance (`VirtualPacketOrigin`: virtual stream, source
+  stream, `VirtualPacketRole`); `applies_track_operations()` reads the
+  toggle. Dangling and self references synthesise nothing; source
+  tracks keep emitting their own packets; the toggle is honoured on both
+  the strict and resilient paths. 7 tests in
+  `tests/track_operation_apply.rs`.
+
 - `examples/schema_validate.rs`: dev CLI printing a file's schema
   verdict, per-class counters, and every finding with offset + element
   name; exit 0 valid / 1 not valid / 2 usage. Black-box validated:
