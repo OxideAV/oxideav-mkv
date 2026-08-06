@@ -781,3 +781,46 @@ fn fuzz_corpus_files_replay_through_resilient_path() {
     }
     assert!(seen >= 5, "corpus seeds present ({seen})");
 }
+
+// =====================================================================
+// 10. Seek-time tick conversion saturates — a hostile TimestampScale
+//     (an 8-octet uinteger can carry up to 2^56-2 nanoseconds per tick)
+//     combined with a huge Cluster Timestamp used to overflow the i128
+//     three-factor product inside the pts<->ticks conversions (a
+//     debug-build multiply panic; fuzz-found 2026-08, seed
+//     regression_seek_tickscale_overflow.bin). Both directions must
+//     clamp instead: the drain and both seek shapes complete without
+//     panicking on the strict *and* resilient paths.
+// =====================================================================
+
+#[test]
+fn hostile_timestamp_scale_seek_saturates() {
+    use oxideav_core::Demuxer as _;
+    let seed = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/corpus/demux/regression_seek_tickscale_overflow.bin"
+    );
+    let data = std::fs::read(seed).expect("regression seed present");
+    for resilient in [false, true] {
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(data.clone()));
+        let opened = if resilient {
+            oxideav_mkv::demux::open_resilient_typed(rs, &oxideav_core::NullCodecResolver)
+        } else {
+            oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver)
+        };
+        let Ok(mut dmx) = opened else {
+            continue; // strict open may reject the damaged tail — legal
+        };
+        for _ in 0..64 {
+            match dmx.next_packet() {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        // The fuzz harness' exact crash shape: seeks after the drain.
+        let _ = dmx.seek_to(0, 0);
+        let _ = dmx.seek_to(0, 12_345);
+        // And the saturating upper extreme in both directions.
+        let _ = dmx.seek_to(0, i64::MAX);
+    }
+}

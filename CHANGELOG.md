@@ -237,6 +237,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fuzz-found (2026-08, bounded run after extending the typed harness
+  pass with TrackOperation application): the pts↔Segment-Tick
+  conversions used by `seek_to` and the resilient Cues-less cluster-scan
+  seek multiplied three attacker-influenced factors in `i128` unchecked —
+  a hostile `TimestampScale` (an 8-octet uinteger reaches 2^56-2)
+  combined with a huge Cluster `Timestamp` overflowed the product (a
+  debug-build panic). Both directions now saturate and the final
+  narrowing clamps instead of truncating; the strict `seek_to` path was
+  deduplicated onto the same two helpers. Regression seed
+  `regression_seek_tickscale_overflow.bin` + a strict/resilient replay
+  test (`injection_robustness::hostile_timestamp_scale_seek_saturates`).
 - Attribution hygiene for `ChapterFlagEnabled` (id `0x4598`): the crate's
   docs cited RFC 9559 chapter sections for it, but RFC 9559 dropped the
   element (Table 53 leaves `0x4598` unassigned; the ChapterAtom sections

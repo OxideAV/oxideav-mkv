@@ -90,9 +90,15 @@ fuzz_target!(|data: &[u8]| {
         let _ = tdmx.chapters().len();
         let _ = tdmx.seek_entries().len();
         let _ = tdmx.cluster_records().len();
+        // TrackOperation application (RFC 9559 §18.8) on: a crafted
+        // TrackOperation subtree must synthesise virtual-track copies
+        // without panicking, and every reported origin must be
+        // self-consistent.
+        tdmx.set_apply_track_operations(true);
+        let n_streams = tdmx.streams().len() as u32;
         for _ in 0..MAX_PACKETS_PER_INPUT {
             match tdmx.next_packet() {
-                Ok(_) => {
+                Ok(pkt) => {
                     // Per-packet side channels: read them while they are
                     // valid (between this packet and the next).
                     let _ = tdmx.block_additions().len();
@@ -101,6 +107,17 @@ fuzz_target!(|data: &[u8]| {
                         let _ = meta.reference_priority();
                         let _ = meta.codec_state().map(|s| s.len());
                         let _ = meta.discard_padding();
+                    }
+                    if let Some(o) = tdmx.virtual_packet_origin() {
+                        assert_eq!(
+                            o.virtual_stream, pkt.stream_index,
+                            "origin must match the synthesised packet's stream"
+                        );
+                        assert_ne!(
+                            o.source_stream, o.virtual_stream,
+                            "self-references never synthesise"
+                        );
+                        assert!(o.virtual_stream < n_streams && o.source_stream < n_streams);
                     }
                 }
                 Err(_) => break,

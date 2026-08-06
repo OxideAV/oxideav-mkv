@@ -8229,19 +8229,7 @@ impl Demuxer for MkvDemuxer {
         // base (timecode_scale_ns / 1e9), so the conversion collapses to
         // a copy — but we still do the full calculation so behaviour is
         // correct when other time bases are supplied.
-        let stream_tb = self.streams[stream_index as usize].time_base.as_rational();
-        let target_ticks_i128: i128 = if stream_tb.num == 0 || stream_tb.den == 0 {
-            pts as i128
-        } else {
-            let numer = pts as i128 * stream_tb.num as i128 * 1_000_000_000i128;
-            let denom = stream_tb.den as i128 * self.timecode_scale_ns as i128;
-            if denom == 0 {
-                pts as i128
-            } else {
-                numer / denom
-            }
-        };
-        let target_ticks: u64 = target_ticks_i128.max(0) as u64;
+        let target_ticks: u64 = self.stream_pts_to_ticks(stream_index, pts);
 
         // Find last cue entry for this track with time <= target_ticks.
         // Cues are sorted by (track, time); use a manual scan of the
@@ -8322,18 +8310,7 @@ impl Demuxer for MkvDemuxer {
         }
 
         // Convert the landed ticks back into the stream's time base.
-        let landed_pts: i64 = if stream_tb.num == 0 || stream_tb.den == 0 {
-            cue_time as i64
-        } else {
-            let numer = cue_time as i128 * stream_tb.den as i128 * self.timecode_scale_ns as i128;
-            let denom = stream_tb.num as i128 * 1_000_000_000i128;
-            if denom == 0 {
-                cue_time as i64
-            } else {
-                (numer / denom) as i64
-            }
-        };
-        Ok(landed_pts)
+        Ok(self.ticks_to_stream_pts(stream_index, cue_time))
     }
 }
 
@@ -9724,37 +9701,48 @@ impl MkvDemuxer {
         }
     }
 
-    /// Convert a stream-time-base `pts` into Matroska Segment Ticks
-    /// (same math as the Cues seek path).
+    /// Convert a stream-time-base `pts` into Matroska Segment Ticks (the
+    /// Cues seek path uses this too).
+    ///
+    /// Saturating: a hostile `TimestampScale` (up to 2^56-2 from an
+    /// 8-octet VINT-sized uinteger) or an extreme stream time base can
+    /// push the 3-factor product past `i128` — the conversion clamps
+    /// instead of overflowing (debug-build panic, fuzz-found 2026-08),
+    /// and the final narrowing clamps into `u64` rather than truncating.
     fn stream_pts_to_ticks(&self, stream_index: u32, pts: i64) -> u64 {
         let stream_tb = self.streams[stream_index as usize].time_base.as_rational();
         let ticks_i128: i128 = if stream_tb.num == 0 || stream_tb.den == 0 {
             pts as i128
         } else {
-            let numer = pts as i128 * stream_tb.num as i128 * 1_000_000_000i128;
-            let denom = stream_tb.den as i128 * self.timecode_scale_ns as i128;
+            let numer = (pts as i128)
+                .saturating_mul(stream_tb.num as i128)
+                .saturating_mul(1_000_000_000i128);
+            let denom = (stream_tb.den as i128).saturating_mul(self.timecode_scale_ns as i128);
             if denom == 0 {
                 pts as i128
             } else {
                 numer / denom
             }
         };
-        ticks_i128.max(0) as u64
+        ticks_i128.clamp(0, u64::MAX as i128) as u64
     }
 
     /// Convert Matroska Segment Ticks back into a stream-time-base pts
-    /// (same math as the Cues seek path).
+    /// (the Cues seek path uses this too). Saturating like
+    /// [`Self::stream_pts_to_ticks`]; the result clamps into `i64`.
     fn ticks_to_stream_pts(&self, stream_index: u32, ticks: u64) -> i64 {
         let stream_tb = self.streams[stream_index as usize].time_base.as_rational();
         if stream_tb.num == 0 || stream_tb.den == 0 {
-            ticks as i64
+            ticks.min(i64::MAX as u64) as i64
         } else {
-            let numer = ticks as i128 * stream_tb.den as i128 * self.timecode_scale_ns as i128;
-            let denom = stream_tb.num as i128 * 1_000_000_000i128;
+            let numer = (ticks as i128)
+                .saturating_mul(stream_tb.den as i128)
+                .saturating_mul(self.timecode_scale_ns as i128);
+            let denom = (stream_tb.num as i128).saturating_mul(1_000_000_000i128);
             if denom == 0 {
-                ticks as i64
+                ticks.min(i64::MAX as u64) as i64
             } else {
-                (numer / denom) as i64
+                (numer / denom).clamp(i64::MIN as i128, i64::MAX as i128) as i64
             }
         }
     }
