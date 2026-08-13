@@ -48,7 +48,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped); the singular `attachment_link()` keeps returning the first.
   Errata ID 8616 (`CueTime` excludes `CodecDelay` / `DiscardPadding` /
   `SeekPreRoll`) matches the arithmetic `seek_to` already uses.
-- 20 new tests across `tests/v5_elements.rs` (9),
+- `Edition::skip_type_at(ns)` — the staged implicit-range rule for
+  `ChapterSkipType` ("only valid until the next `ChapterAtom` with a
+  `ChapterSkipType` value or the end of the file") as a forward-scanning
+  resolver: end-less governing atoms run until the next *governing*
+  sibling (skip-less atoms neither classify nor terminate) or EOF;
+  bounded atoms classify `[start, end)`; the overlap tie-break
+  (latest-starting governing atom) is documented as a Reader choice,
+  not spec.
+- 21 new tests across `tests/v5_elements.rs` (10),
   `tests/mux_v5_elements.rs` (7), and `tests/schema_validate.rs` (4
   more, incl. the muxer-output v5 validation and the
   VersionMismatch-informational pin for v5 elements under a v4 header).

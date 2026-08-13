@@ -411,3 +411,82 @@ fn attachment_links_are_a_list_per_erratum_8615() {
     assert!(id2.attachment_links().is_empty());
     assert_eq!(id2.attachment_link(), None);
 }
+
+#[test]
+fn skip_type_at_applies_the_implicit_range_rule() {
+    use oxideav_mkv::demux::{Chapter, Edition};
+    let atom = |start: u64, end: Option<u64>, skip: Option<ChapterSkipType>| Chapter {
+        time_start_ns: start,
+        time_end_ns: end,
+        skip_type: skip,
+        ..Chapter::default()
+    };
+    let s = 1_000_000_000u64; // one second in Matroska Ticks
+    let ed = Edition {
+        chapters: vec![
+            // Governing, end-less: runs until the *next governing* atom.
+            atom(0, None, Some(ChapterSkipType::OpeningCredits)),
+            // Non-governing: carries no assertion and does NOT terminate
+            // the predecessor's open-ended range.
+            atom(10 * s, None, None),
+            // Governing, bounded: [20 s, 25 s).
+            atom(20 * s, Some(25 * s), Some(ChapterSkipType::Recap)),
+            // Trailing non-governing atom.
+            atom(30 * s, None, None),
+        ],
+        ..Edition::default()
+    };
+    // Inside the open-ended first range — including past the
+    // non-governing atom at 10 s.
+    assert_eq!(
+        ed.skip_type_at(5 * s),
+        Some(ChapterSkipType::OpeningCredits)
+    );
+    assert_eq!(
+        ed.skip_type_at(15 * s),
+        Some(ChapterSkipType::OpeningCredits)
+    );
+    // The next governing atom (20 s) terminates it and governs its own
+    // bounded range.
+    assert_eq!(ed.skip_type_at(22 * s), Some(ChapterSkipType::Recap));
+    // Past the bounded end: nothing governs (the first range was
+    // terminated at 20 s, the second ended at 25 s).
+    assert_eq!(ed.skip_type_at(26 * s), None);
+    assert_eq!(ed.skip_type_at(24 * s), Some(ChapterSkipType::Recap));
+
+    // A file whose only governing atom is end-less classifies to EOF.
+    let ed2 = Edition {
+        chapters: vec![atom(3 * s, None, Some(ChapterSkipType::EndCredits))],
+        ..Edition::default()
+    };
+    assert_eq!(ed2.skip_type_at(2 * s), None, "before the range");
+    assert_eq!(
+        ed2.skip_type_at(1_000_000 * s),
+        Some(ChapterSkipType::EndCredits),
+        "open-ended range runs to EOF"
+    );
+
+    // Overlap tie-break: a bounded governing atom overlapped by a later
+    // governing atom — the latest-starting one wins (documented Reader
+    // choice; the staged text names no precedence).
+    let ed3 = Edition {
+        chapters: vec![
+            atom(0, Some(30 * s), Some(ChapterSkipType::Advertisement)),
+            atom(10 * s, Some(12 * s), Some(ChapterSkipType::Preview)),
+        ],
+        ..Edition::default()
+    };
+    assert_eq!(ed3.skip_type_at(11 * s), Some(ChapterSkipType::Preview));
+    assert_eq!(
+        ed3.skip_type_at(13 * s),
+        Some(ChapterSkipType::Advertisement),
+        "outer bounded range resumes after the overlap"
+    );
+
+    // Pre-v5 file: no atom governs anywhere.
+    let ed4 = Edition {
+        chapters: vec![atom(0, Some(10 * s), None)],
+        ..Edition::default()
+    };
+    assert_eq!(ed4.skip_type_at(5 * s), None);
+}

@@ -6070,6 +6070,69 @@ pub struct Edition {
     pub chapters: Vec<Chapter>,
 }
 
+impl Edition {
+    /// Resolve the effective `ChapterSkipType` classification at
+    /// timestamp `ns` (Matroska Ticks — nanoseconds, the same unit as
+    /// [`Chapter::time_start_ns`]), applying the v5 implicit-range rule
+    /// from the staged `post-rfc9559-elements.md`: "If the `ChapterAtom`
+    /// doesn't contain a `ChapterTimeEnd`, the value of the
+    /// `ChapterSkipType` is only valid until the next `ChapterAtom` with
+    /// a `ChapterSkipType` value or the end of the file." Resolving this
+    /// genuinely needs a forward scan over sibling atoms — an interval
+    /// lookup over `[start, end)` pairs alone is wrong for end-less
+    /// atoms — which is why it is a method here rather than a caller
+    /// exercise.
+    ///
+    /// Semantics, precisely:
+    ///
+    /// * Only atoms that *carry* a `ChapterSkipType` govern (an atom
+    ///   without one carries no assertion and neither classifies nor
+    ///   terminates a predecessor's open-ended range).
+    /// * A governing atom with `ChapterTimeEnd` classifies
+    ///   `[time_start_ns, time_end_ns)`.
+    /// * A governing atom without one classifies from `time_start_ns`
+    ///   until the `time_start_ns` of the **next governing atom in
+    ///   document order**, or EOF.
+    /// * When several governing ranges cover `ns` (a bounded atom
+    ///   overlapping a later one), the latest-starting governing atom in
+    ///   document order wins. The staged text defines no precedence for
+    ///   overlaps — this deterministic tie-break is this Reader's
+    ///   choice, not spec.
+    ///
+    /// Only the edition's **top-level** atoms are scanned: the staged
+    /// rule speaks of sibling atoms, and a nested atom's classification
+    /// interacts with its ancestor chain (the nesting MUST-NOT rule)
+    /// rather than the timeline scan — callers wanting nested resolution
+    /// walk [`Chapter::children`] themselves. Returns `None` when no
+    /// governing range covers `ns` — including for every pre-v5 file
+    /// (no atom carries the element).
+    pub fn skip_type_at(&self, ns: u64) -> Option<ChapterSkipType> {
+        let mut winner: Option<ChapterSkipType> = None;
+        for (i, atom) in self.chapters.iter().enumerate() {
+            let Some(st) = atom.skip_type else {
+                continue;
+            };
+            if ns < atom.time_start_ns {
+                continue;
+            }
+            let end = match atom.time_end_ns {
+                Some(e) => e,
+                None => self.chapters[i + 1..]
+                    .iter()
+                    .find(|c| c.skip_type.is_some())
+                    .map(|c| c.time_start_ns)
+                    .unwrap_or(u64::MAX),
+            };
+            // Document order: a later governing atom covering `ns`
+            // replaces an earlier one.
+            if ns < end || end == u64::MAX {
+                winner = Some(st);
+            }
+        }
+        winner
+    }
+}
+
 /// One `EditionDisplay` master (Matroska v5 element `0x4520`, staged
 /// `post-rfc9559-elements.md`) — a human-readable edition name in one or
 /// more languages. Part of [`Edition::displays`].

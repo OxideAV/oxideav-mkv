@@ -472,7 +472,14 @@ the unified `oxideav` aggregator to wire decoding automatically.
     nested-atom rule (a nested atom MUST NOT repeat its nearest
     ancestor's value) is checked by the schema validator
     (`ChapterSkipTypeNesting`), ancestor-chain-aware and independent of
-    on-disk child order.
+    on-disk child order. `Edition::skip_type_at(ns)` resolves "the skip
+    classification at timestamp T" applying the staged implicit-range
+    rule — an end-less governing atom classifies until the *next atom
+    carrying a `ChapterSkipType`* (skip-less atoms neither classify nor
+    terminate) or EOF, which needs a forward sibling scan rather than an
+    interval lookup; the overlap tie-break (latest-starting governing
+    atom wins) is documented as this Reader's deterministic choice, not
+    spec.
   - `Emphasis` (`0x52F1`): per-`Audio`-master emphasis filter on the
     typed `TrackAudio` record — `emphasis()` returns a bare
     `AudioEmphasis` with the mandatory-but-defaulted `0` materialised
