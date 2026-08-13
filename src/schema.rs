@@ -674,6 +674,16 @@ pub enum SchemaFindingKind {
     /// (RFC 8794 §11.3.1: "the CRC-32 Element MUST be the first
     /// ordered EBML Element within its Parent Element"). Violation.
     MisplacedCrc32,
+    /// A nested `ChapterAtom`'s `ChapterSkipType` (Matroska v5 element
+    /// `0x4588`, staged `post-rfc9559-elements.md`) repeats the value of
+    /// its nearest ancestor atom that has one set — the v5 usage note
+    /// makes that a MUST NOT ("If a `ChapterAtom` is inside a
+    /// `ChapterAtom` that has a `ChapterSkipType` set, it MUST NOT …
+    /// have a `ChapterSkipType` with the same value as it's parent
+    /// `ChapterAtom`"). Needs the ancestor chain, not just the local
+    /// element — the validator tracks it through the recursive atom
+    /// walk. Violation.
+    ChapterSkipTypeNesting,
 }
 
 impl SchemaFindingKind {
@@ -1069,6 +1079,15 @@ fn walk_master<R: Read + Seek>(
         match def {
             Some(d) if d.element_type == ElementType::Master && depth < MAX_SCHEMA_DEPTH => {
                 walk_master(r, body, next, Some(d), None, depth + 1, report)?;
+                // ChapterSkipType nesting rule (Matroska v5, staged
+                // post-rfc9559-elements.md): run one dedicated ancestor-
+                // aware pass per *top-level* ChapterAtom (the recursion
+                // below covers its nested atoms) — the main walk can't
+                // carry the ancestor value because a nested atom may
+                // precede its parent's own ChapterSkipType child on disk.
+                if d.id == ids::CHAPTER_ATOM && parent_id != Some(ids::CHAPTER_ATOM) {
+                    check_chapter_skip_nesting(r, body, next, None, 0, report)?;
+                }
             }
             Some(d) if d.element_type == ElementType::Master => {}
             Some(d) => check_leaf(r, d, pos, body, header.size, report)?,
@@ -1099,6 +1118,76 @@ fn walk_master<R: Read + Seek>(
         }
     }
     Ok(pos)
+}
+
+/// Ancestor-aware `ChapterSkipType` nesting check over one `ChapterAtom`
+/// extent (`start..end` = the atom's body). Two passes per atom, both
+/// bounded by the atom's extent: the first finds the atom's own
+/// `ChapterSkipType` (which may sit *after* nested child atoms on disk —
+/// the rule references the parent's value regardless of child order),
+/// the second recurses into the nested atoms with the effective ancestor
+/// value (the atom's own value when set, else the inherited one — the v5
+/// wording's "inside" is transitive across atoms that omit the element).
+/// Structural damage is left to the main walk: a torn header simply ends
+/// this check.
+fn check_chapter_skip_nesting<R: Read + Seek>(
+    r: &mut R,
+    start: u64,
+    end: u64,
+    inherited: Option<u64>,
+    depth: usize,
+    report: &mut SchemaReport,
+) -> Result<()> {
+    if depth >= MAX_SCHEMA_DEPTH {
+        return Ok(());
+    }
+    // Pass 1: this atom's own ChapterSkipType (first occurrence wins,
+    // matching the reader), remembering its offset for the finding.
+    let mut own: Option<(u64, u64)> = None; // (offset, value)
+    let mut child_atoms: Vec<(u64, u64)> = Vec::new(); // (body, next)
+    let mut pos = start;
+    while pos < end {
+        r.seek(SeekFrom::Start(pos))?;
+        let Ok(header) = ebml::read_element_header(r) else {
+            return Ok(());
+        };
+        if header.size == ebml::VINT_UNKNOWN_SIZE {
+            // No ChapterAtom child may use the unknown-size VINT; the
+            // main walk reports it. Stop here.
+            return Ok(());
+        }
+        let body = pos + header.header_len as u64;
+        let Some(next) = body.checked_add(header.size) else {
+            return Ok(());
+        };
+        if next > end {
+            return Ok(());
+        }
+        if header.id == ids::CHAPTER_SKIP_TYPE && own.is_none() && header.size <= 8 {
+            r.seek(SeekFrom::Start(body))?;
+            let v = ebml::read_uint(r, header.size as usize)?;
+            own = Some((pos, v));
+        } else if header.id == ids::CHAPTER_ATOM {
+            child_atoms.push((body, next));
+        }
+        pos = next;
+    }
+    if let (Some((offset, v)), Some(anc)) = (own, inherited) {
+        if v == anc {
+            push_finding(
+                report,
+                offset,
+                ids::CHAPTER_SKIP_TYPE,
+                SchemaFindingKind::ChapterSkipTypeNesting,
+            );
+        }
+    }
+    // Pass 2: descend with the effective ancestor value.
+    let effective = own.map(|(_, v)| v).or(inherited);
+    for (body, next) in child_atoms {
+        check_chapter_skip_nesting(r, body, next, effective, depth + 1, report)?;
+    }
+    Ok(())
 }
 
 /// Type-shape, `length`, and `range` checks for one non-master leaf.

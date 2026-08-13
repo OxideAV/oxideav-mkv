@@ -246,7 +246,10 @@ the unified `oxideav` aggregator to wire decoding automatically.
   "writer explicitly cleared the flag". `attachment_link()` surfaces the
   `FileUID` of an attachment the track's codec uses (e.g. a font for an
   ASS/SSA subtitle track), matching an `Attachment::uid` from `attachments()`;
-  a spec-illegal `0` (range "not 0") is dropped at parse time.
+  a spec-illegal `0` (range "not 0") is dropped at parse time, and per
+  RFC 9559 errata ID 8615 (the printed `maxOccurs: 1` is bogus) the full
+  multi-occurrence list surfaces on `attachment_links()` in on-disk
+  order, the singular accessor returning the first.
   `TrackIdentity::is_default()` reports the all-absent state. The effective
   language also lifts onto the flat `StreamInfo` view (BCP-47 preferred).
 - **Typed `TrackCodecTiming` accessor** (RFC 9559 §5.1.4.1.25 + §5.1.4.1.26):
@@ -443,6 +446,65 @@ the unified `oxideav` aggregator to wire decoding automatically.
   four-octet ID. All three groups are read-side only: the muxer never
   emits them (an unassigned ID could collide with a future registry
   assignment).
+- **Matroska v5 elements** (staged `post-rfc9559-elements.md` — the six
+  elements the CELLAR schema carries with `minver: 5` that no RFC and no
+  IANA registry row define; parsed unconditionally per the staged doc's
+  "parse all six" posture, mirror-image of the legacy set above):
+  - `EditionDisplay` (`0x4520`) + `EditionString` (`0x4521`) +
+    `EditionLanguageIETF` (`0x45E4`): edition-level display names — the
+    `EditionEntry` analogue of `ChapterDisplay` — surface on
+    `Edition::displays` in on-disk order, each pairing one name string
+    with its BCP 47 tag list (note the upstream `…IETF` spelling; every
+    other BCP 47 element is named `…BCP47`). A master missing its
+    mandatory `EditionString` is dropped; a present-but-*empty* string is
+    kept (the schema doesn't prohibit it); no `und` fallback is
+    synthesised for a language-less entry (none is specified). The full
+    list is surfaced — the schema names no selection rule among multiple
+    displays, so the caller picks by language.
+  - `ChapterSkipType` (`0x4588`): per-atom skip classification on
+    `Chapter::skip_type` as `Option<ChapterSkipType>` — the element has
+    **no default**, so absence stays observable (`None` carries no
+    assertion, distinct from `Some(NoSkipping)`'s positive "do not skip
+    this"). The closed 0..=7 enumeration (incl. the post-RFC
+    `Intermission = 7` addition) decodes to named variants;
+    out-of-enumeration values degrade to `Unknown(v)` ("unrecognised, do
+    not skip" — `is_skippable()` never fires for them). The v5
+    nested-atom rule (a nested atom MUST NOT repeat its nearest
+    ancestor's value) is checked by the schema validator
+    (`ChapterSkipTypeNesting`), ancestor-chain-aware and independent of
+    on-disk child order.
+  - `Emphasis` (`0x52F1`): per-`Audio`-master emphasis filter on the
+    typed `TrackAudio` record — `emphasis()` returns a bare
+    `AudioEmphasis` with the mandatory-but-defaulted `0` materialised
+    (RFC 8794 §11.1.5), `emphasis_explicit()` preserves the on-disk
+    presence (an explicit `0` is distinct from absence — load-bearing
+    for re-mux, since the element carries the CELLAR
+    `stream copy keep="1"` marker: dropping it on a stream copy is a
+    correctness bug, the stored samples stay emphasised). The
+    enumeration is deliberately non-contiguous (0..=5 + 10..=16; 2 is
+    `reserved`, 6..=9 and 17+ unassigned) and closed — no registry, no
+    FCFS path; `needs_deemphasis()` reports the values whose inverse
+    filter the player MUST apply.
+  - `TagBlockAddIDValue` (`0x63C7` — the only one of the six that
+    genuinely postdates RFC 9559): `Targets::block_add_id_values`
+    surfaces the repeatable selector verbatim (default `0` = wildcard;
+    empty list ≡ single `0`). It is the only `Targets` child whose scope
+    is qualified by a *sibling* child: `Targets::applies_to_block_addition
+    (stream_index, mapping_value)` resolves the joint 2×2
+    `TagBlockAddIDValue` × `TagTrackUID` matrix (wildcard/wildcard = all
+    mappings in the Segment; the both-concrete cell is the v5 MUST-match
+    case), and `MkvDemuxer::tags_for_block_addition_mapping` filters the
+    tag list through it. A selector of `1` matches nothing (the referent
+    `BlockAddIDValue` is ranged `>= 2`) — surfaced, not errored.
+- **RFC 9559 errata surfaced** (both `Reported` errata transcribed in the
+  staged `post-rfc9559-elements.md` §8): per errata ID 8615 the printed
+  `AttachmentLink` `maxOccurs: 1` is bogus, so `TrackIdentity` models the
+  element as a list — `attachment_links()` returns every non-zero value
+  in on-disk order while the historical singular `attachment_link()`
+  keeps returning the first. (Errata ID 8616 — `CueTime` = Cluster
+  Timestamp + Block Timestamp, `CodecDelay` / `DiscardPadding` /
+  `SeekPreRoll` excluded — matches the arithmetic `seek_to` already
+  uses.)
 - **Damage-resilient open** (`demux::open_resilient` /
   `demux::open_resilient_typed`): RFC 9559 §26 leaves error handling to
   the Reader ("Matroska Readers decide how to handle the errors whether
@@ -1645,6 +1707,34 @@ the unified `oxideav` aggregator to wire decoding automatically.
   identically. Omitting the call keeps the master off-disk so the demuxer
   surfaces `None` from `content_encodings`. Pairs symmetrically with the
   existing `MkvDemuxer::content_encodings` typed accessor.
+- **Matroska v5 write surface — explicit opt-in, `DocTypeVersion 5`
+  auto-declared** (staged `post-rfc9559-elements.md`; the conservative
+  default is "write none of them"): the demux-side v5 surface is
+  mux-symmetric, but only when the caller queues it —
+  `MkvMuxer::set_edition_displays(Vec<MkvEditionDisplay>)` writes the
+  `EditionDisplay` masters into the single emitted `EditionEntry`
+  (rejected at `write_header` when no chapters are queued —
+  `EditionEntry` needs a `ChapterAtom`, and silent dropping is not an
+  option; `EditionLanguageIETF` tags are validated printable-ASCII at
+  queue time), `MkvChapter::skip_type` writes `ChapterSkipType`,
+  `MkvTrackAudio::emphasis` writes `Emphasis`, and
+  `MkvTagTargets::block_add_id_values` writes the non-zero
+  `TagBlockAddIDValue` selectors (zeros are wildcards expressed by
+  omission, mirroring the UID lists). Queuing any of them flips the
+  emitted EBML header from `DocTypeVersion 4` to `5` (the v5 draft rule:
+  files carrying `minver: 5` elements MUST declare 5+);
+  `DocTypeReadVersion` stays `2` — every v5 element the muxer can emit
+  is skippable by an older Reader. `Emphasis` queued as `NoEmphasis`
+  behaves like omission on disk and does **not** force v5 (the staged
+  note: emitting `Emphasis=0` needlessly upgrades an otherwise-v4 file).
+  Closed enumerations are enforced at queue time (`Reserved` /
+  unassigned `Emphasis` values and `ChapterSkipType` 8+ are rejected —
+  the restrictions bind writers; readers degrade). All four surfaces are
+  rejected on a WebM muxer with **no lenient opt-out** — none of the six
+  is a WebM element (`ChapterSkipType` carries an explicit `webm="0"`
+  marker) and `DocTypeVersion 5` is undefined for the `webm` DocType.
+  The full mux→demux round trip and the muxer-output schema validation
+  (zero findings, v5 header) are pinned in `tests/mux_v5_elements.rs`.
 
 ### WebM-profile conformance (`webm` module)
 
@@ -1717,16 +1807,22 @@ the unified `oxideav` aggregator to wire decoding automatically.
   `MissingMandatory` for `minOccurs >= 1` children with no declared
   default on cleanly-walked masters), the RFC 8794 first-child rule
   for `CRC-32` (`MisplacedCrc32`), `unknownsizeallowed` gating
-  (`UnknownSizeNotAllowed`), and the version window (`Deprecated` +
+  (`UnknownSizeNotAllowed`), the version window (`Deprecated` +
   `VersionMismatch` against the header's `DocTypeVersion`,
-  informational). The removed legacy Signature family classifies
+  informational), and the Matroska-v5 `ChapterSkipType` nesting rule
+  (`ChapterSkipTypeNesting`, violation — a nested `ChapterAtom`
+  repeating its nearest ancestor's skip value; checked with a
+  dedicated ancestor-aware pass per top-level atom, transitive across
+  atoms that omit the element and independent of where the parent's
+  own `ChapterSkipType` sits among its children). The removed legacy
+  Signature family classifies
   `KnownLegacy` (informational, masters descended) rather than
   `UnknownId`, per the staged mapping doc's recognise-and-skip
   recommendation. `is_valid()` = zero violations + clean walk;
   findings carry absolute offsets, capped at 4096 with exact
   counters. The in-tree muxer's own output validates with zero
   violations and zero informational findings — pinned in CI
-  (`tests/schema_validate.rs`, 10 tests, including a no-panic sweep
+  (`tests/schema_validate.rs`, 16 tests, including a no-panic sweep
   over byte soup and every truncation prefix).
 
 ### Codec ID mapping (`codec_id` module)
@@ -1867,7 +1963,11 @@ so the demuxer never hides an unrecognised track.
 `Reclaimed`), the 4 all-ones `Reserved` placeholders excluded — and
 cross-checks `src/ids.rs` in CI, both directions: every registry element
 has a const, and every numeric const is a registry entry, one of the 13
-RFC 8794 EBML-header / EBML-global IDs, or one of the 12 documented
+RFC 8794 EBML-header / EBML-global IDs, one of the six staged post-RFC
+Matroska v5 elements (`EditionDisplay` / `EditionString` /
+`EditionLanguageIETF` / `ChapterSkipType` / `Emphasis` /
+`TagBlockAddIDValue` — no RFC and no IANA row define them; provenance
+pinned in `post-rfc9559-elements.md`), or one of the 12 documented
 legacy exceptions — `ChapterFlagEnabled` (`0x4598`) plus the
 legacy-element-ID mapping set (`EditionFlagHidden` `0x45BD`,
 `ChapterTrack` `0x8F`, `ChapterTrackUID` `0x89`, and the eight-element

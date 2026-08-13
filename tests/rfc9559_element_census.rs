@@ -332,6 +332,22 @@ const OUT_OF_REGISTRY_LEGACY: &[(u32, &str)] = &[
     (0x6532, "SignedElement"),
 ];
 
+/// The Matroska **v5** elements (staged
+/// `docs/container/matroska/post-rfc9559-elements.md`): present in the
+/// CELLAR schema with `minver: 5` but defined by no RFC, no published
+/// Internet-Draft, and no IANA registry row — RFC 9559 froze at Matroska
+/// version 4 and Table 53 leaves these IDs unlisted. The crate parses
+/// all six unconditionally and writes them only on explicit opt-in
+/// (which flips the emitted `DocTypeVersion` to 5).
+const POST_RFC_V5: &[(u32, &str)] = &[
+    (0x4520, "EditionDisplay"),
+    (0x4521, "EditionString"),
+    (0x45E4, "EditionLanguageIETF"),
+    (0x4588, "ChapterSkipType"),
+    (0x52F1, "Emphasis"),
+    (0x63C7, "TagBlockAddIDValue"),
+];
+
 /// Crate const names that deliberately differ from the registry Element
 /// Name (disambiguation prefixes for name collisions inside `ids.rs`).
 const NAME_EXCEPTIONS: &[(u32, &str)] = &[
@@ -425,14 +441,16 @@ fn every_ids_const_is_registry_or_documented_exception() {
         let in_registry = REGISTRY.iter().any(|(id, _, _)| id == v);
         let in_ebml = EBML_RFC8794.iter().any(|(id, _)| id == v);
         let in_legacy = OUT_OF_REGISTRY_LEGACY.iter().any(|(id, _)| id == v);
-        if !(in_registry || in_ebml || in_legacy) {
+        let in_v5 = POST_RFC_V5.iter().any(|(id, _)| id == v);
+        if !(in_registry || in_ebml || in_legacy || in_v5) {
             rogue.push(format!("{name} = 0x{v:X}"));
         }
     }
     assert!(
         rogue.is_empty(),
         "ids.rs consts outside the RFC 9559 registry, the RFC 8794 EBML \
-         header set, and the documented legacy exception: {rogue:?}"
+         header set, the documented legacy exception, and the staged \
+         post-RFC v5 set: {rogue:?}"
     );
 }
 

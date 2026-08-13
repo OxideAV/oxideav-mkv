@@ -9,6 +9,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The six Matroska v5 elements** (staged
+  `docs/container/matroska/post-rfc9559-elements.md` — `minver: 5` in
+  the CELLAR schema; no RFC and no IANA registry row define them),
+  demux + opt-in mux, closing the last "docs-gapped" arm:
+  - Demux: `Edition::displays` (`EditionDisplay` / `EditionString` /
+    `EditionLanguageIETF` — malformed string-less masters dropped,
+    empty strings kept, no `und` synthesised), `Chapter::skip_type`
+    (`Option<ChapterSkipType>`, no default materialised, closed 0..=7
+    enum + `Unknown` degrade), `TrackAudio::emphasis` /
+    `emphasis_explicit` (mandatory-but-defaulted `0`, non-contiguous
+    closed `AudioEmphasis` enum, `needs_deemphasis()`), and
+    `Targets::block_add_id_values` with the joint
+    `TagBlockAddIDValue` × `TagTrackUID` 2×2 matrix resolved by
+    `Targets::applies_to_block_addition` +
+    `MkvDemuxer::tags_for_block_addition_mapping`.
+  - Mux: `MkvMuxer::set_edition_displays`, `MkvChapter::skip_type`,
+    `MkvTrackAudio::emphasis`, `MkvTagTargets::block_add_id_values`.
+    Queuing any v5 element auto-declares `DocTypeVersion 5`
+    (`DocTypeReadVersion` stays 2 — all six are skippable); nothing is
+    written by default; `Emphasis = NoEmphasis` stays off-disk and does
+    not force v5. Closed enumerations enforced at queue time (reserved
+    / unassigned `Emphasis`, `ChapterSkipType` 8+). All four surfaces
+    rejected on WebM with no lenient opt-out (`ChapterSkipType` is the
+    schema's one explicit `webm="0"` element; `DocTypeVersion 5` is
+    undefined for the webm DocType). Live tags carrying v5 selectors
+    under a v4 header are rejected.
+  - Schema validator: new `ChapterSkipTypeNesting` violation — the v5
+    nested-atom rule (a nested `ChapterAtom` MUST NOT repeat its
+    nearest ancestor's skip value), checked ancestor-aware, transitive
+    across skip-less middle atoms, independent of on-disk child order.
+  - Census: the six IDs join `tests/rfc9559_element_census.rs` as a
+    documented out-of-registry exception class with staged provenance.
+- **RFC 9559 errata ID 8615 honoured** (transcribed in the staged doc
+  §8): `AttachmentLink`'s printed `maxOccurs: 1` is bogus —
+  `TrackIdentity::attachment_links()` now surfaces the full
+  multi-occurrence list in on-disk order (spec-illegal zeros still
+  dropped); the singular `attachment_link()` keeps returning the first.
+  Errata ID 8616 (`CueTime` excludes `CodecDelay` / `DiscardPadding` /
+  `SeekPreRoll`) matches the arithmetic `seek_to` already uses.
+- 20 new tests across `tests/v5_elements.rs` (9),
+  `tests/mux_v5_elements.rs` (7), and `tests/schema_validate.rs` (4
+  more, incl. the muxer-output v5 validation and the
+  VersionMismatch-informational pin for v5 elements under a v4 header).
+
 - TrackOperation application edge coverage: the resilient path keeps
   synthesising across a Cluster-stream resync (damage recovered,
   post-damage source Blocks still copied), and a Header-Stripping

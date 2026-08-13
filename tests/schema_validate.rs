@@ -482,3 +482,126 @@ fn arbitrary_bytes_never_panic_validator() {
         let _ = validate(&mut Cursor::new(&good[..cut]));
     }
 }
+
+// --- ChapterSkipType nesting rule (Matroska v5) ---------------------------
+//
+// Staged post-rfc9559-elements.md: "If a ChapterAtom is inside a
+// ChapterAtom that has a ChapterSkipType set, it MUST NOT ... have a
+// ChapterSkipType with the same value as it's parent ChapterAtom." The
+// validator runs an ancestor-aware pass per top-level atom.
+
+/// One valid chapter atom (mandatory ChapterUID + ChapterTimeStart) with
+/// an optional skip type and pre-encoded nested children. `skip_last`
+/// places the ChapterSkipType *after* the nested atoms, pinning the
+/// order-independence of the rule (the parent's value governs regardless
+/// of where it sits among the children).
+fn skip_atom(uid: u64, skip: Option<u64>, skip_last: bool, children: &[Vec<u8>]) -> Vec<u8> {
+    let mut a = Vec::new();
+    a.extend_from_slice(&elem_uint(ids::CHAPTER_UID, uid));
+    a.extend_from_slice(&elem_uint(ids::CHAPTER_TIME_START, 0));
+    if let (Some(v), false) = (skip, skip_last) {
+        a.extend_from_slice(&elem_uint(ids::CHAPTER_SKIP_TYPE, v));
+    }
+    for c in children {
+        a.extend_from_slice(c);
+    }
+    if let (Some(v), true) = (skip, skip_last) {
+        a.extend_from_slice(&elem_uint(ids::CHAPTER_SKIP_TYPE, v));
+    }
+    elem_master(ids::CHAPTER_ATOM, &a)
+}
+
+fn chapters_doc(atoms: &[Vec<u8>]) -> Vec<u8> {
+    let mut ed = Vec::new();
+    for a in atoms {
+        ed.extend_from_slice(a);
+    }
+    let chapters = elem_master(ids::CHAPTERS, &elem_master(ids::EDITION_ENTRY, &ed));
+    // DocTypeVersion 5 so the v5 elements produce no VersionMismatch
+    // informational noise.
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&info());
+    seg.extend_from_slice(&tracks());
+    seg.extend_from_slice(&chapters);
+    seg.extend_from_slice(&cluster());
+    let mut out = ebml_header("matroska", 5);
+    out.extend_from_slice(&elem_master(ids::SEGMENT, &seg));
+    out
+}
+
+#[test]
+fn chapter_skip_type_nesting_violation_flagged() {
+    // Child repeats the parent's value (1) — one violation, found even
+    // though the parent's ChapterSkipType sits *after* the nested atom.
+    let child = skip_atom(2, Some(1), false, &[]);
+    let parent = skip_atom(1, Some(1), true, &[child]);
+    let report = run(&chapters_doc(&[parent]));
+    assert_eq!(
+        kinds(&report)
+            .iter()
+            .filter(|k| matches!(k, SchemaFindingKind::ChapterSkipTypeNesting))
+            .count(),
+        1,
+        "{:?}",
+        report.findings
+    );
+    assert!(!report.is_valid());
+}
+
+#[test]
+fn chapter_skip_type_nesting_rule_is_transitive() {
+    // Grandchild repeats the grandparent's value (2) across a middle
+    // atom that omits the element — the v5 wording's "inside" is
+    // transitive, so this is still a violation.
+    let grandchild = skip_atom(3, Some(2), false, &[]);
+    let middle = skip_atom(2, None, false, &[grandchild]);
+    let top = skip_atom(1, Some(2), false, &[middle]);
+    let report = run(&chapters_doc(&[top]));
+    assert_eq!(
+        kinds(&report)
+            .iter()
+            .filter(|k| matches!(k, SchemaFindingKind::ChapterSkipTypeNesting))
+            .count(),
+        1,
+        "{:?}",
+        report.findings
+    );
+}
+
+#[test]
+fn chapter_skip_type_legal_nesting_passes() {
+    // Different nested value, omitted nested value, and sibling atoms
+    // sharing a value (the rule binds ancestors only) — all legal.
+    let child_diff = skip_atom(2, Some(0), false, &[]);
+    let child_none = skip_atom(3, None, false, &[]);
+    let parent = skip_atom(1, Some(1), false, &[child_diff, child_none]);
+    let sibling = skip_atom(4, Some(1), false, &[]);
+    let report = run(&chapters_doc(&[parent, sibling]));
+    assert_eq!(report.violations, 0, "{:?}", report.findings);
+    assert!(report.is_valid());
+}
+
+#[test]
+fn v5_elements_under_v4_header_are_version_mismatch_informational() {
+    // The same six-element surface under DocTypeVersion 4: minver 5 >
+    // declared 4 → informational VersionMismatch per element, but no
+    // violation (RFC 8794 leaves unknown-element skipping legal).
+    let atom = skip_atom(1, Some(1), false, &[]);
+    let mut ed = Vec::new();
+    let mut disp = Vec::new();
+    disp.extend_from_slice(&elem_str(ids::EDITION_STRING, "Cut"));
+    disp.extend_from_slice(&elem_str(ids::EDITION_LANGUAGE_IETF, "en"));
+    ed.extend_from_slice(&elem_master(ids::EDITION_DISPLAY, &disp));
+    ed.extend_from_slice(&atom);
+    let chapters = elem_master(ids::CHAPTERS, &elem_master(ids::EDITION_ENTRY, &ed));
+    let bytes = doc(&[&info(), &tracks(), &chapters, &cluster()]);
+    let report = run(&bytes);
+    assert!(report.is_valid(), "{:?}", report.findings);
+    let mismatches = kinds(&report)
+        .iter()
+        .filter(|k| matches!(k, SchemaFindingKind::VersionMismatch))
+        .count();
+    // EditionDisplay + EditionString + EditionLanguageIETF +
+    // ChapterSkipType = four v5 occurrences.
+    assert_eq!(mismatches, 4, "{:?}", report.findings);
+}

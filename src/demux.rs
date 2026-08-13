@@ -792,6 +792,7 @@ fn open_typed_impl(
                 output_sampling_frequency_explicit: raw.output_sampling_frequency,
                 channels: raw.channels.unwrap_or(1),
                 bit_depth: raw.bit_depth,
+                emphasis_explicit: raw.emphasis,
             })
         })
         .collect();
@@ -843,7 +844,7 @@ fn open_typed_impl(
             flag_enabled: t.flag_enabled,
             flag_default: t.flag_default,
             flag_lacing: t.flag_lacing,
-            attachment_link: t.attachment_link,
+            attachment_links: t.attachment_links.clone(),
         })
         .collect();
 
@@ -1985,10 +1986,14 @@ struct TrackEntry {
     /// `FlagLacing` (RFC 9559 §5.1.4.1.12, default `1`). `None` when absent;
     /// the default is materialised on the typed surface.
     flag_lacing: Option<u64>,
-    /// `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`) — the `FileUID` of
-    /// an attachment this codec uses. `None` when absent; a spec-illegal `0`
-    /// (range "not 0") is dropped at parse time.
-    attachment_link: Option<u64>,
+    /// `AttachmentLink` values (RFC 9559 §5.1.4.1.24, `maxver: 3`) — the
+    /// `FileUID`s of attachments this codec uses, in on-disk order. RFC 9559
+    /// prints `maxOccurs: 1`, but errata ID 8615 (Reported, Technical —
+    /// transcribed in the staged `post-rfc9559-elements.md` §8) records that
+    /// cap as bogus: a `TrackEntry` can carry several, so the element is
+    /// modelled as a list. Spec-illegal `0`s (range "not 0") are dropped at
+    /// parse time.
+    attachment_links: Vec<u64>,
     /// `BlockAdditionMapping` masters (RFC 9559 §5.1.4.1.17) captured during
     /// the `TrackEntry` walk, one entry per master in on-disk order. Empty
     /// when the `TrackEntry` carried no `BlockAdditionMapping` child (the
@@ -2091,6 +2096,10 @@ struct RawTrackAudio {
     output_sampling_frequency: Option<f64>,
     channels: Option<u64>,
     bit_depth: Option<u64>,
+    /// Matroska v5 `Emphasis` (staged post-rfc9559-elements.md), kept as
+    /// the raw on-disk integer so the typed surface can distinguish an
+    /// explicit `0` from the materialised default.
+    emphasis: Option<u64>,
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -2331,6 +2340,13 @@ struct RawTag {
     edition_uids: Vec<u64>,
     chapter_uids: Vec<u64>,
     attachment_uids: Vec<u64>,
+    /// `TagBlockAddIDValue` values (Matroska v5, staged
+    /// `post-rfc9559-elements.md`), verbatim in on-disk order. Unlike the
+    /// four UID lists these are *not* resolved / filtered here — the
+    /// referential rule only bites in the both-non-zero cell of the joint
+    /// matrix and is a writer obligation; the typed surface keeps the
+    /// on-disk values.
+    block_add_id_values: Vec<u64>,
     /// Optional `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1, default 50) and
     /// `TargetType` informational string (§5.1.8.1.1.2). Both are kept as
     /// captured — the typed [`Targets`] surface lets consumers decide
@@ -2382,6 +2398,7 @@ fn parse_tags(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<RawTag>) -> Result<(
                     edition_uids: Vec::new(),
                     chapter_uids: Vec::new(),
                     attachment_uids: Vec::new(),
+                    block_add_id_values: Vec::new(),
                     target_type_value: None,
                     target_type: None,
                     simple_tags: Vec::new(),
@@ -2447,6 +2464,15 @@ fn parse_targets(r: &mut dyn ReadSeek, end: u64, t: &mut RawTag) -> Result<()> {
             ids::TAG_ATTACHMENT_UID => {
                 let v = read_uint(r, e.size as usize)?;
                 t.attachment_uids.push(v);
+            }
+            // TagBlockAddIDValue (Matroska v5, staged
+            // post-rfc9559-elements.md): repeatable uinteger, default 0
+            // (the wildcard). Kept verbatim — the joint TagTrackUID
+            // matrix is resolved on the typed surface
+            // (`Targets::applies_to_block_addition`), not at parse time.
+            ids::TAG_BLOCK_ADD_ID_VALUE => {
+                let v = read_uint(r, e.size as usize)?;
+                t.block_add_id_values.push(v);
             }
             ids::TARGET_TYPE_VALUE => {
                 t.target_type_value = Some(read_uint(r, e.size as usize)?);
@@ -2707,6 +2733,7 @@ fn resolve_tags(
                 target_type_value: tag.target_type_value,
                 target_type: tag.target_type.clone(),
                 uids: resolved_uids,
+                block_add_id_values: tag.block_add_id_values.clone(),
             },
             simple_tags: typed_simple,
         });
@@ -2756,6 +2783,24 @@ pub struct Targets {
     /// contains a matching `TrackUID`. Dangling references are dropped
     /// per RFC 9559 §5.1.8.1.1.3..§5.1.8.1.1.6.
     pub uids: Vec<TargetUid>,
+    /// `TagBlockAddIDValue` values (Matroska v5 element `0x63C7` — staged
+    /// `post-rfc9559-elements.md`; no RFC and no IANA registry row define
+    /// it, its normative text lives only in the CELLAR schema), verbatim
+    /// in on-disk order. Each value is a copy of a `BlockAddIDValue`
+    /// (RFC 9559 §5.1.4.1.17.1) used as a *target selector*: it scopes the
+    /// Tag to one `BlockAdditionMapping`, exactly the way `TagTrackUID`
+    /// holds a copy of a `TrackUID`. It selects the *mapping*, not the
+    /// per-frame `BlockAddID` inside a `BlockMore`.
+    ///
+    /// The element is repeatable with default `0`, and an empty list is
+    /// semantically identical to a single `0` (the wildcard). Its scope is
+    /// qualified by the sibling `TagTrackUID` — a 2×2 matrix resolved by
+    /// [`Targets::applies_to_block_addition`]; resolving the two axes
+    /// independently gives wrong answers in two of the four cells.
+    /// Since the referent `BlockAddIDValue` is ranged `>= 2`, a value of
+    /// `1` can never match a real mapping (it selects nothing — not a
+    /// parse error); values are surfaced verbatim either way.
+    pub block_add_id_values: Vec<u64>,
 }
 
 impl Targets {
@@ -2776,6 +2821,58 @@ impl Targets {
     /// [`TargetLevel::Other`] rather than being clamped or dropped.
     pub fn target_level(&self) -> Option<TargetLevel> {
         self.target_type_value.map(TargetLevel::from_raw)
+    }
+
+    /// `true` when this `Targets` carries at least one non-zero
+    /// `TagBlockAddIDValue` — i.e. the Tag is scoped to specific
+    /// `BlockAdditionMapping`s rather than applying to all of them. A
+    /// zero value (and an absent element) is the wildcard per the staged
+    /// v5 usage notes, so it does not count as scoping.
+    pub fn block_addition_scoped(&self) -> bool {
+        self.block_add_id_values.iter().any(|&v| v != 0)
+    }
+
+    /// Joint `TagBlockAddIDValue` × `TagTrackUID` resolution (staged
+    /// `post-rfc9559-elements.md` usage notes — the only `Targets` child
+    /// whose scope is qualified by a sibling `Targets` child): does this
+    /// Tag apply to the `BlockAdditionMapping` with `BlockAddIDValue ==
+    /// mapping_value` on the track at `stream_index`?
+    ///
+    /// The four usage-note cells, using the resolved [`TargetUid::Track`]
+    /// entries for the `TagTrackUID` axis (a `0` TagTrackUID and an
+    /// absent one are both "all tracks", which the resolver expresses as
+    /// *no* Track entry):
+    ///
+    /// 1. no selector + no track scope → all mappings in the Segment;
+    /// 2. no selector + track scope → all mappings in the referenced
+    ///    track(s);
+    /// 3. selector + no track scope → all mappings with this value
+    ///    anywhere in the Segment (an unmatched value selects nothing —
+    ///    not an error);
+    /// 4. selector + track scope → the mapping in the referenced track
+    ///    whose `BlockAddIDValue` matches (the usage notes add a MUST:
+    ///    the value has to match a mapping that exists there — a
+    ///    validation concern for the writer, not this predicate).
+    ///
+    /// "No selector" means no non-zero `TagBlockAddIDValue` (the element
+    /// defaults to `0`, and an empty list ≡ a single `0`). Pass the
+    /// mapping's `BlockAdditionMapping::value` (RFC 9559 §5.1.4.1.17.1)
+    /// as `mapping_value`.
+    pub fn applies_to_block_addition(&self, stream_index: u32, mapping_value: u64) -> bool {
+        let track_scoped: bool = self
+            .uids
+            .iter()
+            .any(|u| matches!(u, TargetUid::Track { .. }));
+        let track_matches = !track_scoped
+            || self.uids.iter().any(
+                |u| matches!(u, TargetUid::Track { stream_index: s, .. } if *s == stream_index),
+            );
+        let value_matches = !self.block_addition_scoped()
+            || self
+                .block_add_id_values
+                .iter()
+                .any(|&v| v != 0 && v == mapping_value);
+        track_matches && value_matches
     }
 }
 
@@ -3683,6 +3780,117 @@ pub struct TrackAudio {
     output_sampling_frequency_explicit: Option<f64>,
     channels: u64,
     bit_depth: Option<u64>,
+    emphasis_explicit: Option<u64>,
+}
+
+/// `Emphasis` values (Matroska v5 element `0x52F1`, staged
+/// `post-rfc9559-elements.md`) — the emphasis filter applied to the
+/// stored audio samples. "The player MUST apply the inverse emphasis to
+/// get the proper audio samples": the MUST is on the *player*, not the
+/// muxer — a decoder that ignores a non-zero value produces audibly
+/// wrong (over-bright) output.
+///
+/// The enumeration is closed by the schema (no `enum source` registry
+/// extension, no FCFS path) and deliberately non-contiguous: values 6..=9
+/// and 17+ are unassigned (only value `2` is labelled `reserved`), so
+/// unlisted values surface as [`AudioEmphasis::Unknown`]. The schema
+/// gives filter *time constants*, not coefficients — deriving the actual
+/// de-emphasis filters belongs to the cited external standards, not the
+/// container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioEmphasis {
+    /// `0` — no emphasis (the spec default).
+    NoEmphasis,
+    /// `1` — CD audio: "First order filter with zero point at 50
+    /// microseconds and a pole at 15 microseconds. Also found on DVD
+    /// Audio and MPEG audio."
+    CdAudio,
+    /// `2` — reserved. A writer must not emit it; a reader should treat
+    /// it as unknown (surfaced as its own variant so the on-disk value
+    /// stays distinguishable from the unassigned ones).
+    Reserved,
+    /// `3` — CCIT J.17 (upstream label spelling; the ITU-T
+    /// Recommendation J.17 pre-emphasis curve).
+    CcitJ17,
+    /// `4` — FM 50: "FM Radio in Europe. RC Filter with a time constant
+    /// of 50 microseconds."
+    Fm50,
+    /// `5` — FM 75: "FM Radio in the USA. RC Filter with a time constant
+    /// of 75 microseconds."
+    Fm75,
+    /// `10` — Phono RIAA: t1=3180, t2=318, t3=75 microseconds.
+    PhonoRiaa,
+    /// `11` — Phono IEC N78: t1=3180, t2=450, t3=50 microseconds.
+    PhonoIecN78,
+    /// `12` — Phono TELDEC: t1=3180, t2=318, t3=50 microseconds.
+    PhonoTeldec,
+    /// `13` — Phono EMI: t1=2500, t2=500, t3=70 microseconds.
+    PhonoEmi,
+    /// `14` — Phono Columbia LP: t1=1590, t2=318, t3=100 microseconds.
+    PhonoColumbiaLp,
+    /// `15` — Phono LONDON: t1=1590, t2=318, t3=50 microseconds.
+    PhonoLondon,
+    /// `16` — Phono NARTB: t1=3180, t2=318, t3=100 microseconds.
+    PhonoNartb,
+    /// An unassigned value (6..=9 or 17+). Carries the raw integer
+    /// verbatim.
+    Unknown(u64),
+}
+
+impl AudioEmphasis {
+    /// Map a raw `Emphasis` payload onto the enum, preserving unassigned
+    /// values via [`AudioEmphasis::Unknown`]. Non-contiguous by design —
+    /// do not model the value space as a dense array index.
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            0 => AudioEmphasis::NoEmphasis,
+            1 => AudioEmphasis::CdAudio,
+            2 => AudioEmphasis::Reserved,
+            3 => AudioEmphasis::CcitJ17,
+            4 => AudioEmphasis::Fm50,
+            5 => AudioEmphasis::Fm75,
+            10 => AudioEmphasis::PhonoRiaa,
+            11 => AudioEmphasis::PhonoIecN78,
+            12 => AudioEmphasis::PhonoTeldec,
+            13 => AudioEmphasis::PhonoEmi,
+            14 => AudioEmphasis::PhonoColumbiaLp,
+            15 => AudioEmphasis::PhonoLondon,
+            16 => AudioEmphasis::PhonoNartb,
+            other => AudioEmphasis::Unknown(other),
+        }
+    }
+
+    /// Inverse of [`AudioEmphasis::from_raw`] — round-trip the enum back
+    /// to its on-disk integer.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            AudioEmphasis::NoEmphasis => 0,
+            AudioEmphasis::CdAudio => 1,
+            AudioEmphasis::Reserved => 2,
+            AudioEmphasis::CcitJ17 => 3,
+            AudioEmphasis::Fm50 => 4,
+            AudioEmphasis::Fm75 => 5,
+            AudioEmphasis::PhonoRiaa => 10,
+            AudioEmphasis::PhonoIecN78 => 11,
+            AudioEmphasis::PhonoTeldec => 12,
+            AudioEmphasis::PhonoEmi => 13,
+            AudioEmphasis::PhonoColumbiaLp => 14,
+            AudioEmphasis::PhonoLondon => 15,
+            AudioEmphasis::PhonoNartb => 16,
+            AudioEmphasis::Unknown(v) => v,
+        }
+    }
+
+    /// `true` when playback needs an inverse (de-emphasis) filter — a
+    /// *known, assigned* filter value. `NoEmphasis` needs nothing;
+    /// `Reserved` and `Unknown(_)` name no filter to invert, so a player
+    /// can only pass those samples through (and may want to warn).
+    pub fn needs_deemphasis(self) -> bool {
+        !matches!(
+            self,
+            AudioEmphasis::NoEmphasis | AudioEmphasis::Reserved | AudioEmphasis::Unknown(_)
+        )
+    }
 }
 
 impl TrackAudio {
@@ -3744,6 +3952,37 @@ impl TrackAudio {
             Some(v) => v > self.sampling_frequency,
             None => false,
         }
+    }
+
+    /// `Emphasis` (Matroska v5 element `0x52F1`, staged
+    /// `post-rfc9559-elements.md`) with the schema default `0`
+    /// materialised. The element is "mandatory but defaulted"
+    /// (`minOccurs: 1` with `default: 0`, RFC 8794 §11.1.5): it is
+    /// logically always present, a writer MAY omit it when the value is
+    /// `0`, and a reader MUST infer `0` when absent — so the decoded
+    /// type is a bare [`AudioEmphasis`], never an `Option`.
+    ///
+    /// The stored samples are the *emphasised* ones: for any value other
+    /// than [`AudioEmphasis::NoEmphasis`] the player MUST apply the
+    /// inverse (de-emphasis) filter — see
+    /// [`AudioEmphasis::needs_deemphasis`]. The element carries the
+    /// CELLAR `stream copy keep="1"` marker: a re-mux without
+    /// re-encoding must carry it over (dropping it is a correctness bug,
+    /// not a cosmetic one) — use
+    /// [`emphasis_explicit`](Self::emphasis_explicit) to mirror the
+    /// exact on-disk presence.
+    pub fn emphasis(&self) -> AudioEmphasis {
+        AudioEmphasis::from_raw(self.emphasis_explicit.unwrap_or(0))
+    }
+
+    /// `Emphasis` as it appeared on disk. `Some(v)` when the writer
+    /// emitted the element explicitly (including an explicit `0`);
+    /// `None` when the writer was silent (the `0` default applies on
+    /// [`emphasis`](Self::emphasis)). Lets a re-muxer avoid emitting an
+    /// element the source omitted — emitting `Emphasis` (even as `0`)
+    /// forces `DocTypeVersion >= 5` on an otherwise-v4 file.
+    pub fn emphasis_explicit(&self) -> Option<AudioEmphasis> {
+        self.emphasis_explicit.map(AudioEmphasis::from_raw)
     }
 }
 
@@ -3885,7 +4124,7 @@ pub struct TrackIdentity {
     flag_enabled: Option<u64>,
     flag_default: Option<u64>,
     flag_lacing: Option<u64>,
-    attachment_link: Option<u64>,
+    attachment_links: Vec<u64>,
 }
 
 impl TrackIdentity {
@@ -3977,13 +4216,27 @@ impl TrackIdentity {
         self.flag_lacing.map(|v| v != 0)
     }
 
-    /// `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`) — the `FileUID`
-    /// (§5.1.6.5) of an attachment this track's codec uses, e.g. a font
-    /// referenced by an ASS/SSA subtitle track. `None` when absent or when a
-    /// spec-illegal `0` was dropped at parse time (range "not 0"). The value
-    /// matches an [`Attachment::uid`] surfaced by [`MkvDemuxer::attachments`].
+    /// The first `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`) — the
+    /// `FileUID` (§5.1.6.5) of an attachment this track's codec uses, e.g. a
+    /// font referenced by an ASS/SSA subtitle track. `None` when absent or
+    /// when every occurrence was a spec-illegal `0` dropped at parse time
+    /// (range "not 0"). The value matches an [`Attachment::uid`] surfaced by
+    /// [`MkvDemuxer::attachments`]. Use
+    /// [`attachment_links`](Self::attachment_links) for the full list — a
+    /// track can reference several attachments (e.g. multiple fonts).
     pub fn attachment_link(&self) -> Option<u64> {
-        self.attachment_link
+        self.attachment_links.first().copied()
+    }
+
+    /// Every `AttachmentLink` on the `TrackEntry`, in on-disk order.
+    /// RFC 9559 prints `maxOccurs: 1` for the element, but errata ID 8615
+    /// (Reported, Technical — transcribed in the staged
+    /// `post-rfc9559-elements.md` §8) records that cap as bogus: "There can
+    /// more more than one AttachmentLink in a TrackEntry", so the typed
+    /// surface models a list. Spec-illegal `0`s are dropped at parse time;
+    /// an empty slice means the element was absent.
+    pub fn attachment_links(&self) -> &[u64] {
+        &self.attachment_links
     }
 
     /// `true` when the track carried none of the identity elements on disk —
@@ -3999,7 +4252,7 @@ impl TrackIdentity {
             && self.flag_enabled.is_none()
             && self.flag_default.is_none()
             && self.flag_lacing.is_none()
-            && self.attachment_link.is_none()
+            && self.attachment_links.is_empty()
     }
 }
 
@@ -5800,9 +6053,127 @@ pub struct Edition {
     /// the muxer never emits the element (the ID is formally unassigned
     /// in the IANA registry).
     pub hidden: bool,
+    /// `EditionDisplay` masters (Matroska v5 element `0x4520` — staged
+    /// `post-rfc9559-elements.md`; no RFC and no IANA registry row define
+    /// it), in on-disk order: the edition-level analogue of
+    /// [`ChapterDisplay`] — one entry per language variant, each pairing
+    /// one `EditionString` with zero or more `EditionLanguageIETF` BCP 47
+    /// tags. The schema says nothing about how a player picks among
+    /// multiple entries, so the full list is surfaced and the caller
+    /// selects by language. A malformed master missing its mandatory
+    /// `EditionString` child (`minOccurs: 1`) is dropped at parse time;
+    /// a present-but-empty string is kept (the schema does not prohibit
+    /// it). Empty for every pre-v5 file.
+    pub displays: Vec<EditionDisplay>,
     /// Top-level `ChapterAtom`s in on-disk order. Nested chapters live in
     /// each [`Chapter::children`].
     pub chapters: Vec<Chapter>,
+}
+
+/// One `EditionDisplay` master (Matroska v5 element `0x4520`, staged
+/// `post-rfc9559-elements.md`) — a human-readable edition name in one or
+/// more languages. Part of [`Edition::displays`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditionDisplay {
+    /// `EditionString` (v5 element `0x4521`, utf-8, exactly one per
+    /// `EditionDisplay`) — "the string to use as the edition name". May
+    /// legally be empty (the schema does not prohibit an empty string).
+    pub string: String,
+    /// `EditionLanguageIETF` values (v5 element `0x45E4`, ASCII string,
+    /// unbounded), in on-disk order — RFC 5646 (BCP 47) language tags for
+    /// the string. Note the upstream `…IETF` spelling (every other BCP 47
+    /// element is named `…BCP47`). There is no default and no `und`
+    /// fallback specified: an empty list genuinely means "unspecified
+    /// language" — the reader must not synthesise `und`.
+    pub languages: Vec<String>,
+}
+
+/// `ChapterSkipType` values (Matroska v5 element `0x4588`, staged
+/// `post-rfc9559-elements.md`) — what type of content the `ChapterAtom`
+/// contains, so a player can skip it automatically. The schema's
+/// enumeration is closed at 0..=7 (there is no `enum source` registry
+/// extension, so no FCFS path exists); values 8+ are undefined and
+/// surface as [`ChapterSkipType::Unknown`] — decode them as
+/// "unrecognised, do not skip" rather than erroring (the restriction is
+/// a constraint on writers; RFC 8794 §11.1.4.2 treats out-of-restriction
+/// values as invalid but a robust reader degrades).
+///
+/// The element carries **no default**: absence is not `NoSkipping` —
+/// value `0` is the positive assertion "this content should not be
+/// skipped", whereas absence carries no assertion at all. Hence
+/// [`Chapter::skip_type`] is an `Option`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChapterSkipType {
+    /// `0` — "Content which should not be skipped."
+    NoSkipping,
+    /// `1` — "Credits usually found at the beginning of the content."
+    OpeningCredits,
+    /// `2` — "Credits usually found at the end of the content."
+    EndCredits,
+    /// `3` — "Recap of previous episodes of the content, usually found
+    /// around the beginning."
+    Recap,
+    /// `4` — "Preview of the next episode of the content, usually found
+    /// around the end. It may contain spoilers the user wants to avoid."
+    NextPreview,
+    /// `5` — "Preview of the current episode of the content, usually
+    /// found around the beginning. It may contain spoilers the user want
+    /// to avoid."
+    Preview,
+    /// `6` — "Advertisement within the content."
+    Advertisement,
+    /// `7` — "A pause of content between main parts of the content."
+    /// (Added to the schema after RFC 9559 was published — a parser
+    /// written against a 2024 schema snapshot will not know this value.)
+    Intermission,
+    /// A value outside the closed 0..=7 enumeration. Undefined; treat as
+    /// "unrecognised, do not skip". Carries the raw integer verbatim.
+    Unknown(u64),
+}
+
+impl ChapterSkipType {
+    /// Map a raw `ChapterSkipType` payload onto the enum, preserving
+    /// out-of-enumeration values via [`ChapterSkipType::Unknown`].
+    pub fn from_raw(v: u64) -> Self {
+        match v {
+            0 => ChapterSkipType::NoSkipping,
+            1 => ChapterSkipType::OpeningCredits,
+            2 => ChapterSkipType::EndCredits,
+            3 => ChapterSkipType::Recap,
+            4 => ChapterSkipType::NextPreview,
+            5 => ChapterSkipType::Preview,
+            6 => ChapterSkipType::Advertisement,
+            7 => ChapterSkipType::Intermission,
+            other => ChapterSkipType::Unknown(other),
+        }
+    }
+
+    /// Inverse of [`ChapterSkipType::from_raw`] — round-trip the enum
+    /// back to its on-disk integer.
+    pub fn to_raw(self) -> u64 {
+        match self {
+            ChapterSkipType::NoSkipping => 0,
+            ChapterSkipType::OpeningCredits => 1,
+            ChapterSkipType::EndCredits => 2,
+            ChapterSkipType::Recap => 3,
+            ChapterSkipType::NextPreview => 4,
+            ChapterSkipType::Preview => 5,
+            ChapterSkipType::Advertisement => 6,
+            ChapterSkipType::Intermission => 7,
+            ChapterSkipType::Unknown(v) => v,
+        }
+    }
+
+    /// `true` for the values a player is meant to offer skipping for —
+    /// every *known* value except [`ChapterSkipType::NoSkipping`].
+    /// [`ChapterSkipType::Unknown`] returns `false` (undefined values
+    /// must not trigger a skip).
+    pub fn is_skippable(self) -> bool {
+        !matches!(
+            self,
+            ChapterSkipType::NoSkipping | ChapterSkipType::Unknown(_)
+        )
+    }
 }
 
 /// One `ChapterAtom` (RFC 9559 §5.1.7.1.4) — recursive: a chapter MAY
@@ -5876,6 +6247,21 @@ pub struct Chapter {
     /// the muxer never emits the elements (the IDs are formally
     /// unassigned in the IANA registry).
     pub track_uids: Vec<u64>,
+    /// `ChapterSkipType` (Matroska v5 element `0x4588` — staged
+    /// `post-rfc9559-elements.md`): what type of content this atom
+    /// contains and might be skipped. **No default is materialised** —
+    /// `None` (absent) carries no assertion at all, distinct from
+    /// `Some(NoSkipping)` (the positive assertion "do not skip this").
+    ///
+    /// Two v5 usage rules the container surfaces but leaves to the
+    /// caller / validator: a nested atom inside an atom with a set skip
+    /// type MUST NOT carry the same value (see the schema validator's
+    /// nesting finding); and when the atom has no `ChapterTimeEnd`, the
+    /// classification runs until the next atom carrying a
+    /// `ChapterSkipType`, or EOF — resolving "the skip type at timestamp
+    /// T" needs a forward scan over sibling atoms, not an interval
+    /// lookup.
+    pub skip_type: Option<ChapterSkipType>,
     /// Nested `ChapterAtom`s (RFC 9559 §5.1.7.1.4 is `recursive`).
     pub children: Vec<Chapter>,
 }
@@ -5898,6 +6284,7 @@ impl Default for Chapter {
             displays: Vec::new(),
             chap_processes: Vec::new(),
             track_uids: Vec::new(),
+            skip_type: None,
             children: Vec::new(),
         }
     }
@@ -6039,6 +6426,17 @@ fn parse_edition_entry(
             // registry — staged legacy-element-ids.md): historical
             // default 0, uinteger 0-1.
             ids::EDITION_FLAG_HIDDEN => edition.hidden = read_uint(r, e.size as usize)? != 0,
+            // EditionDisplay (Matroska v5 0x4520, staged
+            // post-rfc9559-elements.md): repeatable master pairing one
+            // mandatory EditionString with 0..n EditionLanguageIETF
+            // tags. A master missing its EditionString is malformed
+            // (minOccurs: 1, no default) and dropped.
+            ids::EDITION_DISPLAY => {
+                let ed_end = r.stream_position()?.saturating_add(e.size);
+                if let Some(disp) = parse_edition_display(r, ed_end)? {
+                    edition.displays.push(disp);
+                }
+            }
             ids::CHAPTER_ATOM => {
                 let ca_end = r.stream_position()?.saturating_add(e.size);
                 let atom = parse_chapter_atom(
@@ -6122,6 +6520,14 @@ fn parse_chapter_atom(
             ids::CHAPTER_PHYSICAL_EQUIV => {
                 atom.physical_equiv = Some(read_uint(r, e.size as usize)?);
             }
+            // ChapterSkipType (Matroska v5 0x4588, staged
+            // post-rfc9559-elements.md): uinteger with NO default —
+            // absence stays observable (`None`), never collapsed into
+            // NoSkipping. Out-of-enumeration values surface as
+            // Unknown(v) per the robust-reader rule.
+            ids::CHAPTER_SKIP_TYPE => {
+                atom.skip_type = Some(ChapterSkipType::from_raw(read_uint(r, e.size as usize)?));
+            }
             ids::CHAPTER_DISPLAY => {
                 let cd_end = r.stream_position()?.saturating_add(e.size);
                 if let Some(disp) = parse_chapter_display(r, cd_end)? {
@@ -6188,6 +6594,37 @@ fn parse_chapter_atom(
         metadata.push((format!("chapter:{index}:title"), t.clone()));
     }
     Ok(atom)
+}
+
+/// Parse one `EditionDisplay` master (Matroska v5 `0x4520`, staged
+/// `post-rfc9559-elements.md`) into a typed [`EditionDisplay`]. Returns
+/// `None` when the mandatory `EditionString` child (`minOccurs: 1`, no
+/// default) is absent — a malformed master. Unlike `ChapterDisplay`
+/// (whose empty `ChapString` rows the flat view always dropped), a
+/// present-but-*empty* `EditionString` is kept: the schema does not
+/// prohibit an empty string and there is no legacy flat-view behaviour
+/// to preserve. Unknown children are skipped per the normal EBML rule.
+fn parse_edition_display(r: &mut dyn ReadSeek, end: u64) -> Result<Option<EditionDisplay>> {
+    let mut string: Option<String> = None;
+    let mut languages: Vec<String> = Vec::new();
+    while r.stream_position()? < end {
+        let e = read_element_header(r)?;
+        match e.id {
+            ids::EDITION_STRING => {
+                let v = read_string(r, e.size as usize)?;
+                // maxOccurs: 1 — first occurrence wins on a malformed
+                // duplicate, mirroring the ChapString handling.
+                if string.is_none() {
+                    string = Some(v);
+                }
+            }
+            ids::EDITION_LANGUAGE_IETF => {
+                languages.push(read_string(r, e.size as usize)?);
+            }
+            _ => skip(r, e.size)?,
+        }
+    }
+    Ok(string.map(|string| EditionDisplay { string, languages }))
 }
 
 /// Parse one `ChapterDisplay` master into a typed [`ChapterDisplay`].
@@ -6986,11 +7423,13 @@ fn parse_track_entry(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Resu
             ids::FLAG_LACING => t.flag_lacing = Some(read_uint(r, e.size as usize)?),
             // `AttachmentLink` (RFC 9559 §5.1.4.1.24, `maxver: 3`). Range
             // "not 0" — a spec-illegal `0` is dropped so the typed surface
-            // never reports a zero attachment UID.
+            // never reports a zero attachment UID. Collected as a list per
+            // errata ID 8615 (the printed `maxOccurs: 1` is bogus; a
+            // TrackEntry can reference several attachments).
             ids::ATTACHMENT_LINK => {
                 let v = read_uint(r, e.size as usize)?;
                 if v != 0 {
-                    t.attachment_link = Some(v);
+                    t.attachment_links.push(v);
                 }
             }
             ids::AUDIO => {
@@ -7561,6 +8000,13 @@ fn parse_audio(r: &mut dyn ReadSeek, end: u64, t: &mut TrackEntry) -> Result<()>
             }
             ids::CHANNEL_POSITIONS => {
                 channel_positions = Some(read_bytes(r, e.size as usize)?);
+            }
+            // Emphasis (Matroska v5 0x52F1, staged
+            // post-rfc9559-elements.md): mandatory-but-defaulted `0`.
+            // Kept raw so the typed surface can distinguish an explicit
+            // on-disk `0` from the materialised default.
+            ids::EMPHASIS => {
+                raw.emphasis = Some(read_uint(r, e.size as usize)?);
             }
             _ => skip(r, e.size)?,
         }
@@ -8335,6 +8781,32 @@ impl MkvDemuxer {
     /// dangling non-zero UIDs are dropped per RFC 9559 §5.1.8.1.1.3..6.
     pub fn tags(&self) -> &[Tag] {
         &self.tags
+    }
+
+    /// Every [`Tag`] whose `Targets` scope applies to the
+    /// `BlockAdditionMapping` with `BlockAddIDValue == mapping_value` on
+    /// the track at `stream_index` — the joint `TagBlockAddIDValue` ×
+    /// `TagTrackUID` resolution from the staged
+    /// `post-rfc9559-elements.md` usage notes (Matroska v5). Thin filter
+    /// over [`tags`](Self::tags) using
+    /// [`Targets::applies_to_block_addition`]; see that predicate for the
+    /// 2×2 scope matrix. Note the wildcard cells make a global-scope Tag
+    /// (no track UIDs, no non-zero selector) apply to *every* mapping, so
+    /// callers typically also filter on
+    /// [`Targets::block_addition_scoped`] when they want only the Tags
+    /// that name mappings specifically.
+    pub fn tags_for_block_addition_mapping(
+        &self,
+        stream_index: u32,
+        mapping_value: u64,
+    ) -> Vec<&Tag> {
+        self.tags
+            .iter()
+            .filter(|t| {
+                t.targets
+                    .applies_to_block_addition(stream_index, mapping_value)
+            })
+            .collect()
     }
 
     /// Linked-Segment Info metadata (RFC 9559 §5.1.2.1..§5.1.2.8 +

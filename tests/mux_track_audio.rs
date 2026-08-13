@@ -150,6 +150,7 @@ fn explicit_hint_overrides_streaminfo_children() {
                 output_sampling_frequency: None,
                 channels: Some(6),
                 bit_depth: Some(24),
+                emphasis: None,
             },
         )
         .expect("set_track_audio");
@@ -174,6 +175,7 @@ fn output_sampling_frequency_sbr_roundtrip() {
                 output_sampling_frequency: Some(44_100.0),
                 channels: None,
                 bit_depth: None,
+                emphasis: None,
             },
         )
         .expect("set_track_audio");
@@ -234,6 +236,7 @@ fn output_sampling_frequency_element_only_when_set() {
                 output_sampling_frequency: None,
                 channels: None,
                 bit_depth: None,
+                emphasis: None,
             },
         )
         .unwrap();
@@ -282,6 +285,7 @@ fn unset_streaminfo_fields_fall_back_to_spec_defaults() {
                 output_sampling_frequency: Some(96_000.0),
                 channels: None,
                 bit_depth: None,
+                emphasis: None,
             },
         )
         .expect("set_track_audio");
@@ -316,6 +320,7 @@ fn last_write_wins() {
                 output_sampling_frequency: None,
                 channels: Some(8),
                 bit_depth: None,
+                emphasis: None,
             },
         )
         .unwrap();

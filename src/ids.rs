@@ -100,6 +100,12 @@ pub const TAG_TRACK_UID: u32 = 0x63C5;
 pub const TAG_EDITION_UID: u32 = 0x63C9;
 pub const TAG_CHAPTER_UID: u32 = 0x63C4;
 pub const TAG_ATTACHMENT_UID: u32 = 0x63C6;
+// TagBlockAddIDValue (Matroska v5, staged post-rfc9559-elements.md —
+// uinteger, default 0, unbounded): a copy of a `BlockAddIDValue`
+// (§5.1.4.1.17.1) used as a Targets selector — it scopes the Tag to a
+// `BlockAdditionMapping`, jointly with the sibling `TagTrackUID` (2×2
+// matrix; 0 = wildcard on each axis).
+pub const TAG_BLOCK_ADD_ID_VALUE: u32 = 0x63C7;
 pub const SIMPLE_TAG: u32 = 0x67C8;
 pub const TAG_NAME: u32 = 0x45A3;
 pub const TAG_STRING: u32 = 0x4487;
@@ -429,6 +435,11 @@ pub const SAMPLING_FREQUENCY: u32 = 0xB5;
 pub const OUTPUT_SAMPLING_FREQUENCY: u32 = 0x78B5;
 pub const CHANNELS: u32 = 0x9F;
 pub const BIT_DEPTH: u32 = 0x6264;
+// Emphasis (Matroska v5, staged post-rfc9559-elements.md — uinteger,
+// mandatory-but-defaulted `0`, `stream copy keep="1"`): "Audio emphasis
+// applied on audio samples. The player MUST apply the inverse emphasis to
+// get the proper audio samples."
+pub const EMPHASIS: u32 = 0x52F1;
 
 // Cluster.
 pub const TIMECODE: u32 = 0xE7;
@@ -556,6 +567,22 @@ pub const CHAP_STRING: u32 = 0x85;
 pub const CHAP_LANGUAGE: u32 = 0x437C;
 pub const CHAP_LANGUAGE_BCP47: u32 = 0x437D;
 pub const CHAP_COUNTRY: u32 = 0x437E;
+
+// Matroska v5 chapter elements (staged post-rfc9559-elements.md — CELLAR
+// schema `minver: 5`; no RFC, no IANA registry row defines them).
+// EditionDisplay (master, unbounded): the edition-level analogue of
+// ChapterDisplay — one per language variant.
+pub const EDITION_DISPLAY: u32 = 0x4520;
+// EditionString (utf-8, exactly 1 per EditionDisplay, mandatory): "the
+// string to use as the edition name."
+pub const EDITION_STRING: u32 = 0x4521;
+// EditionLanguageIETF (string, unbounded): one RFC 5646 (BCP 47) language
+// tag for the EditionString. Note the upstream `…IETF` spelling — every
+// other BCP 47 element is named `…BCP47`; the ID belongs to this spelling.
+pub const EDITION_LANGUAGE_IETF: u32 = 0x45E4;
+// ChapterSkipType (uinteger, 0-1 per ChapterAtom, no default): what type
+// of skippable content the atom contains (values 0..=7, closed enum).
+pub const CHAPTER_SKIP_TYPE: u32 = 0x4588;
 
 // ChapProcess sub-tree (RFC 9559 §5.1.7.1.4.14–19): per-ChapterAtom
 // chapter-codec commands that drive DVD-menu / Matroska-Script chapter

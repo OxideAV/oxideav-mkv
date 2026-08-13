@@ -93,6 +93,7 @@ fn full_atom_fields_round_trip() {
             language_bcp47: None,
         }],
         chap_processes: Vec::new(),
+        skip_type: None,
     }]);
 
     let dmx = demux_typed(bytes);

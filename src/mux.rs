@@ -32,10 +32,10 @@ use oxideav_core::{Muxer, WriteSeek};
 
 use crate::codec_id;
 use crate::demux::{
-    AlphaMode, ChapterTranslate, ChromaSitingHorz, ChromaSitingVert, ColourRange,
-    ContentEncodingTransform, ContentEncodings, DisplayUnit, DocTypeExtension, FieldOrder,
-    FlagInterlaced, MatrixCoefficients, OldStereoMode, Primaries, ProjectionType, SegmentLinking,
-    StereoMode, TrackPlaneType, TransferCharacteristics,
+    AlphaMode, AudioEmphasis, ChapterSkipType, ChapterTranslate, ChromaSitingHorz,
+    ChromaSitingVert, ColourRange, ContentEncodingTransform, ContentEncodings, DisplayUnit,
+    DocTypeExtension, FieldOrder, FlagInterlaced, MatrixCoefficients, OldStereoMode, Primaries,
+    ProjectionType, SegmentLinking, StereoMode, TrackPlaneType, TransferCharacteristics,
 };
 use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
 use crate::ids;
@@ -198,6 +198,24 @@ pub struct MkvTrackAudio {
     /// `BitDepth` (RFC 9559 §5.1.4.1.29.4), bits per sample. `None` defers
     /// to the `StreamInfo`-derived bit width (or omits when neither is set).
     pub bit_depth: Option<u64>,
+    /// `Emphasis` (Matroska v5 element `0x52F1` — staged
+    /// `post-rfc9559-elements.md`): the emphasis filter already applied to
+    /// the stored samples. The element is written **only** for a
+    /// `Some(v)` with `v != NoEmphasis`: the staged note says a writer
+    /// must omit the value-`0` element, since emitting `Emphasis=0`
+    /// needlessly forces `DocTypeVersion >= 5` on an otherwise-v4 file —
+    /// so `Some(AudioEmphasis::NoEmphasis)` behaves like `None` on disk
+    /// and neither forces v5. A non-`NoEmphasis` value bumps the emitted
+    /// `DocTypeVersion` to `5` and is rejected on a WebM muxer (the
+    /// element is not a WebM element, and `DocTypeVersion 5` is undefined
+    /// for the `webm` DocType). [`AudioEmphasis::Reserved`] and
+    /// [`AudioEmphasis::Unknown`] are rejected at queue time — the
+    /// enumeration is closed for writers. Carries the CELLAR
+    /// `stream copy keep="1"` marker: when re-muxing a source track
+    /// without re-encoding, copy the demuxed
+    /// [`crate::demux::TrackAudio::emphasis_explicit`] value through —
+    /// dropping it is a correctness bug (the samples stay emphasised).
+    pub emphasis: Option<AudioEmphasis>,
 }
 
 impl MkvTrackAudio {
@@ -212,6 +230,7 @@ impl MkvTrackAudio {
             output_sampling_frequency: Some(core_sampling_frequency * 2.0),
             channels: None,
             bit_depth: None,
+            emphasis: None,
         }
     }
 }
@@ -520,6 +539,13 @@ pub struct MkvMuxer {
     header_written: bool,
     trailer_written: bool,
     doc_type: DocType,
+    /// The `DocTypeVersion` actually written into the EBML header —
+    /// `4` until [`Muxer::write_header`] runs, then `4` or `5` depending
+    /// on whether any Matroska v5 element was queued (see
+    /// [`MkvMuxer::uses_v5_elements`]). Consulted by
+    /// [`MkvMuxer::write_live_tags`] so a v5-scoped live tag can't land
+    /// under a v4 header.
+    emitted_doc_type_version: u64,
     /// `DocTypeExtension` declarations (RFC 8794 §11.2.9) queued via
     /// [`MkvMuxer::set_doc_type_extensions`]. Emitted into the EBML header at
     /// `write_header` time, after `DocTypeReadVersion`. Empty (the default)
@@ -532,6 +558,13 @@ pub struct MkvMuxer {
     /// `Chapters` SeekHead entry is patched at the same time. Empty list
     /// → no `Chapters` element written and the SeekHead slot is voided.
     chapters: Vec<MkvChapter>,
+    /// `EditionDisplay` masters queued via
+    /// [`MkvMuxer::set_edition_displays`] (Matroska v5) — written into
+    /// the single `EditionEntry` the muxer emits, before the chapter
+    /// atoms. Non-empty requires a non-empty chapter list at
+    /// `write_header` time (`EditionEntry` needs at least one
+    /// `ChapterAtom`) and bumps the emitted `DocTypeVersion` to `5`.
+    edition_displays: Vec<MkvEditionDisplay>,
     /// Attached files queued via [`MkvMuxer::add_attachment`]. Materialised
     /// into an `Attachments` master right after `Chapters` (or right after
     /// `Tracks` if no chapters were queued) in [`MkvMuxer::write_header`];
@@ -1017,6 +1050,20 @@ pub struct MkvChapter {
     /// chapter-codec commands (DVD-menu / Matroska-Script) attached to
     /// this atom. Empty → no `ChapProcess` child written.
     pub chap_processes: Vec<MkvChapProcess>,
+    /// `ChapterSkipType` (Matroska v5 element `0x4588` — staged
+    /// `post-rfc9559-elements.md`): what type of content the atom
+    /// contains and might be skipped. `None` → element omitted (the
+    /// element has no default, so omission carries no assertion —
+    /// distinct from `Some(NoSkipping)`). A `Some` value bumps the
+    /// emitted `DocTypeVersion` to `5` and is rejected on a WebM muxer
+    /// (the element carries an explicit `webm="0"` marker — the only one
+    /// of the six v5 elements where the WebM project recorded a
+    /// deliberate exclusion). [`ChapterSkipType::Unknown`] is rejected at
+    /// queue time — the enumeration is closed at 0..=7 for writers. The
+    /// muxer's chapter list is flat (single edition, no nested atoms), so
+    /// the v5 nested-atom "MUST NOT repeat the parent's value" rule
+    /// cannot be violated on the write side.
+    pub skip_type: Option<ChapterSkipType>,
 }
 
 impl Default for MkvChapter {
@@ -1035,6 +1082,36 @@ impl Default for MkvChapter {
             physical_equiv: None,
             display: Vec::new(),
             chap_processes: Vec::new(),
+            skip_type: None,
+        }
+    }
+}
+
+/// One `EditionDisplay` master (Matroska v5 element `0x4520` — staged
+/// `post-rfc9559-elements.md`) queued via
+/// [`MkvMuxer::set_edition_displays`] — the write-side mirror of
+/// [`crate::demux::EditionDisplay`]: a human-readable edition name in one
+/// or more languages, the edition-level analogue of [`ChapterDisplay`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MkvEditionDisplay {
+    /// `EditionString` (v5 `0x4521`, utf-8, mandatory — exactly one per
+    /// `EditionDisplay`). Always written; an empty string is legal per
+    /// the schema and written as a zero-length element.
+    pub string: String,
+    /// `EditionLanguageIETF` values (v5 `0x45E4`, ASCII string,
+    /// unbounded) — RFC 5646 (BCP 47) tags for the string, written in
+    /// order. May be empty ("unspecified language" — there is no `und`
+    /// fallback in the schema and none is synthesised). Each tag must be
+    /// printable ASCII (the EBML `string` type); validated at queue time.
+    pub languages: Vec<String>,
+}
+
+impl MkvEditionDisplay {
+    /// Convenience constructor pairing one name with one BCP 47 tag.
+    pub fn new(string: impl Into<String>, language: impl Into<String>) -> Self {
+        MkvEditionDisplay {
+            string: string.into(),
+            languages: vec![language.into()],
         }
     }
 }
@@ -1280,6 +1357,20 @@ pub struct MkvTagTargets {
     pub chapter_uids: Vec<u64>,
     /// `TagAttachmentUID` list (RFC 9559 §5.1.8.1.1.6).
     pub attachment_uids: Vec<u64>,
+    /// `TagBlockAddIDValue` list (Matroska v5 element `0x63C7` — staged
+    /// `post-rfc9559-elements.md`): copies of `BlockAddIDValue`s
+    /// (§5.1.4.1.17.1) scoping this tag to specific
+    /// `BlockAdditionMapping`s, jointly with `track_uids` (2×2 wildcard
+    /// matrix — see [`crate::demux::Targets::applies_to_block_addition`]).
+    /// Zero entries are dropped at write time (`0` is the wildcard,
+    /// already expressed by omission — mirroring the UID lists). Any
+    /// non-zero entry bumps the emitted `DocTypeVersion` to `5` and is
+    /// rejected on a WebM muxer. Note the referent `BlockAddIDValue` is
+    /// ranged `>= 2`, so a `1` selects nothing; and when paired with a
+    /// non-zero `track_uids` entry the v5 usage notes make it a MUST that
+    /// the value match a mapping that exists on that track — queue
+    /// mappings via [`MkvMuxer::set_block_addition_mappings`] first.
+    pub block_add_id_values: Vec<u64>,
 }
 
 impl MkvTagTargets {
@@ -1293,6 +1384,9 @@ impl MkvTagTargets {
             && self.edition_uids.is_empty()
             && self.chapter_uids.is_empty()
             && self.attachment_uids.is_empty()
+            // All-zero TagBlockAddIDValue entries are wildcards dropped at
+            // write time, so they leave the Targets master bare too.
+            && self.block_add_id_values.iter().all(|&v| v == 0)
     }
 
     /// Convenience constructor scoping a tag to a single `TrackUID`
@@ -2155,8 +2249,10 @@ impl MkvMuxer {
             header_written: false,
             trailer_written: false,
             doc_type,
+            emitted_doc_type_version: 4,
             doc_type_extensions: Vec::new(),
             chapters: Vec::new(),
+            edition_displays: Vec::new(),
             attachments: Vec::new(),
             tags: Vec::new(),
             segment_linking: None,
@@ -2474,6 +2570,87 @@ impl MkvMuxer {
             )));
         }
         Ok(())
+    }
+
+    /// Queue-time rejection for Matroska v5 elements (staged
+    /// `post-rfc9559-elements.md`) on a WebM muxer — lenient mode
+    /// included. None of the six v5 elements is a WebM element, and
+    /// writing any of them obliges `DocTypeVersion >= 5`, a version
+    /// number that is undefined for the `webm` DocType — so unlike the
+    /// guidelines-profile guard there is no lenient opt-out.
+    fn v5_guard(&self, element: &str) -> Result<()> {
+        if self.doc_type == DocType::Webm {
+            return Err(Error::unsupported(format!(
+                "WebM muxer: {element} is a Matroska v5 element (not defined for WebM, and \
+                 DocTypeVersion 5 is undefined for the webm DocType); write Matroska instead"
+            )));
+        }
+        Ok(())
+    }
+
+    /// `true` when any queued state requires a Matroska v5 element on
+    /// disk — the emitted EBML header then declares `DocTypeVersion 5`
+    /// (the staged v5 draft text: elements with `minver: 5` present in a
+    /// file mean the header MUST have a DocTypeVersion of 5 or more).
+    /// `Emphasis` queued as `NoEmphasis` does not count: the value-`0`
+    /// element stays off-disk precisely so an otherwise-v4 file is not
+    /// needlessly forced to v5.
+    fn uses_v5_elements(&self) -> bool {
+        !self.edition_displays.is_empty()
+            || self.chapters.iter().any(|c| c.skip_type.is_some())
+            || self
+                .track_audio
+                .iter()
+                .flatten()
+                .any(|a| a.emphasis.is_some_and(|e| e != AudioEmphasis::NoEmphasis))
+            || self
+                .tags
+                .iter()
+                .any(|t| t.targets.block_add_id_values.iter().any(|&v| v != 0))
+    }
+
+    /// Queue the `EditionDisplay` masters (Matroska v5 element `0x4520` —
+    /// staged `post-rfc9559-elements.md`) for the single `EditionEntry`
+    /// this muxer emits: human-readable edition names, one entry per
+    /// language variant (the edition-level analogue of the per-chapter
+    /// [`ChapterDisplay`] rows). Replaces any previously queued list.
+    ///
+    /// Must be called before [`Muxer::write_header`]; the queued chapter
+    /// list must be non-empty by the time the header is written
+    /// (`EditionEntry` requires at least one `ChapterAtom`, and the muxer
+    /// writes no `Chapters` element without chapters — the displays would
+    /// be silently dropped otherwise, which `write_header` rejects
+    /// instead). Emitting any display bumps the EBML header's
+    /// `DocTypeVersion` to `5`. Rejected on a WebM muxer (see the type
+    /// docs). Each `languages` entry must be printable ASCII (the EBML
+    /// `string` type — BCP 47 tags are ASCII by construction); an empty
+    /// `string` is legal and written as a zero-length `EditionString`.
+    pub fn set_edition_displays(&mut self, displays: Vec<MkvEditionDisplay>) -> Result<&mut Self> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: set_edition_displays called after write_header",
+            ));
+        }
+        if !displays.is_empty() {
+            self.v5_guard("EditionDisplay")?;
+        }
+        for d in &displays {
+            for lang in &d.languages {
+                if !lang.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
+                    return Err(Error::invalid(format!(
+                        "MKV muxer: EditionLanguageIETF {lang:?} is not printable ASCII \
+                         (EBML string type; BCP 47 tags are ASCII by construction)"
+                    )));
+                }
+            }
+        }
+        self.edition_displays = displays;
+        Ok(self)
+    }
+
+    /// Read-only view of the queued `EditionDisplay` list.
+    pub fn edition_displays(&self) -> &[MkvEditionDisplay] {
+        &self.edition_displays
     }
 
     /// Opt in to the RFC 9559 §25.3.4 livestreaming layout: "In
@@ -3905,6 +4082,31 @@ impl MkvMuxer {
                 "MKV muxer: set_track_audio bit_depth 0 out of range (must be not 0)".to_string(),
             ));
         }
+        // Emphasis (Matroska v5, staged post-rfc9559-elements.md): the
+        // enumeration is closed for writers — value 2 is `reserved` (a
+        // writer must not emit it) and the unassigned values (6..=9,
+        // 17+) are not writable. A non-NoEmphasis value requires
+        // DocTypeVersion 5, which is undefined for WebM; NoEmphasis
+        // behaves like omission (the value-0 element must stay off-disk
+        // so it never forces v5).
+        match audio.emphasis {
+            Some(AudioEmphasis::Reserved) => {
+                return Err(Error::invalid(
+                    "MKV muxer: Emphasis value 2 is reserved (staged \
+                     post-rfc9559-elements.md) — a writer must not emit it",
+                ));
+            }
+            Some(AudioEmphasis::Unknown(v)) => {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: Emphasis value {v} is unassigned (the enumeration is closed \
+                     by the schema; staged post-rfc9559-elements.md) — a writer must not emit it"
+                )));
+            }
+            Some(e) if e != AudioEmphasis::NoEmphasis => {
+                self.v5_guard("Emphasis")?;
+            }
+            _ => {}
+        }
         self.track_audio[stream_index] = Some(audio);
         Ok(self)
     }
@@ -4248,6 +4450,20 @@ impl MkvMuxer {
         if !chapter.chap_processes.is_empty() {
             self.webm_profile_guard("ChapProcess")?;
         }
+        // ChapterSkipType (Matroska v5, staged post-rfc9559-elements.md):
+        // requires DocTypeVersion 5 (never available on WebM — the element
+        // carries an explicit webm="0" marker), and the enumeration is
+        // closed at 0..=7 for writers (no registry, no FCFS path).
+        if let Some(st) = chapter.skip_type {
+            self.v5_guard("ChapterSkipType")?;
+            if matches!(st, ChapterSkipType::Unknown(_)) {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: ChapterSkipType value {} is outside the closed 0..=7 \
+                     enumeration (staged post-rfc9559-elements.md) — a writer must not emit it",
+                    st.to_raw()
+                )));
+            }
+        }
         self.chapters.push(chapter);
         Ok(())
     }
@@ -4354,6 +4570,13 @@ impl MkvMuxer {
             ));
         }
         self.webm_tag_targets_guard(&tag.targets)?;
+        // TagBlockAddIDValue (Matroska v5, staged
+        // post-rfc9559-elements.md): any non-zero selector requires
+        // DocTypeVersion 5 (zeros are wildcards dropped at write time,
+        // exactly like the zero UIDs above).
+        if tag.targets.block_add_id_values.iter().any(|&v| v != 0) {
+            self.v5_guard("TagBlockAddIDValue")?;
+        }
         validate_simple_tags(&tag.simple_tags)?;
         self.tags.push(tag);
         Ok(())
@@ -4408,6 +4631,20 @@ impl MkvMuxer {
                 ));
             }
             self.webm_tag_targets_guard(&tag.targets)?;
+            // TagBlockAddIDValue (Matroska v5): the EBML header is already
+            // on disk, so a v5-scoped live tag is only legal when the
+            // header declared DocTypeVersion 5 (i.e. some v5 element was
+            // queued before write_header).
+            if tag.targets.block_add_id_values.iter().any(|&v| v != 0) {
+                self.v5_guard("TagBlockAddIDValue")?;
+                if self.emitted_doc_type_version < 5 {
+                    return Err(Error::invalid(
+                        "MKV muxer: live Tag carries a non-zero TagBlockAddIDValue (Matroska \
+                         v5) but the EBML header was written with DocTypeVersion 4; queue a v5 \
+                         element before write_header to emit a v5 header",
+                    ));
+                }
+            }
             validate_simple_tags(&tag.simple_tags)?;
         }
         // Flush in-flight laces — their frames belong to the Cluster the
@@ -4780,6 +5017,16 @@ impl Muxer for MkvMuxer {
         if self.header_written {
             return Err(Error::other("MKV muxer: write_header called twice"));
         }
+        // EditionDisplay masters need an EditionEntry to live in, and the
+        // muxer writes no Chapters element without chapters — reject
+        // rather than silently dropping the queued displays.
+        if !self.edition_displays.is_empty() && self.chapters.is_empty() {
+            return Err(Error::invalid(
+                "MKV muxer: EditionDisplay masters were queued (set_edition_displays) but no \
+                 chapters — EditionEntry requires at least one ChapterAtom; queue chapters \
+                 first via add_chapter / add_chapter_full",
+            ));
+        }
         // Anchor so segment_data_start is an absolute file offset even when
         // the output stream already has bytes before us.
         let base_pos = self.output.stream_position().unwrap_or(0);
@@ -4791,8 +5038,20 @@ impl Muxer for MkvMuxer {
         write_uint_element(&mut ebml_body, ids::EBML_MAX_SIZE_LENGTH, 8);
         write_string_element(&mut ebml_body, ids::EBML_DOC_TYPE, self.doc_type.as_str());
         // WebM pins DocTypeVersion to 4 / DocTypeReadVersion to 2 as of the
-        // current spec. Matroska also sits at 4/2 for the features we emit.
-        write_uint_element(&mut ebml_body, ids::EBML_DOC_TYPE_VERSION, 4);
+        // current spec. Matroska also sits at 4/2 for the features we emit —
+        // unless a Matroska v5 element was queued (staged
+        // post-rfc9559-elements.md: v5 elements present in a file mean the
+        // header MUST declare DocTypeVersion 5 or more; the v5_guard keeps
+        // this branch unreachable on WebM). DocTypeReadVersion stays 2
+        // either way: every v5 element the muxer can emit is optional /
+        // skippable, so a v2-capable Reader still reads the file (it just
+        // won't see the v5 surface).
+        self.emitted_doc_type_version = if self.uses_v5_elements() { 5 } else { 4 };
+        write_uint_element(
+            &mut ebml_body,
+            ids::EBML_DOC_TYPE_VERSION,
+            self.emitted_doc_type_version,
+        );
         write_uint_element(&mut ebml_body, ids::EBML_DOC_TYPE_READ_VERSION, 2);
         // DocTypeExtension masters (RFC 8794 §11.2.9), if any were queued via
         // `set_doc_type_extensions`. Each carries a mandatory
@@ -5140,6 +5399,16 @@ impl Muxer for MkvMuxer {
                 });
                 if let Some(bd) = bit_depth {
                     write_uint_element(&mut audio, ids::BIT_DEPTH, bd);
+                }
+                // Emphasis (Matroska v5, staged post-rfc9559-elements.md):
+                // written only for a non-NoEmphasis hint — the value-0
+                // element must stay off-disk so it never needlessly forces
+                // DocTypeVersion 5 (the reader materialises the 0 default).
+                // Reserved / Unknown were rejected at queue time.
+                if let Some(e) = hint.and_then(|h| h.emphasis) {
+                    if e != AudioEmphasis::NoEmphasis {
+                        write_uint_element(&mut audio, ids::EMPHASIS, e.to_raw());
+                    }
                 }
                 // ChannelPositions (RFC 9559 Appendix A.27) — reclaimed Audio
                 // child queued through `set_track_legacy`, written verbatim
@@ -5659,7 +5928,8 @@ impl Muxer for MkvMuxer {
             None
         } else {
             let chapters_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
-            let chapters_bytes = build_chapters_element(&self.chapters, self.webm_strict);
+            let chapters_bytes =
+                build_chapters_element(&self.chapters, &self.edition_displays, self.webm_strict);
             all.extend_from_slice(&chapters_bytes);
             Some(chapters_offset_in_buf)
         };
@@ -7379,12 +7649,29 @@ const EDITION_UID_DEFAULT: u64 = 1;
 /// Build the bytes of a complete `Chapters` master element from the
 /// queued chapter list. Caller appends the returned slice into the
 /// muxer's outgoing buffer.
-fn build_chapters_element(chapters: &[MkvChapter], webm_strict: bool) -> Vec<u8> {
+fn build_chapters_element(
+    chapters: &[MkvChapter],
+    edition_displays: &[MkvEditionDisplay],
+    webm_strict: bool,
+) -> Vec<u8> {
     let mut edition_body = Vec::new();
     // The WebM guidelines keep `EditionEntry` but list `EditionUID` (and
     // the edition flags) as unsupported, so strict WebM omits the child.
     if !webm_strict {
         write_uint_element(&mut edition_body, ids::EDITION_UID, EDITION_UID_DEFAULT);
+    }
+    // EditionDisplay masters (Matroska v5, staged
+    // post-rfc9559-elements.md) — one per language variant, each with its
+    // mandatory EditionString (an empty string is legal and written as a
+    // zero-length element) and 0..n EditionLanguageIETF tags. The v5_guard
+    // keeps these unreachable on a WebM muxer.
+    for d in edition_displays {
+        let mut disp_body = Vec::new();
+        write_string_element(&mut disp_body, ids::EDITION_STRING, &d.string);
+        for lang in &d.languages {
+            write_string_element(&mut disp_body, ids::EDITION_LANGUAGE_IETF, lang);
+        }
+        write_master_element(&mut edition_body, ids::EDITION_DISPLAY, &disp_body);
     }
     for (i, ch) in chapters.iter().enumerate() {
         let atom = build_chapter_atom(i as u64 + 1, ch);
@@ -7436,6 +7723,13 @@ fn build_chapter_atom(default_uid: u64, ch: &MkvChapter) -> Vec<u8> {
     }
     if let Some(pe) = ch.physical_equiv {
         write_uint_element(&mut body, ids::CHAPTER_PHYSICAL_EQUIV, pe);
+    }
+    // ChapterSkipType (Matroska v5, staged post-rfc9559-elements.md):
+    // written only when queued (no default exists — omission carries no
+    // assertion). Unknown values were rejected at queue time; the
+    // v5_guard keeps this unreachable on a WebM muxer.
+    if let Some(st) = ch.skip_type {
+        write_uint_element(&mut body, ids::CHAPTER_SKIP_TYPE, st.to_raw());
     }
     for disp in &ch.display {
         let mut display_body = Vec::new();
@@ -7660,6 +7954,14 @@ fn build_tag_targets(t: &MkvTagTargets) -> Vec<u8> {
     for &uid in &t.attachment_uids {
         if uid != 0 {
             write_uint_element(&mut body, ids::TAG_ATTACHMENT_UID, uid);
+        }
+    }
+    // TagBlockAddIDValue (Matroska v5, staged post-rfc9559-elements.md):
+    // default 0 = wildcard, expressed by omission exactly like the zero
+    // UIDs above, so only non-zero selectors hit the disk.
+    for &v in &t.block_add_id_values {
+        if v != 0 {
+            write_uint_element(&mut body, ids::TAG_BLOCK_ADD_ID_VALUE, v);
         }
     }
     body
