@@ -490,3 +490,52 @@ fn skip_type_at_applies_the_implicit_range_rule() {
     };
     assert_eq!(ed4.skip_type_at(5 * s), None);
 }
+
+#[test]
+fn v5_fuzz_seed_is_a_valid_v5_document() {
+    // The fuzz corpus seed carrying all six v5 elements must stay a
+    // *valid* document (zero schema violations, DocTypeVersion 5, every
+    // v5 surface populated) so mutation fuzzing explores the v5 parse
+    // arms from a well-formed starting point rather than dying at open.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/corpus/demux/seed_v5_elements.mkv"
+    );
+    let bytes = std::fs::read(path).expect("v5 fuzz seed present");
+    let report =
+        oxideav_mkv::schema::validate(&mut Cursor::new(&bytes)).expect("validator walks the seed");
+    assert_eq!(report.doc_type_version, Some(5));
+    assert_eq!(report.violations, 0, "{:?}", report.findings);
+
+    let dmx = demux(bytes);
+    assert_eq!(dmx.ebml_header().doc_type_version, 5);
+    let ed = &dmx.chapters()[0];
+    assert_eq!(ed.displays.len(), 1);
+    assert_eq!(ed.displays[0].languages.len(), 2);
+    assert_eq!(
+        ed.chapters[0].skip_type,
+        Some(ChapterSkipType::OpeningCredits)
+    );
+    assert_eq!(
+        ed.chapters[0].children[0].skip_type,
+        Some(ChapterSkipType::NoSkipping)
+    );
+    assert_eq!(
+        ed.chapters[1].skip_type,
+        Some(ChapterSkipType::Intermission)
+    );
+    let a = dmx.track_audio(0).expect("audio record");
+    assert_eq!(a.emphasis_explicit(), Some(AudioEmphasis::CdAudio));
+    // Single AttachmentLink in the seed: the staged XML still caps
+    // maxOccurs at 1 (errata 8615 is Reported, not merged), and the
+    // seed stays violation-free against the transcription-faithful
+    // validator. The multi-occurrence list surface is covered by the
+    // hand-built fixture above.
+    assert_eq!(
+        dmx.track_identity(0).expect("identity").attachment_links(),
+        &[7]
+    );
+    let tags = dmx.tags();
+    assert_eq!(tags[0].targets.block_add_id_values, vec![2]);
+    assert!(tags[0].targets.applies_to_block_addition(0, 2));
+}

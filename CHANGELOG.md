@@ -56,7 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded atoms classify `[start, end)`; the overlap tie-break
   (latest-starting governing atom) is documented as a Reader choice,
   not spec.
-- 21 new tests across `tests/v5_elements.rs` (10),
+- Fuzz corpus seed `seed_v5_elements.mkv` — a violation-free
+  `DocTypeVersion 5` document exercising all six v5 parse arms
+  (EditionDisplay tree, nested skip types incl. `Intermission`,
+  `Emphasis`, `TagBlockAddIDValue` + `TagTrackUID` joint scope), so
+  mutation fuzzing explores the new surface from a well-formed start;
+  its validity + full v5 decode is pinned by a test.
+- 22 new tests across `tests/v5_elements.rs` (11),
   `tests/mux_v5_elements.rs` (7), and `tests/schema_validate.rs` (4
   more, incl. the muxer-output v5 validation and the
   VersionMismatch-informational pin for v5 elements under a v4 header).
