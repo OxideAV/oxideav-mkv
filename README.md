@@ -547,6 +547,63 @@ the unified `oxideav` aggregator to wire decoding automatically.
   still returns `Error::Unsupported` — the RFC 9559 §23.2 "neither
   SeekHead nor Cues at the start SHOULD be considered non-seekable"
   signal stays observable.
+- **Cues that LIE — trust-but-verify seek + whole-index audit**: the
+  index is pure metadata (every `CueClusterPosition` / `CueTime` /
+  `CueRelativePosition` / `CueBlockNumber` claim restates information
+  about bytes that exist elsewhere in the Segment — RFC 9559 §5.1.5.1,
+  Section 16), so every claim is checkable against the Segment itself.
+  The real-world damage class is a *stale* index (the file was edited or
+  truncated after the `Cues` element was written); the hostile class is
+  a forged one. Two surfaces:
+  - On a resilient open, `seek_to` verifies the chosen cue's landing
+    before committing: the promised offset must carry a parseable
+    `Cluster` header inside the Segment (§5.1.5.1.2.2 — "the Segment
+    Position of the Cluster containing the associated Block"), and the
+    landed Cluster's `Timestamp` must not prove the promised `CueTime`
+    impossible (§11.2 stores Block timestamps as 16-bit signed
+    Track-Tick offsets from the Cluster `Timestamp`, so a `Timestamp`
+    beyond `CueTime + 32768 × TrackTimestampScale` cannot contain the
+    promised Block; the check uses `max(scale, 1.0)` — the global
+    maximum across tracks, since a §18.8 virtual-track seek resolves
+    through source-track cues — so it can never false-positive on a
+    spec-legal file). A lying cue records a `DamageKind::CueLie` event
+    (lying target offset, fallback landing, `bytes_skipped: 0`) and the
+    seek falls back to the linear Cluster-`Timestamp` scan — landing
+    correctly instead of feeding `next_packet` garbage (packet loss
+    through resynchronisation) or silently overshooting the target. The
+    fine-grained `CueRelativePosition` / `CueBlockNumber` lies are not
+    seek lies — those already degrade to a cluster-start walk, which
+    lands correctly. A truncated-but-present final Cluster is not a lie
+    either: its surviving prefix is still the right landing. The strict
+    path stays byte-for-byte unchanged — it trusts the index and
+    surfaces whatever the landing yields (RFC 9559 §26 leaves the
+    choice to the Reader).
+  - `MkvDemuxer::audit_cues() -> CueAuditReport` audits the whole index
+    on strict and resilient opens alike, one entry per
+    `CueTrackPositions` (the same denormalised table `seek_to`
+    consults), typed per-claim findings (`CueLieKind`): `UnknownTrack`
+    (dangling `CueTrack` after a track was dropped),
+    `TargetOutOfSegment`, `TargetNotCluster`, `ClusterTruncated` (the
+    declared Cluster body runs past the Segment end — a truthful index
+    whose file lost its tail), `TimestampImpossible` (the §11.2 bound
+    above; `detail()` carries the landed `Timestamp`),
+    `RelativePositionInvalid` (doesn't resolve to a `SimpleBlock` /
+    `BlockGroup` header inside the body), and `BlockNumberOutOfRange`
+    (1-based count unreachable, or the spec-illegal `0`; `detail()`
+    carries the Blocks found). Read-only with respect to demux state
+    (reader position restored, no packet / CRC / damage bookkeeping
+    touched — callable between `next_packet` calls), findings capped at
+    4096 with an exact uncapped `findings_total()` counter and a
+    per-offset probe cache against hostile fan-in, `is_truthful()` as
+    the headline verdict. `Err` only on input-level I/O failure —
+    hostile content becomes findings, never errors. The in-tree muxer's
+    own emitted index audits truthful, pinned in CI
+    (`tests/seek_cues_lies.rs`, 17 tests: stale/forged offsets, void
+    and mid-element targets, truncation both sides of the last Cluster
+    header, `TrackTimestampScale` slack widening, findings-cap flood,
+    per-seek event logging, fuzz-corpus + byte-soup no-panic sweeps,
+    strict-path trust pin, and the `seed_cue_lies.mkv` corpus-seed pin
+    — one lie of every checkable class from a well-formed start).
 - **Zero-Cluster (metadata-only) Segments open** — the schema gives
   `Cluster` no `minOccurs`, so a Segment carrying only Info / Tracks /
   Chapters / Tags / Attachments (a chapters-only sidecar, or the
@@ -2055,16 +2112,23 @@ replay as a plain `cargo test` too). A third pass drives
 `open_resilient_typed` with a contract stronger than no-panic: a
 resilient `next_packet` may only fail with the clean `Error::Eof` (any
 other error class panics the harness), damage-event bookkeeping must
-never move backwards, and both seek shapes (Cues index + Cues-less
-cluster-scan fallback) run post-drain — so the recovery loop's
-forward-progress guarantee is fuzz-checked. The seed corpus in
+never move backwards, and both seek shapes (Cues index — now
+trust-but-verified, so a lying cue exercises the `CueLie` fallback —
+plus the Cues-less cluster-scan fallback) run post-drain, followed by a
+whole-index `audit_cues` pass asserting its capped findings list stays
+consistent with the exact counter and `is_truthful()` agrees — so the
+recovery loop's forward-progress guarantee is fuzz-checked. The seed corpus in
 `fuzz/corpus/demux/` covers a
 minimal valid Matroska file, a minimal valid WebM file, an EBML-header-
 only stream, five regression inputs (an EBML size-overflow, a
 zero-frame-size fixed-lacing `SimpleBlock`, the 2026-07 fuzz-found
 unknown-size-`Colour` add-overflow, and the 2026-08 fuzz-found
 hostile-`TimestampScale` seek-conversion overflow and forged
-`FileReferral`-size capacity overflow), and two
+`FileReferral`-size capacity overflow), a lying-`Cues` seed
+(`seed_cue_lies.mkv` — one lie of every `CueLieKind` class beside
+truthful entries, so mutation reaches the trust-but-verify seek and
+`audit_cues` arms from a well-formed start; builder-match + findings
+pinned by a test), and two
 corrupted-file seeds (mid-file zeroed bytes, 60% truncation). Every corpus seed also replays
 through the resilient path as a plain `cargo test`
 (`injection_robustness::fuzz_corpus_files_replay_through_resilient_path`).

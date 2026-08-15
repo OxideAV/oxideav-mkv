@@ -156,13 +156,34 @@ fuzz_target!(|data: &[u8]| {
                 assert!(resumed >= ev.offset(), "resync moved backwards");
             }
         }
-        // Cues-less seek fallback (or Cues seek when the index parsed).
+        // Cues-less seek fallback (or Cues seek when the index parsed —
+        // the resilient path now trust-but-verifies the landing and
+        // falls back on a lying cue, so both seeks also exercise the
+        // `CueLie` recovery over arbitrary bytes).
         let _ = rdmx.seek_to(0, 0);
         let _ = rdmx.seek_to(0, 12_345);
         for _ in 0..8 {
             if rdmx.next_packet().is_err() {
                 break;
             }
+        }
+        // Whole-index audit (`audit_cues`): over arbitrary bytes it must
+        // never panic, never error on in-memory input, keep its capped
+        // findings list consistent with the exact counter, and leave the
+        // demux state undisturbed (the drain above already ran, so a
+        // state perturbation would have been position-dependent — the
+        // audit restores the reader).
+        if let Ok(audit) = rdmx.audit_cues() {
+            assert!(
+                (audit.findings().len() as u64) <= audit.findings_total(),
+                "capped list cannot exceed the exact counter"
+            );
+            assert!(audit.findings().len() <= 4096, "findings cap");
+            assert_eq!(
+                audit.is_truthful(),
+                audit.findings_total() == 0,
+                "is_truthful must agree with the counter"
+            );
         }
     }
 

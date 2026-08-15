@@ -1142,6 +1142,24 @@ pub enum DamageKind {
     /// element could be found between the damage and the Segment end.
     /// The tail is dropped and the stream ends cleanly.
     UnrecoverableTail,
+    /// A `Cues` entry selected by `seek_to` lied: its
+    /// `CueClusterPosition` (RFC 9559 §5.1.5.1.2.2 — "the Segment
+    /// Position of the Cluster containing the associated Block") did not
+    /// land on a parseable `Cluster` header inside the Segment, or the
+    /// landed Cluster's `Timestamp` proved the promised `CueTime`
+    /// impossible (RFC 9559 §11.2 bounds a Block's distance from its
+    /// Cluster's `Timestamp` at 32768 Track Ticks). The classic
+    /// real-world shape is a stale index — a file edited or truncated
+    /// after the `Cues` element was written. The resilient seek fell
+    /// back to the linear Cluster-`Timestamp` scan instead of feeding
+    /// `next_packet` garbage (packet loss through resynchronisation) or
+    /// silently overshooting the target; `offset` is the lying target
+    /// offset, `resumed_at` the Cluster the fallback landed on (`None`
+    /// when the scan found nothing either), and `bytes_skipped` is `0`
+    /// (nothing was given up — the seek re-resolved through a different
+    /// index). See also [`MkvDemuxer::audit_cues`] for the whole-index
+    /// audit of the same trust classes.
+    CueLie,
 }
 
 /// One recovery performed by a resilient demux ([`open_resilient`] /
@@ -1182,6 +1200,187 @@ impl DamageEvent {
     pub fn bytes_skipped(&self) -> u64 {
         self.bytes_skipped
     }
+}
+
+/// How a `Cues` entry lied — see [`CueAuditFinding`] and
+/// [`MkvDemuxer::audit_cues`].
+///
+/// RFC 9559 makes the index pure metadata: every `CueClusterPosition` /
+/// `CueTime` / `CueRelativePosition` / `CueBlockNumber` claim is
+/// restated information about bytes that exist elsewhere in the
+/// Segment, so each claim can be checked against the Segment itself.
+/// The audit distinguishes the ways a claim can fail to hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CueLieKind {
+    /// The `CueTrack` (RFC 9559 §5.1.5.1.2.1) names a track number no
+    /// `TrackEntry` in this Segment declares — the classic remnant of a
+    /// re-mux that dropped a track without re-indexing. `seek_to` never
+    /// consults such an entry (it filters by track), so this is
+    /// diagnostic only.
+    UnknownTrack,
+    /// The `CueClusterPosition` target (`segment_data_start +` Segment
+    /// Position, RFC 9559 Section 16) sits at or past the Segment data
+    /// end — for a truncated file, the referenced Cluster is simply
+    /// gone.
+    TargetOutOfSegment,
+    /// The target offset is inside the Segment but no `Cluster` element
+    /// header parses there (garbage bytes, the middle of another
+    /// element, or a different Top-Level element entirely).
+    TargetNotCluster,
+    /// The target *is* a `Cluster` header, but its declared (bounded)
+    /// body runs past the Segment data end — the index told the truth
+    /// when it was written and the file lost its tail afterwards. A
+    /// seek landing here still yields the packets that physically fit
+    /// (resilient mode), so this is the mildest finding class.
+    ClusterTruncated,
+    /// The landed Cluster's `Timestamp` (§5.1.3.1) proves the promised
+    /// `CueTime` impossible: RFC 9559 §11.2 stores Block timestamps as
+    /// 16-bit signed Track-Tick offsets from the Cluster `Timestamp`
+    /// (absolute = `Timestamp + rel × TrackTimestampScale`, `rel >=
+    /// -32768`), so a Cluster whose `Timestamp` exceeds `CueTime +
+    /// 32768 × TrackTimestampScale` cannot contain the promised Block.
+    /// The audit uses `max(TrackTimestampScale, 1.0)` as the scale so a
+    /// sub-1.0 scale can only make the check more lenient — zero false
+    /// positives on spec-legal files. [`CueAuditFinding::detail`]
+    /// carries the landed Cluster `Timestamp`.
+    TimestampImpossible,
+    /// The `CueRelativePosition` (§5.1.5.1.2.3) does not resolve to a
+    /// `SimpleBlock` / `BlockGroup` header inside the target Cluster's
+    /// body — it points past the body end, at unparseable bytes, or at
+    /// some other element. `seek_to` already degrades this to a
+    /// cluster-start walk, so the entry still seeks, just without the
+    /// promised precision.
+    RelativePositionInvalid,
+    /// The `CueBlockNumber` (§5.1.5.1.2.5, 1-based, spec range "not 0")
+    /// exceeds the number of `SimpleBlock` / `BlockGroup` children the
+    /// target Cluster actually holds (or is the spec-illegal `0`).
+    /// [`CueAuditFinding::detail`] carries the number of Blocks found.
+    /// Like [`RelativePositionInvalid`](Self::RelativePositionInvalid),
+    /// `seek_to` degrades this to a cluster-start walk.
+    BlockNumberOutOfRange,
+}
+
+/// One lie found by [`MkvDemuxer::audit_cues`]: a single `Cues` claim
+/// that the Segment's actual bytes contradict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CueAuditFinding {
+    kind: CueLieKind,
+    entry_index: usize,
+    track: u64,
+    cue_time: u64,
+    cluster_offset: u64,
+    target_offset: u64,
+    detail: Option<u64>,
+}
+
+impl CueAuditFinding {
+    /// Which trust class failed.
+    pub fn kind(&self) -> CueLieKind {
+        self.kind
+    }
+
+    /// 0-based index of the entry in the audited seek table (the same
+    /// denormalised per-`CueTrackPositions` order `seek_to` consults —
+    /// one row per `CueTrackPositions`, sorted by (track, time)).
+    pub fn entry_index(&self) -> usize {
+        self.entry_index
+    }
+
+    /// The entry's `CueTrack` value (a Matroska track number).
+    pub fn track(&self) -> u64 {
+        self.track
+    }
+
+    /// The entry's `CueTime` in Segment Ticks (the file's
+    /// `TimestampScale`).
+    pub fn cue_time(&self) -> u64 {
+        self.cue_time
+    }
+
+    /// The entry's `CueClusterPosition` as stored — a Segment Position
+    /// (RFC 9559 Section 16), relative to the first Segment-data byte.
+    pub fn cluster_offset(&self) -> u64 {
+        self.cluster_offset
+    }
+
+    /// The absolute input offset the `CueClusterPosition` resolves to
+    /// (`segment_data_start + cluster_offset`, saturating).
+    pub fn target_offset(&self) -> u64 {
+        self.target_offset
+    }
+
+    /// Kind-specific evidence: the landed Cluster `Timestamp` for
+    /// [`CueLieKind::TimestampImpossible`], the number of Blocks
+    /// actually found for [`CueLieKind::BlockNumberOutOfRange`], `None`
+    /// otherwise.
+    pub fn detail(&self) -> Option<u64> {
+        self.detail
+    }
+}
+
+/// Report from [`MkvDemuxer::audit_cues`] — the whole-index audit of
+/// every claim the `Cues` element makes about the Segment.
+#[derive(Clone, Debug, Default)]
+pub struct CueAuditReport {
+    entries_checked: u64,
+    findings: Vec<CueAuditFinding>,
+    findings_total: u64,
+}
+
+impl CueAuditReport {
+    /// How many seek-table entries were audited — one per
+    /// `CueTrackPositions` (the same denormalised rows `seek_to`
+    /// consults).
+    pub fn entries_checked(&self) -> u64 {
+        self.entries_checked
+    }
+
+    /// The recorded findings, in entry order, capped at 4096 rows on a
+    /// hostile index; [`findings_total`](Self::findings_total) keeps the
+    /// exact count either way.
+    pub fn findings(&self) -> &[CueAuditFinding] {
+        &self.findings
+    }
+
+    /// Exact number of lies found, uncapped.
+    pub fn findings_total(&self) -> u64 {
+        self.findings_total
+    }
+
+    /// `true` exactly when every audited claim held — the index can be
+    /// trusted for seeking (offsets land on Clusters, times are
+    /// consistent, fine-grained positions resolve to Blocks).
+    pub fn is_truthful(&self) -> bool {
+        self.findings_total == 0
+    }
+}
+
+/// Findings cap for [`CueAuditReport`] — same bound the `webm::scan` /
+/// `schema::validate` reports use, so a hostile index can't make the
+/// audit allocate without bound.
+const MAX_CUE_AUDIT_FINDINGS: usize = 4096;
+
+/// What [`MkvDemuxer::probe_cue_target`] found at a `CueClusterPosition`
+/// target offset.
+#[derive(Clone, Copy)]
+enum CueProbe {
+    /// Target at or past the Segment data end.
+    OutOfSegment,
+    /// No `Cluster` element header parses at the target.
+    NotCluster,
+    /// A `Cluster` header parses at the target.
+    Cluster {
+        /// Absolute offset of the first body byte (after id+size).
+        body_start: u64,
+        /// Declared body end (`body_start + size`, unclamped) — `None`
+        /// for an unknown-size Cluster.
+        declared_end: Option<u64>,
+        /// The Cluster's `Timestamp`, when one was found among the
+        /// leading children (§5.1.3.1 — SHOULD be first; `CRC-32` /
+        /// `Position` / `PrevSize` / `SilentTracks` tolerated in
+        /// front).
+        timestamp: Option<u64>,
+    },
 }
 
 /// The 4-byte Top-Level element IDs a resync scan re-anchors on. Every
@@ -8786,6 +8985,41 @@ impl Demuxer for MkvDemuxer {
                 })?,
         };
 
+        // Trust-but-verify (resilient only): RFC 9559 §26 leaves error
+        // handling to the Reader, and a Cues index can lie — the classic
+        // real-world shape is a stale index (the file was edited or
+        // truncated after the Cues element was written), the hostile
+        // shape a forged CueClusterPosition. Before committing to the
+        // jump, check that the promised offset lands on a parseable
+        // `Cluster` header inside the Segment (§5.1.5.1.2.2 — the
+        // Segment Position "of the Cluster containing the associated
+        // Block") and that the landed Cluster's Timestamp doesn't prove
+        // the promised CueTime impossible (§11.2 bounds a Block's
+        // distance from its Cluster Timestamp at 32768 Track Ticks). A
+        // lying cue records a `DamageKind::CueLie` event and the seek
+        // falls back to the linear Cluster-Timestamp scan — landing
+        // correctly instead of feeding `next_packet` garbage (packet
+        // loss through resynchronisation) or silently overshooting the
+        // target. The strict path stays byte-for-byte unchanged: it
+        // trusts the index and surfaces whatever the landing yields.
+        if self.resilient {
+            let abs = self.segment_data_start.saturating_add(cue_cluster_offset);
+            if self.cue_landing_lie(abs, cue_time)?.is_some() {
+                let landed = self.seek_by_cluster_scan(stream_index, pts);
+                let resumed_at = match landed {
+                    Ok(_) => Some(self.input.stream_position()?),
+                    Err(_) => None,
+                };
+                self.damage_events.push(DamageEvent {
+                    kind: DamageKind::CueLie,
+                    offset: abs,
+                    resumed_at,
+                    bytes_skipped: 0,
+                });
+                return landed;
+            }
+        }
+
         let abs = self.segment_data_start + cue_cluster_offset;
         self.input.seek(SeekFrom::Start(abs))?;
         // Reset cluster reader state + any previously queued packets.
@@ -8940,6 +9174,277 @@ impl MkvDemuxer {
     /// the fact.
     pub fn damage_events(&self) -> &[DamageEvent] {
         &self.damage_events
+    }
+
+    /// Audit every claim the `Cues` element makes about this Segment and
+    /// report the lies (RFC 9559 §5.1.5.1) — the whole-index counterpart
+    /// of the per-seek trust-but-verify check the resilient `seek_to`
+    /// performs.
+    ///
+    /// The index is pure metadata: each `CueClusterPosition` / `CueTime`
+    /// / `CueRelativePosition` / `CueBlockNumber` restates information
+    /// about bytes that exist elsewhere in the Segment, so each claim is
+    /// checked against the Segment itself. Audited per entry (one row
+    /// per `CueTrackPositions`, the same denormalised table `seek_to`
+    /// consults):
+    ///
+    /// * the `CueTrack` names a declared track ([`CueLieKind::UnknownTrack`]),
+    /// * the `CueClusterPosition` target sits inside the Segment
+    ///   ([`CueLieKind::TargetOutOfSegment`]) and a `Cluster` header
+    ///   parses there ([`CueLieKind::TargetNotCluster`]),
+    /// * the Cluster's declared body fits inside the Segment
+    ///   ([`CueLieKind::ClusterTruncated`] — the stale index of a
+    ///   truncated file),
+    /// * the Cluster's `Timestamp` doesn't prove the `CueTime`
+    ///   impossible under the §11.2 Block-timestamp bounds
+    ///   ([`CueLieKind::TimestampImpossible`]),
+    /// * a `CueRelativePosition` resolves to a `SimpleBlock` /
+    ///   `BlockGroup` header inside the Cluster body
+    ///   ([`CueLieKind::RelativePositionInvalid`]),
+    /// * a `CueBlockNumber` is 1-based-reachable among the Cluster's
+    ///   Blocks ([`CueLieKind::BlockNumberOutOfRange`]).
+    ///
+    /// Read-only with respect to the demux state: the input position is
+    /// restored, no packet / CRC / damage bookkeeping changes, and
+    /// calling it between `next_packet` calls does not perturb the
+    /// stream. Cost is O(index) header probes plus, for entries carrying
+    /// a `CueBlockNumber` / `CueRelativePosition`, a bounded walk of the
+    /// referenced Cluster's children. Works on strict and resilient
+    /// opens alike; a file with no `Cues` reports zero entries checked
+    /// (and is trivially truthful — absence is legal, §22.1 only
+    /// RECOMMENDS the element).
+    ///
+    /// `Err` only on an input-level I/O failure (seek/tell), never on
+    /// index or Segment content — hostile content becomes findings, not
+    /// errors.
+    pub fn audit_cues(&mut self) -> Result<CueAuditReport> {
+        let pos0 = self.input.stream_position()?;
+        let mut report = CueAuditReport::default();
+        let entries: Vec<CueEntry> = self.cues.clone();
+        // Per-target probe cache: several entries commonly reference the
+        // same Cluster (multi-track CuePoints), and a hostile index can
+        // reference one offset thousands of times — probe each once.
+        let mut probes: std::collections::HashMap<u64, CueProbe> = std::collections::HashMap::new();
+        for (entry_index, cue) in entries.iter().enumerate() {
+            report.entries_checked += 1;
+            let target_offset = self.segment_data_start.saturating_add(cue.cluster_offset);
+            let push = |report: &mut CueAuditReport, kind: CueLieKind, detail: Option<u64>| {
+                report.findings_total += 1;
+                if report.findings.len() < MAX_CUE_AUDIT_FINDINGS {
+                    report.findings.push(CueAuditFinding {
+                        kind,
+                        entry_index,
+                        track: cue.track,
+                        cue_time: cue.time,
+                        cluster_offset: cue.cluster_offset,
+                        target_offset,
+                        detail,
+                    });
+                }
+            };
+            if !self.track_index_by_number.contains_key(&cue.track) {
+                push(&mut report, CueLieKind::UnknownTrack, None);
+            }
+            // Probe the CueClusterPosition target (cached per offset).
+            let probed = match probes.get(&target_offset) {
+                Some(p) => *p,
+                None => {
+                    let p = self.probe_cue_target(target_offset)?;
+                    probes.insert(target_offset, p);
+                    p
+                }
+            };
+            let (body_start, declared_end, timestamp) = match probed {
+                CueProbe::OutOfSegment => {
+                    push(&mut report, CueLieKind::TargetOutOfSegment, None);
+                    continue;
+                }
+                CueProbe::NotCluster => {
+                    push(&mut report, CueLieKind::TargetNotCluster, None);
+                    continue;
+                }
+                CueProbe::Cluster {
+                    body_start,
+                    declared_end,
+                    timestamp,
+                } => (body_start, declared_end, timestamp),
+            };
+            if let Some(end) = declared_end {
+                if end > self.segment_data_end {
+                    push(
+                        &mut report,
+                        CueLieKind::ClusterTruncated,
+                        Some(end - self.segment_data_end),
+                    );
+                }
+            }
+            if let Some(tc) = timestamp {
+                if tc > cue.time.saturating_add(self.cue_slack_ticks(cue.track)) {
+                    push(&mut report, CueLieKind::TimestampImpossible, Some(tc));
+                }
+            }
+            // Fine-grained claims need the Cluster's usable body bounds
+            // (clamped — a truncated Cluster's missing bytes can't hold
+            // a Block).
+            let body_end = declared_end
+                .unwrap_or(self.segment_data_end)
+                .min(self.segment_data_end);
+            if let Some(rel) = cue.relative_position {
+                let rel_target = body_start.saturating_add(rel);
+                let ok = rel_target < body_end && {
+                    self.input.seek(SeekFrom::Start(rel_target))?;
+                    matches!(
+                        read_element_header(&mut *self.input),
+                        Ok(e) if e.id == ids::SIMPLE_BLOCK || e.id == ids::BLOCK_GROUP
+                    )
+                };
+                if !ok {
+                    push(&mut report, CueLieKind::RelativePositionInvalid, None);
+                }
+            }
+            if let Some(n) = cue.block_number {
+                let found = if n == 0 {
+                    0 // spec-illegal "not 0" — flagged below, no walk needed
+                } else {
+                    self.count_cluster_blocks(body_start, body_end, n)?
+                };
+                if n == 0 || found < n {
+                    push(&mut report, CueLieKind::BlockNumberOutOfRange, Some(found));
+                }
+            }
+        }
+        self.input.seek(SeekFrom::Start(pos0))?;
+        Ok(report)
+    }
+
+    /// Probe what actually sits at a `CueClusterPosition` target offset
+    /// — shared by [`Self::audit_cues`] and the resilient `seek_to`
+    /// verification. Moves the reader; callers reposition.
+    fn probe_cue_target(&mut self, abs: u64) -> Result<CueProbe> {
+        if abs >= self.segment_data_end {
+            return Ok(CueProbe::OutOfSegment);
+        }
+        self.input.seek(SeekFrom::Start(abs))?;
+        let e = match read_element_header(&mut *self.input) {
+            Ok(e) => e,
+            Err(_) => return Ok(CueProbe::NotCluster),
+        };
+        if e.id != ids::CLUSTER {
+            return Ok(CueProbe::NotCluster);
+        }
+        let body_start = self.input.stream_position()?;
+        let declared_end = if e.size == VINT_UNKNOWN_SIZE {
+            None
+        } else {
+            Some(body_start.saturating_add(e.size))
+        };
+        // Leading-children walk for the Timestamp (§5.1.3.1 — SHOULD be
+        // the first child; tolerate CRC-32 / Position / PrevSize /
+        // SilentTracks in front, mirroring the Cues-less scan).
+        let limit = declared_end
+            .unwrap_or(self.segment_data_end)
+            .min(self.segment_data_end);
+        let mut timestamp = None;
+        while self.input.stream_position()? < limit {
+            let c = match read_element_header(&mut *self.input) {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            match c.id {
+                ids::TIMECODE => {
+                    timestamp = read_uint(&mut *self.input, c.size as usize).ok();
+                    break;
+                }
+                ids::CRC32 | ids::POSITION | ids::PREV_SIZE | ids::SILENT_TRACKS => {
+                    if skip(&mut *self.input, c.size).is_err() {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(CueProbe::Cluster {
+            body_start,
+            declared_end,
+            timestamp,
+        })
+    }
+
+    /// The resilient `seek_to` verification: is the cue's landing a lie
+    /// bad enough to lose or misplace the stream? Only the classes that
+    /// would — a target that isn't a Cluster inside the Segment, or a
+    /// Cluster whose `Timestamp` proves the `CueTime` impossible
+    /// (silent overshoot). The fine-grained `CueRelativePosition` /
+    /// `CueBlockNumber` lies are *not* checked here: `seek_to` already
+    /// degrades those to a cluster-start walk, which lands correctly.
+    /// The slack is the *global* maximum over all tracks rather than the
+    /// seeked track's own: a virtual-track seek resolves through source
+    /// tracks' cues (§18.8 Cues union), so the seeked track's
+    /// `TrackTimestampScale` may not be the one that governs the cue —
+    /// the global maximum stays sound for every entry.
+    fn cue_landing_lie(&mut self, abs: u64, cue_time: u64) -> Result<Option<CueLieKind>> {
+        let slack = (0..self.track_number_by_index.len())
+            .map(|ix| self.cue_slack_ticks(self.track_number_by_index[ix]))
+            .max()
+            .unwrap_or(32768);
+        Ok(match self.probe_cue_target(abs)? {
+            CueProbe::OutOfSegment => Some(CueLieKind::TargetOutOfSegment),
+            CueProbe::NotCluster => Some(CueLieKind::TargetNotCluster),
+            CueProbe::Cluster {
+                timestamp: Some(tc),
+                ..
+            } if tc > cue_time.saturating_add(slack) => Some(CueLieKind::TimestampImpossible),
+            CueProbe::Cluster { .. } => None,
+        })
+    }
+
+    /// Slack, in Segment Ticks, within which a Cluster `Timestamp` may
+    /// legally exceed a `CueTime` promising a Block in that Cluster:
+    /// RFC 9559 §11.2 — Block absolute time = `Cluster Timestamp + rel ×
+    /// TrackTimestampScale` with `rel` a 16-bit signed Track-Tick count,
+    /// so `Timestamp <= CueTime + 32768 × TrackTimestampScale` for any
+    /// containable Block. Uses `max(TrackTimestampScale, 1.0)` (spec
+    /// default `1.0`, §5.1.4.1.15) so a sub-1.0 scale only loosens the
+    /// bound — the check can never false-positive on a spec-legal file.
+    fn cue_slack_ticks(&self, track_number: u64) -> u64 {
+        let tts = self
+            .track_index_by_number
+            .get(&track_number)
+            .and_then(|&ix| self.track_timing.get(ix as usize))
+            .map(|t| t.track_timestamp_scale())
+            .unwrap_or(1.0);
+        let slack = 32768.0_f64 * tts.max(1.0);
+        if slack.is_finite() && slack < u64::MAX as f64 {
+            slack.ceil() as u64
+        } else {
+            u64::MAX
+        }
+    }
+
+    /// Count `SimpleBlock` / `BlockGroup` children of a Cluster body,
+    /// stopping at `need` (the audit only asks "are there at least n?").
+    /// Tolerant: an unparseable / self-inconsistent child ends the count
+    /// — bytes that can't be walked can't be the promised Block.
+    fn count_cluster_blocks(&mut self, body_start: u64, body_end: u64, need: u64) -> Result<u64> {
+        let mut count: u64 = 0;
+        let mut pos = body_start;
+        while pos < body_end && count < need {
+            self.input.seek(SeekFrom::Start(pos))?;
+            let child = match read_element_header(&mut *self.input) {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            if child.id == ids::SIMPLE_BLOCK || child.id == ids::BLOCK_GROUP {
+                count += 1;
+            }
+            let child_body_start = self.input.stream_position()?;
+            let next = child_body_start.saturating_add(child.size);
+            if next > body_end || next <= pos {
+                break;
+            }
+            pos = next;
+        }
+        Ok(count)
     }
 
     /// Per-Cluster typed records (RFC 9559 §5.1.3.2 — `Position`,

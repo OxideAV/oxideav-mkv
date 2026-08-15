@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Seek-pathology depth — a `Cues` index that parses cleanly but
+  LIES** (stale after an external edit/truncation, or forged). The
+  index is pure metadata — every `CueClusterPosition` / `CueTime` /
+  `CueRelativePosition` / `CueBlockNumber` claim restates information
+  about bytes that exist elsewhere in the Segment (RFC 9559 §5.1.5.1,
+  Section 16) — so every claim is now checkable against the Segment
+  itself:
+  - Resilient `seek_to` trust-but-verifies the chosen cue's landing:
+    the promised offset must carry a parseable `Cluster` header inside
+    the Segment (§5.1.5.1.2.2), and the landed Cluster's `Timestamp`
+    must not prove the promised `CueTime` impossible (§11.2 — Block
+    timestamps are 16-bit signed Track-Tick offsets, so a `Timestamp`
+    beyond `CueTime + 32768 × max(TrackTimestampScale, 1.0)` cannot
+    contain the promised Block; the seek path uses the global maximum
+    scale across tracks since a §18.8 virtual-track seek resolves
+    through source-track cues — zero false positives on spec-legal
+    files). A lying cue records the new `DamageKind::CueLie` event
+    (lying target offset, fallback landing offset, `bytes_skipped: 0`)
+    and the seek falls back to the linear Cluster-`Timestamp` scan —
+    landing correctly instead of feeding `next_packet` garbage (packet
+    loss through resynchronisation) or silently overshooting the
+    target. Fine-grained `CueRelativePosition` / `CueBlockNumber` lies
+    stay non-events (they already degrade to a cluster-start walk), a
+    truncated-but-present final Cluster is not a lie (its surviving
+    prefix is the right landing), and the strict path stays
+    byte-for-byte unchanged — it trusts the index per the Reader
+    freedom RFC 9559 §26 grants.
+  - `MkvDemuxer::audit_cues() -> CueAuditReport` — the whole-index
+    audit, strict and resilient opens alike, one row per
+    `CueTrackPositions` (the same denormalised table `seek_to`
+    consults). Typed findings (`CueAuditFinding` / `CueLieKind`):
+    `UnknownTrack`, `TargetOutOfSegment`, `TargetNotCluster`,
+    `ClusterTruncated` (declared Cluster body past the Segment end),
+    `TimestampImpossible` (`detail()` = landed `Timestamp`),
+    `RelativePositionInvalid` (doesn't resolve to a `SimpleBlock` /
+    `BlockGroup` header), `BlockNumberOutOfRange` (`detail()` = Blocks
+    found; the spec-illegal `0` included). Read-only with respect to
+    demux state (reader position restored — callable between
+    `next_packet` calls), findings capped at 4096 with an exact
+    uncapped `findings_total()`, per-offset probe cache against
+    hostile fan-in, `is_truthful()` headline verdict, `Err` only on
+    input-level I/O failure.
+  - The fuzz harness's resilient pass now also runs `audit_cues`
+    post-drain (no-panic + counter-consistency + `is_truthful`
+    agreement over arbitrary bytes), and its two seeks exercise the
+    `CueLie` verification whenever a Cues index parsed. New corpus
+    seed `seed_cue_lies.mkv` — one lie of every `CueLieKind` class
+    beside truthful entries (including truthful `CueRelativePosition`
+    / `CueBlockNumber` arms), so mutation explores the new surface
+    from a well-formed start; byte-exact builder match + per-class
+    findings pinned by a test.
+  - 17 tests in `tests/seek_cues_lies.rs`: truthful-baseline audits in
+    both modes (including truthful `CueRelativePosition` /
+    `CueBlockNumber` arms), audit-does-not-disturb-streaming pin,
+    forged offsets into a Cluster body / past the Segment / at a
+    `Void`, the strict-path trust pin, stale-index
+    `TimestampImpossible` with overshoot-prevention,
+    `TrackTimestampScale` slack widening, truncation on both sides of
+    the last Cluster header (`ClusterTruncated` vs `TargetOutOfSegment`
+    + last-surviving-Cluster fallback), fine-grained lies flagged
+    without seek fallback, dangling-`CueTrack` diagnostics, a
+    5000-entry findings-cap flood, per-recovery event logging (two
+    seeks over the same lie record two events; a truthful seek in
+    between records none), fuzz-corpus + byte-soup no-panic sweeps,
+    the corpus-seed pin, and the in-tree muxer's own index auditing
+    truthful.
+
 - **The six Matroska v5 elements** (staged
   `docs/container/matroska/post-rfc9559-elements.md` — `minver: 5` in
   the CELLAR schema; no RFC and no IANA registry row define them),
