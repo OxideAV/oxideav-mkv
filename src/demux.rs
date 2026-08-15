@@ -9020,7 +9020,12 @@ impl Demuxer for MkvDemuxer {
             }
         }
 
-        let abs = self.segment_data_start + cue_cluster_offset;
+        // Saturating: a forged 8-octet CueClusterPosition near 2^64 must
+        // not overflow the add (debug-build panic; fuzz-found 2026-08 the
+        // moment a fixed-8-position seed entered the corpus). Saturation
+        // parks the reader past EoF, where the next read reports a clean
+        // end — same shape as every other hostile-size guard.
+        let abs = self.segment_data_start.saturating_add(cue_cluster_offset);
         self.input.seek(SeekFrom::Start(abs))?;
         // Reset cluster reader state + any previously queued packets.
         // The "most recently returned packet" the block-additions

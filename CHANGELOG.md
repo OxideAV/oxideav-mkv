@@ -60,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     / `CueBlockNumber` arms), so mutation explores the new surface
     from a well-formed start; byte-exact builder match + per-class
     findings pinned by a test.
-  - 17 tests in `tests/seek_cues_lies.rs`: truthful-baseline audits in
+  - 18 tests in `tests/seek_cues_lies.rs`: truthful-baseline audits in
     both modes (including truthful `CueRelativePosition` /
     `CueBlockNumber` arms), audit-does-not-disturb-streaming pin,
     forged offsets into a Cluster body / past the Segment / at a
@@ -367,6 +367,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RFC 9559 element-ID registry is read and written" claim in CI.
 
 ### Fixed
+
+- Fuzz-found (2026-08, within seconds of the lying-`Cues` seed
+  entering the corpus): the strict `seek_to`'s absolute-offset
+  computation added `segment_data_start + CueClusterPosition`
+  unchecked — a forged fixed-8 position near `2^64` panicked a debug
+  build on add-overflow before the landing was ever read. The add now
+  saturates (the reader parks past EoF, where the next read reports a
+  clean end — same shape as every other hostile-size guard). Regression
+  input `regression_cue_position_overflow.bin` staged in the corpus +
+  a hand-built `u64::MAX`-position pin for both open modes
+  (`forged_max_cue_position_never_panics`).
 
 - Fuzz-found (2026-08, CI fuzz cycle): the reclaimed `FileReferral`
   AttachedFile child (RFC 9559 Appendix A.40) was read with

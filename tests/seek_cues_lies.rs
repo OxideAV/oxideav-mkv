@@ -742,6 +742,50 @@ fn audit_never_panics_on_fuzz_corpus_and_soup() {
 }
 
 #[test]
+fn forged_max_cue_position_never_panics() {
+    // A fixed-8 CueClusterPosition of 2^64-1: the strict seek's
+    // absolute-offset computation must saturate, not overflow (a
+    // debug-build panic fuzz-found 2026-08 the moment a
+    // fixed-8-position seed entered the corpus). The staged regression
+    // input is the raw fuzz artifact; the hand-built equivalent pins
+    // both modes' semantics.
+    let mut cues = truthful_cues();
+    cues[2].offset = Some(u64::MAX);
+    let built = build(&TIMES, &cues, None, false);
+
+    // Strict: trusts, saturates, parks past EoF — Ok seek, then a clean
+    // end (or error), never a panic.
+    let mut dmx = open_strict(&built.bytes);
+    let landed = dmx.seek_to(0, 200_000).expect("strict seek");
+    assert_eq!(landed, 200_000);
+    assert!(
+        dmx.next_packet().is_err(),
+        "nothing lives at the fake offset"
+    );
+
+    // Resilient: the lie is caught up front and the seek recovers.
+    let mut rdmx = open_resilient(&built.bytes);
+    assert_eq!(rdmx.seek_to(0, 200_000).expect("resilient seek"), 200_000);
+    assert_eq!(rdmx.next_packet().expect("pkt").data.as_slice(), &[0xA2]);
+    assert_eq!(rdmx.damage_events().len(), 1);
+    assert_eq!(rdmx.damage_events()[0].kind(), DamageKind::CueLie);
+
+    // The staged fuzz artifact replays clean through every entry point
+    // the harness drives (the corpus replay test covers the resilient
+    // path fleet-wide; this pins the strict seek that crashed).
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fuzz/corpus/demux/regression_cue_position_overflow.bin"
+    ))
+    .expect("regression seed present");
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(raw));
+    if let Ok(mut d) = oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver) {
+        let _ = d.seek_to(0, 0);
+        let _ = d.next_packet();
+    }
+}
+
+#[test]
 fn each_recovered_seek_records_its_own_event() {
     // Every resilient seek is an independent operation: seeking the same
     // lying cue twice performs two recoveries and records two `CueLie`

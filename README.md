@@ -598,7 +598,7 @@ the unified `oxideav` aggregator to wire decoding automatically.
     the headline verdict. `Err` only on input-level I/O failure —
     hostile content becomes findings, never errors. The in-tree muxer's
     own emitted index audits truthful, pinned in CI
-    (`tests/seek_cues_lies.rs`, 17 tests: stale/forged offsets, void
+    (`tests/seek_cues_lies.rs`, 18 tests: stale/forged offsets, void
     and mid-element targets, truncation both sides of the last Cluster
     header, `TrackTimestampScale` slack widening, findings-cap flood,
     per-seek event logging, fuzz-corpus + byte-soup no-panic sweeps,
@@ -2120,11 +2120,14 @@ consistent with the exact counter and `is_truthful()` agrees — so the
 recovery loop's forward-progress guarantee is fuzz-checked. The seed corpus in
 `fuzz/corpus/demux/` covers a
 minimal valid Matroska file, a minimal valid WebM file, an EBML-header-
-only stream, five regression inputs (an EBML size-overflow, a
+only stream, six regression inputs (an EBML size-overflow, a
 zero-frame-size fixed-lacing `SimpleBlock`, the 2026-07 fuzz-found
 unknown-size-`Colour` add-overflow, and the 2026-08 fuzz-found
-hostile-`TimestampScale` seek-conversion overflow and forged
-`FileReferral`-size capacity overflow), a lying-`Cues` seed
+hostile-`TimestampScale` seek-conversion overflow, forged
+`FileReferral`-size capacity overflow, and forged fixed-8
+`CueClusterPosition` seek add-overflow — found within seconds of the
+lying-`Cues` seed entering the corpus, fixed by saturating the strict
+seek's absolute-offset computation), a lying-`Cues` seed
 (`seed_cue_lies.mkv` — one lie of every `CueLieKind` class beside
 truthful entries, so mutation reaches the trust-but-verify seek and
 `audit_cues` arms from a well-formed start; builder-match + findings
