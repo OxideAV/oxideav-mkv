@@ -1360,6 +1360,117 @@ impl CueAuditReport {
 /// audit allocate without bound.
 const MAX_CUE_AUDIT_FINDINGS: usize = 4096;
 
+/// How a `SeekHead` entry lied — see [`SeekAuditFinding`] and
+/// [`MkvDemuxer::audit_seek_head`].
+///
+/// Like the `Cues`, the MetaSeek index is pure metadata: every
+/// `SeekID` / `SeekPosition` pair (RFC 9559 §5.1.1.1) restates where a
+/// Top-Level Element lives, so each claim can be checked against the
+/// Segment itself. The stale shape is an index left behind by an edit
+/// that moved elements; the hostile shape is a forged one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeekLieKind {
+    /// The `Seek` master omitted its `minOccurs: 1` `SeekPosition`
+    /// child (§5.1.1.1.2). Parse time already surfaces this via
+    /// [`SeekEntry::has_position`]` == false`; the audit counts it so
+    /// the whole-index verdict covers it.
+    MissingPosition,
+    /// The `SeekID` payload isn't a decodable 1..=4-octet EBML ID
+    /// (§5.1.1.1.1 — [`SeekEntry::seek_id`] returns `None`), so the
+    /// claim cannot even be compared against the target.
+    MalformedId,
+    /// The `SeekPosition` target (`segment_data_start +` Segment
+    /// Position, Section 16) sits at or past the Segment data end.
+    TargetOutOfSegment,
+    /// The target is inside the Segment but no element header parses
+    /// there, or the header carries a different ID than the `SeekID`
+    /// promised. [`SeekAuditFinding::found_id`] carries the ID that
+    /// actually parsed (when one did).
+    TargetMismatch,
+}
+
+/// One lie found by [`MkvDemuxer::audit_seek_head`]: a single MetaSeek
+/// claim the Segment's actual bytes contradict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeekAuditFinding {
+    kind: SeekLieKind,
+    entry_index: usize,
+    seek_id: Option<u32>,
+    seek_position: u64,
+    target_offset: u64,
+    found_id: Option<u32>,
+}
+
+impl SeekAuditFinding {
+    /// Which trust class failed.
+    pub fn kind(&self) -> SeekLieKind {
+        self.kind
+    }
+
+    /// 0-based index into [`MkvDemuxer::seek_entries`] (document order,
+    /// both SeekHeads of a two-`SeekHead` layout accumulated).
+    pub fn entry_index(&self) -> usize {
+        self.entry_index
+    }
+
+    /// The promised element ID ([`SeekEntry::seek_id`]) — `None` when
+    /// the on-disk `SeekID` payload wasn't a 1..=4-octet ID.
+    pub fn seek_id(&self) -> Option<u32> {
+        self.seek_id
+    }
+
+    /// The entry's `SeekPosition` as stored (Segment Position).
+    pub fn seek_position(&self) -> u64 {
+        self.seek_position
+    }
+
+    /// The absolute input offset the `SeekPosition` resolves to.
+    pub fn target_offset(&self) -> u64 {
+        self.target_offset
+    }
+
+    /// For [`SeekLieKind::TargetMismatch`]: the element ID that
+    /// actually parsed at the target (`None` when nothing parsed).
+    pub fn found_id(&self) -> Option<u32> {
+        self.found_id
+    }
+}
+
+/// Report from [`MkvDemuxer::audit_seek_head`] — the whole-index audit
+/// of every claim the MetaSeek (`SeekHead`) element makes.
+#[derive(Clone, Debug, Default)]
+pub struct SeekHeadAuditReport {
+    entries_checked: u64,
+    findings: Vec<SeekAuditFinding>,
+    findings_total: u64,
+}
+
+impl SeekHeadAuditReport {
+    /// How many `Seek` entries were audited — the full
+    /// [`MkvDemuxer::seek_entries`] slice.
+    pub fn entries_checked(&self) -> u64 {
+        self.entries_checked
+    }
+
+    /// The recorded findings, in entry order, capped at 4096 rows;
+    /// [`findings_total`](Self::findings_total) keeps the exact count.
+    pub fn findings(&self) -> &[SeekAuditFinding] {
+        &self.findings
+    }
+
+    /// Exact number of lies found, uncapped.
+    pub fn findings_total(&self) -> u64 {
+        self.findings_total
+    }
+
+    /// `true` exactly when every audited claim held — each `SeekID` /
+    /// `SeekPosition` pair lands on an element header carrying exactly
+    /// the promised ID.
+    pub fn is_truthful(&self) -> bool {
+        self.findings_total == 0
+    }
+}
+
 /// What [`MkvDemuxer::probe_cue_target`] found at a `CueClusterPosition`
 /// target offset.
 #[derive(Clone, Copy)]
@@ -9316,6 +9427,82 @@ impl MkvDemuxer {
                 if n == 0 || found < n {
                     push(&mut report, CueLieKind::BlockNumberOutOfRange, Some(found));
                 }
+            }
+        }
+        self.input.seek(SeekFrom::Start(pos0))?;
+        Ok(report)
+    }
+
+    /// Audit every claim the MetaSeek (`SeekHead`) element makes about
+    /// this Segment and report the lies (RFC 9559 §5.1.1) — the
+    /// [`audit_cues`](Self::audit_cues) counterpart for the file's
+    /// *other* self-referential index.
+    ///
+    /// Each `Seek` entry pairs a `SeekID` (§5.1.1.1.1 — the binary EBML
+    /// ID of a Top-Level Element) with a `SeekPosition` (§5.1.1.1.2 — a
+    /// Segment Position per Section 16). The audit resolves each
+    /// position and requires an element header carrying exactly the
+    /// promised ID to parse there; the ways a claim can fail are the
+    /// typed [`SeekLieKind`] classes ([`MissingPosition`] /
+    /// [`MalformedId`] / [`TargetOutOfSegment`] / [`TargetMismatch`]).
+    /// The open path already trust-but-verifies the entries it
+    /// *follows* (late post-Cluster masters); the audit checks every
+    /// entry, including the ones navigation never needed.
+    ///
+    /// Same contract as `audit_cues`: read-only with respect to demux
+    /// state (reader position restored), strict and resilient opens
+    /// alike, findings capped at 4096 with an exact uncapped
+    /// [`findings_total`](SeekHeadAuditReport::findings_total), a file
+    /// with no `SeekHead` reports zero entries checked (trivially
+    /// truthful — §6.3 only RECOMMENDS the element), and `Err` only on
+    /// an input-level I/O failure — hostile content becomes findings.
+    ///
+    /// [`MissingPosition`]: SeekLieKind::MissingPosition
+    /// [`MalformedId`]: SeekLieKind::MalformedId
+    /// [`TargetOutOfSegment`]: SeekLieKind::TargetOutOfSegment
+    /// [`TargetMismatch`]: SeekLieKind::TargetMismatch
+    pub fn audit_seek_head(&mut self) -> Result<SeekHeadAuditReport> {
+        let pos0 = self.input.stream_position()?;
+        let mut report = SeekHeadAuditReport::default();
+        let claims: Vec<(Option<u32>, u64, bool)> = self
+            .seek_entries
+            .iter()
+            .map(|e| (e.seek_id(), e.seek_position(), e.has_position()))
+            .collect();
+        for (entry_index, (seek_id, seek_position, has_position)) in claims.into_iter().enumerate()
+        {
+            report.entries_checked += 1;
+            let target_offset = self.segment_data_start.saturating_add(seek_position);
+            let mut push = |kind: SeekLieKind, found_id: Option<u32>| {
+                report.findings_total += 1;
+                if report.findings.len() < MAX_CUE_AUDIT_FINDINGS {
+                    report.findings.push(SeekAuditFinding {
+                        kind,
+                        entry_index,
+                        seek_id,
+                        seek_position,
+                        target_offset,
+                        found_id,
+                    });
+                }
+            };
+            if !has_position {
+                push(SeekLieKind::MissingPosition, None);
+                continue;
+            }
+            let Some(promised) = seek_id else {
+                push(SeekLieKind::MalformedId, None);
+                continue;
+            };
+            if target_offset >= self.segment_data_end {
+                push(SeekLieKind::TargetOutOfSegment, None);
+                continue;
+            }
+            self.input.seek(SeekFrom::Start(target_offset))?;
+            match read_element_header(&mut *self.input) {
+                Ok(e) if e.id == promised => {}
+                Ok(e) => push(SeekLieKind::TargetMismatch, Some(e.id)),
+                Err(_) => push(SeekLieKind::TargetMismatch, None),
             }
         }
         self.input.seek(SeekFrom::Start(pos0))?;

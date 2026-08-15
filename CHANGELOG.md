@@ -60,6 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     / `CueBlockNumber` arms), so mutation explores the new surface
     from a well-formed start; byte-exact builder match + per-class
     findings pinned by a test.
+  - `MkvDemuxer::audit_seek_head() -> SeekHeadAuditReport` — the same
+    whole-index treatment for the file's *other* self-referential
+    index: every MetaSeek `SeekID` / `SeekPosition` pair (RFC 9559
+    §5.1.1.1) resolved and required to land on an element header
+    carrying exactly the promised ID. Typed `SeekLieKind` findings
+    (`MissingPosition` / `MalformedId` / `TargetOutOfSegment` /
+    `TargetMismatch` with `found_id()`), same read-only /
+    both-modes / capped-plus-exact-counter contract as `audit_cues`,
+    fuzz-harness consistency asserts, and 8 tests in
+    `tests/seek_head_lies.rs` (incl. the in-tree muxer's emitted
+    SeekHead auditing truthful and a position-0 entry resolving to the
+    SeekHead itself being reported as a mismatch with the found ID).
   - 18 tests in `tests/seek_cues_lies.rs`: truthful-baseline audits in
     both modes (including truthful `CueRelativePosition` /
     `CueBlockNumber` arms), audit-does-not-disturb-streaming pin,

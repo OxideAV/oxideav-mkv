@@ -185,6 +185,19 @@ fuzz_target!(|data: &[u8]| {
                 "is_truthful must agree with the counter"
             );
         }
+        // Same contract for the MetaSeek audit (`audit_seek_head`).
+        if let Ok(audit) = rdmx.audit_seek_head() {
+            assert!(
+                (audit.findings().len() as u64) <= audit.findings_total(),
+                "capped list cannot exceed the exact counter"
+            );
+            assert!(audit.findings().len() <= 4096, "findings cap");
+            assert_eq!(
+                audit.is_truthful(),
+                audit.findings_total() == 0,
+                "is_truthful must agree with the counter"
+            );
+        }
     }
 
     // Fourth pass: the WebM conformance scanner (`webm::scan`) — a pure

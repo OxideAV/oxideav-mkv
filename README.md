@@ -604,6 +604,22 @@ the unified `oxideav` aggregator to wire decoding automatically.
     per-seek event logging, fuzz-corpus + byte-soup no-panic sweeps,
     strict-path trust pin, and the `seed_cue_lies.mkv` corpus-seed pin
     — one lie of every checkable class from a well-formed start).
+  - `MkvDemuxer::audit_seek_head() -> SeekHeadAuditReport` extends the
+    same treatment to the file's *other* self-referential index: every
+    MetaSeek `Seek` entry's `SeekID` / `SeekPosition` pair (RFC 9559
+    §5.1.1.1) is resolved and must land on an element header carrying
+    exactly the promised ID. Typed `SeekLieKind` findings:
+    `MissingPosition` (the `minOccurs: 1` child omitted),
+    `MalformedId` (payload not a 1..=4-octet EBML ID),
+    `TargetOutOfSegment`, and `TargetMismatch` (with the ID that
+    actually parsed on `found_id()`). The open path already
+    trust-but-verifies the entries it *follows* (late post-Cluster
+    masters); the audit checks every entry, including the ones
+    navigation never needed. Same contract as `audit_cues` (read-only,
+    both open modes, 4096-cap + exact counter, `Err` only on I/O). The
+    in-tree muxer's emitted SeekHead audits truthful — pinned along
+    with mismatch/garbage/malformed shapes in
+    `tests/seek_head_lies.rs` (8 tests).
 - **Zero-Cluster (metadata-only) Segments open** — the schema gives
   `Cluster` no `minOccurs`, so a Segment carrying only Info / Tracks /
   Chapters / Tags / Attachments (a chapters-only sidecar, or the
