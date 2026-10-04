@@ -665,6 +665,16 @@ fn open_typed_impl(
             // conversions before decoding.
             params.pixel_format =
                 video_config::pixel_format_from_config(params.codec_id.as_str(), &params.extradata);
+            // The picture size the decoder emits: the SPS's cropping
+            // window wins over a `PixelWidth` / `PixelHeight` that
+            // declares the coded (macroblock-aligned) size.
+            if let Some((w, h)) = video_config::cropped_dimensions_from_config(
+                params.codec_id.as_str(),
+                &params.extradata,
+            ) {
+                params.width = Some(w);
+                params.height = Some(h);
+            }
         }
         // RFC 9559 §5.1.4.1.19 / §5.1.4.1.20: surface the per-track language
         // when the file carried one. `LanguageBCP47` supersedes `Language`
