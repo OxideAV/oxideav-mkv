@@ -5,6 +5,8 @@
 //! time, extracting frames from `SimpleBlock` and `BlockGroup → Block`
 //! elements (lacing-aware).
 
+mod video_config;
+
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
@@ -628,6 +630,11 @@ fn open_typed_impl(
         if t.track_type == ids::TRACK_TYPE_VIDEO {
             params.width = Some(t.width as u32);
             params.height = Some(t.height as u32);
+            // The decoded-picture layout, from the avcC / hvcC
+            // CodecPrivate, so consumers can plan pixel-format
+            // conversions before decoding.
+            params.pixel_format =
+                video_config::pixel_format_from_config(params.codec_id.as_str(), &params.extradata);
         }
         // RFC 9559 §5.1.4.1.19 / §5.1.4.1.20: surface the per-track language
         // when the file carried one. `LanguageBCP47` supersedes `Language`
