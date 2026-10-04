@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
+
+### Other
+
+- report the SPS-cropped picture size for H.264 / HEVC tracks
+- bare-AU frames, CodecPrivate ASC, HE-AAC output rate, legacy profile CodecIDs
+- declare the H.264 / HEVC picture layout from avcC / hvcC
+- README examples use the current registry API
+
 ### Fixed
 
 - `A_AAC` muxing stored ADTS-framed packets verbatim and wrote no
