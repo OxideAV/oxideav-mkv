@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `A_AAC` muxing stored ADTS-framed packets verbatim and wrote no
+  `CodecPrivate` for streams without extradata. Frames are now bare
+  access units (ADTS headers stripped) and an AAC-LC AudioSpecificConfig
+  is synthesised from the stream geometry when needed.
+- HE-AAC tracks demuxed at the AAC core rate (`SamplingFrequency`), so a
+  decode to WAV played at half speed. The AAC stream rate is now
+  `OutputSamplingFrequency` (or the SBR rate the ASC declares); the
+  muxer writes the core rate / SBR output rate pair from an
+  SBR-signalling ASC.
+- The deprecated profile CodecIDs (`A_AAC/MPEG2|MPEG4/MAIN|LC|LC/SBR|SSR|LTP`)
+  all map to `aac`, with an AudioSpecificConfig synthesised from the
+  profile when `CodecPrivate` is absent.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.9...v0.0.10) - 2026-08-15
 
 ### Other

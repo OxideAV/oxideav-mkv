@@ -44,7 +44,11 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "A_PCM/INT/LIT" => "pcm_s16le",
         "A_PCM/INT/BIG" => "pcm_s16be",
         "A_PCM/FLOAT/IEEE" => "pcm_f32le",
-        "A_AAC" | "A_AAC/MPEG4/LC" | "A_AAC/MPEG2/LC" => "aac",
+        "A_AAC" => "aac",
+        // The deprecated profile-specific AAC ids (Matroska codec
+        // mappings) — all AAC; the profile feeds a synthesised
+        // AudioSpecificConfig when CodecPrivate is absent.
+        s if s.starts_with("A_AAC/MPEG2/") || s.starts_with("A_AAC/MPEG4/") => "aac",
         "A_MPEG/L3" => "mp3",
         "A_AC3" => "ac3",
         "A_EAC3" => "eac3",

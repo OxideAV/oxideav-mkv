@@ -616,6 +616,36 @@ fn open_typed_impl(
         if t.track_type == ids::TRACK_TYPE_AUDIO {
             params.sample_rate = Some(t.sample_rate.round() as u32);
             params.channels = Some(t.channels as u16);
+            if codec_id.as_str() == "aac" {
+                let osf = t
+                    .audio_raw
+                    .and_then(|a| a.output_sampling_frequency)
+                    .map(|f| f.round() as u32);
+                // Legacy profile CodecIDs carry no CodecPrivate: build the
+                // AudioSpecificConfig they imply (SBR output rate from
+                // OutputSamplingFrequency, else twice the core rate).
+                if params.extradata.is_empty() {
+                    if let Some((aot, sbr)) =
+                        crate::aac::legacy_codec_id_profile(&t.codec_id_string)
+                    {
+                        let core = t.sample_rate.round() as u32;
+                        let out = osf.filter(|&o| o != core).unwrap_or(core * 2);
+                        if let Some(asc) =
+                            crate::aac::legacy_asc(aot, sbr, core, out, t.channels as u16)
+                        {
+                            params.extradata = asc;
+                        }
+                    }
+                }
+                // SamplingFrequency is the AAC *core* rate; the decoded
+                // output of an SBR stream runs at OutputSamplingFrequency
+                // (RFC 9559 §5.1.4.1.29.2), or at the SBR rate the ASC
+                // declares. Report the rate the decoder emits.
+                let asc_sbr = crate::aac::asc_rates(&params.extradata).and_then(|r| r.sbr_rate);
+                if let Some(rate) = osf.or(asc_sbr) {
+                    params.sample_rate = Some(rate);
+                }
+            }
             params.sample_format = match (params.codec_id.as_str(), t.bit_depth) {
                 ("pcm_s16le", _) => Some(SampleFormat::S16),
                 ("pcm_s16be", _) => Some(SampleFormat::S16),

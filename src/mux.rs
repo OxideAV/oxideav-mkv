@@ -5326,7 +5326,16 @@ impl Muxer for MkvMuxer {
                 write_string_element(&mut t, ids::CODEC_ID, &raw);
             }
             // CodecPrivate with codec-specific normalisation.
-            let cp = encode_codec_private(&s.params.codec_id, &s.params.extradata);
+            let mut cp = encode_codec_private(&s.params.codec_id, &s.params.extradata);
+            // `A_AAC` requires the AudioSpecificConfig in CodecPrivate;
+            // a stream handed over without one (ADTS-framed packets
+            // carry their configuration in-band) gets the AAC-LC ASC
+            // its geometry implies.
+            if cp.is_empty() && s.params.codec_id.as_str() == "aac" {
+                if let Ok(asc) = crate::aac::lc_asc_from_params(&s.params) {
+                    cp = asc;
+                }
+            }
             if !cp.is_empty() {
                 write_bytes_element(&mut t, ids::CODEC_PRIVATE, &cp);
             }
@@ -5372,18 +5381,30 @@ impl Muxer for MkvMuxer {
                 // the demuxer materialises the §5.1.4.1.29.1 / .3 spec
                 // defaults (8000.0 Hz / 1 channel) or surfaces `None`
                 // (BitDepth — §5.1.4.1.29.4 has no default).
+                // `A_AAC` with SBR (HE-AAC): SamplingFrequency is the AAC
+                // core rate and OutputSamplingFrequency the SBR output
+                // rate the decoder emits (= StreamInfo `sample_rate`),
+                // both read from the AudioSpecificConfig.
+                let aac_sbr = if s.params.codec_id.as_str() == "aac" {
+                    crate::aac::asc_rates(&cp).and_then(|r| r.sbr_rate.map(|o| (r.core_rate, o)))
+                } else {
+                    None
+                };
                 let sampling_frequency = hint
                     .and_then(|h| h.sampling_frequency)
+                    .or_else(|| aac_sbr.map(|(core, _)| f64::from(core)))
                     .or_else(|| s.params.sample_rate.map(|sr| sr as f64));
                 if let Some(sf) = sampling_frequency {
                     write_float_element(&mut audio, ids::SAMPLING_FREQUENCY, sf);
                 }
                 // OutputSamplingFrequency (§5.1.4.1.29.2): the SBR output
-                // rate. StreamInfo has no equivalent, so this child only
-                // appears when the hint supplied it. Omission lets the
-                // demuxer apply the Table 19 derived default
-                // (= SamplingFrequency).
-                if let Some(osf) = hint.and_then(|h| h.output_sampling_frequency) {
+                // rate. From the hint, or from an SBR-signalling AAC ASC;
+                // otherwise omitted so the demuxer applies the Table 19
+                // derived default (= SamplingFrequency).
+                if let Some(osf) = hint
+                    .and_then(|h| h.output_sampling_frequency)
+                    .or_else(|| aac_sbr.map(|(_, out)| f64::from(out)))
+                {
                     write_float_element(&mut audio, ids::OUTPUT_SAMPLING_FREQUENCY, osf);
                 }
                 let channels = hint
@@ -6133,6 +6154,22 @@ impl MkvMuxer {
                 stream_idx
             )));
         }
+        // `A_AAC`: a frame is one bare access unit (the configuration is
+        // in CodecPrivate) — drop an ADTS transport header if present.
+        let stripped;
+        let packet = if self.streams[stream_idx].params.codec_id.as_str() == "aac" {
+            match crate::aac::strip_adts(&packet.data)? {
+                std::borrow::Cow::Borrowed(au) if au.len() != packet.data.len() => {
+                    let mut p = packet.clone();
+                    p.data = au.to_vec();
+                    stripped = p;
+                    &stripped
+                }
+                _ => packet,
+            }
+        } else {
+            packet
+        };
         let track_number = self.track_numbers[stream_idx];
         let stream_time_base = self.streams[stream_idx].time_base;
         let media_type = self.streams[stream_idx].params.media_type;
