@@ -13,8 +13,6 @@ framework but usable standalone.
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-container = "0.1"
 oxideav-mkv = "0.0"
 ```
 
@@ -24,21 +22,22 @@ Register both containers (`"matroska"` and `"webm"`) and let the probe
 pick which DocType the file carries:
 
 ```rust
-use oxideav_container::ContainerRegistry;
+use oxideav_core::RuntimeContext;
 
-let mut containers = ContainerRegistry::new();
-oxideav_mkv::register(&mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_mkv::register(&mut ctx);
 
-let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
+let mut input: Box<dyn oxideav_core::ReadSeek> = Box::new(
     std::fs::File::open("movie.mkv")?,
 );
-let mut dmx = containers.open_demuxer("matroska", input)?;
+let format = ctx.containers.probe_input(input.as_mut(), Some("mkv"))?; // "matroska" or "webm"
+let mut dmx = ctx.containers.open_demuxer(&format, input, &ctx.codecs)?;
 for s in dmx.streams() {
     println!("track {}: {}", s.index, s.params.codec_id.as_str());
 }
 loop {
     match dmx.next_packet() {
-        Ok(p) => { /* feed p into a decoder from oxideav-codec */ }
+        Ok(p) => { /* feed p into a decoder from ctx.codecs */ let _ = p; }
         Err(oxideav_core::Error::Eof) => break,
         Err(e) => return Err(e.into()),
     }
@@ -49,8 +48,9 @@ loop {
 The demuxer returns raw `Packet` bytes — pair it with a decoder crate
 (e.g. [`oxideav-opus`](https://crates.io/crates/oxideav-opus),
 [`oxideav-flac`](https://crates.io/crates/oxideav-flac),
-[`oxideav-vp9`](https://crates.io/crates/oxideav-vp9)) or go through
-the unified `oxideav` aggregator to wire decoding automatically.
+[`oxideav-vp9`](https://crates.io/crates/oxideav-vp9)) registered into
+the same `RuntimeContext`, or call `oxideav_meta::register_all(&mut ctx)`
+to register every codec the build enables.
 
 ## What's implemented
 
