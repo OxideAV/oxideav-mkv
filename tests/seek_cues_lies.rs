@@ -570,10 +570,11 @@ fn truncated_file_flags_cluster_truncated_then_out_of_segment() {
     let landed = rdmx.seek_to(0, 200_000).expect("seek");
     assert_eq!(landed, 100_000, "lands the last surviving Cluster");
     assert_eq!(rdmx.next_packet().expect("pkt").data.as_slice(), &[0xA1]);
-    assert!(rdmx
-        .damage_events()
-        .iter()
-        .any(|e| e.kind() == DamageKind::CueLie));
+    assert!(
+        rdmx.damage_events()
+            .iter()
+            .any(|e| e.kind() == DamageKind::CueLie)
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -592,10 +593,12 @@ fn relative_position_lies_are_flagged_but_not_seek_lies() {
     let mut dmx = open_strict(&built.bytes);
     let report = dmx.audit_cues().expect("audit");
     assert_eq!(report.findings_total(), 2);
-    assert!(report
-        .findings()
-        .iter()
-        .all(|f| f.kind() == CueLieKind::RelativePositionInvalid));
+    assert!(
+        report
+            .findings()
+            .iter()
+            .all(|f| f.kind() == CueLieKind::RelativePositionInvalid)
+    );
     assert_eq!(report.findings()[0].entry_index(), 1);
     assert_eq!(report.findings()[1].entry_index(), 2);
 

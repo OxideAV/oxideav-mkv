@@ -340,24 +340,26 @@ fn mux_setter_validation() {
     let mut mx = MkvMuxer::new_matroska(ws, &[audio_stream()]).expect("muxer construct");
 
     // Empty name rejected.
-    assert!(mx
-        .set_doc_type_extensions(vec![DocTypeExtension {
+    assert!(
+        mx.set_doc_type_extensions(vec![DocTypeExtension {
             name: String::new(),
             version: 1,
         }])
-        .is_err());
+        .is_err()
+    );
 
     // Zero version rejected.
-    assert!(mx
-        .set_doc_type_extensions(vec![DocTypeExtension {
+    assert!(
+        mx.set_doc_type_extensions(vec![DocTypeExtension {
             name: "x".to_string(),
             version: 0,
         }])
-        .is_err());
+        .is_err()
+    );
 
     // Duplicate name rejected.
-    assert!(mx
-        .set_doc_type_extensions(vec![
+    assert!(
+        mx.set_doc_type_extensions(vec![
             DocTypeExtension {
                 name: "dup".to_string(),
                 version: 1,
@@ -367,24 +369,27 @@ fn mux_setter_validation() {
                 version: 2,
             },
         ])
-        .is_err());
+        .is_err()
+    );
 
     // A valid call still succeeds after the rejected ones.
-    assert!(mx
-        .set_doc_type_extensions(vec![DocTypeExtension {
+    assert!(
+        mx.set_doc_type_extensions(vec![DocTypeExtension {
             name: "ok".to_string(),
             version: 1,
         }])
-        .is_ok());
+        .is_ok()
+    );
 
     // Post-write_header use rejected.
     let ws2: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
     let mut mx2 = MkvMuxer::new_matroska(ws2, &[audio_stream()]).expect("muxer construct");
     mx2.write_header().expect("write_header");
-    assert!(mx2
-        .set_doc_type_extensions(vec![DocTypeExtension {
+    assert!(
+        mx2.set_doc_type_extensions(vec![DocTypeExtension {
             name: "late".to_string(),
             version: 1,
         }])
-        .is_err());
+        .is_err()
+    );
 }

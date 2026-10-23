@@ -388,61 +388,66 @@ fn rejects_out_of_range_values() {
 
     // SamplingFrequency must be > 0.
     let mut mx = make();
-    assert!(mx
-        .set_track_audio(
+    assert!(
+        mx.set_track_audio(
             0,
             MkvTrackAudio {
                 sampling_frequency: Some(0.0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
 
     // OutputSamplingFrequency must be > 0 (and finite).
     let mut mx = make();
-    assert!(mx
-        .set_track_audio(
+    assert!(
+        mx.set_track_audio(
             0,
             MkvTrackAudio {
                 output_sampling_frequency: Some(-1.0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
     let mut mx = make();
-    assert!(mx
-        .set_track_audio(
+    assert!(
+        mx.set_track_audio(
             0,
             MkvTrackAudio {
                 output_sampling_frequency: Some(f64::NAN),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
 
     // Channels must be != 0.
     let mut mx = make();
-    assert!(mx
-        .set_track_audio(
+    assert!(
+        mx.set_track_audio(
             0,
             MkvTrackAudio {
                 channels: Some(0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
 
     // BitDepth must be != 0.
     let mut mx = make();
-    assert!(mx
-        .set_track_audio(
+    assert!(
+        mx.set_track_audio(
             0,
             MkvTrackAudio {
                 bit_depth: Some(0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]

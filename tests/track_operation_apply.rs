@@ -648,9 +648,11 @@ fn background_other_planes_and_mixed_operation_order() {
         ],
         "planes before joins, each in on-disk order"
     );
-    assert!(pkts[1..]
-        .iter()
-        .all(|(p, _)| p.stream_index == 1 && p.data == vec![0x99]));
+    assert!(
+        pkts[1..]
+            .iter()
+            .all(|(p, _)| p.stream_index == 1 && p.data == vec![0x99])
+    );
 }
 
 // --- Virtual-track seek (Cues union, §18.8) -------------------------------

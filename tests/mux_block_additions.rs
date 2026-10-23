@@ -245,30 +245,34 @@ fn validation_rejects_spec_violations_before_writing() {
 
     let p = packet(0, 0, true, 0x11, 8);
     // Undeclared stream: §5.1.4.1.16 default 0 = "no BlockAdditions".
-    assert!(mx
-        .write_packet_with_additions(
+    assert!(
+        mx.write_packet_with_additions(
             &packet(1, 0, true, 0x22, 8),
             &[MkvBlockAddition::codec_defined(vec![0x01])],
         )
-        .is_err());
+        .is_err()
+    );
     // BlockAddID 0: §5.1.3.5.2.3 ranges the element as "not 0".
-    assert!(mx
-        .write_packet_with_additions(&p, &[MkvBlockAddition::new(0, vec![0x01])])
-        .is_err());
+    assert!(
+        mx.write_packet_with_additions(&p, &[MkvBlockAddition::new(0, vec![0x01])])
+            .is_err()
+    );
     // BlockAddID above the declared MaxBlockAdditionID.
-    assert!(mx
-        .write_packet_with_additions(&p, &[MkvBlockAddition::new(3, vec![0x01])])
-        .is_err());
+    assert!(
+        mx.write_packet_with_additions(&p, &[MkvBlockAddition::new(3, vec![0x01])])
+            .is_err()
+    );
     // Duplicate BlockAddID within one BlockAdditions (§5.1.3.5.2.3 MUST).
-    assert!(mx
-        .write_packet_with_additions(
+    assert!(
+        mx.write_packet_with_additions(
             &p,
             &[
                 MkvBlockAddition::new(2, vec![0x01]),
                 MkvBlockAddition::new(2, vec![0x02]),
             ],
         )
-        .is_err());
+        .is_err()
+    );
     // A spec-conformant write on the declared stream still succeeds.
     mx.write_packet_with_additions(&p, &[MkvBlockAddition::new(2, vec![0x01])])
         .expect("valid additions accepted");
@@ -323,12 +327,13 @@ fn explicit_zero_declaration_is_on_disk_but_still_gates_writes() {
     mx.set_max_block_addition_id(0, 0).expect("explicit zero");
     assert_eq!(mx.max_block_addition_id(0), Some(0));
     mx.write_header().expect("write_header");
-    assert!(mx
-        .write_packet_with_additions(
+    assert!(
+        mx.write_packet_with_additions(
             &packet(0, 0, true, 0x11, 8),
             &[MkvBlockAddition::codec_defined(vec![0x01])],
         )
-        .is_err());
+        .is_err()
+    );
     mx.write_packet(&packet(0, 0, true, 0x11, 8))
         .expect("plain packet");
     mx.write_trailer().expect("write_trailer");

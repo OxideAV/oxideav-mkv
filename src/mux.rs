@@ -37,7 +37,7 @@ use crate::demux::{
     DocTypeExtension, FieldOrder, FlagInterlaced, MatrixCoefficients, OldStereoMode, Primaries,
     ProjectionType, SegmentLinking, StereoMode, TrackPlaneType, TransferCharacteristics,
 };
-use crate::ebml::{crc32_ieee, write_element_id, write_vint, VINT_UNKNOWN_SIZE};
+use crate::ebml::{VINT_UNKNOWN_SIZE, crc32_ieee, write_element_id, write_vint};
 use crate::ids;
 
 /// Cluster every ~5 seconds (in MKV ms timecode units) — the RFC 9559
@@ -3197,14 +3197,14 @@ impl MkvMuxer {
                 &legacy.trick_master_track_segment_uid,
             ),
         ] {
-            if let Some(bytes) = uid {
-                if bytes.len() != 16 {
-                    return Err(Error::invalid(format!(
-                        "MKV muxer: set_track_legacy given a {label} of {} bytes \
+            if let Some(bytes) = uid
+                && bytes.len() != 16
+            {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: set_track_legacy given a {label} of {} bytes \
                          (a SegmentUUID is a 128-bit / 16-byte value)",
-                        bytes.len()
-                    )));
-                }
+                    bytes.len()
+                )));
             }
         }
         self.track_legacy[stream_index] = if legacy.is_empty() {
@@ -4062,12 +4062,12 @@ impl MkvMuxer {
             ("sampling_frequency", audio.sampling_frequency),
             ("output_sampling_frequency", audio.output_sampling_frequency),
         ] {
-            if let Some(v) = freq {
-                if !(v.is_finite() && v > 0.0) {
-                    return Err(Error::invalid(format!(
-                        "MKV muxer: set_track_audio {name} {v} out of range (must be finite and > 0)"
-                    )));
-                }
+            if let Some(v) = freq
+                && !(v.is_finite() && v > 0.0)
+            {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: set_track_audio {name} {v} out of range (must be finite and > 0)"
+                )));
             }
         }
         // RFC 9559 §5.1.4.1.29.3 / .4: Channels and BitDepth are ranged
@@ -4183,12 +4183,12 @@ impl MkvMuxer {
             ));
         }
         // RFC 9559 §5.1.4.1.15: TrackTimestampScale is ranged "> 0x0p+0".
-        if let Some(v) = timing.track_timestamp_scale {
-            if !(v.is_finite() && v > 0.0) {
-                return Err(Error::invalid(format!(
-                    "MKV muxer: set_track_timing track_timestamp_scale {v} out of range (must be finite and > 0)"
-                )));
-            }
+        if let Some(v) = timing.track_timestamp_scale
+            && !(v.is_finite() && v > 0.0)
+        {
+            return Err(Error::invalid(format!(
+                "MKV muxer: set_track_timing track_timestamp_scale {v} out of range (must be finite and > 0)"
+            )));
         }
         self.track_timing[stream_index] = Some(timing);
         Ok(self)
@@ -4398,13 +4398,13 @@ impl MkvMuxer {
                 "MKV muxer: add_chapter_full called after write_header",
             ));
         }
-        if let Some(end) = chapter.time_end_ns {
-            if end < chapter.time_start_ns {
-                return Err(Error::invalid(format!(
-                    "MKV muxer: chapter end_time_ns ({end}) < start_time_ns ({})",
-                    chapter.time_start_ns
-                )));
-            }
+        if let Some(end) = chapter.time_end_ns
+            && end < chapter.time_start_ns
+        {
+            return Err(Error::invalid(format!(
+                "MKV muxer: chapter end_time_ns ({end}) < start_time_ns ({})",
+                chapter.time_start_ns
+            )));
         }
         // RFC 9559 §5.1.7.1.4.1: ChapterUID has range "not 0".
         if chapter.uid == Some(0) {
@@ -4421,13 +4421,13 @@ impl MkvMuxer {
             ));
         }
         // §5.1.7.1.4.6: ChapterSegmentUUID is a 16-byte SegmentUUID.
-        if let Some(uuid) = &chapter.segment_uuid {
-            if uuid.len() != 16 {
-                return Err(Error::invalid(format!(
-                    "MKV muxer: ChapterSegmentUUID must be 16 bytes (RFC 9559 §5.1.7.1.4.6), got {}",
-                    uuid.len()
-                )));
-            }
+        if let Some(uuid) = &chapter.segment_uuid
+            && uuid.len() != 16
+        {
+            return Err(Error::invalid(format!(
+                "MKV muxer: ChapterSegmentUUID must be 16 bytes (RFC 9559 §5.1.7.1.4.6), got {}",
+                uuid.len()
+            )));
         }
         // WebM strict mode: the guidelines keep ChapterAtom but list the
         // hidden/enabled flags, the Medium-Linking pair, the physical
@@ -4710,13 +4710,13 @@ impl MkvMuxer {
             ("PrevUUID", &linking.prev_uuid),
             ("NextUUID", &linking.next_uuid),
         ] {
-            if let Some(bytes) = uuid {
-                if bytes.len() != 16 {
-                    return Err(Error::invalid(format!(
-                        "MKV muxer: {name} must be exactly 16 bytes (RFC 9559 §5.1.2, length: 16), got {}",
-                        bytes.len()
-                    )));
-                }
+            if let Some(bytes) = uuid
+                && bytes.len() != 16
+            {
+                return Err(Error::invalid(format!(
+                    "MKV muxer: {name} must be exactly 16 bytes (RFC 9559 §5.1.2, length: 16), got {}",
+                    bytes.len()
+                )));
             }
         }
         for fam in &linking.families {
@@ -5124,11 +5124,11 @@ impl Muxer for MkvMuxer {
             write_segment_linking(&mut info_body, linking);
         }
         write_uint_element(&mut info_body, ids::TIMECODE_SCALE, 1_000_000); // 1 ms
-                                                                            // Duration finalization (§5.1.2.10): reserve a Duration-sized Void
-                                                                            // at the position where `Duration` belongs in the §5.1.2 element
-                                                                            // order, so `write_trailer` can patch the measured value in place.
-                                                                            // If the trailer never runs (a crashed producer), the file carries
-                                                                            // a harmless Void instead of a bogus duration.
+        // Duration finalization (§5.1.2.10): reserve a Duration-sized Void
+        // at the position where `Duration` belongs in the §5.1.2 element
+        // order, so `write_trailer` can patch the measured value in place.
+        // If the trailer never runs (a crashed producer), the file carries
+        // a harmless Void instead of a bogus duration.
         let duration_slot_in_info_body = if self.duration_finalization {
             let off = info_body.len();
             info_body.push(ids::VOID as u8);
@@ -5331,10 +5331,11 @@ impl Muxer for MkvMuxer {
             // a stream handed over without one (ADTS-framed packets
             // carry their configuration in-band) gets the AAC-LC ASC
             // its geometry implies.
-            if cp.is_empty() && s.params.codec_id.as_str() == "aac" {
-                if let Ok(asc) = crate::aac::lc_asc_from_params(&s.params) {
-                    cp = asc;
-                }
+            if cp.is_empty()
+                && s.params.codec_id.as_str() == "aac"
+                && let Ok(asc) = crate::aac::lc_asc_from_params(&s.params)
+            {
+                cp = asc;
             }
             if !cp.is_empty() {
                 write_bytes_element(&mut t, ids::CODEC_PRIVATE, &cp);
@@ -5426,18 +5427,18 @@ impl Muxer for MkvMuxer {
                 // element must stay off-disk so it never needlessly forces
                 // DocTypeVersion 5 (the reader materialises the 0 default).
                 // Reserved / Unknown were rejected at queue time.
-                if let Some(e) = hint.and_then(|h| h.emphasis) {
-                    if e != AudioEmphasis::NoEmphasis {
-                        write_uint_element(&mut audio, ids::EMPHASIS, e.to_raw());
-                    }
+                if let Some(e) = hint.and_then(|h| h.emphasis)
+                    && e != AudioEmphasis::NoEmphasis
+                {
+                    write_uint_element(&mut audio, ids::EMPHASIS, e.to_raw());
                 }
                 // ChannelPositions (RFC 9559 Appendix A.27) — reclaimed Audio
                 // child queued through `set_track_legacy`, written verbatim
                 // for a faithful re-mux.
-                if let Some(leg) = &self.track_legacy[i] {
-                    if let Some(cp) = &leg.channel_positions {
-                        write_bytes_element(&mut audio, ids::CHANNEL_POSITIONS, cp);
-                    }
+                if let Some(leg) = &self.track_legacy[i]
+                    && let Some(cp) = &leg.channel_positions
+                {
+                    write_bytes_element(&mut audio, ids::CHANNEL_POSITIONS, cp);
                 }
                 write_master_element(&mut t, ids::AUDIO, &audio);
             }
@@ -6336,9 +6337,11 @@ impl MkvMuxer {
             } else if packet.flags.keyframe {
                 Vec::new()
             } else {
-                vec![self.last_block_pts_ms[stream_idx]
-                    .map(|prev| prev - pts_ms)
-                    .unwrap_or(0)]
+                vec![
+                    self.last_block_pts_ms[stream_idx]
+                        .map(|prev| prev - pts_ms)
+                        .unwrap_or(0),
+                ]
             };
             // BlockDuration (§5.1.3.5.3) in track ticks (ms). Only
             // emitted when the packet carries a non-negative duration —
@@ -7733,10 +7736,10 @@ fn build_chapters_element(
 fn build_chapter_atom(default_uid: u64, ch: &MkvChapter) -> Vec<u8> {
     let mut body = Vec::new();
     write_uint_element(&mut body, ids::CHAPTER_UID, ch.uid.unwrap_or(default_uid));
-    if let Some(suid) = ch.string_uid.as_deref() {
-        if !suid.is_empty() {
-            write_string_element(&mut body, ids::CHAPTER_STRING_UID, suid);
-        }
+    if let Some(suid) = ch.string_uid.as_deref()
+        && !suid.is_empty()
+    {
+        write_string_element(&mut body, ids::CHAPTER_STRING_UID, suid);
     }
     write_uint_element(&mut body, ids::CHAPTER_TIME_START, ch.time_start_ns);
     if let Some(end) = ch.time_end_ns {
@@ -7841,10 +7844,10 @@ fn build_attachments_element(attachments: &[MkvAttachment]) -> Vec<u8> {
 /// `MkvAttachment` without losing or reordering fields.
 fn build_attached_file(index: u64, att: &MkvAttachment) -> Vec<u8> {
     let mut body = Vec::new();
-    if let Some(desc) = att.description.as_deref() {
-        if !desc.is_empty() {
-            write_string_element(&mut body, ids::FILE_DESCRIPTION, desc);
-        }
+    if let Some(desc) = att.description.as_deref()
+        && !desc.is_empty()
+    {
+        write_string_element(&mut body, ids::FILE_DESCRIPTION, desc);
     }
     write_string_element(&mut body, ids::FILE_NAME, &att.filename);
     write_string_element(&mut body, ids::FILE_MIME_TYPE, &att.mime_type);
@@ -7968,10 +7971,10 @@ fn build_tag_targets(t: &MkvTagTargets) -> Vec<u8> {
     if let Some(ttv) = t.target_type_value {
         write_uint_element(&mut body, ids::TARGET_TYPE_VALUE, ttv);
     }
-    if let Some(tt) = t.target_type.as_deref() {
-        if !tt.is_empty() {
-            write_string_element(&mut body, ids::TARGET_TYPE, tt);
-        }
+    if let Some(tt) = t.target_type.as_deref()
+        && !tt.is_empty()
+    {
+        write_string_element(&mut body, ids::TARGET_TYPE, tt);
     }
     for &uid in &t.track_uids {
         if uid != 0 {

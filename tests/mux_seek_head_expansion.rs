@@ -19,7 +19,7 @@ use std::io::{Cursor, Seek, SeekFrom};
 
 use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase};
 use oxideav_core::{Demuxer, Error, ReadSeek, WriteSeek};
-use oxideav_mkv::ebml::{read_element_header, VINT_UNKNOWN_SIZE};
+use oxideav_mkv::ebml::{VINT_UNKNOWN_SIZE, read_element_header};
 use oxideav_mkv::ids;
 use oxideav_mkv::mux::MkvMuxer;
 

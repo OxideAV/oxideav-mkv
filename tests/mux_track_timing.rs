@@ -316,59 +316,64 @@ fn rejects_out_of_range_values() {
 
     // DefaultDuration must be != 0.
     let mut mx = make();
-    assert!(mx
-        .set_track_timing(
+    assert!(
+        mx.set_track_timing(
             0,
             MkvTrackTiming {
                 default_duration: Some(0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
 
     // DefaultDecodedFieldDuration must be != 0.
     let mut mx = make();
-    assert!(mx
-        .set_track_timing(
+    assert!(
+        mx.set_track_timing(
             0,
             MkvTrackTiming {
                 default_decoded_field_duration: Some(0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
 
     // TrackTimestampScale must be > 0 and finite.
     let mut mx = make();
-    assert!(mx
-        .set_track_timing(
+    assert!(
+        mx.set_track_timing(
             0,
             MkvTrackTiming {
                 track_timestamp_scale: Some(0.0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
     let mut mx = make();
-    assert!(mx
-        .set_track_timing(
+    assert!(
+        mx.set_track_timing(
             0,
             MkvTrackTiming {
                 track_timestamp_scale: Some(-1.0),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
     let mut mx = make();
-    assert!(mx
-        .set_track_timing(
+    assert!(
+        mx.set_track_timing(
             0,
             MkvTrackTiming {
                 track_timestamp_scale: Some(f64::NAN),
                 ..Default::default()
             }
         )
-        .is_err());
+        .is_err()
+    );
 }
 
 #[test]

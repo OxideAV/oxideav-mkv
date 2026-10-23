@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use oxideav_core::{
     CodecId, CodecParameters, Demuxer, Muxer, Packet, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
-use oxideav_mkv::ebml::{read_element_header, read_uint, VINT_UNKNOWN_SIZE};
+use oxideav_mkv::ebml::{VINT_UNKNOWN_SIZE, read_element_header, read_uint};
 use oxideav_mkv::ids;
 use oxideav_mkv::mux::{LacingMode, MkvMuxer};
 

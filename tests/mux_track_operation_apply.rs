@@ -175,9 +175,10 @@ fn muxed_join_reapplies() {
         vec![(0, 0x10, 0), (5, 0x20, 1), (10, 0x11, 0), (20, 0x21, 1)],
         "timestamp-ordered merge of both sources"
     );
-    assert!(virt
-        .iter()
-        .all(|(_, o)| o.unwrap().role == VirtualPacketRole::Joined));
+    assert!(
+        virt.iter()
+            .all(|(_, o)| o.unwrap().role == VirtualPacketRole::Joined)
+    );
 }
 
 /// Seeking the muxed virtual track goes through the §18.8 Cues union over

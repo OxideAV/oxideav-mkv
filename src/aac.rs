@@ -104,7 +104,7 @@ pub(crate) fn lc_asc_from_params(params: &CodecParameters) -> Result<Vec<u8>> {
             return Err(Error::invalid(format!(
                 "MKV muxer: aac stream missing extradata (AudioSpecificConfig) and \
                  {other:?} channels have no default channelConfiguration"
-            )))
+            )));
         }
     };
     Ok(asc_bytes(2, idx, cfg))

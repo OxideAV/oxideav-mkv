@@ -11,9 +11,9 @@
 
 use oxideav_mkv::ids;
 use oxideav_mkv::schema::{
-    element_def, ElementDef, ElementType, EBML_SUPPLEMENT, NO_MAX_VER, SCHEMA,
+    EBML_SUPPLEMENT, ElementDef, ElementType, NO_MAX_VER, SCHEMA, element_def,
 };
-use oxideav_mkv::webm::{webm_element_support, WebmSupport};
+use oxideav_mkv::webm::{WebmSupport, webm_element_support};
 
 #[test]
 fn schema_counts_and_sortedness() {

@@ -39,7 +39,7 @@ use oxideav_core::{
     CodecId, CodecParameters, Demuxer, Error, Muxer, Packet, ReadSeek, StreamInfo, TimeBase,
     WriteSeek,
 };
-use oxideav_mkv::ebml::{read_element_header, VINT_UNKNOWN_SIZE};
+use oxideav_mkv::ebml::{VINT_UNKNOWN_SIZE, read_element_header};
 use oxideav_mkv::ids;
 use oxideav_mkv::mux::{MkvAttachment, MkvChapter, MkvMuxer};
 

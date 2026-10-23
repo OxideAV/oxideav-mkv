@@ -299,7 +299,7 @@ fn cue_relative_position_out_of_range_falls_back_gracefully() {
 /// going back through the demuxer because we want to assert on the
 /// *written* bytes, not the parsed ones.
 fn extract_cue_positions(bytes: &[u8]) -> Vec<(u64, Option<u64>)> {
-    use oxideav_mkv::ebml::{read_element_header, VINT_UNKNOWN_SIZE};
+    use oxideav_mkv::ebml::{VINT_UNKNOWN_SIZE, read_element_header};
     use std::io::{Cursor, Seek, SeekFrom};
 
     let file_len = bytes.len() as u64;

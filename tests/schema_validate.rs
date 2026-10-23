@@ -14,7 +14,7 @@ use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
 use oxideav_mkv::mux::MkvMuxer;
-use oxideav_mkv::schema::{validate, SchemaFindingKind, SchemaReport};
+use oxideav_mkv::schema::{SchemaFindingKind, SchemaReport, validate};
 
 fn elem_uint(id: u32, value: u64) -> Vec<u8> {
     let n = if value == 0 {
@@ -285,10 +285,12 @@ fn occurrence_violations_are_flagged() {
         .findings
         .iter()
         .any(|f| f.kind == SchemaFindingKind::TooManyOccurrences && f.id == ids::TIMECODE_SCALE));
-    assert!(report
-        .findings
-        .iter()
-        .any(|f| f.kind == SchemaFindingKind::MissingMandatory && f.id == ids::CODEC_ID));
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == SchemaFindingKind::MissingMandatory && f.id == ids::CODEC_ID)
+    );
 }
 
 #[test]
@@ -300,10 +302,12 @@ fn misplaced_crc32_is_flagged() {
     let cl = elem_master(ids::CLUSTER, &c);
     let report = run(&doc(&[&info(), &tracks(), &cl]));
     assert!(!report.is_valid());
-    assert!(report
-        .findings
-        .iter()
-        .any(|f| f.kind == SchemaFindingKind::MisplacedCrc32));
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == SchemaFindingKind::MisplacedCrc32)
+    );
     // A leading CRC-32 is NOT flagged.
     let mut c = Vec::new();
     c.extend_from_slice(&elem_bin(ids::CRC32, &[0u8; 4]));
@@ -327,10 +331,12 @@ fn unknown_size_where_not_allowed_stops_walk() {
     bad.push(0xFF); // unknown-size VINT — Info has no unknownsizeallowed
     let report = run(&doc(&[&bad]));
     assert!(!report.is_valid());
-    assert!(report
-        .findings
-        .iter()
-        .any(|f| f.kind == SchemaFindingKind::UnknownSizeNotAllowed && f.id == ids::INFO));
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| f.kind == SchemaFindingKind::UnknownSizeNotAllowed && f.id == ids::INFO)
+    );
     assert!(report.scan_stopped_at.is_some());
 }
 

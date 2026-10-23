@@ -934,8 +934,9 @@ fn mastering_metadata_out_of_range_values_pass_through() {
     let m = got
         .mastering_metadata()
         .expect("MasteringMetadata surfaced");
-    assert!(m
-        .primary_r_chromaticity_x()
-        .is_some_and(|v| (v - 1.5).abs() < 1e-9));
+    assert!(
+        m.primary_r_chromaticity_x()
+            .is_some_and(|v| (v - 1.5).abs() < 1e-9)
+    );
     assert!(m.luminance_min().is_some_and(|v| (v + 1.0).abs() < 1e-9));
 }

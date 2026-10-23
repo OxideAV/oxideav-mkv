@@ -420,8 +420,9 @@ fn setter_rejects_spec_violations() {
 
     mx.write_header().expect("write_header");
     // After write_header the setter rejects.
-    assert!(mx
-        .set_track_translates(0, vec![MkvTrackTranslate::new(vec![0x01], 0)])
-        .is_err());
+    assert!(
+        mx.set_track_translates(0, vec![MkvTrackTranslate::new(vec![0x01], 0)])
+            .is_err()
+    );
     let _ = std::fs::remove_file(&tmp);
 }

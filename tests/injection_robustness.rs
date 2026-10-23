@@ -418,8 +418,8 @@ fn next_packet_rejects_simple_block_with_truncated_payload_after_lacing() {
     block_body.extend_from_slice(&0i16.to_be_bytes());
     block_body.push(0x02); // flags: lacing=1 (Xiph), no keyframe bit
     block_body.push(0x02); // n_frames - 1 = 2 → 3 frames
-                           // Xiph sizes: claim two sizes of 200 each → 400 bytes total demanded
-                           // but only 4 bytes of payload follow.
+    // Xiph sizes: claim two sizes of 200 each → 400 bytes total demanded
+    // but only 4 bytes of payload follow.
     block_body.push(200u8);
     block_body.push(200u8);
     block_body.extend_from_slice(&[0u8; 4]);

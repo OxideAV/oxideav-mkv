@@ -22,7 +22,7 @@ use std::io::Cursor;
 use oxideav_core::{CodecId, CodecParameters, Muxer, Packet, StreamInfo, TimeBase, WriteSeek};
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
-use oxideav_mkv::webm::{scan, webm_element_support, WebmSupport};
+use oxideav_mkv::webm::{WebmSupport, scan, webm_element_support};
 
 // ---------------------------------------------------------------------------
 // EBML byte-building helpers.

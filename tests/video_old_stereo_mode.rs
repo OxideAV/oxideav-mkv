@@ -414,9 +414,10 @@ fn mux_setter_validation() {
         "audio track has no Video master"
     );
     // Out-of-range index is rejected.
-    assert!(mx
-        .set_video_old_stereo_mode(99, OldStereoMode::Mono)
-        .is_err());
+    assert!(
+        mx.set_video_old_stereo_mode(99, OldStereoMode::Mono)
+            .is_err()
+    );
 
     // Post-write_header use is rejected.
     let ws2: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));

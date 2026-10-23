@@ -560,12 +560,12 @@ fn walk_children<R: Read + Seek>(
                 return Ok(pos);
             }
         };
-        if let Some(term) = terminate_on {
-            if term.contains(&header.id) {
-                // The unknown-size master we are walking ends here.
-                r.seek(SeekFrom::Start(pos))?;
-                return Ok(pos);
-            }
+        if let Some(term) = terminate_on
+            && term.contains(&header.id)
+        {
+            // The unknown-size master we are walking ends here.
+            r.seek(SeekFrom::Start(pos))?;
+            return Ok(pos);
         }
         record(report, pos, header.id);
         let body = pos + header.header_len as u64;

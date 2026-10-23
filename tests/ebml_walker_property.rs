@@ -35,7 +35,7 @@
 use std::io::Cursor;
 
 use oxideav_mkv::ebml::{
-    read_element_header, read_vint, skip, write_element_id, write_vint, VINT_UNKNOWN_SIZE,
+    VINT_UNKNOWN_SIZE, read_element_header, read_vint, skip, write_element_id, write_vint,
 };
 
 /// Deterministic splitmix64 — a tiny, well-distributed PRNG so the suite is

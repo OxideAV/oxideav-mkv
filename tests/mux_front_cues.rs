@@ -130,7 +130,8 @@ fn top_level_ids(bytes: &[u8]) -> Vec<(u32, u64)> {
 fn seek_head_cues_target(bytes: Vec<u8>) -> Option<u64> {
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let dmx = oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("open");
-    let seg_start = {
+
+    {
         // EBML header length + Segment id (4) + size VINT (1 for 0xFF).
         let mut found = None;
         for se in dmx.seek_entries() {
@@ -139,8 +140,7 @@ fn seek_head_cues_target(bytes: Vec<u8>) -> Option<u64> {
             }
         }
         found
-    };
-    seg_start
+    }
 }
 
 #[test]

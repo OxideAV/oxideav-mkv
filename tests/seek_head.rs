@@ -25,7 +25,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use oxideav_core::{CodecId, CodecParameters, Packet, StreamInfo, TimeBase};
 use oxideav_core::{ReadSeek, WriteSeek};
-use oxideav_mkv::ebml::{read_element_header, read_uint, VINT_UNKNOWN_SIZE};
+use oxideav_mkv::ebml::{VINT_UNKNOWN_SIZE, read_element_header, read_uint};
 use oxideav_mkv::ids;
 
 fn opus_head(channels: u8, sample_rate: u32, pre_skip: u16) -> Vec<u8> {

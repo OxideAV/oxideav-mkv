@@ -44,7 +44,7 @@ fn tmp_path(tag: &str) -> std::path::PathBuf {
 use oxideav_core::{
     CodecId, CodecParameters, Error, Muxer, Packet, ReadSeek, StreamInfo, TimeBase, WriteSeek,
 };
-use oxideav_mkv::ebml::{read_element_header, read_uint, VINT_UNKNOWN_SIZE};
+use oxideav_mkv::ebml::{VINT_UNKNOWN_SIZE, read_element_header, read_uint};
 use oxideav_mkv::ids;
 use oxideav_mkv::mux::{ChapterDisplay, MkvChapter, MkvMuxer};
 

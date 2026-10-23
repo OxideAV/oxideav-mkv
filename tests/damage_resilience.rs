@@ -469,10 +469,11 @@ fn resilient_seek_falls_back_when_cues_master_is_damaged() {
     assert!(open_strict(bytes.clone()).is_err());
 
     let mut dmx = open_resilient(bytes).expect("resilient open");
-    assert!(dmx
-        .damage_events()
-        .iter()
-        .any(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES)));
+    assert!(
+        dmx.damage_events()
+            .iter()
+            .any(|e| e.kind() == DamageKind::DamagedMaster(ids::CUES))
+    );
     let landed = dmx.seek_to(0, 1000).expect("fallback seek");
     assert_eq!(landed, 1000);
     assert_eq!(drain(&mut dmx), vec![(1000, 0x22)]);

@@ -17,8 +17,8 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
 use crate::ebml::{
-    crc32_ieee, read_bytes, read_element_header, read_float, read_int, read_string, read_uint,
-    read_vint, skip, VINT_UNKNOWN_SIZE,
+    VINT_UNKNOWN_SIZE, crc32_ieee, read_bytes, read_element_header, read_float, read_int,
+    read_string, read_uint, read_vint, skip,
 };
 use crate::ids;
 
@@ -309,8 +309,8 @@ fn open_typed_impl(
             // element when the element size is known (CRC needs a bounded
             // body). The helper rewinds the reader to `body_start` so the
             // parse below is unaffected.
-            if let Some(end) = body_end_known {
-                if matches!(
+            if let Some(end) = body_end_known
+                && matches!(
                     e.id,
                     ids::INFO
                         | ids::TRACKS
@@ -319,11 +319,10 @@ fn open_typed_impl(
                         | ids::CHAPTERS
                         | ids::ATTACHMENTS
                         | ids::SEEK_HEAD
-                ) {
-                    if let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)? {
-                        crc_status.push(s);
-                    }
-                }
+                )
+                && let Some(s) = validate_top_level_crc(&mut *input, e.id, body_start, end)?
+            {
+                crc_status.push(s);
             }
             match e.id {
                 ids::INFO => {
@@ -495,25 +494,25 @@ fn open_typed_impl(
     // to segment end looking for a top-level Cues element. We keep this
     // best-effort: any I/O error or parse problem leaves `cues` empty
     // and falls back to Unsupported at seek time.
-    if cues.is_empty() {
-        if let Some(first_cluster) = first_cluster_offset {
-            let resume_pos = input.stream_position()?;
-            if scan_cues_from(
-                &mut *input,
-                first_cluster,
-                segment_data_end,
-                &mut cues,
-                &mut cue_points,
-                &mut crc_status,
-            )
-            .is_err()
-            {
-                cues.clear();
-                cue_points.clear();
-            }
-            // Restore reader position to the first cluster for next_packet().
-            input.seek(SeekFrom::Start(resume_pos))?;
+    if cues.is_empty()
+        && let Some(first_cluster) = first_cluster_offset
+    {
+        let resume_pos = input.stream_position()?;
+        if scan_cues_from(
+            &mut *input,
+            first_cluster,
+            segment_data_end,
+            &mut cues,
+            &mut cue_points,
+            &mut crc_status,
+        )
+        .is_err()
+        {
+            cues.clear();
+            cue_points.clear();
         }
+        // Restore reader position to the first cluster for next_packet().
+        input.seek(SeekFrom::Start(resume_pos))?;
     }
 
     // Sort cues by (track, time) for stable lookup.
@@ -624,17 +623,16 @@ fn open_typed_impl(
                 // Legacy profile CodecIDs carry no CodecPrivate: build the
                 // AudioSpecificConfig they imply (SBR output rate from
                 // OutputSamplingFrequency, else twice the core rate).
-                if params.extradata.is_empty() {
-                    if let Some((aot, sbr)) =
+                if params.extradata.is_empty()
+                    && let Some((aot, sbr)) =
                         crate::aac::legacy_codec_id_profile(&t.codec_id_string)
+                {
+                    let core = t.sample_rate.round() as u32;
+                    let out = osf.filter(|&o| o != core).unwrap_or(core * 2);
+                    if let Some(asc) =
+                        crate::aac::legacy_asc(aot, sbr, core, out, t.channels as u16)
                     {
-                        let core = t.sample_rate.round() as u32;
-                        let out = osf.filter(|&o| o != core).unwrap_or(core * 2);
-                        if let Some(asc) =
-                            crate::aac::legacy_asc(aot, sbr, core, out, t.channels as u16)
-                        {
-                            params.extradata = asc;
-                        }
+                        params.extradata = asc;
                     }
                 }
                 // SamplingFrequency is the AAC *core* rate; the decoded
@@ -3077,11 +3075,12 @@ fn resolve_tags(
             // non-empty string. Binary tag values (cover art, etc.) and
             // empty placeholders are skipped to match the pre-typed
             // behaviour where only `(name, str)` pairs surfaced.
-            if let SimpleTagValue::String(ref v) = raw.value {
-                if !raw.name.is_empty() && !v.is_empty() {
-                    let key = format!("{prefix}{}", raw.name.to_ascii_lowercase());
-                    metadata.push((key, v.clone()));
-                }
+            if let SimpleTagValue::String(ref v) = raw.value
+                && !raw.name.is_empty()
+                && !v.is_empty()
+            {
+                let key = format!("{prefix}{}", raw.name.to_ascii_lowercase());
+                metadata.push((key, v.clone()));
             }
         }
 
@@ -6133,11 +6132,7 @@ fn compute_header_strip_prefix(enc: &ContentEncodings) -> Option<Vec<u8>> {
             _ => return None,
         }
     }
-    if saw_strip {
-        Some(prefix)
-    } else {
-        None
-    }
+    if saw_strip { Some(prefix) } else { None }
 }
 
 /// One `ContentEncoding` (RFC 9559 §5.1.4.1.31.1): a single compression or
@@ -7227,15 +7222,15 @@ fn parse_attached_file(
             _ => skip(r, e.size)?,
         }
     }
-    if let Some(ref n) = filename {
-        if !n.is_empty() {
-            metadata.push((format!("attachment:{index}:filename"), n.clone()));
-        }
+    if let Some(ref n) = filename
+        && !n.is_empty()
+    {
+        metadata.push((format!("attachment:{index}:filename"), n.clone()));
     }
-    if let Some(ref m) = mime {
-        if !m.is_empty() {
-            metadata.push((format!("attachment:{index}:mime_type"), m.clone()));
-        }
+    if let Some(ref m) = mime
+        && !m.is_empty()
+    {
+        metadata.push((format!("attachment:{index}:mime_type"), m.clone()));
     }
     if has_data {
         metadata.push((
@@ -7243,10 +7238,10 @@ fn parse_attached_file(
             data_size.to_string(),
         ));
     }
-    if let Some(ref d) = description {
-        if !d.is_empty() {
-            metadata.push((format!("attachment:{index}:description"), d.clone()));
-        }
+    if let Some(ref d) = description
+        && !d.is_empty()
+    {
+        metadata.push((format!("attachment:{index}:description"), d.clone()));
     }
     attachments.push(Attachment {
         index,
@@ -7725,10 +7720,10 @@ fn scan_cues_from(
             // happens to be a `CRC-32` rather than a `CuePoint`,
             // `parse_cues` skips it the same way the early-Cues path
             // does, since it tolerates unknown ids inside Cues.
-            if e.size != VINT_UNKNOWN_SIZE {
-                if let Some(s) = validate_top_level_crc(r, ids::CUES, body_start, body_end)? {
-                    crc_status.push(s);
-                }
+            if e.size != VINT_UNKNOWN_SIZE
+                && let Some(s) = validate_top_level_crc(r, ids::CUES, body_start, body_end)?
+            {
+                crc_status.push(s);
             }
             parse_cues(r, body_end, out, typed)?;
             return Ok(());
@@ -8204,10 +8199,10 @@ fn parse_combine_planes(r: &mut dyn ReadSeek, end: u64, op: &mut RawTrackOperati
                 }
                 // TrackPlaneUID is mandatory (minOccurs=1) and "not 0"; a
                 // plane without one is malformed and dropped.
-                if let Some(u) = uid {
-                    if u != 0 {
-                        op.planes.push((u, plane_type));
-                    }
+                if let Some(u) = uid
+                    && u != 0
+                {
+                    op.planes.push((u, plane_type));
                 }
             }
             _ => skip(r, e.size)?,
@@ -8304,10 +8299,11 @@ fn parse_block_additions(r: &mut dyn ReadSeek, end: u64) -> Result<Vec<BlockAddi
                         _ => skip(r, c.size)?,
                     }
                 }
-                if let Some(data) = data {
-                    if id != 0 && !out.iter().any(|a| a.id == id) {
-                        out.push(BlockAddition { id, data });
-                    }
+                if let Some(data) = data
+                    && id != 0
+                    && !out.iter().any(|a| a.id == id)
+                {
+                    out.push(BlockAddition { id, data });
                 }
             }
             _ => skip(r, e.size)?,
@@ -9432,19 +9428,19 @@ impl MkvDemuxer {
                     timestamp,
                 } => (body_start, declared_end, timestamp),
             };
-            if let Some(end) = declared_end {
-                if end > self.segment_data_end {
-                    push(
-                        &mut report,
-                        CueLieKind::ClusterTruncated,
-                        Some(end - self.segment_data_end),
-                    );
-                }
+            if let Some(end) = declared_end
+                && end > self.segment_data_end
+            {
+                push(
+                    &mut report,
+                    CueLieKind::ClusterTruncated,
+                    Some(end - self.segment_data_end),
+                );
             }
-            if let Some(tc) = timestamp {
-                if tc > cue.time.saturating_add(self.cue_slack_ticks(cue.track)) {
-                    push(&mut report, CueLieKind::TimestampImpossible, Some(tc));
-                }
+            if let Some(tc) = timestamp
+                && tc > cue.time.saturating_add(self.cue_slack_ticks(cue.track))
+            {
+                push(&mut report, CueLieKind::TimestampImpossible, Some(tc));
             }
             // Fine-grained claims need the Cluster's usable body bounds
             // (clamped — a truncated Cluster's missing bytes can't hold
@@ -11635,7 +11631,7 @@ fn parse_fixed_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     }
     let n_frames = body[0] as usize + 1;
     let payload = &body[1..];
-    if payload.len() % n_frames != 0 {
+    if !payload.len().is_multiple_of(n_frames) {
         return Err(Error::invalid("MKV fixed lacing: non-divisible payload"));
     }
     let frame_size = payload.len() / n_frames;
