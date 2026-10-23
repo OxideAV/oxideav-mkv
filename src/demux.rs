@@ -489,31 +489,16 @@ fn open_typed_impl(
         input.seek(SeekFrom::Start(resume_pos))?;
     }
 
-    // Cues are often written after the final Cluster — if we haven't seen
-    // them yet and the segment size is known, scan from the first cluster
-    // to segment end looking for a top-level Cues element. We keep this
-    // best-effort: any I/O error or parse problem leaves `cues` empty
-    // and falls back to Unsupported at seek time.
-    if cues.is_empty()
-        && let Some(first_cluster) = first_cluster_offset
-    {
-        let resume_pos = input.stream_position()?;
-        if scan_cues_from(
-            &mut *input,
-            first_cluster,
-            segment_data_end,
-            &mut cues,
-            &mut cue_points,
-            &mut crc_status,
-        )
-        .is_err()
-        {
-            cues.clear();
-            cue_points.clear();
-        }
-        // Restore reader position to the first cluster for next_packet().
-        input.seek(SeekFrom::Start(resume_pos))?;
-    }
+    // A `Cues` element that is neither stored before the first Cluster
+    // nor referenced by a SeekHead (RFC 9559 §6.4 SHOULD — violated by
+    // `mkvmerge --no-cues`-style outputs, which carry no Cues at all, and
+    // by writers that drop the SeekHead entry) is NOT hunted for here:
+    // walking the Cluster run element by element to find it costs one
+    // positioned read per Cluster, which a byte-range transport bills as
+    // one request per Cluster across the whole file. Seeking without
+    // Cues bisects the Cluster run instead (`MkvDemuxer::seek_to`), and a
+    // caller with cheap local I/O that wants the index anyway can opt in
+    // through `MkvDemuxer::scan_for_cues`.
 
     // Sort cues by (track, time) for stable lookup.
     cues.sort_by(|a, b| a.track.cmp(&b.track).then(a.time.cmp(&b.time)));
@@ -1152,12 +1137,35 @@ fn open_typed_impl(
         damage_events,
         resync_floor: 0,
         first_cluster_offset,
+        last_seek_strategy: None,
+        segment_unknown_size: seg.size == VINT_UNKNOWN_SIZE,
         track_uid_to_index,
         chapter_uid_to_index,
         attachment_uid_to_index,
         edition_uid_to_index,
         tag_metadata_entries,
     })
+}
+
+/// How the most recent [`Demuxer::seek_to`] located the Cluster it landed
+/// on — see [`MkvDemuxer::seek_strategy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeekStrategy {
+    /// A `Cues` lookup (RFC 9559 §22): one jump to the
+    /// `CueClusterPosition` of the last `CuePoint` at or before the target.
+    Cues,
+    /// No usable `Cues`: byte-offset bisection over the Cluster run. Each
+    /// probe reads one bounded window at the midpoint of the unexplored
+    /// byte range, resynchronises on the next vetted `Cluster` header
+    /// inside it and reads that Cluster's `Timestamp`, so the landing
+    /// costs ~log2(clusters) positioned reads instead of one per Cluster.
+    Bisection,
+    /// No usable `Cues` and the bisection premise failed — a vetted
+    /// Cluster whose `Timestamp` was out of storage order, or the probe
+    /// budget ran out: the linear Cluster-`Timestamp` walk from the first
+    /// Cluster found the landing instead.
+    LinearScan,
 }
 
 /// What kind of damage a resilient demux recovered from — see
@@ -1679,6 +1687,329 @@ fn vet_top_level_candidate(r: &mut dyn ReadSeek, candidate: u64, end: u64) -> Re
         return Ok(None);
     }
     Ok(Some(candidate))
+}
+
+/// Window one bisection probe reads at its start offset. Big enough to
+/// hold a whole typical Cluster header plus leading children, small
+/// enough that a probe costs one modest byte-range request.
+const PROBE_CHUNK: usize = 64 * 1024;
+/// Ceiling the probe window grows to (doubling per read) while a window
+/// held no vetted Cluster header — a Cluster at the RFC 9559 §25.1
+/// recommended ceiling (5 MB) is crossed in a handful of reads.
+const PROBE_CHUNK_MAX: usize = 1024 * 1024;
+/// Hard cap on bisection probes per seek: 2^40 bytes of Cluster run halve
+/// to a window in 24 steps; the margin absorbs gaps and false candidates.
+const BISECT_MAX_PROBES: u32 = 96;
+/// Bytes carried from one probe window into the next so a candidate
+/// whose header and leading children straddle the boundary is vetted
+/// with context instead of a second read.
+const PROBE_CARRY: usize = 64;
+
+/// Child-element IDs the bisection vet accepts in a `Cluster` body: the
+/// RFC 9559 §5.1.3 children, the reclaimed `EncryptedBlock` (Appendix
+/// A.15) and legacy direct `Block` children the stream walk tolerates,
+/// `SilentTracks` (Appendix A.1), `CRC-32` and `Void`.
+const CLUSTER_CHILD_IDS: [u32; 12] = [
+    ids::TIMECODE,
+    ids::CRC32,
+    ids::POSITION,
+    ids::PREV_SIZE,
+    ids::SILENT_TRACKS,
+    ids::SIMPLE_BLOCK,
+    ids::BLOCK_GROUP,
+    ids::ENCRYPTED_BLOCK,
+    ids::VOID,
+    ids::BLOCK,
+    ids::BLOCK_DURATION,
+    ids::REFERENCE_BLOCK,
+];
+
+/// Number of leading Cluster children the in-window vet walks.
+const PROBE_VET_CHILDREN: usize = 8;
+
+/// One confirmed `Cluster` located by a bisection probe.
+#[derive(Clone, Copy, Debug)]
+struct ClusterProbe {
+    /// Absolute offset of the Cluster's Element ID byte.
+    offset: u64,
+    /// The Cluster's `Timestamp` (Segment Ticks).
+    timestamp: u64,
+    /// Absolute offset of the first byte after the Cluster (clamped to the
+    /// Segment end) when its size is known; `None` for an unknown-size
+    /// Cluster, whose end only the next Top-Level element defines.
+    next: Option<u64>,
+}
+
+enum WindowVet {
+    Accept(ClusterProbe),
+    Reject,
+    /// The window ended before the vet could reach the `Timestamp`.
+    NeedMore,
+}
+
+/// Vet a `Cluster` candidate whose Element ID starts at `buf[0]` (absolute
+/// offset `abs`) using only the bytes in `buf`. Accepted when the header
+/// parses, the body is bounded by `end` (an overrun is tolerated only
+/// when `tolerate_overrun`, the resilient reader's truncated final
+/// Cluster), every leading child seen (up to [`PROBE_VET_CHILDREN`])
+/// parses with a known Cluster-child ID and a body inside the Cluster,
+/// and a `Timestamp` precedes the first block — the RFC 9559 §5.1.3.1
+/// usage note (first child, or second after a `CRC-32`) widened to the
+/// `Position` / `PrevSize` / `SilentTracks` / `Void` prefixes the stream
+/// walk tolerates. Payload bytes that spell the Cluster ID fail one of
+/// these checks with overwhelming probability; the boundary check in
+/// [`probe_cluster_from`] catches the remainder.
+fn vet_cluster_in_window(buf: &[u8], abs: u64, end: u64, tolerate_overrun: bool) -> WindowVet {
+    // A window that reaches the end of the data cannot be extended: a
+    // header or value cut short there is a rejection, not a NeedMore.
+    let window_is_final = abs.saturating_add(buf.len() as u64) >= end;
+    let cut_short = || {
+        if window_is_final {
+            WindowVet::Reject
+        } else {
+            WindowVet::NeedMore
+        }
+    };
+    let mut cur = std::io::Cursor::new(buf);
+    let hdr = match read_element_header(&mut cur) {
+        Ok(h) if h.id == ids::CLUSTER => h,
+        Ok(_) => return WindowVet::Reject,
+        // Longest header: 4-byte ID + 8-byte size.
+        Err(_) if buf.len() < 12 => return cut_short(),
+        Err(_) => return WindowVet::Reject,
+    };
+    let body_start = abs.saturating_add(hdr.header_len as u64);
+    let (limit, next) = if hdr.size == VINT_UNKNOWN_SIZE {
+        (end, None)
+    } else {
+        let declared = body_start.saturating_add(hdr.size);
+        if declared > end {
+            if !tolerate_overrun {
+                return WindowVet::Reject;
+            }
+            (end, Some(end))
+        } else {
+            (declared, Some(declared))
+        }
+    };
+    let mut pos = body_start;
+    let mut timestamp: Option<u64> = None;
+    let mut children = 0usize;
+    while pos < limit && children < PROBE_VET_CHILDREN {
+        let rel = (pos - abs) as usize;
+        if rel >= buf.len() {
+            break;
+        }
+        let mut c = std::io::Cursor::new(&buf[rel..]);
+        let child = match read_element_header(&mut c) {
+            Ok(h) => h,
+            // A child header cut by the window's end: not a verdict
+            // unless the window is the data's end.
+            Err(_) if buf.len() - rel < 12 => return cut_short(),
+            Err(_) => return WindowVet::Reject,
+        };
+        if child.size == VINT_UNKNOWN_SIZE || !CLUSTER_CHILD_IDS.contains(&child.id) {
+            return WindowVet::Reject;
+        }
+        let child_body = pos.saturating_add(child.header_len as u64);
+        let child_end = child_body.saturating_add(child.size);
+        if child_end > limit {
+            return WindowVet::Reject;
+        }
+        match child.id {
+            ids::TIMECODE => {
+                if child.size == 0 || child.size > 8 {
+                    return WindowVet::Reject;
+                }
+                let v_rel = (child_body - abs) as usize;
+                let v_end = v_rel + child.size as usize;
+                if v_end > buf.len() {
+                    return cut_short();
+                }
+                let mut v = 0u64;
+                for &b in &buf[v_rel..v_end] {
+                    v = (v << 8) | b as u64;
+                }
+                timestamp = Some(v);
+                break;
+            }
+            ids::SIMPLE_BLOCK | ids::BLOCK_GROUP | ids::ENCRYPTED_BLOCK | ids::BLOCK => {
+                // A block before any Timestamp: not a Cluster the seek
+                // could land on (the stream walk needs the Timestamp
+                // first too).
+                return WindowVet::Reject;
+            }
+            _ => {}
+        }
+        pos = child_end;
+        children += 1;
+    }
+    match timestamp {
+        Some(ts) => WindowVet::Accept(ClusterProbe {
+            offset: abs,
+            timestamp: ts,
+            next,
+        }),
+        None if pos >= limit => WindowVet::Reject,
+        None => cut_short(),
+    }
+}
+
+/// Fill `buf` from `r` (retrying `Interrupted`), returning the number of
+/// bytes read; stops early at end of input.
+fn read_fully(r: &mut dyn ReadSeek, buf: &mut [u8]) -> usize {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    filled
+}
+
+/// Re-vet a candidate at `abs` with a full window read at the candidate
+/// itself (the window that found it ended before its `Timestamp`).
+fn vet_cluster_via_reader(
+    r: &mut dyn ReadSeek,
+    abs: u64,
+    end: u64,
+    tolerate_overrun: bool,
+) -> Result<Option<ClusterProbe>> {
+    let want = (end.saturating_sub(abs) as usize).min(PROBE_CHUNK);
+    let mut buf = vec![0u8; want];
+    r.seek(SeekFrom::Start(abs))?;
+    let n = read_fully(r, &mut buf);
+    buf.truncate(n);
+    Ok(
+        match vet_cluster_in_window(&buf, abs, end, tolerate_overrun) {
+            WindowVet::Accept(p) => Some(p),
+            _ => None,
+        },
+    )
+}
+
+/// Is the element right after `c` a Top-Level element (or `Void`), the
+/// way a real Cluster's successor must be? Payload bytes impersonating a
+/// Cluster header are followed by more payload. Checked from `window`
+/// (absolute start `window_start`) when the successor's header lies in
+/// it, otherwise with one positioned read. An unknown-size candidate has
+/// no declared end to check and is taken at face value — the
+/// conservative verdict (the stream walk after landing resynchronises on
+/// garbage the same way it does for any damaged unknown-size run).
+fn confirm_cluster_boundary(
+    r: &mut dyn ReadSeek,
+    c: ClusterProbe,
+    end: u64,
+    window: &[u8],
+    window_start: u64,
+) -> Result<bool> {
+    let Some(next) = c.next else {
+        return Ok(true);
+    };
+    if next >= end {
+        return Ok(true);
+    }
+    let successor_ok = |h: Result<crate::ebml::ElementHeader>| match h {
+        Ok(h) => TOP_LEVEL_IDS.contains(&h.id) || h.id == ids::VOID,
+        Err(_) => false,
+    };
+    if next >= window_start {
+        let rel = (next - window_start) as usize;
+        if rel + 12 <= window.len() {
+            let mut cur = std::io::Cursor::new(&window[rel..]);
+            return Ok(successor_ok(read_element_header(&mut cur)));
+        }
+    }
+    r.seek(SeekFrom::Start(next))?;
+    Ok(successor_ok(read_element_header(&mut *r)))
+}
+
+/// Bisection probe: the first confirmed `Cluster` whose Element ID starts
+/// in `[from, scan_end)`, or `None` when the range holds none. Bodies
+/// are bounded by `end` (the Segment end), not by `scan_end`: a Cluster
+/// that starts inside the range and runs past it is a hit. Reads
+/// `[from, …)` in windows ([`PROBE_CHUNK`], doubling to
+/// [`PROBE_CHUNK_MAX`] while nothing vets), scanning each for the 4-byte
+/// Cluster ID and vetting candidates in place
+/// ([`vet_cluster_in_window`]); a candidate too close to the window's
+/// end is deferred to the next window (which starts [`PROBE_CARRY`]
+/// bytes early) or, when there is no next window, re-read at itself. A
+/// vetted candidate is then confirmed by its boundary
+/// ([`confirm_cluster_boundary`]) unless it starts exactly at
+/// `trusted_at` — the byte right after a Cluster the caller already
+/// trusts, where the element found is that Cluster's successor by
+/// construction. One positioned read per window, at most one more for
+/// the boundary.
+///
+/// The reader position on return is unspecified; the caller seeks.
+fn probe_cluster_from(
+    r: &mut dyn ReadSeek,
+    from: u64,
+    scan_end: u64,
+    end: u64,
+    tolerate_overrun: bool,
+    trusted_at: Option<u64>,
+) -> Result<Option<ClusterProbe>> {
+    let scan_end = scan_end.min(end);
+    if from >= scan_end {
+        return Ok(None);
+    }
+    let cluster_id = ids::CLUSTER.to_be_bytes();
+    let mut chunk = PROBE_CHUNK;
+    let mut base = from;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    while base < scan_end {
+        let want = ((end - base) as usize).min(chunk);
+        buf.clear();
+        buf.extend_from_slice(&carry);
+        buf.resize(carry.len() + want, 0);
+        r.seek(SeekFrom::Start(base))?;
+        let carry_len = carry.len();
+        let filled = read_fully(r, &mut buf[carry_len..]);
+        if filled == 0 {
+            return Ok(None);
+        }
+        buf.truncate(carry_len + filled);
+        let window_start = base - carry_len as u64;
+        let window_end = window_start + buf.len() as u64;
+        let has_next_window = window_end < scan_end;
+        let mut i = 0usize;
+        while i + 4 <= buf.len() {
+            let abs = window_start + i as u64;
+            if abs >= scan_end {
+                return Ok(None);
+            }
+            if buf[i..i + 4] != cluster_id {
+                i += 1;
+                continue;
+            }
+            if has_next_window && buf.len() - i <= PROBE_CARRY {
+                // Vet it with context from the next window instead.
+                break;
+            }
+            let vetted = match vet_cluster_in_window(&buf[i..], abs, end, tolerate_overrun) {
+                WindowVet::Accept(p) => Some(p),
+                WindowVet::Reject => None,
+                WindowVet::NeedMore => vet_cluster_via_reader(r, abs, end, tolerate_overrun)?,
+            };
+            if let Some(p) = vetted
+                && (trusted_at == Some(abs)
+                    || confirm_cluster_boundary(r, p, end, &buf, window_start)?)
+            {
+                return Ok(Some(p));
+            }
+            i += 1;
+        }
+        let keep = buf.len().min(PROBE_CARRY);
+        carry = buf[buf.len() - keep..].to_vec();
+        base = window_end;
+        chunk = (chunk * 2).min(PROBE_CHUNK_MAX);
+    }
+    Ok(None)
 }
 
 #[derive(Default)]
@@ -8988,12 +9319,19 @@ pub struct MkvDemuxer {
     /// same bytes and loop.
     resync_floor: u64,
     /// Absolute offset of the first `Cluster` element header — the anchor
-    /// for the resilient Cues-less seek fallback
-    /// ([`MkvDemuxer::seek_by_cluster_scan`]). `None` for a legal
-    /// zero-Cluster (metadata-only) Segment — the schema gives `Cluster`
-    /// no `minOccurs` — in which case `next_packet` reports a clean
-    /// `Error::Eof` and both seek paths return `Error::Unsupported`.
+    /// for the Cues-less seek ([`MkvDemuxer::seek_cueless`] bisection,
+    /// [`MkvDemuxer::seek_by_cluster_scan`] linear fallback). `None` for
+    /// a legal zero-Cluster (metadata-only) Segment — the schema gives
+    /// `Cluster` no `minOccurs` — in which case `next_packet` reports a
+    /// clean `Error::Eof` and every seek path returns `Error::Unsupported`.
     first_cluster_offset: Option<u64>,
+    /// Strategy the most recent successful `seek_to` used; see
+    /// [`MkvDemuxer::seek_strategy`].
+    last_seek_strategy: Option<SeekStrategy>,
+    /// The Segment used the unknown-size VINT — the RFC 9559 §23.2 live
+    /// stream shape. Together with "no SeekHead, no Cues" it is the
+    /// §23.2 non-seekable signal the strict path honours.
+    segment_unknown_size: bool,
     /// `TrackUID` → stream-index map, kept from the open-time walk so a
     /// mid-stream `Tags` element (RFC 9559 §23.2 live tagging) resolves
     /// its `TagTrackUID` scopes exactly like the open-time one.
@@ -9074,16 +9412,24 @@ impl Demuxer for MkvDemuxer {
             )));
         }
         if self.cues.is_empty() {
-            if self.resilient {
-                // Cues-less / damaged-Cues fallback (RFC 9559 §22.1 only
-                // RECOMMENDS a Cues element): linearly scan Cluster
-                // Timestamps and land on the last Cluster at or before
-                // the target.
-                return self.seek_by_cluster_scan(stream_index, pts);
+            // RFC 9559 §23.2: a stream with neither a SeekHead list nor a
+            // Cues list at its beginning SHOULD be considered
+            // non-seekable — the live-stream shape (unknown-size
+            // Segment). The strict path honours that signal; the
+            // resilient path, like a player that knows the capture has
+            // ended, seeks anyway.
+            if !self.resilient && self.segment_unknown_size && self.seek_entries.is_empty() {
+                return Err(Error::unsupported(
+                    "MKV: live stream (unknown-size Segment, no SeekHead, no Cues) is \
+                     non-seekable (RFC 9559 §23.2) — open_resilient seeks it anyway",
+                ));
             }
-            return Err(Error::unsupported(
-                "MKV: no Cues index in file — cannot seek",
-            ));
+            // Cues-less (RFC 9559 §22.1 only RECOMMENDS a Cues element)
+            // or damaged-Cues (resilient open skipped the master): bisect
+            // the Cluster run on byte offset, landing on the last Cluster
+            // whose Timestamp is at or before the target — same contract
+            // as a Cues landing, ~log2(clusters) positioned reads.
+            return self.seek_cueless(stream_index, pts);
         }
         let track_number = self.track_number_by_index[stream_index as usize];
 
@@ -9159,7 +9505,7 @@ impl Demuxer for MkvDemuxer {
         if self.resilient {
             let abs = self.segment_data_start.saturating_add(cue_cluster_offset);
             if self.cue_landing_lie(abs, cue_time)?.is_some() {
-                let landed = self.seek_by_cluster_scan(stream_index, pts);
+                let landed = self.seek_cueless(stream_index, pts);
                 let resumed_at = match landed {
                     Ok(_) => Some(self.input.stream_position()?),
                     Err(_) => None,
@@ -9184,11 +9530,8 @@ impl Demuxer for MkvDemuxer {
         // Reset cluster reader state + any previously queued packets.
         // The "most recently returned packet" the block-additions
         // surface refers to is invalidated by the jump too.
-        self.cluster_state = ClusterState::Idle;
-        self.out_queue.clear();
-        self.last_block_additions = None;
-        self.last_block_group_meta = None;
-        self.last_virtual_origin = None;
+        self.reset_after_seek();
+        self.last_seek_strategy = Some(SeekStrategy::Cues);
 
         // RFC 9559 §5.1.5.1.2.3: when the Cues entry carries a
         // `CueRelativePosition`, the referenced SimpleBlock / BlockGroup
@@ -11131,12 +11474,196 @@ impl MkvDemuxer {
         let (cluster_off, landed_ticks) = best
             .ok_or_else(|| Error::unsupported("MKV: no parseable Cluster Timestamp to seek by"))?;
         self.input.seek(SeekFrom::Start(cluster_off))?;
+        self.reset_after_seek();
+        self.last_seek_strategy = Some(SeekStrategy::LinearScan);
+        Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
+    }
+
+    /// Cues-less seek: byte-offset bisection over the Cluster run, with
+    /// the linear Cluster-`Timestamp` walk ([`Self::seek_by_cluster_scan`])
+    /// as the fallback when the bisection premise is disproved.
+    ///
+    /// Premise: Clusters are stored in ascending `Timestamp` order. RFC
+    /// 9559 never states it outright, but every optimum layout in §25.3
+    /// and the §22.1 recommendation that `CuePoint`s be sorted by
+    /// `CueTime` in storage order assume it, and the WebM container
+    /// guidelines make it a MUST ("all absolute (block + cluster)
+    /// timecodes MUST be monotonically increasing"). Because it is a
+    /// premise and not a guarantee, every probe is checked against the
+    /// bracket the earlier probes established: a confirmed Cluster whose
+    /// `Timestamp` falls outside `[lo, hi]` proves the run unsorted, and
+    /// the seek degrades to the linear walk, which assumes nothing about
+    /// order. Landing contract is the Cues path's: the last Cluster
+    /// whose `Timestamp` is at or before the target, the first Cluster
+    /// for a target before it.
+    ///
+    /// Cost: ~log2(clusters) probes, each one bounded read at the
+    /// midpoint of the unexplored byte range (`PROBE_CHUNK`, doubling up
+    /// to `PROBE_CHUNK_MAX` only while no Cluster header is in sight)
+    /// plus, for a mid-run candidate whose end lies past the window, one
+    /// boundary read that confirms it is a real Cluster; then one or two
+    /// forward steps to close the last gap. A byte-range transport sees
+    /// one request per read.
+    fn seek_cueless(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        let target = self.stream_pts_to_ticks(stream_index, pts);
+        let Some(first_off) = self.first_cluster_offset else {
+            return Err(Error::unsupported(
+                "MKV: no Clusters in Segment — cannot seek",
+            ));
+        };
+        let end = self.segment_data_end;
+        let tolerate_overrun = self.resilient;
+        let Some(first) = probe_cluster_from(
+            &mut *self.input,
+            first_off,
+            end,
+            end,
+            tolerate_overrun,
+            Some(first_off),
+        )?
+        else {
+            // Nothing vets as a Cluster from the first one on — let the
+            // linear walk (which also tolerates garbage) give its verdict.
+            return self.seek_by_cluster_scan(stream_index, pts);
+        };
+        // Best landing so far: the last confirmed Cluster at or before
+        // the target. The first Cluster seeds it so a target before the
+        // run lands there (parity with the Cues path's first-cue
+        // fallback).
+        let mut lo = first;
+        // Exclusive byte bound: every Cluster at or past `hi_off` has a
+        // Timestamp after the target (or `hi_off` is the Segment end).
+        let mut hi_off = end;
+        let mut hi_ts: Option<u64> = None;
+        let mut probes: u32 = 0;
+        while target > lo.timestamp {
+            // Unexplored byte range: after `lo` (its body end when the
+            // size is known, else the byte after its ID — the probe then
+            // walks through lo's own body) and before `hi_off`.
+            let lo_next = lo.next.unwrap_or_else(|| lo.offset.saturating_add(1));
+            if lo_next >= hi_off || probes >= BISECT_MAX_PROBES {
+                break;
+            }
+            probes += 1;
+            let gap = hi_off - lo_next;
+            // Narrow gaps: step forward from `lo`, so the last Cluster(s)
+            // between `lo` and `hi` are read in order (the element at a
+            // known-size lo's end is trusted — no boundary read). Wide
+            // gaps: halve.
+            let (from, trusted) = if gap <= 2 * PROBE_CHUNK as u64 {
+                (lo_next, lo.next)
+            } else {
+                (lo_next + gap / 2, None)
+            };
+            match probe_cluster_from(
+                &mut *self.input,
+                from,
+                hi_off,
+                end,
+                tolerate_overrun,
+                trusted,
+            )? {
+                None => {
+                    if from == lo_next {
+                        // Nothing after `lo` before `hi`: `lo` is the landing.
+                        break;
+                    }
+                    // `[from, hi_off)` holds no Cluster — the answer, if
+                    // any, is in `[lo_next, from)`.
+                    hi_off = from;
+                }
+                Some(c) => {
+                    let in_bracket =
+                        c.timestamp >= lo.timestamp && hi_ts.is_none_or(|h| c.timestamp <= h);
+                    if !in_bracket {
+                        // A genuine Cluster out of storage order: the run
+                        // is not sorted, bisection cannot be trusted —
+                        // walk it.
+                        return self.seek_by_cluster_scan(stream_index, pts);
+                    }
+                    if c.timestamp <= target {
+                        lo = c;
+                    } else {
+                        hi_off = c.offset;
+                        hi_ts = Some(c.timestamp);
+                    }
+                }
+            }
+        }
+        self.input.seek(SeekFrom::Start(lo.offset))?;
+        self.reset_after_seek();
+        self.last_seek_strategy = Some(SeekStrategy::Bisection);
+        Ok(self.ticks_to_stream_pts(stream_index, lo.timestamp))
+    }
+
+    /// Reset the Cluster reader state and every "most recently returned
+    /// packet" side channel after the reader has been repositioned by a
+    /// seek.
+    fn reset_after_seek(&mut self) {
         self.cluster_state = ClusterState::Idle;
         self.out_queue.clear();
         self.last_block_additions = None;
         self.last_block_group_meta = None;
         self.last_virtual_origin = None;
-        Ok(self.ticks_to_stream_pts(stream_index, landed_ticks))
+    }
+
+    /// Which strategy the most recent successful [`Demuxer::seek_to`]
+    /// landed with, or `None` before the first seek. Lets a caller on an
+    /// expensive transport (HTTP byte-range) tell a one-request `Cues`
+    /// landing from the ~log2(clusters) [`SeekStrategy::Bisection`] a
+    /// Cues-less file costs, and spot a [`SeekStrategy::LinearScan`]
+    /// (unsorted Cluster run) it may want to avoid repeating.
+    pub fn seek_strategy(&self) -> Option<SeekStrategy> {
+        self.last_seek_strategy
+    }
+
+    /// Opt in to hunting for a `Cues` element the open did not find —
+    /// one stored after the Cluster run without a SeekHead entry
+    /// pointing at it (RFC 9559 §6.4 says it SHOULD be stored before the
+    /// first Cluster or be referenced by a SeekHead; this is the layout
+    /// that violates both).
+    ///
+    /// The hunt walks the Top-Level elements from the first Cluster to
+    /// the Segment end, one positioned read per element — cheap on a
+    /// local file, one byte-range request per Cluster over HTTP, which
+    /// is exactly why [`open`] no longer does it on its own. Returns
+    /// `Ok(true)` when a `Cues` index is now loaded (already loaded, or
+    /// found and parsed), `Ok(false)` when the Segment holds none —
+    /// subsequent seeks then keep bisecting. The reader position is
+    /// restored, so the call can be made at any point between packets.
+    /// Strict demuxers surface an I/O or parse error met on the walk;
+    /// resilient ones report `Ok(false)` instead.
+    pub fn scan_for_cues(&mut self) -> Result<bool> {
+        if !self.cues.is_empty() {
+            return Ok(true);
+        }
+        let Some(first) = self.first_cluster_offset else {
+            return Ok(false);
+        };
+        let resume = self.input.stream_position()?;
+        let mut cues: Vec<CueEntry> = Vec::new();
+        let mut points: Vec<CuePoint> = Vec::new();
+        let walked = scan_cues_from(
+            &mut *self.input,
+            first,
+            self.segment_data_end,
+            &mut cues,
+            &mut points,
+            &mut self.crc_status,
+        );
+        self.input.seek(SeekFrom::Start(resume))?;
+        match walked {
+            Ok(()) => {}
+            Err(_) if self.resilient => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        if cues.is_empty() {
+            return Ok(false);
+        }
+        cues.sort_by(|a, b| a.track.cmp(&b.track).then(a.time.cmp(&b.time)));
+        self.cues = cues;
+        self.cue_points = points;
+        Ok(true)
     }
 
     /// Parse a `Tags` element encountered during the Cluster walk and

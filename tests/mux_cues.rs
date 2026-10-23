@@ -226,9 +226,10 @@ fn audio_only_mux_emits_cues() {
 }
 
 /// Confirm the Cues element is positioned after the last Cluster — so it
-/// belongs at end-of-file, not at the start. The demuxer's own
-/// `scan_cues_from` handles the end-of-file layout, but we assert it
-/// explicitly here to guard against layout regressions.
+/// belongs at end-of-file, not at the start. The demuxer reaches the
+/// end-of-file layout through the SeekHead entry the muxer writes (the
+/// open no longer walks the Cluster run to find late Cues), but we
+/// assert the layout explicitly here to guard against regressions.
 #[test]
 fn cues_are_emitted_at_end() {
     let (video, audio) = build_streams();

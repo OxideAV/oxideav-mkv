@@ -8,7 +8,7 @@
 //! * `landed_pts <= target_pts`  (never overshoots the request)
 //! * the first packet read after the seek carries `pts >= landed_pts`
 //!   (we landed on the cluster the cue pointed at, not an earlier one)
-//! * a missing-Cues file returns `Error::Unsupported`.
+//! * a missing-Cues file seeks by bisecting the Cluster run.
 //!
 //! The file uses a 1 ms timecode scale so Matroska ticks and stream-side
 //! pts are numerically identical — makes the assertions easy to read.
@@ -17,12 +17,13 @@
 
 use std::io::Cursor;
 
-use oxideav_core::Error;
 use oxideav_core::ReadSeek;
+use oxideav_core::{Demuxer, Error};
 
 // Re-export the EBML primitives we need — the test drops down below the
 // muxer API and writes raw elements because we want to control the Cues
 // byte-layout precisely.
+use oxideav_mkv::demux::SeekStrategy;
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -308,16 +309,31 @@ fn seek_to_before_start_uses_first_cue() {
 }
 
 #[test]
-fn seek_to_without_cues_is_unsupported() {
+fn seek_to_without_cues_bisects_the_cluster_run() {
+    // RFC 9559 §22.1 only RECOMMENDS a Cues element; a strict demuxer
+    // seeks a Cues-less file by byte-offset bisection over the Cluster
+    // run with the same landing contract as a Cues lookup (issue #9).
     let (bytes, _) = build_mkv_with_cues(false);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let mut dmx =
-        oxideav_mkv::demux::open(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+        oxideav_mkv::demux::open_typed(rs, &oxideav_core::NullCodecResolver).expect("demux open");
+    assert!(dmx.cue_points().is_empty());
+    assert_eq!(dmx.seek_strategy(), None);
 
-    match dmx.seek_to(0, 1000) {
-        Err(Error::Unsupported(_)) => {}
-        other => panic!("expected Error::Unsupported without Cues, got {other:?}"),
-    }
+    let landed = dmx.seek_to(0, 1000).expect("cue-less seek");
+    assert_eq!(landed, 1000);
+    assert_eq!(dmx.seek_strategy(), Some(SeekStrategy::Bisection));
+    let pkt = dmx.next_packet().expect("packet after seek");
+    assert_eq!(pkt.pts, Some(1000));
+    assert_eq!(pkt.data, vec![0xBB]);
+
+    // Between two Clusters: the last one at or before the target.
+    assert_eq!(dmx.seek_to(0, 1500).expect("seek"), 1000);
+    // Before the first Cluster: the first Cluster (Cues-path parity).
+    assert_eq!(dmx.seek_to(0, -7).expect("seek"), 0);
+    // Past the last Cluster: the last Cluster.
+    assert_eq!(dmx.seek_to(0, 99_000).expect("seek"), 2000);
+    assert_eq!(dmx.next_packet().expect("packet").data, vec![0xCC]);
 }
 
 #[test]

@@ -7,9 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SeekStrategy` + `MkvDemuxer::seek_strategy()`: which tier the most
+  recent `seek_to` landed with — `Cues` (one jump), `Bisection`
+  (Cues-less byte-offset bisection over the Cluster run, ~log2(clusters)
+  positioned reads, exact Cues-style landing, monotone), or `LinearScan`
+  (the bisection premise of ascending Cluster Timestamps was disproved
+  by a probe and the linear Cluster-Timestamp walk landed instead).
+- `MkvDemuxer::scan_for_cues()`: opt-in hunt for a `Cues` element that
+  is neither front-stored nor SeekHead-reachable (the walk `open` used
+  to run unconditionally); returns whether an index is now loaded.
+- `examples/seek_cost.rs`: prints the range-request / read / byte cost
+  of an open and a seek sweep the way an HTTP byte-range reader bills
+  them.
+
 ### Changed
 
 - edition 2024, MSRV 1.95
+- `open` / `open_resilient` no longer walk the Cluster run element by
+  element to find a late `Cues` element the SeekHead does not reference
+  (issue #9: one positioned read — one HTTP range request — per
+  Cluster, 534 requests to open a 48 MB / 521-Cluster `--no-cues` file;
+  now 12, flat in the Cluster count). Such a file still seeks, by
+  bisection; `scan_for_cues()` restores the old index-at-open behaviour
+  on demand. Files whose Cues are front-stored or SeekHead-reachable are
+  unaffected.
+- Strict `seek_to` on a Cues-less file no longer returns
+  `Error::Unsupported`: it bisects the Cluster run like the resilient
+  path (11–17 range requests per seek on the 48 MB fixture, against the
+  resilient linear walk's 2 per Cluster). The one strict refusal left is
+  the RFC 9559 §23.2 non-seekable signal — an unknown-size Segment with
+  neither SeekHead nor Cues (the live-stream shape) — which
+  `open_resilient` overrides. A resilient seek through a lying cue now
+  falls back to the bisection too.
 
 ## [0.0.11](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.10...v0.0.11) - 2026-10-04
 

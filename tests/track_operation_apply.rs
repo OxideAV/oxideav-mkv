@@ -732,9 +732,15 @@ fn join_file_with_cues() -> Vec<u8> {
 /// With application off, seeking the virtual stream keeps the historical
 /// behaviour: the file has no Cues rows for the virtual track's number, so
 /// the strict path reports Unsupported.
+///
+/// The fixture stores its Cues after the Clusters with no SeekHead, which
+/// `open` no longer hunts for (issue #9) — the tests load the index
+/// through the opt-in `scan_for_cues` so the Cues-union logic is what is
+/// exercised, not the Cues-less bisection.
 #[test]
 fn virtual_seek_without_application_is_unsupported() {
     let mut dmx = open(join_file_with_cues());
+    assert!(dmx.scan_for_cues().expect("late Cues"));
     match dmx.seek_to(2, 20) {
         Err(oxideav_core::Error::Unsupported { .. }) => {}
         other => panic!("expected Unsupported, got {other:?}"),
@@ -750,6 +756,7 @@ fn virtual_seek_without_application_is_unsupported() {
 #[test]
 fn virtual_seek_unions_the_source_cues() {
     let mut dmx = open(join_file_with_cues());
+    assert!(dmx.scan_for_cues().expect("late Cues"));
     dmx.set_apply_track_operations(true);
 
     // Target 25: track 1's best cue is (25, c1), track 2's is (20, c1) —
@@ -825,6 +832,7 @@ fn virtual_track_with_own_cues_uses_them() {
     out.extend_from_slice(&segment);
 
     let mut dmx = open(out);
+    assert!(dmx.scan_for_cues().expect("late Cues"));
     dmx.set_apply_track_operations(true);
     let landed = dmx.seek_to(2, 30).expect("virtual seek via own cues");
     assert_eq!(landed, 20, "landed on the virtual track's own cue");

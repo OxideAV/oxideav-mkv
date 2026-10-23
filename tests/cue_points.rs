@@ -347,9 +347,12 @@ fn multiple_cue_points_preserve_document_order() {
 }
 
 #[test]
-fn cues_after_last_cluster_late_scan_path() {
-    // The common index-at-end layout drives the best-effort scan_cues_from
-    // path; the typed collector is fed there too.
+fn cues_after_last_cluster_without_seek_head_are_opt_in() {
+    // Index-at-end with no SeekHead pointing at it (RFC 9559 §6.4 SHOULD
+    // violated both ways): the open no longer walks the Cluster run to
+    // find it (issue #9 — one positioned read per Cluster), so the typed
+    // view is empty until the caller opts in through `scan_for_cues`,
+    // which feeds the same typed collector.
     let mut tp = Vec::new();
     tp.extend_from_slice(&elem_uint(ids::CUE_TRACK, 1));
     tp.extend_from_slice(&elem_uint(ids::CUE_CLUSTER_POSITION, 0x55));
@@ -358,7 +361,12 @@ fn cues_after_last_cluster_late_scan_path() {
     let ctp = elem_master(ids::CUE_TRACK_POSITIONS, &tp);
     let cb = cue_point(123, &ctp);
 
-    let dmx = open(build_cues_last(&cb, &[cluster_body(0, 0x11)]));
+    let mut dmx = open(build_cues_last(&cb, &[cluster_body(0, 0x11)]));
+    assert!(
+        dmx.cue_points().is_empty(),
+        "late Cues are not hunted at open"
+    );
+    assert!(dmx.scan_for_cues().expect("hunt"));
     let pts = dmx.cue_points();
     assert_eq!(pts.len(), 1);
     assert_eq!(pts[0].time, 123);

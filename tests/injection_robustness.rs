@@ -26,7 +26,7 @@
 
 use std::io::Cursor;
 
-use oxideav_core::ReadSeek;
+use oxideav_core::{Demuxer, ReadSeek};
 use oxideav_mkv::ebml::{self, write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -588,10 +588,13 @@ fn seek_to_with_forged_cue_relative_position_does_not_panic() {
     seg_body.extend_from_slice(&cues);
     let bytes = header_plus_segment(&seg_body);
 
-    let mut dmx = match open(bytes) {
-        Ok(d) => d,
-        Err(_) => return,
+    let Ok(mut dmx) = open_typed(bytes) else {
+        return;
     };
+    // The Cues sit after the Cluster with no SeekHead: load them through
+    // the opt-in hunt so the hostile CueRelativePosition is what the seek
+    // consumes (a Cues-less seek would bisect past it).
+    let _ = dmx.scan_for_cues();
     // seek_to may succeed (degrading to "walk from cluster start") or
     // fail; either is acceptable. The contract under test is no panic.
     let _ = dmx.seek_to(0, 0);
