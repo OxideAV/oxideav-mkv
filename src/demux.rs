@@ -15,7 +15,7 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::codec_id::{from_matroska, strip_bitmapinfoheader};
+use crate::codec_id::{ACM_CODEC_ID, AcmFormat, VFW_CODEC_ID, from_matroska, strip_compat_header};
 use crate::ebml::{
     VINT_UNKNOWN_SIZE, crc32_ieee, read_bytes, read_element_header, read_float, read_int,
     read_string, read_uint, read_vint, skip,
@@ -556,11 +556,9 @@ fn open_typed_impl(
         // stream). Extract the FourCC from CodecPrivate bytes 16..20 and
         // retry via the Fourcc tag path.
         if codec_id.is_none()
-            && t.codec_id_string == "V_MS/VFW/FOURCC"
-            && t.codec_private.len() >= 20
+            && t.codec_id_string == VFW_CODEC_ID
+            && let Some(fcc) = crate::codec_id::vfw_fourcc(&t.codec_private)
         {
-            let mut fcc = [0u8; 4];
-            fcc.copy_from_slice(&t.codec_private[16..20]);
             let fcc_tag = CodecTag::fourcc(&fcc);
             let mut fcc_ctx = ProbeContext::new(&fcc_tag).header(&t.codec_private);
             if t.width > 0 {
@@ -570,6 +568,29 @@ fn open_typed_impl(
                 fcc_ctx = fcc_ctx.height(t.height as u32);
             }
             codec_id = codecs.resolve_tag(&fcc_ctx);
+        }
+        // A_MS/ACM tunnels a WAVEFORMATEX(TENSIBLE): codec crates claim
+        // the `wFormatTag` (the AVI / WAV resolution path), so retry
+        // with the effective tag (the SubFormat's legacy tag for an
+        // EXTENSIBLE header).
+        let acm = if t.codec_id_string == ACM_CODEC_ID {
+            AcmFormat::parse(&t.codec_private)
+        } else {
+            None
+        };
+        if codec_id.is_none()
+            && let Some(f) = &acm
+        {
+            let wf_tag = CodecTag::wave_format(f.effective_tag);
+            let mut wf_ctx = ProbeContext::new(&wf_tag)
+                .header(&t.codec_private)
+                .bits(f.bits_per_sample)
+                .channels(f.channels)
+                .sample_rate(f.samples_per_sec);
+            if f.channels == 0 && t.channels > 0 {
+                wf_ctx = wf_ctx.channels(t.channels as u16);
+            }
+            codec_id = codecs.resolve_tag(&wf_ctx);
         }
         let codec_id =
             codec_id.unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private));
@@ -592,14 +613,40 @@ fn open_typed_impl(
         //     config record.
         //   * `A_FLAC`: the CodecPrivate sometimes has a leading `"fLaC"`
         //     magic; our FLAC decoder expects metadata blocks only.
-        let stripped = strip_bitmapinfoheader(&t.codec_id_string, &t.codec_private);
+        //   * `A_MS/ACM`: the WAVEFORMATEX header (and the EXTENSIBLE
+        //     extension) wraps the codec's `cbSize` bytes.
+        let stripped = strip_compat_header(&t.codec_id_string, &t.codec_private);
         params.extradata = match codec_id.as_str() {
             "flac" if stripped.starts_with(b"fLaC") => stripped[4..].to_vec(),
             _ => stripped,
         };
+        // Stamp the compatibility-mode wire identity (the FourCC / the
+        // wFormatTag as written), the way the AVI demuxer does, so a
+        // consumer can tell which tunnelled codec an unclaimed track is.
+        if t.codec_id_string == VFW_CODEC_ID
+            && let Some(fcc) = crate::codec_id::vfw_fourcc(&t.codec_private)
+        {
+            params.tag = Some(CodecTag::fourcc(&fcc));
+        } else if let Some(f) = &acm {
+            params.tag = Some(CodecTag::wave_format(f.format_tag));
+        }
         if t.track_type == ids::TRACK_TYPE_AUDIO {
             params.sample_rate = Some(t.sample_rate.round() as u32);
             params.channels = Some(t.channels as u16);
+            // An ACM track's WAVEFORMATEX is the codec's own view of the
+            // stream; it fills whatever the Audio element left at its
+            // default and gives the nominal bit rate.
+            if let Some(f) = &acm {
+                if params.sample_rate == Some(0) && f.samples_per_sec > 0 {
+                    params.sample_rate = Some(f.samples_per_sec);
+                }
+                if params.channels == Some(0) && f.channels > 0 {
+                    params.channels = Some(f.channels);
+                }
+                if f.avg_bytes_per_sec > 0 {
+                    params.bit_rate = Some(f.avg_bytes_per_sec as u64 * 8);
+                }
+            }
             if codec_id.as_str() == "aac" {
                 let osf = t
                     .audio_raw
@@ -630,6 +677,10 @@ fn open_typed_impl(
                 }
             }
             params.sample_format = match (params.codec_id.as_str(), t.bit_depth) {
+                ("pcm_u8", _) => Some(SampleFormat::U8),
+                ("pcm_s24le", _) => Some(SampleFormat::S24),
+                ("pcm_s32le", _) => Some(SampleFormat::S32),
+                ("pcm_f64le", _) => Some(SampleFormat::F64),
                 ("pcm_s16le", _) => Some(SampleFormat::S16),
                 ("pcm_s16be", _) => Some(SampleFormat::S16),
                 ("pcm_f32le", _) => Some(SampleFormat::F32),

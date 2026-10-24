@@ -1949,8 +1949,16 @@ implemented for roundtrip:
   `A_PCM/INT/BIG`, `A_PCM/FLOAT/IEEE`, `A_AAC` (+ `MPEG4/LC` /
   `MPEG2/LC` aliases), `A_MPEG/L3`, `A_AC3`, `A_EAC3`.
 - Video: `V_VP8`, `V_VP9`, `V_AV1`, `V_MPEG4/ISO/AVC`,
-  `V_MPEGH/ISO/HEVC`, `V_FFV1`, `V_THEORA`, plus `V_MS/VFW/FOURCC` with
-  BITMAPINFOHEADER fourcc extraction (e.g. `FFV1`).
+  `V_MPEGH/ISO/HEVC`, `V_FFV1`, `V_THEORA`.
+- Compatibility modes (demux): `V_MS/VFW/FOURCC` resolves through the
+  BITMAPINFOHEADER `biCompression` FourCC and `A_MS/ACM` through the
+  WAVEFORMATEX `wFormatTag` (the SubFormat's legacy tag for
+  WAVE_FORMAT_EXTENSIBLE) — whichever codec claims that FourCC / tag
+  in the registry, as the AVI demuxer resolves it; the header is
+  stripped from `extradata` and the wire identity kept in
+  `params.tag`. Unclaimed tracks surface as `mkv:vfw:<FOURCC>` /
+  `mkv:acm:0xHHHH` (PCM / A-law / µ-law / `FFV1` / 24-bit `BI_RGB`
+  map without a registry).
 - Subtitle: `S_TEXT/UTF8` (subrip), `S_TEXT/SSA`, `S_TEXT/ASS`,
   `S_TEXT/WEBVTT`, `S_TEXT/USF`, `S_VOBSUB` (DVD), `S_HDMV/PGS` /
   `S_HDMV/TEXTST` (Blu-ray), `S_DVBSUB`, `S_KATE`. Subtitle tracks

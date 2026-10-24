@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`A_MS/ACM` audio tracks resolve through their WAVEFORMATEX.** The
+  `wFormatTag` (for `WAVE_FORMAT_EXTENSIBLE`, the legacy tag inside a
+  `DEFINE_WAVEFORMATEX_GUID` SubFormat) is offered to the codec
+  registry as `CodecTag::wave_format`, the way the AVI demuxer
+  resolves the same header — e.g. ffmpeg's `wmav2`-in-Matroska now
+  opens as `wma2` and decodes. `extradata` is the codec's `cbSize`
+  bytes (header and EXTENSIBLE extension stripped); a channel count /
+  rate the Audio element left unset is filled from the header, and
+  `nAvgBytesPerSec` gives `bit_rate`. Registry-less fallback maps the
+  PCM family depth-aware (`pcm_u8` / `pcm_s16le` / `pcm_s24le` /
+  `pcm_s32le` / `pcm_f32le` / `pcm_f64le`) plus `pcm_alaw` /
+  `pcm_mulaw`. New public `codec_id::AcmFormat` (`#[non_exhaustive]`),
+  `codec_id::vfw_fourcc`, `codec_id::strip_compat_header`,
+  `VFW_CODEC_ID` / `ACM_CODEC_ID`.
+- `V_MS/VFW/FOURCC` and `A_MS/ACM` streams carry their wire identity
+  in `params.tag` (`CodecTag::fourcc` / `CodecTag::wave_format`).
 - `SeekStrategy` + `MkvDemuxer::seek_strategy()`: which tier the most
   recent `seek_to` landed with — `Cues` (one jump), `Bisection`
   (Cues-less byte-offset bisection over the Cluster run, ~log2(clusters)
@@ -24,6 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Unclaimed VFW / ACM tracks use a stable placeholder id:**
+  `mkv:vfw:<FOURCC>` (`mkv:vfw:0xHHHHHHHH` for a non-printable FourCC)
+  replaces `mkv:BI/<FOURCC>`, and `mkv:acm:0xHHHH` replaces the
+  pass-through `mkv:A_MS/ACM` (corpus id 233, ffmpeg's `wmv2` in
+  Matroska, now reports `mkv:vfw:WMV2` — no fleet codec claims
+  `WMV2`). A 24-bit `BI_RGB` header maps to `rgb24`, as in AVI.
 - edition 2024, MSRV 1.95
 - `open` / `open_resilient` no longer walk the Cluster run element by
   element to find a late `Cues` element the SeekHead does not reference

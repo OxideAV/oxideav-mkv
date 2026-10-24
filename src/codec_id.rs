@@ -33,9 +33,11 @@ pub fn is_webm_codec(id: &CodecId) -> bool {
 /// Best-effort mapping from a Matroska codec id string (e.g. `"A_FLAC"`) to
 /// the oxideav codec id we use internally.
 ///
-/// `codec_private` is consulted for `V_MS/VFW/FOURCC` tracks because the
-/// BITMAPINFOHEADER's `biCompression` field carries the actual codec. For
-/// other codec ids it is ignored.
+/// `codec_private` is consulted for `V_MS/VFW/FOURCC` tracks (the
+/// BITMAPINFOHEADER's `biCompression` carries the actual codec) and for
+/// `A_MS/ACM` tracks (the WAVEFORMATEX's `wFormatTag`). For other codec
+/// ids it is ignored. This is the registry-less fallback; the demuxer
+/// first offers those FourCCs / format tags to the codec registry.
 pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
     let id = match s {
         "A_FLAC" => "flac",
@@ -72,7 +74,8 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "V_MPEGH/ISO/HEVC" => "h265",
         "V_FFV1" => "ffv1",
         "V_THEORA" => "theora",
-        "V_MS/VFW/FOURCC" => return from_bitmapinfoheader(codec_private),
+        VFW_CODEC_ID => return from_bitmapinfoheader(codec_private),
+        ACM_CODEC_ID => return from_waveformatex(codec_private),
         // Subtitles. Matroska's "S_TEXT/*" family carries plain UTF-8 with
         // per-format markup; "S_HDMV/PGS" carries Blu-ray bitmap subs;
         // "S_VOBSUB" carries DVD bitmap subs. We map them to short oxideav
@@ -93,30 +96,186 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
     CodecId::new(id)
 }
 
-/// Extract the codec id from a BITMAPINFOHEADER `CodecPrivate` blob. The
-/// fourcc lives at bytes 16..20 (biCompression). Unrecognised fourcc falls
-/// back to `mkv:BI/<fourcc>`.
+/// Matroska CodecID of the VFW-compatibility video mode: CodecPrivate
+/// carries a Win32 `BITMAPINFOHEADER` whose `biCompression` names the
+/// codec.
+pub const VFW_CODEC_ID: &str = "V_MS/VFW/FOURCC";
+
+/// Matroska CodecID of the ACM-compatibility audio mode: CodecPrivate
+/// carries a Win32 `WAVEFORMATEX` whose `wFormatTag` names the codec.
+pub const ACM_CODEC_ID: &str = "A_MS/ACM";
+
+/// Size of the bare `BITMAPINFOHEADER` (docs/container/vfw §Definition).
+const BITMAPINFOHEADER_LEN: usize = 40;
+/// Size of the bare `WAVEFORMATEX` (wFormatTag … cbSize).
+const WAVEFORMATEX_LEN: usize = 18;
+/// `WAVE_FORMAT_EXTENSIBLE` escape tag.
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+/// Bytes the `WAVEFORMATEXTENSIBLE` extension adds after `cbSize`
+/// (`Samples` 2 + `dwChannelMask` 4 + `SubFormat` 16).
+const EXTENSIBLE_EXT_LEN: usize = 22;
+/// The shared tail (`Data2..Data4`) of every `DEFINE_WAVEFORMATEX_GUID`
+/// SubFormat — `xxxxxxxx-0000-0010-8000-00aa00389b71`, stored
+/// little-endian for `Data2` / `Data3` (docs/container/riff/
+/// waveformatextensible/ms-converting-format-tags-and-subformat-guids.md).
+const WAVEFORMATEX_GUID_TAIL: [u8; 12] = [
+    0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+];
+
+/// The `biCompression` FourCC of a `V_MS/VFW/FOURCC` CodecPrivate
+/// (`BITMAPINFOHEADER` bytes 16..20, stored as the four characters in
+/// file order), or `None` when the blob is too short to hold it.
+pub fn vfw_fourcc(codec_private: &[u8]) -> Option<[u8; 4]> {
+    codec_private.get(16..20).map(|b| [b[0], b[1], b[2], b[3]])
+}
+
+/// The `WAVEFORMATEX` fields of an `A_MS/ACM` CodecPrivate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AcmFormat {
+    /// `wFormatTag` as written (may be `0xFFFE`, WAVE_FORMAT_EXTENSIBLE).
+    pub format_tag: u16,
+    /// The tag that names the codec: `format_tag`, or — for an
+    /// EXTENSIBLE header whose SubFormat is a `DEFINE_WAVEFORMATEX_GUID`
+    /// GUID — the legacy tag in the GUID's first DWORD.
+    pub effective_tag: u16,
+    /// `nChannels`.
+    pub channels: u16,
+    /// `nSamplesPerSec`.
+    pub samples_per_sec: u32,
+    /// `nAvgBytesPerSec`.
+    pub avg_bytes_per_sec: u32,
+    /// `nBlockAlign`.
+    pub block_align: u16,
+    /// `wBitsPerSample` (the EXTENSIBLE `wValidBitsPerSample` when
+    /// that is non-zero).
+    pub bits_per_sample: u16,
+    /// Codec-specific bytes after the header (after the 22-byte
+    /// extension for EXTENSIBLE), bounded by `cbSize`.
+    pub extradata: Vec<u8>,
+}
+
+impl AcmFormat {
+    /// Parse a `WAVEFORMATEX` / `WAVEFORMATEXTENSIBLE` blob. A
+    /// 16-byte `PCMWAVEFORMAT` (no `cbSize`) is accepted with empty
+    /// extradata. Returns `None` below 16 bytes.
+    pub fn parse(cp: &[u8]) -> Option<Self> {
+        if cp.len() < 16 {
+            return None;
+        }
+        let u16_at = |o: usize| u16::from_le_bytes([cp[o], cp[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes([cp[o], cp[o + 1], cp[o + 2], cp[o + 3]]);
+        let format_tag = u16_at(0);
+        let mut bits_per_sample = u16_at(14);
+        let cb_size = if cp.len() >= WAVEFORMATEX_LEN {
+            u16_at(16) as usize
+        } else {
+            0
+        };
+        let tail_end = (WAVEFORMATEX_LEN + cb_size).min(cp.len());
+        let mut extra_start = WAVEFORMATEX_LEN.min(tail_end);
+        let mut effective_tag = format_tag;
+        if format_tag == WAVE_FORMAT_EXTENSIBLE
+            && cb_size >= EXTENSIBLE_EXT_LEN
+            && cp.len() >= WAVEFORMATEX_LEN + EXTENSIBLE_EXT_LEN
+        {
+            let valid = u16_at(18);
+            if valid > 0 {
+                bits_per_sample = valid;
+            }
+            let guid = &cp[24..40];
+            if guid[4..16] == WAVEFORMATEX_GUID_TAIL && guid[2] == 0 && guid[3] == 0 {
+                effective_tag = u16::from_le_bytes([guid[0], guid[1]]);
+            }
+            extra_start = WAVEFORMATEX_LEN + EXTENSIBLE_EXT_LEN;
+        }
+        Some(Self {
+            format_tag,
+            effective_tag,
+            channels: u16_at(2),
+            samples_per_sec: u32_at(4),
+            avg_bytes_per_sec: u32_at(8),
+            block_align: u16_at(12),
+            bits_per_sample,
+            extradata: cp[extra_start..tail_end.max(extra_start)].to_vec(),
+        })
+    }
+}
+
+/// Codec id for a `V_MS/VFW/FOURCC` track when no registered codec
+/// claims its FourCC: the few ids the container itself owns, else the
+/// stable placeholder `mkv:vfw:<FOURCC>` (`mkv:vfw:0xHHHHHHHH` when the
+/// FourCC is not printable ASCII). Codec crates claim their FourCCs
+/// through `CodecTag::fourcc`, which the demuxer consults first — the
+/// same resolution the AVI demuxer runs on a `strf` BITMAPINFOHEADER.
 fn from_bitmapinfoheader(cp: &[u8]) -> CodecId {
-    if cp.len() < 20 {
-        return CodecId::new("mkv:BI/<truncated>");
+    let Some(fourcc) = vfw_fourcc(cp) else {
+        return CodecId::new("mkv:vfw:<truncated>");
+    };
+    match &fourcc {
+        b"FFV1" => return CodecId::new("ffv1"),
+        // BI_RGB (0): uncompressed 24-bit RGB is the one layout with a
+        // conventional fleet id (mirrors the AVI demuxer).
+        [0, 0, 0, 0] if cp.get(14..16) == Some(&24u16.to_le_bytes()[..]) => {
+            return CodecId::new("rgb24");
+        }
+        _ => {}
     }
-    let fourcc = &cp[16..20];
-    let fourcc_str = std::str::from_utf8(fourcc).unwrap_or("????");
-    match fourcc_str {
-        "FFV1" => CodecId::new("ffv1"),
-        other => CodecId::new(format!("mkv:BI/{other}")),
+    if fourcc.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        CodecId::new(format!(
+            "mkv:vfw:{}",
+            std::str::from_utf8(&fourcc).unwrap_or("????")
+        ))
+    } else {
+        CodecId::new(format!(
+            "mkv:vfw:0x{:02X}{:02X}{:02X}{:02X}",
+            fourcc[0], fourcc[1], fourcc[2], fourcc[3]
+        ))
     }
+}
+
+/// Codec id for an `A_MS/ACM` track when no registered codec claims
+/// its `wFormatTag`: the PCM / G.711 family the container can name
+/// from the header alone (depth-aware, as the AVI demuxer does), else
+/// the stable placeholder `mkv:acm:0xHHHH` (the effective tag).
+fn from_waveformatex(cp: &[u8]) -> CodecId {
+    let Some(f) = AcmFormat::parse(cp) else {
+        return CodecId::new("mkv:acm:<truncated>");
+    };
+    CodecId::new(match (f.effective_tag, f.bits_per_sample) {
+        (0x0001, 8) => "pcm_u8",
+        (0x0001, 24) => "pcm_s24le",
+        (0x0001, 32) => "pcm_s32le",
+        (0x0001, _) => "pcm_s16le",
+        (0x0003, 64) => "pcm_f64le",
+        (0x0003, _) => "pcm_f32le",
+        (0x0006, _) => "pcm_alaw",
+        (0x0007, _) => "pcm_mulaw",
+        (tag, _) => return CodecId::new(format!("mkv:acm:0x{tag:04X}")),
+    })
 }
 
 /// If `codec_private` is a BITMAPINFOHEADER, return the inner codec-specific
 /// extradata (everything after the 40-byte header). Otherwise returns the
 /// slice unchanged.
 pub fn strip_bitmapinfoheader(codec_id: &str, codec_private: &[u8]) -> Vec<u8> {
-    if codec_id == "V_MS/VFW/FOURCC" && codec_private.len() >= 40 {
-        codec_private[40..].to_vec()
+    if codec_id == VFW_CODEC_ID && codec_private.len() >= BITMAPINFOHEADER_LEN {
+        codec_private[BITMAPINFOHEADER_LEN..].to_vec()
     } else {
         codec_private.to_vec()
     }
+}
+
+/// The codec's own configuration bytes from a CodecPrivate: the
+/// `BITMAPINFOHEADER` (`V_MS/VFW/FOURCC`) or `WAVEFORMATEX` (`A_MS/ACM`)
+/// wrapper is removed; any other CodecPrivate is returned unchanged.
+pub fn strip_compat_header(codec_id: &str, codec_private: &[u8]) -> Vec<u8> {
+    if codec_id == ACM_CODEC_ID {
+        return AcmFormat::parse(codec_private)
+            .map(|f| f.extradata)
+            .unwrap_or_default();
+    }
+    strip_bitmapinfoheader(codec_id, codec_private)
 }
 
 /// Inverse of `from_matroska` for codecs we support writing. Returns `None`
