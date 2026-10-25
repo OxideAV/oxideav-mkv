@@ -1,5 +1,5 @@
-//! Decoded-picture layout of an H.264 / H.265 track, read from its
-//! decoder configuration record.
+//! Decoded-picture layout of a video track, read from its decoder
+//! configuration record (or, failing that, the `Colour` element).
 //!
 //! The track entry itself only names the codec and the
 //! dimensions. Consumers that plan pixel-format conversions before
@@ -13,12 +13,85 @@
 //!   elements are 4:2:0 at 8 bits (§7.4.2.1.1 inference).
 //! * `hvcC` (§8.3.3.1) carries `chromaFormat`,
 //!   `bitDepthLumaMinus8` and `bitDepthChromaMinus8` directly.
+//! * `V_VP9` CodecPrivate (WebM container guidelines, "VP9 Codec
+//!   Feature Metadata") is a list of `ID, Length, data` features:
+//!   Profile (1), Level (2), Bit Depth (3), Chroma Subsampling (4).
+//!   Missing features are filled from what the profile fixes (VP9
+//!   §6.2.2 `color_config()`: profiles 0 / 1 are 8-bit, profiles 0 / 2
+//!   are 4:2:0) and from the `Colour` element.
+//! * `V_AV1` CodecPrivate is an `AV1CodecConfigurationRecord` (AV1
+//!   ISOBMFF binding §2.3.3): `high_bitdepth`, `twelve_bit`,
+//!   `monochrome`, `chroma_subsampling_x` / `_y` mirror the Sequence
+//!   Header's `color_config()`.
+//! * Any of those codecs whose record says nothing falls back to the
+//!   `Colour` element's `BitsPerChannel` + `ChromaSubsamplingHorz` /
+//!   `ChromaSubsamplingVert` (RFC 9559 §5.1.4.1.28.18..20) when all
+//!   three are stated.
 //!
 //! The mapping follows the decoders' output convention: planar Y, Cb,
 //! Cr (luma only for 4:0:0); samples above 8 bits as little-endian
-//! `u16`.
+//! `u16`. VP8 (RFC 6386 §2) is always 8-bit 4:2:0.
 
 use oxideav_core::PixelFormat;
+
+/// Chroma layout codes used below: the H.264 / H.265
+/// `chroma_format_idc` values (0 = 4:0:0, 1 = 4:2:0, 2 = 4:2:2,
+/// 3 = 4:4:4) plus [`CHROMA_440`] for the full-width, half-height
+/// geometry VP9 and AV1 can signal.
+const CHROMA_440: u8 = 4;
+
+/// The `Colour` element's layout statement: `BitsPerChannel` (`0` =
+/// unspecified) and the optional `ChromaSubsamplingHorz` /
+/// `ChromaSubsamplingVert`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ColourLayout {
+    pub(crate) bits_per_channel: u64,
+    pub(crate) chroma_subsampling_horz: Option<u64>,
+    pub(crate) chroma_subsampling_vert: Option<u64>,
+}
+
+impl ColourLayout {
+    /// The chroma code the `ChromaSubsampling*` pair states.
+    fn chroma(&self) -> Option<u8> {
+        Some(
+            match (self.chroma_subsampling_horz?, self.chroma_subsampling_vert?) {
+                (1, 1) => 1,
+                (1, 0) => 2,
+                (0, 0) => 3,
+                (0, 1) => CHROMA_440,
+                _ => return None,
+            },
+        )
+    }
+
+    /// `BitsPerChannel`, when stated.
+    fn bits(&self) -> Option<u8> {
+        match self.bits_per_channel {
+            0 => None,
+            b => u8::try_from(b).ok(),
+        }
+    }
+}
+
+/// The picture layout the decoder of a `codec_id` track emits, from
+/// the configuration record in `extradata` first and the `Colour`
+/// element second. `None` when neither states it unambiguously.
+pub(crate) fn pixel_format_for_track(
+    codec_id: &str,
+    extradata: &[u8],
+    colour: Option<ColourLayout>,
+) -> Option<PixelFormat> {
+    let colour = colour.unwrap_or_default();
+    let from_record = match codec_id {
+        "h264" | "h265" | "hevc" => pixel_format_from_config(codec_id, extradata),
+        "vp9" => vp9_layout(extradata, &colour).and_then(|(c, b)| layout_pixel_format(c, b)),
+        "av1" => av1c_layout(extradata).and_then(|(c, b)| layout_pixel_format(c, b)),
+        // RFC 6386 §2: VP8 frames are 8-bit YUV 4:2:0.
+        "vp8" => return Some(PixelFormat::Yuv420P),
+        _ => return None,
+    };
+    from_record.or_else(|| layout_pixel_format(colour.chroma()?, colour.bits()?))
+}
 
 /// The picture layout implied by `extradata` for `codec_id` (`h264`
 /// or `h265` / `hevc`), or `None` when the record is absent,
@@ -32,22 +105,161 @@ pub(crate) fn pixel_format_from_config(codec_id: &str, extradata: &[u8]) -> Opti
     if chroma != 0 && luma_bits != chroma_bits {
         return None;
     }
+    layout_pixel_format(chroma, luma_bits)
+}
+
+/// `(chroma code, bit depth)` → the decoder's output [`PixelFormat`].
+fn layout_pixel_format(chroma: u8, bits: u8) -> Option<PixelFormat> {
     use PixelFormat::*;
-    Some(match (chroma, luma_bits) {
+    Some(match (chroma, bits) {
         (0, 8) => Gray8,
         (0, 10) => Gray10Le,
         (0, 12) => Gray12Le,
         (1, 8) => Yuv420P,
         (2, 8) => Yuv422P,
         (3, 8) => Yuv444P,
+        (CHROMA_440, 8) => Yuv440P,
         (1, 10) => Yuv420P10Le,
         (2, 10) => Yuv422P10Le,
         (3, 10) => Yuv444P10Le,
+        (CHROMA_440, 10) => Yuv440P10Le,
         (1, 12) => Yuv420P12Le,
         (2, 12) => Yuv422P12Le,
         (3, 12) => Yuv444P12Le,
+        (CHROMA_440, 12) => Yuv440P12Le,
         _ => return None,
     })
+}
+
+/// `(chroma code, bit depth)` of a VP9 track: the CodecPrivate
+/// features, completed by what the profile fixes and by `colour`.
+fn vp9_layout(features: &[u8], colour: &ColourLayout) -> Option<(u8, u8)> {
+    let (mut profile, mut bits, mut chroma) = (None, None, None);
+    let mut pos = 0;
+    while pos + 2 <= features.len() {
+        let (id, len) = (features[pos], features[pos + 1] as usize);
+        let Some(data) = features.get(pos + 2..pos + 2 + len) else {
+            break;
+        };
+        if len == 1 {
+            match id {
+                1 => profile = Some(data[0]),
+                3 => bits = Some(data[0]),
+                // 0 / 1 are both 4:2:0 (vertical / co-located siting).
+                4 => {
+                    chroma = match data[0] {
+                        0 | 1 => Some(1),
+                        2 => Some(2),
+                        3 => Some(3),
+                        _ => None,
+                    }
+                }
+                _ => {}
+            }
+        }
+        pos += 2 + len;
+    }
+    let bits = bits
+        .filter(|b| matches!(b, 8 | 10 | 12))
+        .or(colour.bits())
+        .or(match profile {
+            Some(0 | 1) => Some(8),
+            _ => None,
+        })?;
+    let chroma = chroma.or(colour.chroma()).or(match profile {
+        Some(0 | 2) => Some(1),
+        _ => None,
+    })?;
+    // VP9 has no 4:0:0 layout.
+    (chroma != 0).then_some((chroma, bits))
+}
+
+/// The picture layout a VP9 key frame's uncompressed header states
+/// (VP9 §6.2 `uncompressed_header()` up to §6.2.2 `color_config()`),
+/// or `None` for anything but a key frame or a malformed header. A
+/// superframe (Annex B) starts with its first frame, so `frame` may be
+/// one.
+pub(crate) fn vp9_frame_pixel_format(frame: &[u8]) -> Option<PixelFormat> {
+    let mut r = BitReader::new(frame);
+    if r.bits(2)? != 2 {
+        return None; // frame_marker
+    }
+    let low = r.bits(1)?;
+    let high = r.bits(1)?;
+    let profile = (high << 1) | low;
+    if profile == 3 {
+        r.skip(1)?; // reserved_zero
+    }
+    if r.bit()? {
+        return None; // show_existing_frame
+    }
+    if r.bit()? {
+        return None; // frame_type != KEY_FRAME
+    }
+    r.skip(2)?; // show_frame, error_resilient_mode
+    if r.bits(24)? != 0x49_83_42 {
+        return None; // frame_sync_code
+    }
+    let bits = if profile >= 2 {
+        if r.bit()? { 12 } else { 10 }
+    } else {
+        8
+    };
+    let color_space = r.bits(3)?;
+    let chroma = if color_space != 7 {
+        r.skip(1)?; // color_range
+        if profile == 1 || profile == 3 {
+            let ssx = r.bit()?;
+            let ssy = r.bit()?;
+            match (ssx, ssy) {
+                (true, true) => 1,
+                (true, false) => 2,
+                (false, false) => 3,
+                (false, true) => CHROMA_440,
+            }
+        } else {
+            1
+        }
+    } else if profile == 1 || profile == 3 {
+        // CS_RGB: 4:4:4, which the decoder emits as three full planes.
+        3
+    } else {
+        // §7.2.2: CS_RGB is not allowed in profiles 0 / 2.
+        return None;
+    };
+    layout_pixel_format(chroma, bits)
+}
+
+/// `(chroma code, bit depth)` from an `AV1CodecConfigurationRecord`
+/// (AV1 ISOBMFF binding §2.3.3): byte 0 is `marker` (1) + `version`
+/// (1); byte 2 holds `seq_tier_0`, `high_bitdepth`, `twelve_bit`,
+/// `monochrome`, `chroma_subsampling_x`, `chroma_subsampling_y` from
+/// the most significant bit down.
+fn av1c_layout(rec: &[u8]) -> Option<(u8, u8)> {
+    if rec.len() < 4 || rec[0] != 0x81 {
+        return None;
+    }
+    let b = rec[2];
+    let high_bitdepth = b & 0x40 != 0;
+    let twelve_bit = b & 0x20 != 0;
+    let monochrome = b & 0x10 != 0;
+    let ssx = b & 0x08 != 0;
+    let ssy = b & 0x04 != 0;
+    let bits = match (high_bitdepth, twelve_bit) {
+        (false, _) => 8,
+        (true, false) => 10,
+        (true, true) => 12,
+    };
+    let chroma = match (monochrome, ssx, ssy) {
+        (true, _, _) => 0,
+        (false, true, true) => 1,
+        (false, true, false) => 2,
+        (false, false, false) => 3,
+        // AV1 §6.4.2: subsampling_y without subsampling_x is not a
+        // conformant layout.
+        (false, false, true) => return None,
+    };
+    Some((chroma, bits))
 }
 
 /// The size of the pictures the decoder outputs for `codec_id` (`h264`
@@ -400,9 +612,79 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/// The frame rate a `DefaultDuration` of `ns` nanoseconds per frame
+/// states, as an exact rational. The element is an integer, so a
+/// rate like 24000/1001 (41 708 333.3… ns) is stored rounded; a rate
+/// over a denominator of 1 or 1001 whose frame duration rounds to
+/// `ns` is the one the writer meant. Any other duration gives
+/// `1e9 / ns` reduced.
+pub(crate) fn frame_rate_from_default_duration(ns: u64) -> Option<oxideav_core::Rational> {
+    const NS: u128 = 1_000_000_000;
+    if ns == 0 {
+        return None;
+    }
+    let ns128 = u128::from(ns);
+    for den in [1u128, 1001] {
+        let num = (NS * den + ns128 / 2) / ns128;
+        if num == 0 {
+            continue;
+        }
+        // Frame duration of num/den fps, rounded to the nearest ns.
+        let back = (NS * den + num / 2) / num;
+        if back == ns128 {
+            return Some(oxideav_core::Rational::new(num as i64, den as i64));
+        }
+    }
+    let (mut a, mut b) = (NS, ns128);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    let (num, den) = (NS / a, ns128 / a);
+    Some(oxideav_core::Rational::new(
+        i64::try_from(num).ok()?,
+        i64::try_from(den).ok()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_duration_gives_the_exact_rate() {
+        let r = |ns| frame_rate_from_default_duration(ns).map(|r| (r.num, r.den));
+        assert_eq!(r(40_000_000), Some((25, 1)));
+        assert_eq!(r(41_666_667), Some((24, 1)));
+        assert_eq!(r(33_333_333), Some((30, 1)));
+        assert_eq!(r(41_708_333), Some((24000, 1001)));
+        assert_eq!(r(33_366_667), Some((30000, 1001)));
+        assert_eq!(r(16_683_333), Some((60000, 1001)));
+        // Neither x/1 nor x/1001: 1e9 / ns, reduced.
+        assert_eq!(r(30_000_007), Some((1_000_000_000, 30_000_007)));
+        assert_eq!(r(0), None);
+    }
+
+    #[test]
+    fn vp9_key_frame_header_states_the_layout() {
+        // frame_marker 2, profile 0, key frame, sync code, color_space 1.
+        let p0 = [0b1000_0000 | 0b0000_0010, 0x49, 0x83, 0x42, 0b0010_0000];
+        // Byte 0: 10 0 0 | 0 0 1 0 → marker, low=0, high=0,
+        // show_existing=0, frame_type=0, show_frame=1, error_res=0.
+        assert_eq!(vp9_frame_pixel_format(&p0), Some(PixelFormat::Yuv420P));
+        // Profile 1 (low bit set), 4:2:2: color_space 1, range 0,
+        // ssx 1, ssy 0.
+        let p1 = [0b1010_0010, 0x49, 0x83, 0x42, 0b0010_1000];
+        assert_eq!(vp9_frame_pixel_format(&p1), Some(PixelFormat::Yuv422P));
+        // Profile 2 (high bit), ten_or_twelve_bit = 1 → 12-bit 4:2:0.
+        let p2 = [0b1001_0010, 0x49, 0x83, 0x42, 0b1001_0000];
+        assert_eq!(vp9_frame_pixel_format(&p2), Some(PixelFormat::Yuv420P12Le));
+        // An inter frame (frame_type 1) states nothing.
+        let inter = [0b1000_0110, 0, 0, 0, 0];
+        assert_eq!(vp9_frame_pixel_format(&inter), None);
+        // Bad sync code.
+        let bad = [0b1000_0010, 0x49, 0x83, 0x43, 0];
+        assert_eq!(vp9_frame_pixel_format(&bad), None);
+    }
 
     fn avcc(sps: &[u8]) -> Vec<u8> {
         let mut r = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe1];

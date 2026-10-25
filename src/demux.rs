@@ -694,11 +694,30 @@ fn open_typed_impl(
         if t.track_type == ids::TRACK_TYPE_VIDEO {
             params.width = Some(t.width as u32);
             params.height = Some(t.height as u32);
-            // The decoded-picture layout, from the avcC / hvcC
-            // CodecPrivate, so consumers can plan pixel-format
+            // The decoded-picture layout, from the avcC / hvcC / VP9
+            // feature / av1C CodecPrivate (the `Colour` element as a
+            // fallback), so consumers can plan pixel-format
             // conversions before decoding.
-            params.pixel_format =
-                video_config::pixel_format_from_config(params.codec_id.as_str(), &params.extradata);
+            let colour_layout = t.colour_raw.as_ref().map(|c| video_config::ColourLayout {
+                bits_per_channel: c.bits_per_channel,
+                chroma_subsampling_horz: c.chroma_subsampling_horz,
+                chroma_subsampling_vert: c.chroma_subsampling_vert,
+            });
+            params.pixel_format = video_config::pixel_format_for_track(
+                params.codec_id.as_str(),
+                &params.extradata,
+                colour_layout,
+            );
+            // RFC 9559 §5.1.4.1.28.27..30: the `Colour` code points are
+            // the ITU-T H.273 ones; `Range` 1 / 2 are limited / full.
+            if let Some(c) = &t.colour_raw {
+                params.color_signal = colour_signal(c);
+            }
+            // `DefaultDuration` (RFC 9559 §5.1.4.1.13) is the
+            // nanoseconds per frame of a constant-rate track.
+            if let Some(dd) = t.timing_raw.default_duration {
+                params.frame_rate = video_config::frame_rate_from_default_duration(dd);
+            }
             // The picture size the decoder emits: the SPS's cropping
             // window wins over a `PixelWidth` / `PixelHeight` that
             // declares the coded (macroblock-aligned) size.
@@ -1133,7 +1152,7 @@ fn open_typed_impl(
         track_number_by_index[idx as usize] = *num;
     }
 
-    Ok(MkvDemuxer {
+    let mut demuxer = MkvDemuxer {
         input,
         ebml_header,
         streams,
@@ -1195,8 +1214,14 @@ fn open_typed_impl(
         attachment_uid_to_index,
         edition_uid_to_index,
         tag_metadata_entries,
-    })
+    };
+    demuxer.layouts_from_first_frames();
+    Ok(demuxer)
 }
+
+/// How far into the Cluster stream [`MkvDemuxer::layouts_from_first_frames`]
+/// reads (bytes past the first Cluster) before giving up.
+const FIRST_FRAME_PEEK_BYTES: u64 = 4 << 20;
 
 /// How the most recent [`Demuxer::seek_to`] located the Cluster it landed
 /// on — see [`MkvDemuxer::seek_strategy`].
@@ -2837,6 +2862,24 @@ struct RawTrackAudio {
     /// the raw on-disk integer so the typed surface can distinguish an
     /// explicit `0` from the materialised default.
     emphasis: Option<u64>,
+}
+
+/// The [`ColorSignal`](oxideav_core::ColorSignal) a `Colour` master
+/// states. Code points outside `u8` and the reserved / unspecified
+/// `Range` values leave that part unspecified.
+fn colour_signal(c: &RawColour) -> oxideav_core::ColorSignal {
+    use oxideav_core::{ColorPrimaries, ColorRange, MatrixCoefficients, TransferCharacteristics};
+    let code = |v: u64| u8::try_from(v).unwrap_or(2);
+    oxideav_core::ColorSignal::new(
+        match c.range {
+            ids::COLOUR_RANGE_BROADCAST => ColorRange::Limited,
+            ids::COLOUR_RANGE_FULL => ColorRange::Full,
+            _ => ColorRange::Unspecified,
+        },
+        ColorPrimaries(code(c.primaries)),
+        TransferCharacteristics(code(c.transfer_characteristics)),
+        MatrixCoefficients(code(c.matrix_coefficients)),
+    )
 }
 
 /// Parser-private staging form of `Colour` — only the bits that have a
@@ -11645,6 +11688,101 @@ impl MkvDemuxer {
         self.reset_after_seek();
         self.last_seek_strategy = Some(SeekStrategy::Bisection);
         Ok(self.ticks_to_stream_pts(stream_index, lo.timestamp))
+    }
+
+    /// Fill the `pixel_format` of every VP9 track whose CodecPrivate and
+    /// `Colour` element leave it unstated (the common WebM case: the
+    /// features list is a SHOULD, and writers often omit it) from the
+    /// track's first key frame, whose uncompressed header states the
+    /// profile, bit depth and subsampling (VP9 §6.2 / §6.2.2).
+    ///
+    /// Side-effect free: a plain element walk from the current reader
+    /// position (the first Cluster) over `Cluster` / `BlockGroup`
+    /// children, reading the head of each unlaced `SimpleBlock` /
+    /// `Block` of a wanted track without `ContentEncodings`, then the
+    /// reader goes back where it was. It gives up
+    /// [`FIRST_FRAME_PEEK_BYTES`] in, or on the first element it
+    /// cannot walk.
+    fn layouts_from_first_frames(&mut self) {
+        let mut wanted: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|s| {
+                s.params.codec_id.as_str() == "vp9"
+                    && s.params.pixel_format.is_none()
+                    && self
+                        .content_encodings
+                        .get(s.index as usize)
+                        .is_some_and(|e| e.is_none())
+            })
+            .map(|s| s.index)
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let Ok(start) = self.input.stream_position() else {
+            return;
+        };
+        let limit = start
+            .saturating_add(FIRST_FRAME_PEEK_BYTES)
+            .min(self.segment_data_end);
+        let _ = self.scan_first_frames(&mut wanted, limit);
+        let _ = self.input.seek(SeekFrom::Start(start));
+    }
+
+    fn scan_first_frames(&mut self, wanted: &mut Vec<u32>, limit: u64) -> Result<()> {
+        while !wanted.is_empty() {
+            let pos = self.input.stream_position()?;
+            if pos >= limit {
+                return Ok(());
+            }
+            let hdr = read_element_header(&mut *self.input)?;
+            match hdr.id {
+                // Masters whose children are walked in place.
+                ids::CLUSTER | ids::BLOCK_GROUP => {}
+                ids::SIMPLE_BLOCK | ids::BLOCK if hdr.size != VINT_UNKNOWN_SIZE => {
+                    let body = self.input.stream_position()?;
+                    let head_len = hdr.size.min(64) as usize;
+                    let head = read_bytes(&mut *self.input, head_len)?;
+                    self.input
+                        .seek(SeekFrom::Start(body.saturating_add(hdr.size)))?;
+                    // Block header (RFC 9559 §10.1): track number VINT,
+                    // 16-bit timestamp, flags; lacing bits 0x06.
+                    let mut cur = std::io::Cursor::new(&head[..]);
+                    let (track, _) = read_vint(&mut cur, false)?;
+                    let at = cur.position() as usize + 3;
+                    let (Some(&flags), Some(frame)) = (head.get(at - 1), head.get(at..)) else {
+                        continue;
+                    };
+                    if flags & 0x06 != 0 {
+                        continue;
+                    }
+                    let Some(&idx) = self.track_index_by_number.get(&track) else {
+                        continue;
+                    };
+                    if let Some(w) = wanted.iter().position(|&x| x == idx) {
+                        // Only the first Block of the track counts: a
+                        // stream starts on a key frame, anything else is
+                        // not a statement about the stream.
+                        wanted.swap_remove(w);
+                        if let Some(pf) = video_config::vp9_frame_pixel_format(frame) {
+                            self.streams[idx as usize].params.pixel_format = Some(pf);
+                        }
+                    }
+                }
+                _ if hdr.size == VINT_UNKNOWN_SIZE => return Ok(()),
+                _ => {
+                    let next = pos
+                        .saturating_add(hdr.header_len as u64)
+                        .saturating_add(hdr.size);
+                    if next >= limit {
+                        return Ok(());
+                    }
+                    self.input.seek(SeekFrom::Start(next))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Reset the Cluster reader state and every "most recently returned

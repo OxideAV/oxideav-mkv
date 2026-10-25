@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Video stream parameters filled from what the file states.**
+  `CodecParameters::pixel_format` now covers VP9 (WebM "VP9 Codec
+  Feature Metadata" CodecPrivate — profile / bit depth / chroma
+  subsampling — completed by what the profile fixes and by the
+  `Colour` element; when neither states it, the track's first key
+  frame's uncompressed header does, read side-effect free at open),
+  AV1 (`AV1CodecConfigurationRecord` CodecPrivate: high_bitdepth /
+  twelve_bit / monochrome / subsampling), VP8 (always 8-bit 4:2:0) and,
+  for any of H.264 / HEVC / VP9 / AV1 whose record says nothing, the
+  `Colour` element's `BitsPerChannel` + `ChromaSubsampling*`.
+  `frame_rate` comes from `DefaultDuration` as an exact rational
+  (41 708 333 ns → 24000/1001), and `color_signal` from the `Colour`
+  element's range / primaries / transfer / matrix. Verified against
+  ffprobe on ffmpeg-made H.264 / HEVC / VP9 / AV1 fixtures (8- and
+  10-bit 4:2:0, 4:2:2, 4:4:4) in `tests/stream_parameters.rs`.
 - **`A_MS/ACM` audio tracks resolve through their WAVEFORMATEX.** The
   `wFormatTag` (for `WAVE_FORMAT_EXTENSIBLE`, the legacy tag inside a
   `DEFINE_WAVEFORMATEX_GUID` SubFormat) is offered to the codec
