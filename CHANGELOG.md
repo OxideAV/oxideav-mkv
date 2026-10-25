@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.11...v0.0.12) - 2026-10-25
+
+### Other
+
+- fill pixel_format for VP9 / AV1 / VP8, frame_rate from DefaultDuration, color_signal from Colour
+- V_MS/VFW/FOURCC + A_MS/ACM resolve through the tunnelled Win32 header
+- Cues-less seek by byte-offset bisection; open no longer hunts for late Cues ([#9](https://github.com/OxideAV/oxideav-mkv/pull/9))
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - **Video stream parameters filled from what the file states.**
