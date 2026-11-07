@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.12...v0.0.13) - 2026-11-07
+
+### Other
+
+- interpolated probe placement for the Cues-less seek ([#9](https://github.com/OxideAV/oxideav-mkv/pull/9))
+- API hygiene: #[non_exhaustive] on growable enums + every public record, with_* setters / constructors / Default
+
 ### Changed
 
 - Cues-less `seek_to` places its probes by interpolation (#9): the probe
