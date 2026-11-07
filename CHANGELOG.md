@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Cues-less `seek_to` places its probes by interpolation (#9): the probe
+  offset is estimated from the bracketing Cluster Timestamps (the Segment
+  `Duration` standing in for the Segment end) and pulled back one Cluster
+  length, with plain halving taking over whenever an interpolated probe
+  fails to halve the unexplored range. Landings are unchanged (the last
+  Cluster at or before the target); the cost on Cues-stripped ffmpeg
+  output drops from a mean of 11–13 byte-range requests per seek to
+  4.6–4.8 (worst 6) on 54- and 540-Cluster files, and stays within ~2x
+  the bisection bound on skewed-bitrate runs or with a wrong or absent
+  `Duration`.
+
 ### Added
 
 - `with_<field>` setters on every muxer-side record: `MkvTrackAudio`, `MkvTrackTiming`, `MkvTrackCodecTiming`, `MkvTrackIdentity`, `MkvTrackTranslate`, `MkvTrackLegacy`, `MkvChapter`, `MkvEditionDisplay`, `MkvChapProcess`, `MkvChapProcessCommand`, `mux::ChapterDisplay`, `MkvAttachment`, `MkvTag`, `MkvTagTargets`, `MkvSimpleTag`, `MkvVideoGeometry`, `MkvVideoColour`, `MkvMasteringMetadata`, `MkvProjection`, `MkvTrackAudienceFlags`, `MkvBlockAddition`, `BlockGroupOptions`, `MkvTrackOperation` (setters that already existed are kept as they were).

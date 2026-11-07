@@ -81,15 +81,21 @@ to register every codec the build enables.
      `CueClusterPosition` of the last `CuePoint` at or before the target.
   2. `SeekStrategy::Bisection` — no usable `Cues` (`mkvmerge --no-cues`-style
      output, a damaged `Cues` master the resilient open skipped, a lying
-     cue): byte-offset bisection over the Cluster run. Each probe reads one
-     bounded window at the midpoint of the unexplored byte range,
-     resynchronises on the next vetted `Cluster` header in it (header +
-     leading children parse, `Timestamp` before the first block, successor
-     is a Top-Level element) and reads that Cluster's `Timestamp`, so a
-     landing costs ~log2(clusters) positioned reads — measured 11–17
-     byte-range requests on a 48 MB / 521-Cluster file against ~540 for a
-     linear walk — and lands exactly where a Cues lookup would: the last
-     Cluster at or before the target, monotone in the target.
+     cue): a byte-offset search over the Cluster run. Each probe reads one
+     bounded window inside the unexplored byte range, resynchronises on
+     the next vetted `Cluster` header in it (header + leading children
+     parse, `Timestamp` before the first block, successor is a Top-Level
+     element) and reads that Cluster's `Timestamp`. The probe point is
+     interpolated from the bracketing Timestamps (the Segment `Duration`
+     stands in for the Segment end until a later Cluster is seen), pulled
+     back one Cluster length, and handed to plain halving whenever an
+     interpolated probe fails to halve the range — so a skewed bitrate or
+     a wrong `Duration` costs at most ~2x the bisection bound and never
+     moves the landing. Measured on Cues-stripped ffmpeg output: a mean of
+     4.6–4.8 byte-range requests per seek (worst 6) on 54- and 540-Cluster
+     files, against 11–13 for plain halving and ~500 for a linear walk.
+     Lands exactly where a Cues lookup would: the last Cluster at or
+     before the target, monotone in the target.
   3. `SeekStrategy::LinearScan` — the bisection premise (ascending Cluster
      `Timestamp`s, a MUST in the WebM guidelines and the assumption behind
      every §25.3 layout) is checked on every probe; a Cluster found out of

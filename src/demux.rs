@@ -1165,6 +1165,8 @@ fn open_typed_impl(
         time_base,
         metadata,
         duration_micros,
+        segment_duration_ticks: (info.duration.is_finite() && info.duration > 0.0)
+            .then_some(info.duration as u64),
         cues,
         cue_points,
         timecode_scale_ns,
@@ -1231,11 +1233,15 @@ pub enum SeekStrategy {
     /// A `Cues` lookup (RFC 9559 §22): one jump to the
     /// `CueClusterPosition` of the last `CuePoint` at or before the target.
     Cues,
-    /// No usable `Cues`: byte-offset bisection over the Cluster run. Each
-    /// probe reads one bounded window at the midpoint of the unexplored
-    /// byte range, resynchronises on the next vetted `Cluster` header
-    /// inside it and reads that Cluster's `Timestamp`, so the landing
-    /// costs ~log2(clusters) positioned reads instead of one per Cluster.
+    /// No usable `Cues`: a byte-offset search over the Cluster run. Each
+    /// probe reads one bounded window inside the unexplored byte range,
+    /// resynchronises on the next vetted `Cluster` header inside it and
+    /// reads that Cluster's `Timestamp`. The probe point is interpolated
+    /// from the bracketing Timestamps (the Segment `Duration` standing in
+    /// for the Segment end until a later Cluster is seen), falling back
+    /// to the midpoint whenever an interpolated probe fails to halve the
+    /// range — a handful of positioned reads on a steady-bitrate file,
+    /// never more than ~2·log2(clusters), instead of one per Cluster.
     Bisection,
     /// No usable `Cues` and the bisection premise failed — a vetted
     /// Cluster whose `Timestamp` was out of storage order, or the probe
@@ -2089,6 +2095,34 @@ fn probe_cluster_from(
         chunk = (chunk * 2).min(PROBE_CHUNK_MAX);
     }
     Ok(None)
+}
+
+/// Byte offset at which an interpolated Cues-less seek probe starts.
+///
+/// The estimate is the point of `[lo_off, hi_off)` whose share of the
+/// range equals the target's share of `[lo_ts, hi_ts]` (Cluster bytes
+/// taken as roughly proportional to Cluster time). The Cluster holding
+/// the target starts *before* the byte the estimate names, and a probe
+/// returns the first Cluster at or after its start, so the probe is
+/// pulled back by `back_off` (one Cluster length, as sampled from the
+/// lower bracket) to land on the wanted Cluster rather than its
+/// successor. Clamped into the range; `hi_ts` must exceed `lo_ts`.
+fn interpolation_offset(
+    lo_off: u64,
+    hi_off: u64,
+    lo_ts: u64,
+    hi_ts: u64,
+    target: u64,
+    back_off: u64,
+) -> u64 {
+    let span = (hi_off - lo_off) as u128;
+    let num = (target.clamp(lo_ts, hi_ts) - lo_ts) as u128;
+    let den = (hi_ts - lo_ts) as u128;
+    let estimate = lo_off + (span * num / den) as u64;
+    estimate
+        .saturating_sub(back_off)
+        .min(hi_off.saturating_sub(1))
+        .max(lo_off)
 }
 
 #[derive(Default)]
@@ -9268,6 +9302,11 @@ pub struct MkvDemuxer {
     time_base: TimeBase,
     metadata: Vec<(String, String)>,
     duration_micros: i64,
+    /// `Segment\Info\Duration` (RFC 9559 §5.1.2.10) in Segment Ticks,
+    /// when present. Used only to place the first Cues-less seek probe
+    /// (interpolation needs a Timestamp for the Segment end); never
+    /// trusted for a landing.
+    segment_duration_ticks: Option<u64>,
     /// Cue index entries, sorted by (track, time). Empty if the file has
     /// no Cues element — `seek_to` returns `Error::Unsupported` in that
     /// case.
@@ -11677,8 +11716,18 @@ impl MkvDemuxer {
     /// whose `Timestamp` is at or before the target, the first Cluster
     /// for a target before it.
     ///
-    /// Cost: ~log2(clusters) probes, each one bounded read at the
-    /// midpoint of the unexplored byte range (`PROBE_CHUNK`, doubling up
+    /// Probe placement: interpolated on Timestamp between the brackets
+    /// (Segment `Duration` for the Segment end while no upper Cluster is
+    /// known) and pulled back one Cluster length so the probe meets the
+    /// wanted Cluster rather than its successor; an interpolated probe
+    /// that does not at least halve the unexplored range hands the next
+    /// probe to plain halving, so a skewed bitrate or a wrong `Duration`
+    /// costs at most ~2x the bisection bound. A wrong estimate only
+    /// moves probes, never the landing.
+    ///
+    /// Cost: ~log2(clusters) probes at worst (typically 3-6 on a
+    /// steady-bitrate file), each one bounded read in the unexplored
+    /// byte range (`PROBE_CHUNK`, doubling up
     /// to `PROBE_CHUNK_MAX` only while no Cluster header is in sight)
     /// plus, for a mid-run candidate whose end lies past the window, one
     /// boundary read that confirms it is a real Cluster; then one or two
@@ -11716,6 +11765,12 @@ impl MkvDemuxer {
         let mut hi_off = end;
         let mut hi_ts: Option<u64> = None;
         let mut probes: u32 = 0;
+        // Interpolation guard: an interpolated probe that fails to at
+        // least halve the unexplored range hands the next step to plain
+        // halving, so the worst case stays within ~2x the bisection
+        // bound however uneven the bitrate (or however wrong a declared
+        // Duration) is.
+        let mut interpolate = true;
         while target > lo.timestamp {
             // Unexplored byte range: after `lo` (its body end when the
             // size is known, else the byte after its ID — the probe then
@@ -11729,9 +11784,28 @@ impl MkvDemuxer {
             // Narrow gaps: step forward from `lo`, so the last Cluster(s)
             // between `lo` and `hi` are read in order (the element at a
             // known-size lo's end is trusted — no boundary read). Wide
-            // gaps: halve.
+            // gaps: interpolate on Timestamp when the upper bracket has
+            // one (guarded, see `interpolate`), else halve.
+            let interpolated = if gap <= 2 * PROBE_CHUNK as u64 || !interpolate {
+                None
+            } else {
+                // Timestamp at `hi_off`: the bracketing Cluster's when one
+                // was probed, else the declared Segment Duration for the
+                // Segment end (an estimate only — placement, never landing).
+                let hi_t = match hi_ts {
+                    Some(h) => Some(h),
+                    None if hi_off == end => self.segment_duration_ticks,
+                    None => None,
+                };
+                hi_t.filter(|&h| h > lo.timestamp).map(|h| {
+                    let lo_len = lo.next.map_or(PROBE_CHUNK as u64, |n| n - lo.offset);
+                    interpolation_offset(lo_next, hi_off, lo.timestamp, h, target, lo_len)
+                })
+            };
             let (from, trusted) = if gap <= 2 * PROBE_CHUNK as u64 {
                 (lo_next, lo.next)
+            } else if let Some(at) = interpolated {
+                (at, if at == lo_next { lo.next } else { None })
             } else {
                 (lo_next + gap / 2, None)
             };
@@ -11768,6 +11842,12 @@ impl MkvDemuxer {
                         hi_ts = Some(c.timestamp);
                     }
                 }
+            }
+            if interpolated.is_some() {
+                let lo_next = lo.next.unwrap_or_else(|| lo.offset.saturating_add(1));
+                interpolate = hi_off.saturating_sub(lo_next) <= gap / 2;
+            } else {
+                interpolate = true;
             }
         }
         self.input.seek(SeekFrom::Start(lo.offset))?;

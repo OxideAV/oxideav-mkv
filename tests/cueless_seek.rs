@@ -595,12 +595,14 @@ fn unsorted_cluster_run_degrades_to_the_linear_walk() {
         clusters: Vec::new(),
     };
     for i in 0..n {
-        // Ascending, except a block of nine Clusters in the second half
-        // that jump back in time — a mid-run probe lands on one of them.
+        // Ascending from 1 000, except a block of nine Clusters in the
+        // second half that jump back in time (Timestamps 100..900 —
+        // before even the first Cluster's, so any probe that meets one
+        // sees it fall outside the bracket).
         let tc = if (20..29).contains(&i) {
             (i as u64 - 19) * 100
         } else {
-            i as u64 * 1000
+            (i as u64 + 1) * 1000
         };
         run.timestamps.push(tc);
         run.clusters.push(elem_master(
@@ -611,18 +613,148 @@ fn unsorted_cluster_run_degrades_to_the_linear_walk() {
     let bytes: Arc<[u8]> = build(&run, &[], &[]).into();
     for resilient in [false, true] {
         let (mut dmx, _counters) = open_counting(&bytes, resilient);
-        // The linear walk's contract on an unsorted run: the last Cluster
-        // at or before the target, stopping at the first Cluster at or
-        // past it in storage order.
-        let landed = dmx.seek_to(0, 31_000).expect("seek");
-        assert_eq!(landed, 31_000);
+        // A target between Cluster 19 (20 000) and Cluster 29 (30 000):
+        // however the probes are placed, settling the landing on Cluster
+        // 19 needs its successor — a block Cluster, whose Timestamp falls
+        // outside any bracket (premise disproved). The linear walk's
+        // contract on an unsorted run: the last Cluster at or before the
+        // target, stopping at the first Cluster past it in storage order
+        // — Cluster 28 (900).
+        let landed = dmx.seek_to(0, 20_500).expect("seek");
+        assert_eq!(landed, 900);
         assert_eq!(dmx.seek_strategy(), Some(SeekStrategy::LinearScan));
+        assert_eq!(dmx.next_packet().unwrap().pts, Some(900));
+        // A target in the sorted tail lands on Cluster 30 whichever
+        // strategy the probes end up taking (both contracts agree there).
+        let landed = dmx.seek_to(0, 31_500).expect("seek");
+        assert_eq!(landed, 31_000);
         assert_eq!(dmx.next_packet().unwrap().pts, Some(31_000));
         // A target the bisection resolves without touching the unsorted
         // block still bisects.
         let landed = dmx.seek_to(0, 2_500).expect("seek");
         assert_eq!(landed, 2_000);
         assert_eq!(dmx.seek_strategy(), Some(SeekStrategy::Bisection));
+    }
+}
+
+// ---------------------------------------------------------------------
+// 5b. probe placement: interpolation on a steady run, guarded on a skewed
+//     one, never trusted for the landing
+// ---------------------------------------------------------------------
+
+/// Segment like [`build`] but with an explicit (possibly absent or
+/// wrong) `Info\Duration`.
+fn build_with_duration(run: &Run, duration_ms: Option<f64>) -> Vec<u8> {
+    let mut seg = Vec::new();
+    let mut info = elem_uint(ids::TIMECODE_SCALE, 1_000_000);
+    if let Some(d) = duration_ms {
+        info.extend_from_slice(&elem_float_be_f64(ids::DURATION, d));
+    }
+    seg.extend_from_slice(&elem_master(ids::INFO, &info));
+    seg.extend_from_slice(&tracks_master());
+    for c in &run.clusters {
+        seg.extend_from_slice(c);
+    }
+    let mut out = ebml_header();
+    out.extend_from_slice(&elem_master(ids::SEGMENT, &seg));
+    out
+}
+
+/// Total requests a [`sweep`] costs (the per-seek mean is what a player
+/// scrubbing the timeline pays).
+fn sweep_total(
+    dmx: &mut MkvDemuxer,
+    counters: &Counters,
+    run: &Run,
+    targets: &[i64],
+) -> (u64, u64) {
+    let before = counters.requests();
+    let max = sweep(
+        dmx,
+        counters,
+        &run.timestamps,
+        targets,
+        SeekStrategy::Bisection,
+    );
+    (max, counters.requests() - before)
+}
+
+#[test]
+fn steady_bitrate_run_seeks_in_a_handful_of_requests() {
+    // ~60-120 KB jittered Clusters, 1 s each: bytes track time closely
+    // enough that the interpolated probe lands next to the target. Plain
+    // halving costs a mean of ~14 (53 Clusters) / ~18 (521 Clusters)
+    // requests per seek on these runs; interpolation ~8 on both.
+    for n in [53usize, 521] {
+        let run = ascending_run(n);
+        let bytes: Arc<[u8]> = build(&run, &[], &[]).into();
+        let (mut dmx, counters) = open_counting(&bytes, false);
+        let targets: Vec<i64> = (0..64).map(|i| (n as i64 * 1000) * i / 64 + 333).collect();
+        let (max, total) = sweep_total(&mut dmx, &counters, &run, &targets);
+        let mean = total as f64 / targets.len() as f64;
+        eprintln!("{n} clusters: mean {mean:.2} requests/seek, worst {max}");
+        assert!(
+            mean <= 9.0,
+            "{n} clusters: mean {mean:.2} requests per seek"
+        );
+        assert!(max <= seek_budget(n), "{n} clusters: worst {max}");
+    }
+}
+
+#[test]
+fn skewed_bitrate_run_stays_within_twice_the_bisection_bound() {
+    // First half: 1 s Clusters of ~240 KB; second half: 1 s Clusters of
+    // ~6 KB — byte offset is wildly non-linear in time, so the
+    // interpolated probes miss and the halving guard has to take over.
+    let n = 400usize;
+    let mut run = Run {
+        timestamps: Vec::new(),
+        clusters: Vec::new(),
+    };
+    for i in 0..n {
+        let tc = i as u64 * 1000;
+        let len = if i < n / 2 { 240_000 } else { 6_000 } + (i * 37) % 500;
+        run.timestamps.push(tc);
+        run.clusters.push(elem_master(
+            ids::CLUSTER,
+            &cluster_body(tc, &payload(len, 3000 + i as u64)),
+        ));
+    }
+    let bytes: Arc<[u8]> = build(&run, &[], &[]).into();
+    for resilient in [false, true] {
+        let (mut dmx, counters) = open_counting(&bytes, resilient);
+        let targets = sweep_targets(&run.timestamps);
+        let (max, _) = sweep_total(&mut dmx, &counters, &run, &targets);
+        assert!(
+            max <= 2 * seek_budget(n),
+            "resilient={resilient}: worst {max} > {}",
+            2 * seek_budget(n)
+        );
+    }
+}
+
+#[test]
+fn wrong_or_absent_duration_moves_probes_never_the_landing() {
+    let n = 120usize;
+    let run = ascending_run(n);
+    let actual = n as f64 * 1000.0;
+    for duration in [
+        None,
+        Some(1.0),
+        Some(actual / 10.0),
+        Some(actual * 100.0),
+        Some(f64::MAX),
+    ] {
+        let bytes: Arc<[u8]> = build_with_duration(&run, duration).into();
+        for resilient in [false, true] {
+            let (mut dmx, counters) = open_counting(&bytes, resilient);
+            let targets = sweep_targets(&run.timestamps);
+            let (max, _) = sweep_total(&mut dmx, &counters, &run, &targets);
+            assert!(
+                max <= 2 * seek_budget(n),
+                "Duration {duration:?} resilient={resilient}: worst {max}"
+            );
+        }
     }
 }
 
