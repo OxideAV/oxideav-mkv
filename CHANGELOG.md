@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The muxer writes only registered Matroska CodecIDs.** A codec with
+  no native mapping used to be written as `X_<codec id>` (e.g.
+  `X_mjpeg`), which no reader — this crate's demuxer included —
+  resolved. Each stream's CodecID is now planned at open
+  (`codec_id::plan_track_codec`): native id; a `CodecTag::Matroska`
+  verbatim; a demuxer placeholder back to the id it was read under
+  (`mkv:<CodecID>`, `mkv:vfw:<FOURCC>`, `mkv:acm:0xHHHH`); the
+  `V_MS/VFW/FOURCC` track (`BITMAPINFOHEADER` CodecPrivate) for Motion
+  JPEG `MJPG`, Cinepak `CVID`, HuffYUV `HFYU`, Lagarith `LAGS`, 24-bit
+  `BI_RGB` and any FourCC-tagged video; the `A_MS/ACM` track
+  (`WAVEFORMATEX` CodecPrivate) for 8/24/32-bit integer and 64-bit float
+  PCM, A-law, µ-law and any `wFormatTag`-tagged audio. Anything else is
+  `Error::Unsupported` at open, so a container-fit check sees the
+  truth. `V_THEORA` is now written too (it was read only).
+  `tests/codec_id_matrix.rs` round-trips 49 codec rows (mux → demux →
+  same codec id, parameters, extradata, packet bytes, timestamps,
+  keyframe flags → remux under the same CodecID); `ffmpeg` decodes the
+  MJPEG / 24-bit PCM / A-law files byte-identically to their sources.
+
+### Fixed
+
+- **SimpleBlock keyframe flag.** Every SimpleBlock packet was reported
+  as a keyframe; the packet flag now follows the Block's `KEY` bit
+  (RFC 9559 §10.2, §10.4), so delta frames demux as delta frames.
+- Files written by earlier releases under `X_<codec id>` read back as
+  `<codec id>`; `V_MS/VFW/FOURCC` tracks with `MJPG` / `CVID` / `HFYU`
+  / `LAGS` resolve without a codec registry.
+
 ### Added
 
 - **Video stream parameters filled from what the file states.**

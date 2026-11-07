@@ -311,7 +311,7 @@ fn channel_positions_round_trips_in_audio_master() {
     // RFC 9559 Appendix A.27 — ChannelPositions is nested in the Audio
     // master, so it needs an audio track to land. Drive a one-track audio
     // MKV and confirm the binary table round-trips through TrackLegacy.
-    let mut p = CodecParameters::audio(CodecId::new("A_PCM/INT/LIT"));
+    let mut p = CodecParameters::audio(CodecId::new("pcm_s16le"));
     p.sample_rate = Some(48_000);
     p.channels = Some(2);
     let audio = StreamInfo {

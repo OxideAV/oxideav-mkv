@@ -418,6 +418,10 @@ impl MkvTrackIdentity {
 pub struct MkvMuxer {
     output: Box<dyn WriteSeek>,
     streams: Vec<StreamInfo>,
+    /// Per-stream `CodecID` / `CodecPrivate` plan, resolved at open time
+    /// by [`codec_id::plan_track_codec`] (a stream with no registered
+    /// CodecID is refused there, before anything is written).
+    track_codecs: Vec<codec_id::TrackCodec>,
     /// Per-stream MKV track numbers (1-indexed).
     track_numbers: Vec<u64>,
     /// Per-stream running pts, in the stream's own time base. Used to
@@ -2212,11 +2216,22 @@ impl MkvMuxer {
                 }
             }
         }
+        let track_codecs = streams
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                codec_id::plan_track_codec(&s.params).map_err(|e| match e {
+                    Error::Unsupported(msg) => Error::unsupported(format!("stream {i}: {msg}")),
+                    other => other,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let stream_track_numbers: Vec<u64> = (0..streams.len() as u64).map(|i| i + 1).collect();
         let n = streams.len();
         Ok(MkvMuxer {
             output,
             streams: streams.to_vec(),
+            track_codecs,
             track_numbers: stream_track_numbers,
             stream_pts: vec![0i64; n],
             cluster_open: false,
@@ -5317,16 +5332,27 @@ impl Muxer for MkvMuxer {
             } else if let Some(lang) = hint_lang.or(s.params.language.as_deref()) {
                 write_string_element(&mut t, ids::LANGUAGE, lang);
             }
-            if let Some(name) = codec_id::to_matroska(&s.params.codec_id) {
-                write_string_element(&mut t, ids::CODEC_ID, name);
-            } else {
-                // Fall back to a Matroska-style unknown id; players will reject
-                // this but the file is otherwise valid.
-                let raw = format!("X_{}", s.params.codec_id);
-                write_string_element(&mut t, ids::CODEC_ID, &raw);
-            }
-            // CodecPrivate with codec-specific normalisation.
-            let mut cp = encode_codec_private(&s.params.codec_id, &s.params.extradata);
+            // CodecID (RFC 9559 §5.1.4.1.21) as planned at open time, and
+            // the CodecPrivate (§5.1.4.1.22) that CodecID's mapping wants:
+            // the codec-specific normalisation for a native id, the
+            // extradata as-is for a verbatim id, or the Win32 header the
+            // VFW / ACM compatibility track tunnels.
+            let plan = &self.track_codecs[i];
+            write_string_element(&mut t, ids::CODEC_ID, plan.codec_id());
+            let mut cp = match plan {
+                codec_id::TrackCodec::Native(_) => {
+                    encode_codec_private(&s.params.codec_id, &s.params.extradata)
+                }
+                codec_id::TrackCodec::Verbatim(_) => s.params.extradata.clone(),
+                codec_id::TrackCodec::Vfw { fourcc, bit_count } => {
+                    codec_id::bitmapinfoheader(*fourcc, *bit_count, &s.params)
+                }
+                codec_id::TrackCodec::Acm {
+                    format_tag,
+                    bits_per_sample,
+                    pcm,
+                } => codec_id::waveformatex(*format_tag, *bits_per_sample, *pcm, &s.params)?,
+            };
             // `A_AAC` requires the AudioSpecificConfig in CodecPrivate;
             // a stream handed over without one (ADTS-framed packets
             // carry their configuration in-band) gets the AAC-LC ASC

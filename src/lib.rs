@@ -2,8 +2,21 @@
 //!
 //! Implements the EBML primitives plus enough of the Matroska schema to
 //! demux the audio codecs oxideav already understands (FLAC, Opus, Vorbis,
-//! PCM). The muxer can write back any codec we can carry — there are no
-//! codec-specific assumptions in the container layer.
+//! PCM). The muxer writes every stream under a registered Matroska
+//! CodecID — native, the `V_MS/VFW/FOURCC` / `A_MS/ACM` compatibility
+//! tracks, or the CodecID a demuxed track was read under — and refuses
+//! at open a stream it has no CodecID for
+//! ([`codec_id::plan_track_codec`]).
+//!
+//! # Mid-stream shape changes
+//!
+//! A track header states one shape per Segment (RFC 9559 §23.2 puts a
+//! codec / resolution change at a Segment boundary). The core
+//! [`Muxer`](oxideav_core::Muxer) API carries no parameters-change event
+//! (a `Frame::StreamParams` ends at the encoder; a `Packet` has no
+//! shape), so the muxer writes each header from the `StreamInfo` it was
+//! opened with. A caller following a shape change finishes this file and
+//! opens a new muxer for the new shape.
 //!
 //! WebM is exposed as a first-class peer of Matroska: the demuxer is
 //! shared (the two formats are byte-identical except for the DocType

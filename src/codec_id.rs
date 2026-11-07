@@ -2,7 +2,7 @@
 //!
 //! Reference: <https://www.matroska.org/technical/codec_specs.html>
 
-use oxideav_core::CodecId;
+use oxideav_core::{CodecId, CodecParameters, CodecTag, Error, MediaType, Result};
 
 /// Matroska CodecID strings that WebM permits.
 ///
@@ -74,6 +74,14 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "V_MPEGH/ISO/HEVC" => "h265",
         "V_FFV1" => "ffv1",
         "V_THEORA" => "theora",
+        // Files written by oxideav-mkv up to 0.0.11 carried every codec
+        // without a native mapping as `X_<oxideav codec id>` (e.g.
+        // `X_mjpeg`). Those ids are not registered Matroska CodecIDs, but
+        // the suffix is the fleet codec id verbatim, so they still read
+        // back. The muxer no longer writes them.
+        s if s.len() > 2 && s.starts_with(LEGACY_PRIVATE_PREFIX) => {
+            return CodecId::new(&s[LEGACY_PRIVATE_PREFIX.len()..]);
+        }
         VFW_CODEC_ID => return from_bitmapinfoheader(codec_private),
         ACM_CODEC_ID => return from_waveformatex(codec_private),
         // Subtitles. Matroska's "S_TEXT/*" family carries plain UTF-8 with
@@ -95,6 +103,10 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
     };
     CodecId::new(id)
 }
+
+/// Prefix of the unregistered `X_<codec id>` CodecIDs earlier releases
+/// of this muxer wrote for codecs without a native mapping.
+const LEGACY_PRIVATE_PREFIX: &str = "X_";
 
 /// Matroska CodecID of the VFW-compatibility video mode: CodecPrivate
 /// carries a Win32 `BITMAPINFOHEADER` whose `biCompression` names the
@@ -212,6 +224,15 @@ fn from_bitmapinfoheader(cp: &[u8]) -> CodecId {
     let Some(fourcc) = vfw_fourcc(cp) else {
         return CodecId::new("mkv:vfw:<truncated>");
     };
+    // The FourCCs the muxer itself writes through the compatibility
+    // track (see [`VFW_FOURCCS`]) resolve without a codec registry, so a
+    // file this crate wrote reads back under the same codec id.
+    if let Some((id, _)) = VFW_FOURCCS
+        .iter()
+        .find(|(_, f)| f.eq_ignore_ascii_case(&fourcc))
+    {
+        return CodecId::new(*id);
+    }
     match &fourcc {
         b"FFV1" => return CodecId::new("ffv1"),
         // BI_RGB (0): uncompressed 24-bit RGB is the one layout with a
@@ -307,6 +328,7 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "h264" => "V_MPEG4/ISO/AVC",
         "h265" => "V_MPEGH/ISO/HEVC",
         "ffv1" => "V_FFV1",
+        "theora" => "V_THEORA",
         "subrip" => "S_TEXT/UTF8",
         "ssa" => "S_TEXT/SSA",
         "ass" => "S_TEXT/ASS",
@@ -319,6 +341,280 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "kate" => "S_KATE",
         _ => return None,
     })
+}
+
+/// Fleet video codecs without a native Matroska CodecID that the muxer
+/// carries through the VFW compatibility track (`V_MS/VFW/FOURCC`),
+/// with the `biCompression` FourCC each is written under. Every FourCC
+/// here is one docs/container/vfw names for that codec; the demuxer maps
+/// them back without a registry.
+pub const VFW_FOURCCS: &[(&str, [u8; 4])] = &[
+    ("mjpeg", *b"MJPG"),
+    ("cinepak", *b"CVID"),
+    ("huffyuv", *b"HFYU"),
+    ("lagarith", *b"LAGS"),
+];
+
+/// Fleet PCM / G.711 codecs carried through the ACM compatibility track
+/// (`A_MS/ACM`): `(codec id, wFormatTag, wBitsPerSample)`. These are the
+/// exact inverses of the depth-aware names the demuxer gives an
+/// unclaimed WAVEFORMATEX.
+const ACM_FORMATS: &[(&str, u16, u16)] = &[
+    ("pcm_u8", 0x0001, 8),
+    ("pcm_s24le", 0x0001, 24),
+    ("pcm_s32le", 0x0001, 32),
+    ("pcm_f64le", 0x0003, 64),
+    ("pcm_alaw", 0x0006, 8),
+    ("pcm_mulaw", 0x0007, 8),
+];
+
+/// How the muxer writes one track's `CodecID` / `CodecPrivate`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum TrackCodec {
+    /// A Matroska CodecID with its own CodecPrivate rule; the muxer
+    /// applies the codec-specific normalisation to the extradata.
+    Native(&'static str),
+    /// A CodecID string written verbatim with the extradata as
+    /// CodecPrivate: an id the demuxer read but no codec claimed
+    /// (`mkv:<CodecID>`), or one a stream announced through
+    /// [`CodecTag::Matroska`].
+    Verbatim(String),
+    /// `V_MS/VFW/FOURCC` — CodecPrivate is a `BITMAPINFOHEADER` with
+    /// this `biCompression` and `biBitCount`, followed by the extradata.
+    Vfw {
+        /// `biCompression`, in file byte order.
+        fourcc: [u8; 4],
+        /// `biBitCount`.
+        bit_count: u16,
+    },
+    /// `A_MS/ACM` — CodecPrivate is a `WAVEFORMATEX` with this
+    /// `wFormatTag` / `wBitsPerSample`, `cbSize` = extradata length,
+    /// followed by the extradata.
+    Acm {
+        /// `wFormatTag`.
+        format_tag: u16,
+        /// `wBitsPerSample` (0 when the stream does not state it).
+        bits_per_sample: u16,
+        /// `true` for the PCM / G.711 tags, whose `nBlockAlign` and
+        /// `nAvgBytesPerSec` follow from the geometry.
+        pcm: bool,
+    },
+}
+
+impl TrackCodec {
+    /// The CodecID string this plan writes.
+    pub fn codec_id(&self) -> &str {
+        match self {
+            TrackCodec::Native(s) => s,
+            TrackCodec::Verbatim(s) => s,
+            TrackCodec::Vfw { .. } => VFW_CODEC_ID,
+            TrackCodec::Acm { .. } => ACM_CODEC_ID,
+        }
+    }
+}
+
+/// `true` when `s` can stand as a CodecID the muxer writes verbatim:
+/// non-empty printable ASCII (Matroska CodecIDs are `string`, RFC 9559
+/// §5.1.4.1.21, i.e. printable ASCII per RFC 8794 §7.4) and not one of
+/// the placeholder names this crate generates for an unreadable header.
+fn is_writable_codec_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| (0x20..=0x7E).contains(&b))
+        && !s.contains('<')
+        && !s.starts_with(LEGACY_PRIVATE_PREFIX)
+}
+
+/// Parse the FourCC out of a `mkv:vfw:<FOURCC>` / `mkv:vfw:0xHHHHHHHH`
+/// placeholder id.
+fn parse_vfw_placeholder(rest: &str) -> Option<[u8; 4]> {
+    if let Some(hex) = rest.strip_prefix("0x") {
+        if hex.len() != 8 {
+            return None;
+        }
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        return Some(v.to_be_bytes());
+    }
+    let b = rest.as_bytes();
+    (b.len() == 4).then(|| [b[0], b[1], b[2], b[3]])
+}
+
+/// Parse the tag out of a `mkv:acm:0xHHHH` placeholder id.
+fn parse_acm_placeholder(rest: &str) -> Option<u16> {
+    let hex = rest.strip_prefix("0x")?;
+    (hex.len() == 4).then(|| u16::from_str_radix(hex, 16).ok())?
+}
+
+/// `wBitsPerSample` a stream states through its sample format.
+fn stated_bits(params: &CodecParameters) -> u16 {
+    params
+        .sample_format
+        .map(|f| (f.bytes_per_sample() * 8) as u16)
+        .unwrap_or(0)
+}
+
+/// Decide the `CodecID` (and CodecPrivate shape) the muxer writes for a
+/// stream, or refuse it.
+///
+/// In order:
+/// 1. the native Matroska CodecID ([`to_matroska`]);
+/// 2. a [`CodecTag::Matroska`] the stream carries, written verbatim;
+/// 3. a demuxer placeholder — `mkv:vfw:<FOURCC>` → the VFW track,
+///    `mkv:acm:0xHHHH` → the ACM track, `mkv:<CodecID>` → that CodecID
+///    verbatim — so a remux of a track no codec claimed writes back the
+///    id it was read under;
+/// 4. the fleet codecs this crate carries through the compatibility
+///    tracks ([`VFW_FOURCCS`], the PCM / G.711 depths);
+/// 5. a video stream tagged with a non-zero FourCC → the VFW track; an
+///    audio stream tagged with a `wFormatTag` → the ACM track.
+///
+/// Anything else is [`Error::Unsupported`]: the muxer never invents a
+/// CodecID (earlier releases wrote an unregistered `X_<id>`), so a
+/// caller learns at open time that this container cannot carry the
+/// stream instead of producing a file no reader resolves.
+pub fn plan_track_codec(params: &CodecParameters) -> Result<TrackCodec> {
+    let id = params.codec_id.as_str();
+    if let Some(native) = to_matroska(&params.codec_id) {
+        return Ok(TrackCodec::Native(native));
+    }
+    let video = params.media_type == MediaType::Video;
+    let audio = params.media_type == MediaType::Audio;
+    if let Some(CodecTag::Matroska(s)) = &params.tag
+        && is_writable_codec_id(s)
+    {
+        return Ok(TrackCodec::Verbatim(s.clone()));
+    }
+    if let Some(rest) = id.strip_prefix("mkv:vfw:") {
+        if let (true, Some(fourcc)) = (video, parse_vfw_placeholder(rest))
+            && fourcc != [0; 4]
+        {
+            return Ok(TrackCodec::Vfw {
+                fourcc,
+                bit_count: 24,
+            });
+        }
+    } else if let Some(rest) = id.strip_prefix("mkv:acm:") {
+        if let (true, Some(format_tag)) = (audio, parse_acm_placeholder(rest)) {
+            return Ok(TrackCodec::Acm {
+                format_tag,
+                bits_per_sample: stated_bits(params),
+                pcm: false,
+            });
+        }
+    } else if let Some(rest) = id.strip_prefix("mkv:")
+        && is_writable_codec_id(rest)
+    {
+        return Ok(TrackCodec::Verbatim(rest.to_owned()));
+    }
+    if video {
+        if id == "rgb24" {
+            return Ok(TrackCodec::Vfw {
+                fourcc: [0; 4],
+                bit_count: 24,
+            });
+        }
+        if let Some((_, fourcc)) = VFW_FOURCCS.iter().find(|(c, _)| *c == id) {
+            return Ok(TrackCodec::Vfw {
+                fourcc: *fourcc,
+                bit_count: 24,
+            });
+        }
+        if let Some(CodecTag::Fourcc(fourcc)) = &params.tag
+            && *fourcc != [0; 4]
+        {
+            return Ok(TrackCodec::Vfw {
+                fourcc: *fourcc,
+                bit_count: 24,
+            });
+        }
+    }
+    if audio {
+        if let Some((_, format_tag, bits)) = ACM_FORMATS.iter().find(|(c, _, _)| *c == id) {
+            return Ok(TrackCodec::Acm {
+                format_tag: *format_tag,
+                bits_per_sample: *bits,
+                pcm: true,
+            });
+        }
+        if let Some(CodecTag::WaveFormat(format_tag)) = &params.tag {
+            return Ok(TrackCodec::Acm {
+                format_tag: *format_tag,
+                bits_per_sample: stated_bits(params),
+                pcm: false,
+            });
+        }
+    }
+    Err(Error::unsupported(format!(
+        "Matroska muxer: codec '{id}' has no registered Matroska CodecID and no \
+         VFW FourCC / ACM wFormatTag to carry it under"
+    )))
+}
+
+/// Build the `V_MS/VFW/FOURCC` CodecPrivate: a `BITMAPINFOHEADER`
+/// (docs/container/vfw, §BITMAPINFOHEADER — 40 bytes, little-endian)
+/// followed by the codec's extradata. `biSize` counts the header plus
+/// that tail; `biHeight` is positive (required for compressed formats,
+/// bottom-up for BI_RGB); `biSizeImage` is the DWORD-aligned
+/// `stride * height` of a `biBitCount` picture.
+pub fn bitmapinfoheader(fourcc: [u8; 4], bit_count: u16, params: &CodecParameters) -> Vec<u8> {
+    let w = params.width.unwrap_or(0);
+    let h = params.height.unwrap_or(0);
+    let stride = ((u64::from(w) * u64::from(bit_count)).div_ceil(32) * 4) as u32;
+    let size_image = stride.saturating_mul(h);
+    let mut out = Vec::with_capacity(BITMAPINFOHEADER_LEN + params.extradata.len());
+    out.extend_from_slice(&((BITMAPINFOHEADER_LEN + params.extradata.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&(w.min(i32::MAX as u32) as i32).to_le_bytes());
+    out.extend_from_slice(&(h.min(i32::MAX as u32) as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    out.extend_from_slice(&bit_count.to_le_bytes());
+    out.extend_from_slice(&fourcc); // biCompression, FourCC chars in file order
+    out.extend_from_slice(&size_image.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+    out.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+    out.extend_from_slice(&params.extradata);
+    out
+}
+
+/// Build the `A_MS/ACM` CodecPrivate: a `WAVEFORMATEX` (wFormatTag,
+/// nChannels, nSamplesPerSec, nAvgBytesPerSec, nBlockAlign,
+/// wBitsPerSample, cbSize — 18 bytes little-endian) followed by
+/// `cbSize` = extradata bytes. For PCM / G.711, `nBlockAlign` is one
+/// sample frame and `nAvgBytesPerSec` the byte rate; otherwise
+/// `nAvgBytesPerSec` is the stated bit rate / 8 and `nBlockAlign` 0
+/// (not stated).
+pub fn waveformatex(
+    format_tag: u16,
+    bits_per_sample: u16,
+    pcm: bool,
+    params: &CodecParameters,
+) -> Result<Vec<u8>> {
+    let cb_size = u16::try_from(params.extradata.len()).map_err(|_| {
+        Error::invalid("Matroska muxer: A_MS/ACM extradata exceeds the 65535-byte cbSize")
+    })?;
+    let channels = params.channels.unwrap_or(0);
+    let rate = params.sample_rate.unwrap_or(0);
+    let (block_align, avg) = if pcm {
+        let ba = (u32::from(channels) * u32::from(bits_per_sample)).div_ceil(8);
+        (ba as u16, rate.saturating_mul(ba))
+    } else {
+        let avg = params
+            .bit_rate
+            .map(|b| (b / 8).min(u64::from(u32::MAX)) as u32)
+            .unwrap_or(0);
+        (0, avg)
+    };
+    let mut out = Vec::with_capacity(WAVEFORMATEX_LEN + params.extradata.len());
+    out.extend_from_slice(&format_tag.to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&avg.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits_per_sample.to_le_bytes());
+    out.extend_from_slice(&cb_size.to_le_bytes());
+    out.extend_from_slice(&params.extradata);
+    Ok(out)
 }
 
 #[cfg(test)]

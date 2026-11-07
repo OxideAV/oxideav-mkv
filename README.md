@@ -1968,6 +1968,45 @@ implemented for roundtrip:
 Unknown MKV codec IDs fall back to a pass-through `mkv:<raw-id>` form
 so the demuxer never hides an unrecognised track.
 
+**What the muxer writes** (`codec_id::plan_track_codec`, decided when
+the muxer is opened):
+
+1. the native CodecID above (the list is symmetric: every id the
+   demuxer maps, the muxer writes, `V_THEORA` included);
+2. a `CodecTag::Matroska` the stream carries, verbatim;
+3. a demuxer placeholder back to the id it was read under —
+   `mkv:<CodecID>` verbatim, `mkv:vfw:<FOURCC>` / `mkv:acm:0xHHHH`
+   through the compatibility track with that FourCC / tag — so a remux
+   of a track no codec claimed is lossless;
+4. `V_MS/VFW/FOURCC` (CodecPrivate = 40-byte `BITMAPINFOHEADER` +
+   extradata) for Motion JPEG (`MJPG`), Cinepak (`CVID`), HuffYUV
+   (`HFYU`), Lagarith (`LAGS`), 24-bit `BI_RGB` (`rgb24`), and any video
+   stream tagged with a FourCC; `A_MS/ACM` (CodecPrivate =
+   `WAVEFORMATEX` + `cbSize` extradata) for `pcm_u8` / `pcm_s24le` /
+   `pcm_s32le` / `pcm_f64le` / A-law / µ-law and any audio stream tagged
+   with a `wFormatTag`.
+
+Anything else is refused with `Error::Unsupported` at open — earlier
+releases wrote an unregistered `X_<codec id>` that no reader resolved
+(files carrying one still read back as `<codec id>`). Pinned by the
+49-row mux → demux → remux matrix in `tests/codec_id_matrix.rs`; the
+MJPEG / 24-bit PCM / A-law files it writes decode identically to their
+sources in `ffmpeg`.
+
+### Mid-stream shape changes
+
+A Matroska track header (`CodecID`, `CodecPrivate`, `PixelWidth` /
+`PixelHeight`, `SamplingFrequency`, `Channels`, `BitDepth`) states one
+shape for the whole Segment; RFC 9559 §23.2 places a change of codec or
+resolution at a Segment boundary. The core `Muxer` contract has no
+in-band parameters event — a `Frame::StreamParams` stops at the encoder
+(which re-configures or returns `Error::Unsupported`), and `Packet`
+carries no shape — so this muxer writes every track header from the
+`StreamInfo` it was opened with and cannot detect a later change. A
+caller that follows a shape change must finish this file
+(`write_trailer`) and open a new muxer for the new shape; the muxer
+never rewrites a header to match.
+
 ### Probes + registration
 
 - Registers both `"matroska"` and `"webm"` with the container registry.

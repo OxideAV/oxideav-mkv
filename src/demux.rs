@@ -12170,14 +12170,17 @@ impl MkvDemuxer {
         cluster_timecode: i64,
         _hint: bool,
     ) -> Result<()> {
-        // SimpleBlock: keyframe bit is bit 7 of flags byte.
-        // BlockGroup/Block has the same layout but no keyframe bit.
-        // We pass through whatever's set in the flags byte for SimpleBlock.
+        // SimpleBlock: keyframe bit is bit 7 of flags byte (RFC 9559
+        // §10.2 `KEY`, set when the Block contains only keyframes) and is
+        // the packet's keyframe flag as written — a SimpleBlock without
+        // it is a non-RAP (§10.4). BlockGroup/Block has the same
+        // layout but no keyframe bit; its caller defaults to keyframe and
+        // a `ReferenceBlock` clears it.
         // A SimpleBlock can never carry BlockAdditions (the element lives
         // only on BlockGroup, RFC 9559 §5.1.3.5.2) nor the BlockGroup meta
         // children (ReferenceBlock / ReferencePriority / CodecState /
         // DiscardPadding).
-        self.queue_block_packets_with(bytes, cluster_timecode, true, None, None, None)
+        self.queue_block_packets_with(bytes, cluster_timecode, false, None, None, None)
     }
 
     fn queue_block_packets_with(
