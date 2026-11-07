@@ -142,7 +142,7 @@ pub fn vfw_fourcc(codec_private: &[u8]) -> Option<[u8; 4]> {
 }
 
 /// The `WAVEFORMATEX` fields of an `A_MS/ACM` CodecPrivate.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct AcmFormat {
     /// `wFormatTag` as written (may be `0xFFFE`, WAVE_FORMAT_EXTENSIBLE).

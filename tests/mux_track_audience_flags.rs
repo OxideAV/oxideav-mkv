@@ -174,14 +174,8 @@ fn forced_explicit_zero_writes_element() {
     // to override a downstream tool that might infer something else).
     let streams = [video_stream(0)];
     let bytes = mux_with(&streams, |mx| {
-        mx.set_track_audience_flags(
-            0,
-            MkvTrackAudienceFlags {
-                forced: Some(false),
-                ..Default::default()
-            },
-        )
-        .expect("set_track_audience_flags");
+        mx.set_track_audience_flags(0, MkvTrackAudienceFlags::default().with_forced(Some(false)))
+            .expect("set_track_audience_flags");
     });
     assert!(
         contains_id2(&bytes, 0x55AA),
@@ -224,14 +218,13 @@ fn roundtrip_all_five_minver4_true() {
     let bytes = mux_with(&streams, |mx| {
         mx.set_track_audience_flags(
             1,
-            MkvTrackAudienceFlags {
-                forced: None,
-                hearing_impaired: Some(true),
-                visual_impaired: Some(true),
-                text_descriptions: Some(true),
-                original: Some(true),
-                commentary: Some(true),
-            },
+            MkvTrackAudienceFlags::default()
+                .with_forced(None)
+                .with_hearing_impaired(Some(true))
+                .with_visual_impaired(Some(true))
+                .with_text_descriptions(Some(true))
+                .with_original(Some(true))
+                .with_commentary(Some(true)),
         )
         .expect("set_track_audience_flags");
     });
@@ -262,10 +255,7 @@ fn explicit_false_distinct_from_absent() {
     let bytes = mux_with(&streams, |mx| {
         mx.set_track_audience_flags(
             0,
-            MkvTrackAudienceFlags {
-                hearing_impaired: Some(false),
-                ..Default::default()
-            },
+            MkvTrackAudienceFlags::default().with_hearing_impaired(Some(false)),
         )
         .expect("set_track_audience_flags");
     });
@@ -296,19 +286,14 @@ fn accepted_on_audio_and_video_tracks() {
     let bytes = mux_with(&streams, |mx| {
         mx.set_track_audience_flags(
             0,
-            MkvTrackAudienceFlags {
-                original: Some(true),
-                ..Default::default()
-            },
+            MkvTrackAudienceFlags::default().with_original(Some(true)),
         )
         .expect("video track accepts audience flags");
         mx.set_track_audience_flags(
             1,
-            MkvTrackAudienceFlags {
-                original: Some(true),
-                commentary: Some(true),
-                ..Default::default()
-            },
+            MkvTrackAudienceFlags::default()
+                .with_original(Some(true))
+                .with_commentary(Some(true)),
         )
         .expect("audio track accepts audience flags");
     });
@@ -387,11 +372,9 @@ fn accessor_returns_queued_value() {
     let streams = [video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer construct");
     assert_eq!(mx.track_audience_flags(0), None, "nothing queued yet");
-    let queued = MkvTrackAudienceFlags {
-        forced: Some(true),
-        original: Some(false),
-        ..Default::default()
-    };
+    let queued = MkvTrackAudienceFlags::default()
+        .with_forced(Some(true))
+        .with_original(Some(false));
     mx.set_track_audience_flags(0, queued).expect("queue");
     assert_eq!(mx.track_audience_flags(0), Some(queued));
     assert_eq!(mx.track_audience_flags(7), None, "out of range → None");

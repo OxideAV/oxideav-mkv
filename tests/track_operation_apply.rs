@@ -287,11 +287,7 @@ fn join_blocks_synthesises_the_virtual_stream() {
         );
         assert_eq!(
             *o,
-            Some(VirtualPacketOrigin {
-                virtual_stream: 2,
-                source_stream: *src,
-                role: VirtualPacketRole::Joined,
-            }),
+            Some(VirtualPacketOrigin::new(2, *src, VirtualPacketRole::Joined)),
             "virtual packet {i} origin"
         );
     }
@@ -347,20 +343,12 @@ fn dangling_self_and_multiple_consumers() {
     assert_eq!(pkts[1].0.stream_index, 1);
     assert_eq!(
         pkts[1].1,
-        Some(VirtualPacketOrigin {
-            virtual_stream: 1,
-            source_stream: 0,
-            role: VirtualPacketRole::Joined,
-        })
+        Some(VirtualPacketOrigin::new(1, 0, VirtualPacketRole::Joined))
     );
     assert_eq!(pkts[2].0.stream_index, 2);
     assert_eq!(
         pkts[2].1,
-        Some(VirtualPacketOrigin {
-            virtual_stream: 2,
-            source_stream: 0,
-            role: VirtualPacketRole::Joined,
-        })
+        Some(VirtualPacketOrigin::new(2, 0, VirtualPacketRole::Joined))
     );
     // All three carry the same bytes.
     assert!(pkts.iter().all(|(p, _)| p.data == vec![0x77]));
@@ -445,11 +433,7 @@ fn virtual_copy_shares_block_additions() {
     assert_eq!(copy.data, vec![0x42]);
     assert_eq!(
         dmx.virtual_packet_origin(),
-        Some(VirtualPacketOrigin {
-            virtual_stream: 1,
-            source_stream: 0,
-            role: VirtualPacketRole::Joined,
-        })
+        Some(VirtualPacketOrigin::new(1, 0, VirtualPacketRole::Joined))
     );
     let copy_adds: Vec<Vec<u8>> = dmx
         .block_additions()

@@ -1247,6 +1247,7 @@ pub enum SeekStrategy {
 /// What kind of damage a resilient demux recovered from — see
 /// [`DamageEvent`] and [`MkvDemuxer::damage_events`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DamageKind {
     /// A Top-Level master element (id given) failed to parse during the
     /// open-time Segment walk. Whatever the parser lifted before the
@@ -1340,6 +1341,7 @@ impl DamageEvent {
 /// Segment, so each claim can be checked against the Segment itself.
 /// The audit distinguishes the ways a claim can fail to hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CueLieKind {
     /// The `CueTrack` (RFC 9559 §5.1.5.1.2.1) names a track number no
     /// `TrackEntry` in this Segment declares — the classic remnant of a
@@ -1498,6 +1500,7 @@ const MAX_CUE_AUDIT_FINDINGS: usize = 4096;
 /// Segment itself. The stale shape is an index left behind by an edit
 /// that moved elements; the hostile shape is a forged one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SeekLieKind {
     /// The `Seek` master omitted its `minOccurs: 1` `SeekPosition`
     /// child (§5.1.1.1.2). Parse time already surfaces this via
@@ -2108,7 +2111,8 @@ struct SegmentInfo {
 /// of the element's data. Elements with no `CRC-32` child are not
 /// represented here — absence of a status means "no CRC to check,"
 /// which the spec explicitly permits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct CrcStatus {
     /// EBML element ID of the Top-Level master that carried the `CRC-32`
     /// child (e.g. [`ids::TRACKS`], [`ids::INFO`]).
@@ -2155,6 +2159,7 @@ impl CrcStatus {
 /// reverse walker would consume to step back across the previous
 /// Cluster.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClusterRecord {
     /// Absolute file offset of the Cluster's body (the byte right after
     /// its id+size header). Stable across re-seeks; used as the dedup
@@ -2302,6 +2307,7 @@ impl SeekEntry {
 /// [`next_uuid`]: SegmentLinking::next_uuid
 /// [`families`]: SegmentLinking::families
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SegmentLinking {
     /// `SegmentUUID` (RFC 9559 §5.1.2.1, id `0x73A4`) — the 128-bit UID
     /// identifying this Segment among others. Verbatim bytes (normally
@@ -2366,6 +2372,7 @@ impl SegmentLinking {
 /// SegmentUUID) without rewriting the opaque chapter-codec command data —
 /// only the mapping changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapterTranslate {
     /// `ChapterTranslateID` (RFC 9559 §5.1.2.8.1, id `0x69A5`,
     /// `minOccurs: 1`) — the binary value representing this Segment in the
@@ -2396,6 +2403,7 @@ pub struct ChapterTranslate {
 /// The `TrackEntry`-level twin of [`ChapterTranslate`] (the Segment-level
 /// mapping), surfaced per stream via [`MkvDemuxer::track_translates`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackTranslate {
     /// `TrackTranslateTrackID` (RFC 9559 §5.1.4.1.27.1, id `0x66A5`,
     /// `minOccurs: 1`) — the binary value the chapter codec uses to name
@@ -2447,6 +2455,7 @@ pub struct TrackTranslate {
 /// common case for a modern file, in which case the typed accessor returns
 /// `None` rather than a hollow record.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TrackLegacy {
     /// `CodecSettings` (RFC 9559 Appendix A.19, id `0x3A9697`, utf-8) — a
     /// string describing the encoding settings used. `None` when absent.
@@ -3530,7 +3539,8 @@ fn resolve_tags(
 /// surfaced in metadata corresponds to a [`SimpleTag`] inside one of these
 /// `Tag`s, but [`SimpleTag`] additionally preserves language, default
 /// flag, original case, and binary payloads that the flat view discards.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
+#[non_exhaustive]
 pub struct Tag {
     /// Scope of this tag — see [`Targets`] for the per-field semantics.
     pub targets: Targets,
@@ -3547,6 +3557,7 @@ pub struct Tag {
 /// global as far as scoping is concerned — those fields are purely
 /// informational display hints per RFC 9559 §5.1.8.1.1.1 / §5.1.8.1.1.2.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Targets {
     /// `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1). Default per spec is 50
     /// ("ALBUM / OPERA / CONCERT / MOVIE / EPISODE") but we surface
@@ -3673,6 +3684,7 @@ impl Targets {
 /// level so an unrecognised value doesn't break the comparison rule for
 /// the named ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum TargetLevel {
     /// `10` — `SHOT`. The lowest hierarchy found in music or movies.
     Shot,
@@ -3786,7 +3798,8 @@ pub enum TargetUid {
 /// `TagName` case (the flat view lower-cases) plus language metadata and
 /// binary-payload tags (e.g. cover-art bytes) that the legacy
 /// `(key, value)` view can't represent.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Default)]
+#[non_exhaustive]
 pub struct SimpleTag {
     /// `TagName` (RFC 9559 §5.1.8.1.2.1).
     pub name: String,
@@ -3849,6 +3862,7 @@ pub enum SimpleTagValue {
 /// being dropped — the spec lets a virtual track reference a track that a
 /// reader chose not to surface.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackOperation {
     /// Resolved `TrackCombinePlanes` planes, in on-disk order. Empty when
     /// the operation has no `TrackCombinePlanes` child.
@@ -3871,6 +3885,7 @@ impl TrackOperation {
 /// [`TrackOperation::planes`] list: a referenced video track plus the role
 /// it plays in the combined 3D track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrackPlane {
     /// The plane's source track, resolved from its `TrackPlaneUID`.
     pub track: TrackRef,
@@ -3878,8 +3893,16 @@ pub struct TrackPlane {
     pub plane_type: TrackPlaneType,
 }
 
+impl TrackPlane {
+    /// Build `TrackPlane` from every field, in declaration order.
+    pub fn new(track: TrackRef, plane_type: TrackPlaneType) -> Self {
+        Self { track, plane_type }
+    }
+}
+
 /// `TrackPlaneType` (RFC 9559 §5.1.4.1.30.4, Table 20).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TrackPlaneType {
     /// `0` — left eye.
     LeftEye,
@@ -3924,7 +3947,8 @@ impl TrackPlaneType {
 /// [`Demuxer::streams`](oxideav_core::Demuxer::streams) when the UID
 /// matches a track in the same Segment, or `None` for a dangling
 /// reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct TrackRef {
     /// The referenced `TrackUID` as stored in the file.
     pub track_uid: u64,
@@ -3948,6 +3972,7 @@ pub struct TrackRef {
 /// a caller feeding a stereoscopic `TrackCombinePlanes` track routes each
 /// packet to the decoder for its plane by matching `role`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VirtualPacketOrigin {
     /// Stream index of the virtual track the packet was synthesised for
     /// (always equal to the returned packet's `stream_index`).
@@ -3958,9 +3983,21 @@ pub struct VirtualPacketOrigin {
     pub role: VirtualPacketRole,
 }
 
+impl VirtualPacketOrigin {
+    /// Build `VirtualPacketOrigin` from every field, in declaration order.
+    pub fn new(virtual_stream: u32, source_stream: u32, role: VirtualPacketRole) -> Self {
+        Self {
+            virtual_stream,
+            source_stream,
+            role,
+        }
+    }
+}
+
 /// The `TrackOperation` reference kind behind a synthesised virtual-track
 /// packet — see [`VirtualPacketOrigin::role`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VirtualPacketRole {
     /// The source is a `TrackCombinePlanes > TrackPlane` reference (RFC
     /// 9559 §5.1.4.1.30.2): the packet carries one plane of the combined
@@ -4049,7 +4086,8 @@ fn build_virtual_consumers(
 ///
 /// Container-level only — the bytes inside `BlockAdditional` are not
 /// surfaced here; this just declares the *shape* of the side channel.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct BlockAdditionMapping {
     /// `BlockAddIDValue` (RFC 9559 §5.1.4.1.17.1) — the `BlockAddID`
     /// (§5.1.3.5.2.3) value this mapping describes. Range is "`>=2`"
@@ -4579,6 +4617,7 @@ pub struct TrackAudio {
 /// de-emphasis filters belongs to the cited external standards, not the
 /// container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioEmphasis {
     /// `0` — no emphasis (the spec default).
     NoEmphasis,
@@ -5156,6 +5195,7 @@ impl VideoInterlacing {
 /// `FlagInterlaced` (RFC 9559 §5.1.4.1.28.1, Table 3): whether the video
 /// track's frames are interlaced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum FlagInterlaced {
     /// `0` — interlacing status is unknown. Spec default; "SHOULD be
     /// avoided" per Table 3.
@@ -5202,6 +5242,7 @@ impl FlagInterlaced {
 /// [`FlagInterlaced::Interlaced`] — the spec is explicit that the element
 /// MUST be ignored otherwise.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FieldOrder {
     /// `0` — progressive. Table 4 marks this value as "SHOULD be avoided;
     /// setting FlagInterlaced to 2 is sufficient", but it's still a legal
@@ -5272,7 +5313,8 @@ impl FieldOrder {
 ///
 /// [`name`]: DocTypeExtension::name
 /// [`version`]: DocTypeExtension::version
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct DocTypeExtension {
     /// `DocTypeExtensionName` (RFC 8794 §11.2.10): the name distinguishing
     /// this extension from others of the same `DocType` + `DocTypeVersion`.
@@ -5298,7 +5340,8 @@ pub struct DocTypeExtension {
 /// for the common file that declares none).
 ///
 /// [`doc_type_extensions`]: EbmlHeader::doc_type_extensions
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct EbmlHeader {
     /// `EBMLVersion` (RFC 8794 §11.2.2): the version of EBML used to create the
     /// file. Spec default `1` materialised when absent.
@@ -5347,6 +5390,7 @@ pub struct EbmlHeader {
 /// "right eye is first" / "left eye is first" parenthetical phrasings.
 /// Per §18.10 odd values of StereoMode mean the left eye comes first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum StereoMode {
     /// `0` — mono (no stereo packing). Spec default.
     #[default]
@@ -5470,6 +5514,7 @@ impl StereoMode {
 /// modern file legitimately has no `OldStereoMode` at all. Values outside
 /// Table 7 pass through [`OldStereoMode::Other`] rather than being dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OldStereoMode {
     /// `0` — mono (no stereo packing).
     Mono,
@@ -5529,6 +5574,7 @@ impl OldStereoMode {
 /// additions, so any value outside Table 18 passes through the
 /// [`ProjectionType::Other`] variant rather than being dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ProjectionType {
     /// `0` — rectangular (flat) projection. Spec default; per §5.1.4.1.28.43
     /// `ProjectionPrivate` MUST NOT be present when this type is in effect.
@@ -5676,6 +5722,7 @@ impl Projection {
 /// additions. The §5.1.4.1.28.4 default `0` is materialised on the typed
 /// surface so an empty `Video` master decodes as `Some(AlphaMode::None)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum AlphaMode {
     /// `0` — no alpha-channel data. Spec default; either the
     /// `BlockAdditional` element with `BlockAddID=1` is absent, or it
@@ -5869,6 +5916,7 @@ impl VideoGeometry {
 /// outside the registered set surfaces via [`DisplayUnit::Other`] rather than
 /// being dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum DisplayUnit {
     /// `0` — display dimensions are in pixels. Spec default.
     #[default]
@@ -6052,6 +6100,7 @@ impl VideoColour {
 /// (with `3` reserved) — any other value surfaces via
 /// [`MatrixCoefficients::Other`] for forward compatibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatrixCoefficients {
     Identity,
     BT709,
@@ -6125,6 +6174,7 @@ impl MatrixCoefficients {
 
 /// `ChromaSitingHorz` (RFC 9559 §5.1.4.1.28.23, Table 13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ChromaSitingHorz {
     /// `0` — spec default.
     #[default]
@@ -6165,6 +6215,7 @@ impl ChromaSitingHorz {
 
 /// `ChromaSitingVert` (RFC 9559 §5.1.4.1.28.24, Table 14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ChromaSitingVert {
     /// `0` — spec default.
     #[default]
@@ -6206,6 +6257,7 @@ impl ChromaSitingVert {
 /// `Range` (RFC 9559 §5.1.4.1.28.25, Table 15): clipping of the colour
 /// ranges. Spec default `0` (*unspecified*).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ColourRange {
     /// `0` — spec default.
     #[default]
@@ -6251,6 +6303,7 @@ impl ColourRange {
 /// `TransferCharacteristics` (RFC 9559 §5.1.4.1.28.26, Table 16) — the
 /// transfer function the video uses; adopted from Table 3 of ITU-T H.273.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TransferCharacteristics {
     Reserved0,
     BT709,
@@ -6335,6 +6388,7 @@ impl TransferCharacteristics {
 /// `Primaries` (RFC 9559 §5.1.4.1.28.27, Table 17) — the colour primaries
 /// the video uses; adopted from Table 2 of ITU-T H.273.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Primaries {
     Reserved0,
     BT709,
@@ -6494,6 +6548,7 @@ impl MasteringMetadata {
 /// `encodings` is returned sorted by descending `order` so iterating it
 /// front-to-back is the spec-mandated *decode* order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentEncodings {
     /// Each [`ContentEncoding`], sorted by descending
     /// [`ContentEncoding::order`] (decode order — apply the first entry
@@ -6563,6 +6618,7 @@ fn compute_header_strip_prefix(enc: &ContentEncodings) -> Option<Vec<u8>> {
 /// One `ContentEncoding` (RFC 9559 §5.1.4.1.31.1): a single compression or
 /// encryption step in a track's [`ContentEncodings`] chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentEncoding {
     /// `ContentEncodingOrder` (§5.1.4.1.31.2, default 0). Encodings are
     /// applied to the data on *write* from lowest order to highest, so a
@@ -6573,6 +6629,21 @@ pub struct ContentEncoding {
     pub scope: ContentEncodingScope,
     /// The transformation itself — compression or encryption settings.
     pub transform: ContentEncodingTransform,
+}
+
+impl ContentEncoding {
+    /// Build `ContentEncoding` from every field, in declaration order.
+    pub fn new(
+        order: u64,
+        scope: ContentEncodingScope,
+        transform: ContentEncodingTransform,
+    ) -> Self {
+        Self {
+            order,
+            scope,
+            transform,
+        }
+    }
 }
 
 /// `ContentEncodingScope` (RFC 9559 §5.1.4.1.31.3, Table 21): a bit field
@@ -6641,6 +6712,7 @@ pub enum ContentEncodingTransform {
 /// `Option<u64>` rather than a synthesised enum. The container is a pure
 /// carrier: it never computes, verifies, or interprets a signature.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ContentSigning {
     /// `ContentSignature` (Appendix A.33, id `0x47E3`, binary): the
     /// cryptographic signature of the contents. `None` when absent.
@@ -6671,6 +6743,7 @@ impl ContentSigning {
 
 /// `ContentCompAlgo` (RFC 9559 §5.1.4.1.31.6, Table 23).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentCompAlgo {
     /// `0` — zlib (RFC 1950).
     Zlib,
@@ -6716,6 +6789,7 @@ impl ContentCompAlgo {
 
 /// `ContentEncAlgo` (RFC 9559 §5.1.4.1.31.9, Table 24).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentEncAlgo {
     /// `0` — not encrypted (signals only signing, per spec).
     None,
@@ -6768,6 +6842,7 @@ impl ContentEncAlgo {
 
 /// `AESSettingsCipherMode` (RFC 9559 §5.1.4.1.31.12, Table 26).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AesCipherMode {
     /// `1` — AES-CTR (counter mode).
     Ctr,
@@ -6811,6 +6886,7 @@ impl AesCipherMode {
 /// string; this typed view preserves the edition grouping, edition flags,
 /// nested chapters, and *all* multilingual [`ChapterDisplay`] rows.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Edition {
     /// `EditionUID` (RFC 9559 §5.1.7.1.1). `None` when the element was
     /// absent (it's optional); never zero (the spec bars 0).
@@ -6914,6 +6990,7 @@ impl Edition {
 /// `post-rfc9559-elements.md`) — a human-readable edition name in one or
 /// more languages. Part of [`Edition::displays`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EditionDisplay {
     /// `EditionString` (v5 element `0x4521`, utf-8, exactly one per
     /// `EditionDisplay`) — "the string to use as the edition name". May
@@ -6943,6 +7020,7 @@ pub struct EditionDisplay {
 /// skipped", whereas absence carries no assertion at all. Hence
 /// [`Chapter::skip_type`] is an `Option`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChapterSkipType {
     /// `0` — "Content which should not be skipped."
     NoSkipping,
@@ -7024,6 +7102,7 @@ impl ChapterSkipType {
 /// (default = 0); every other field is the zero-value equivalent of
 /// "element absent."
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Chapter {
     /// 1-based index across the whole `Chapters` element, assigned in
     /// document order (top-level then nested, depth-first). Matches the
@@ -7133,6 +7212,7 @@ impl Default for Chapter {
 /// One `ChapterDisplay` master (RFC 9559 §5.1.7.1.4.9) — a chapter title
 /// in one language. Part of [`Chapter::displays`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapterDisplay {
     /// `ChapString` (RFC 9559 §5.1.7.1.4.10) — the title text.
     pub string: String,
@@ -7156,6 +7236,7 @@ pub struct ChapterDisplay {
 /// container surfaces the raw payloads only — it never executes a chapter
 /// command. Part of [`Chapter::chap_processes`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapProcess {
     /// `ChapProcessCodecID` (RFC 9559 §5.1.7.1.4.15) — the chapter-codec
     /// type. Spec default is `0` (Matroska Script); materialised so
@@ -7175,6 +7256,7 @@ pub struct ChapProcess {
 /// chapter-codec command and when it should run. Part of
 /// [`ChapProcess::commands`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChapProcessCommand {
     /// `ChapProcessTime` (RFC 9559 §5.1.7.1.4.18) — when the command
     /// SHOULD be handled: `0` during the whole chapter, `1` before
@@ -7699,7 +7781,8 @@ fn parse_attached_file(
 /// same `N` used by the flat `attachment:N:*` metadata keys and by
 /// `tag:attachment:N:<name>` Tag scopes, so a caller can correlate the
 /// three views.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct Attachment {
     /// 1-based position of this attachment within the Segment's
     /// `Attachments` element. Matches the `N` in the corresponding
@@ -7819,6 +7902,7 @@ struct CueEntry {
 /// bit-exactly. Use the demuxer's `TimestampScale` (1 ms on our own muxer)
 /// to convert.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CuePoint {
     /// `CueTime` (RFC 9559 §5.1.5.1.1, id `0xB3`) — absolute timestamp of
     /// the seek point in Segment Ticks. `minOccurs: 1`; defaults to `0`
@@ -7833,6 +7917,7 @@ pub struct CuePoint {
 /// One `Cues > CuePoint > CueTrackPositions` (RFC 9559 §5.1.5.1.2): the
 /// position of a Block on one track at the parent [`CuePoint`]'s timestamp.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CueTrackPositions {
     /// `CueTrack` (RFC 9559 §5.1.5.1.2.1, id `0xF7`, `range: not 0`) — the
     /// track number this position is for.
@@ -7873,6 +7958,7 @@ pub struct CueTrackPositions {
 /// One `Cues > CuePoint > CueTrackPositions > CueReference` (RFC 9559
 /// §5.1.5.1.2.7): a reference to a Block the cue's Block depends on.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CueReference {
     /// `CueRefTime` (RFC 9559 §5.1.5.1.2.8, id `0x96`, `minOccurs: 1`) —
     /// the timestamp of the referenced Block in Segment Ticks. Defaults to

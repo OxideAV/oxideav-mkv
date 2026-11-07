@@ -161,20 +161,18 @@ fn header_with_two_extensions() {
     assert_eq!(h.ebml_max_id_length, 4);
     assert_eq!(h.ebml_max_size_length, 8);
     assert_eq!(h.doc_type_extensions.len(), 2);
-    assert_eq!(
-        h.doc_type_extensions[0],
-        DocTypeExtension {
-            name: "webmproject.org/mkv/dav1d".to_string(),
-            version: 4,
-        }
-    );
-    assert_eq!(
-        h.doc_type_extensions[1],
-        DocTypeExtension {
-            name: "my-experiment".to_string(),
-            version: 1,
-        }
-    );
+    assert_eq!(h.doc_type_extensions[0], {
+        let mut doc_type_extension = DocTypeExtension::default();
+        doc_type_extension.name = "webmproject.org/mkv/dav1d".to_string();
+        doc_type_extension.version = 4;
+        doc_type_extension
+    });
+    assert_eq!(h.doc_type_extensions[1], {
+        let mut doc_type_extension = DocTypeExtension::default();
+        doc_type_extension.name = "my-experiment".to_string();
+        doc_type_extension.version = 1;
+        doc_type_extension
+    });
 }
 
 /// Absent `DocTypeVersion` / `DocTypeReadVersion` materialise the RFC 8794
@@ -269,13 +267,17 @@ fn audio_stream() -> StreamInfo {
 #[test]
 fn mux_write_round_trips_through_demux() {
     let exts = vec![
-        DocTypeExtension {
-            name: "ext-alpha".to_string(),
-            version: 2,
+        {
+            let mut doc_type_extension = DocTypeExtension::default();
+            doc_type_extension.name = "ext-alpha".to_string();
+            doc_type_extension.version = 2;
+            doc_type_extension
         },
-        DocTypeExtension {
-            name: "ext-beta".to_string(),
-            version: 5,
+        {
+            let mut doc_type_extension = DocTypeExtension::default();
+            doc_type_extension.name = "ext-beta".to_string();
+            doc_type_extension.version = 5;
+            doc_type_extension
         },
     ];
 
@@ -341,18 +343,22 @@ fn mux_setter_validation() {
 
     // Empty name rejected.
     assert!(
-        mx.set_doc_type_extensions(vec![DocTypeExtension {
-            name: String::new(),
-            version: 1,
+        mx.set_doc_type_extensions(vec![{
+            let mut doc_type_extension = DocTypeExtension::default();
+            doc_type_extension.name = String::new();
+            doc_type_extension.version = 1;
+            doc_type_extension
         }])
         .is_err()
     );
 
     // Zero version rejected.
     assert!(
-        mx.set_doc_type_extensions(vec![DocTypeExtension {
-            name: "x".to_string(),
-            version: 0,
+        mx.set_doc_type_extensions(vec![{
+            let mut doc_type_extension = DocTypeExtension::default();
+            doc_type_extension.name = "x".to_string();
+            doc_type_extension.version = 0;
+            doc_type_extension
         }])
         .is_err()
     );
@@ -360,13 +366,17 @@ fn mux_setter_validation() {
     // Duplicate name rejected.
     assert!(
         mx.set_doc_type_extensions(vec![
-            DocTypeExtension {
-                name: "dup".to_string(),
-                version: 1,
+            {
+                let mut doc_type_extension = DocTypeExtension::default();
+                doc_type_extension.name = "dup".to_string();
+                doc_type_extension.version = 1;
+                doc_type_extension
             },
-            DocTypeExtension {
-                name: "dup".to_string(),
-                version: 2,
+            {
+                let mut doc_type_extension = DocTypeExtension::default();
+                doc_type_extension.name = "dup".to_string();
+                doc_type_extension.version = 2;
+                doc_type_extension
             },
         ])
         .is_err()
@@ -374,9 +384,11 @@ fn mux_setter_validation() {
 
     // A valid call still succeeds after the rejected ones.
     assert!(
-        mx.set_doc_type_extensions(vec![DocTypeExtension {
-            name: "ok".to_string(),
-            version: 1,
+        mx.set_doc_type_extensions(vec![{
+            let mut doc_type_extension = DocTypeExtension::default();
+            doc_type_extension.name = "ok".to_string();
+            doc_type_extension.version = 1;
+            doc_type_extension
         }])
         .is_ok()
     );
@@ -386,9 +398,11 @@ fn mux_setter_validation() {
     let mut mx2 = MkvMuxer::new_matroska(ws2, &[audio_stream()]).expect("muxer construct");
     mx2.write_header().expect("write_header");
     assert!(
-        mx2.set_doc_type_extensions(vec![DocTypeExtension {
-            name: "late".to_string(),
-            version: 1,
+        mx2.set_doc_type_extensions(vec![{
+            let mut doc_type_extension = DocTypeExtension::default();
+            doc_type_extension.name = "late".to_string();
+            doc_type_extension.version = 1;
+            doc_type_extension
         }])
         .is_err()
     );

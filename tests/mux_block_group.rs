@@ -109,29 +109,25 @@ fn roundtrip_all_block_group_children() {
         // explicitly.
         let mut kf = packet(0, 0, true, 0x11, 24);
         kf.duration = Some(40);
-        let kf_opts = BlockGroupOptions {
-            reference_priority: 3,
-            codec_state: Some(vec![0xC0, 0xDE, 0xC5]),
-            discard_padding: Some(7_000),
-            ..Default::default()
-        };
+        let kf_opts = BlockGroupOptions::default()
+            .with_reference_priority(3)
+            .with_codec_state(Some(vec![0xC0, 0xDE, 0xC5]))
+            .with_discard_padding(Some(7_000));
         mx.write_packet_with_block_group(&kf, &kf_opts)
             .expect("keyframe block group");
 
         // A non-keyframe with two explicit ReferenceBlocks, additions, and
         // negative DiscardPadding (beginning padding).
         let p = packet(0, 40, false, 0x22, 16);
-        let opts = BlockGroupOptions {
-            additions: vec![
+        let opts = BlockGroupOptions::default()
+            .with_additions(vec![
                 MkvBlockAddition::codec_defined(vec![0xAA; 6]),
                 MkvBlockAddition::new(2, vec![0xBB; 3]),
-            ],
-            reference_blocks: vec![-40, 0],
-            reference_priority: 0,
-            codec_state: None,
-            discard_padding: Some(-1_500),
-            ..Default::default()
-        };
+            ])
+            .with_reference_blocks(vec![-40, 0])
+            .with_reference_priority(0)
+            .with_codec_state(None)
+            .with_discard_padding(Some(-1_500));
         mx.write_packet_with_block_group(&p, &opts)
             .expect("non-keyframe block group");
     });
@@ -191,17 +187,14 @@ fn roundtrip_reclaimed_block_group_children() {
     let bytes = mux_with(&streams, |mx| {
         mx.write_header().expect("write_header");
         let p = packet(0, 0, true, 0x33, 20);
-        let opts = BlockGroupOptions {
-            block_virtual: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
-            reference_virtual: Some(-9_001),
-            slices: vec![
+        let opts = BlockGroupOptions::default()
+            .with_block_virtual(Some(vec![0xDE, 0xAD, 0xBE, 0xEF]))
+            .with_reference_virtual(Some(-9_001))
+            .with_slices(vec![
                 TimeSlice::from_fields(Some(0), Some(7), Some(2), Some(100), Some(200)),
-                // An empty TimeSlice still preserves the on-disk count.
                 TimeSlice::from_fields(None, None, None, None, None),
-            ],
-            reference_frame: Some(ReferenceFrame::from_fields(Some(4096), Some(33))),
-            ..Default::default()
-        };
+            ])
+            .with_reference_frame(Some(ReferenceFrame::from_fields(Some(4096), Some(33))));
         mx.write_packet_with_block_group(&p, &opts)
             .expect("legacy block group");
     });
@@ -238,10 +231,7 @@ fn discard_padding_only_group_needs_no_max_block_addition_id() {
         // DiscardPadding must not require it.
         mx.write_header().expect("write_header");
         let p = packet(0, 0, true, 0x33, 12);
-        let opts = BlockGroupOptions {
-            discard_padding: Some(2_000),
-            ..Default::default()
-        };
+        let opts = BlockGroupOptions::default().with_discard_padding(Some(2_000));
         mx.write_packet_with_block_group(&p, &opts)
             .expect("discard-padding-only group");
     });

@@ -152,14 +152,12 @@ const FONT_BYTES: &[u8] = b"\x00\x01OTTO\x00\x10test font\x00";
 fn attachments_round_trip_through_demuxer_metadata() {
     let attachments = vec![
         MkvAttachment::new("cover.jpg", "image/jpeg", COVER_BYTES.to_vec()),
-        MkvAttachment {
-            filename: "subset.otf".into(),
-            mime_type: "application/x-truetype-font".into(),
-            data: FONT_BYTES.to_vec(),
-            uid: Some(0xCAFE_F00D_DEAD_BEEF),
-            description: Some("Embedded subtitle font".into()),
-            ..Default::default()
-        },
+        MkvAttachment::default()
+            .with_filename("subset.otf".into())
+            .with_mime_type("application/x-truetype-font".into())
+            .with_data(FONT_BYTES.to_vec())
+            .with_uid(Some(0xCAFE_F00D_DEAD_BEEF))
+            .with_description(Some("Embedded subtitle font".into())),
     ];
     let bytes = mux_with_attachments_collect(&attachments);
 
@@ -199,14 +197,12 @@ fn attachments_round_trip_through_demuxer_metadata() {
 fn typed_attachments_accessor_round_trip_with_payload_fetch() {
     let attachments = vec![
         MkvAttachment::new("cover.jpg", "image/jpeg", COVER_BYTES.to_vec()),
-        MkvAttachment {
-            filename: "subset.otf".into(),
-            mime_type: "application/x-truetype-font".into(),
-            data: FONT_BYTES.to_vec(),
-            uid: Some(0xCAFE_F00D_DEAD_BEEF),
-            description: Some("Embedded subtitle font".into()),
-            ..Default::default()
-        },
+        MkvAttachment::default()
+            .with_filename("subset.otf".into())
+            .with_mime_type("application/x-truetype-font".into())
+            .with_data(FONT_BYTES.to_vec())
+            .with_uid(Some(0xCAFE_F00D_DEAD_BEEF))
+            .with_description(Some("Embedded subtitle font".into())),
     ];
     let bytes = mux_with_attachments_collect(&attachments);
 
@@ -247,12 +243,12 @@ fn attachments_master_sits_after_tracks_before_first_cluster() {
         let ws: Box<dyn WriteSeek> = Box::new(f);
         let stream = pcm_stream();
         let mut mx = MkvMuxer::new_matroska(ws, &[stream]).expect("muxer construct");
-        mx.add_chapter_full(MkvChapter {
-            time_start_ns: 0,
-            time_end_ns: Some(1_000_000_000),
-            display: Vec::new(),
-            ..Default::default()
-        })
+        mx.add_chapter_full(
+            MkvChapter::default()
+                .with_time_start_ns(0)
+                .with_time_end_ns(Some(1_000_000_000))
+                .with_display(Vec::new()),
+        )
         .expect("queue chapter");
         mx.add_attachment(MkvAttachment::new(
             "cover.jpg",
@@ -423,14 +419,12 @@ fn add_attachment_rejects_explicit_zero_uid() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let stream = pcm_stream();
     let mut mx = MkvMuxer::new_matroska(ws, &[stream]).expect("muxer construct");
-    let att = MkvAttachment {
-        filename: "x.bin".into(),
-        mime_type: "application/octet-stream".into(),
-        data: vec![0u8; 4],
-        uid: Some(0),
-        description: None,
-        ..Default::default()
-    };
+    let att = MkvAttachment::default()
+        .with_filename("x.bin".into())
+        .with_mime_type("application/octet-stream".into())
+        .with_data(vec![0u8; 4])
+        .with_uid(Some(0))
+        .with_description(None);
     let err = mx
         .add_attachment(att)
         .expect_err("uid=Some(0) violates §5.1.6.1.5 range: not 0");
@@ -468,14 +462,12 @@ fn empty_description_is_omitted_on_disk() {
     // FileDescription on disk — the demuxer's flat metadata view
     // hides empty strings as "no description present," and we want
     // the on-disk view to match.
-    let att = MkvAttachment {
-        filename: "x.bin".into(),
-        mime_type: "application/octet-stream".into(),
-        data: vec![0u8; 4],
-        uid: None,
-        description: Some("".into()),
-        ..Default::default()
-    };
+    let att = MkvAttachment::default()
+        .with_filename("x.bin".into())
+        .with_mime_type("application/octet-stream".into())
+        .with_data(vec![0u8; 4])
+        .with_uid(None)
+        .with_description(Some("".into()));
     let bytes = mux_with_attachments_collect(&[att]);
     let dmx = open_demuxer(bytes);
     let md: Vec<(String, String)> = dmx.metadata().to_vec();
@@ -494,16 +486,15 @@ fn reclaimed_divx_font_children_round_trip() {
     // reclaimed children. The muxer writes them through the new
     // `MkvAttachment` fields and the demuxer surfaces them verbatim on
     // the typed `Attachment` accessor.
-    let att = MkvAttachment {
-        filename: "divx.ttf".into(),
-        mime_type: "application/x-truetype-font".into(),
-        data: FONT_BYTES.to_vec(),
-        uid: Some(0x1234_5678),
-        description: None,
-        referral: Some(b"\xDE\xAD\xBE\xEF".to_vec()),
-        used_start_time: Some(1_000_000),
-        used_end_time: Some(9_500_000),
-    };
+    let att = MkvAttachment::default()
+        .with_filename("divx.ttf".into())
+        .with_mime_type("application/x-truetype-font".into())
+        .with_data(FONT_BYTES.to_vec())
+        .with_uid(Some(0x1234_5678))
+        .with_description(None)
+        .with_referral(Some(b"\xDE\xAD\xBE\xEF".to_vec()))
+        .with_used_start_time(Some(1_000_000))
+        .with_used_end_time(Some(9_500_000));
     let bytes = mux_with_attachments_collect(&[att]);
     let dmx = open_typed(bytes);
     let atts = dmx.attachments().to_vec();
@@ -534,16 +525,15 @@ fn reclaimed_children_absent_when_not_supplied() {
 fn reclaimed_used_times_zero_round_trips_as_some_zero() {
     // A present explicit `0` must survive as `Some(0)`, distinct from an
     // absent element (`None`), so a re-mux reproduces the on-disk shape.
-    let att = MkvAttachment {
-        filename: "f.ttf".into(),
-        mime_type: "application/x-truetype-font".into(),
-        data: FONT_BYTES.to_vec(),
-        uid: None,
-        description: None,
-        referral: None,
-        used_start_time: Some(0),
-        used_end_time: Some(0),
-    };
+    let att = MkvAttachment::default()
+        .with_filename("f.ttf".into())
+        .with_mime_type("application/x-truetype-font".into())
+        .with_data(FONT_BYTES.to_vec())
+        .with_uid(None)
+        .with_description(None)
+        .with_referral(None)
+        .with_used_start_time(Some(0))
+        .with_used_end_time(Some(0));
     let bytes = mux_with_attachments_collect(&[att]);
     let dmx = open_typed(bytes);
     let a = &dmx.attachments()[0];
@@ -556,16 +546,15 @@ fn reclaimed_used_times_zero_round_trips_as_some_zero() {
 fn reclaimed_empty_referral_round_trips_as_some_empty() {
     // `Some(vec![])` referral emits a zero-length binary element and must
     // survive as `Some(vec![])`, not collapse to `None`.
-    let att = MkvAttachment {
-        filename: "f.ttf".into(),
-        mime_type: "application/x-truetype-font".into(),
-        data: FONT_BYTES.to_vec(),
-        uid: None,
-        description: None,
-        referral: Some(Vec::new()),
-        used_start_time: None,
-        used_end_time: None,
-    };
+    let att = MkvAttachment::default()
+        .with_filename("f.ttf".into())
+        .with_mime_type("application/x-truetype-font".into())
+        .with_data(FONT_BYTES.to_vec())
+        .with_uid(None)
+        .with_description(None)
+        .with_referral(Some(Vec::new()))
+        .with_used_start_time(None)
+        .with_used_end_time(None);
     let bytes = mux_with_attachments_collect(&[att]);
     let dmx = open_typed(bytes);
     let a = &dmx.attachments()[0];

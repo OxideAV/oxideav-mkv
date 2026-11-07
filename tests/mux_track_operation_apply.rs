@@ -130,11 +130,11 @@ fn muxed_stereo_3d_reapplies() {
         assert_eq!(p.data, vec![*payload; 4], "virtual packet {i} bytes");
         assert_eq!(
             *o,
-            Some(VirtualPacketOrigin {
-                virtual_stream: 2,
-                source_stream: *src,
-                role: VirtualPacketRole::Plane(*plane),
-            }),
+            Some(VirtualPacketOrigin::new(
+                2,
+                *src,
+                VirtualPacketRole::Plane(*plane)
+            )),
             "virtual packet {i} origin"
         );
     }

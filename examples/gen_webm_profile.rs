@@ -41,10 +41,11 @@ fn main() {
     mux.add_chapter(0, Some(4_000_000_000), "Intro").unwrap();
     mux.add_tag(MkvTag::global("TITLE", "webm profile demo"))
         .unwrap();
-    mux.add_tag(MkvTag {
-        targets: MkvTagTargets::track(1),
-        simple_tags: vec![MkvSimpleTag::new("ENCODER_SETTINGS", "none")],
-    })
+    mux.add_tag(
+        MkvTag::default()
+            .with_targets(MkvTagTargets::track(1))
+            .with_simple_tags(vec![MkvSimpleTag::new("ENCODER_SETTINGS", "none")]),
+    )
     .unwrap();
     if front_cues {
         mux.with_front_cues(4096).unwrap();

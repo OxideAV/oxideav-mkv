@@ -155,10 +155,9 @@ fn both_children_roundtrip_on_video() {
     let dmx = demux_typed(mux_one(video_stream(), |mx| {
         mx.set_track_codec_timing(
             0,
-            MkvTrackCodecTiming {
-                codec_delay: Some(3_250_000),
-                seek_pre_roll: Some(80_000_000),
-            },
+            MkvTrackCodecTiming::default()
+                .with_codec_delay(Some(3_250_000))
+                .with_seek_pre_roll(Some(80_000_000)),
         )
         .expect("set_track_codec_timing");
     }));

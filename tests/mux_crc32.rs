@@ -140,17 +140,16 @@ fn info_tracks_cues_carry_valid_crc() {
 
 #[test]
 fn chapters_master_carries_valid_crc_when_present() {
-    let chap = MkvChapter {
-        time_start_ns: 0,
-        time_end_ns: Some(500_000_000),
-        display: vec![ChapterDisplay {
-            title: "Intro".into(),
-            language: "eng".into(),
-            country: None,
-            language_bcp47: None,
-        }],
-        ..Default::default()
-    };
+    let chap = MkvChapter::default()
+        .with_time_start_ns(0)
+        .with_time_end_ns(Some(500_000_000))
+        .with_display(vec![
+            ChapterDisplay::default()
+                .with_title("Intro".into())
+                .with_language("eng".into())
+                .with_country(None)
+                .with_language_bcp47(None),
+        ]);
     let bytes = mux_minimal(std::slice::from_ref(&chap), &[]);
     let statuses = collect_crc_statuses(bytes);
     let chapters_status = statuses

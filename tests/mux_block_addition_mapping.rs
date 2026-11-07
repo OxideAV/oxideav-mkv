@@ -95,11 +95,13 @@ fn demux(bytes: Vec<u8>) -> oxideav_mkv::demux::MkvDemuxer {
 
 #[test]
 fn full_mapping_roundtrips() {
-    let mapping = BlockAdditionMapping {
-        value: Some(4),
-        name: Some("dolby-vision-rpu".to_string()),
-        addid_type: 0x1_2345,
-        extra_data: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+    let mapping = {
+        let mut block_addition_mapping = BlockAdditionMapping::default();
+        block_addition_mapping.value = Some(4);
+        block_addition_mapping.name = Some("dolby-vision-rpu".to_string());
+        block_addition_mapping.addid_type = 0x1_2345;
+        block_addition_mapping.extra_data = Some(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        block_addition_mapping
     };
     let dmx = demux(mux_video(|mx| {
         mx.set_block_addition_mappings(0, vec![mapping.clone()])
@@ -113,17 +115,21 @@ fn full_mapping_roundtrips() {
 
 #[test]
 fn multiple_mappings_preserve_order() {
-    let m1 = BlockAdditionMapping {
-        value: Some(2),
-        name: None,
-        addid_type: 5,
-        extra_data: None,
+    let m1 = {
+        let mut block_addition_mapping = BlockAdditionMapping::default();
+        block_addition_mapping.value = Some(2);
+        block_addition_mapping.name = None;
+        block_addition_mapping.addid_type = 5;
+        block_addition_mapping.extra_data = None;
+        block_addition_mapping
     };
-    let m2 = BlockAdditionMapping {
-        value: Some(3),
-        name: Some("second".to_string()),
-        addid_type: 7,
-        extra_data: Some(vec![0x01]),
+    let m2 = {
+        let mut block_addition_mapping = BlockAdditionMapping::default();
+        block_addition_mapping.value = Some(3);
+        block_addition_mapping.name = Some("second".to_string());
+        block_addition_mapping.addid_type = 7;
+        block_addition_mapping.extra_data = Some(vec![0x01]);
+        block_addition_mapping
     };
     let dmx = demux(mux_video(|mx| {
         mx.set_block_addition_mappings(0, vec![m1.clone(), m2.clone()])
@@ -138,11 +144,13 @@ fn default_type_zero_stays_off_disk_but_roundtrips() {
     // addid_type 0 is the §5.1.4.1.17.3 default; per the usage note a
     // codec-defined mapping pairs with BlockAddIDValue 1. The BlockAddIDType
     // child stays off-disk, yet decodes back to 0.
-    let mapping = BlockAdditionMapping {
-        value: Some(1),
-        name: None,
-        addid_type: 0,
-        extra_data: None,
+    let mapping = {
+        let mut block_addition_mapping = BlockAdditionMapping::default();
+        block_addition_mapping.value = Some(1);
+        block_addition_mapping.name = None;
+        block_addition_mapping.addid_type = 0;
+        block_addition_mapping.extra_data = None;
+        block_addition_mapping
     };
     let bytes = mux_video(|mx| {
         mx.set_block_addition_mappings(0, vec![mapping.clone()])
@@ -179,11 +187,13 @@ fn empty_slice_clears_and_accessor_reflects() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[video_stream()]).expect("construct");
     assert!(mx.block_addition_mappings(0).is_empty());
-    let m = BlockAdditionMapping {
-        value: Some(2),
-        name: None,
-        addid_type: 3,
-        extra_data: None,
+    let m = {
+        let mut block_addition_mapping = BlockAdditionMapping::default();
+        block_addition_mapping.value = Some(2);
+        block_addition_mapping.name = None;
+        block_addition_mapping.addid_type = 3;
+        block_addition_mapping.extra_data = None;
+        block_addition_mapping
     };
     mx.set_block_addition_mappings(0, vec![m.clone()]).unwrap();
     assert_eq!(mx.block_addition_mappings(0), [m].as_slice());

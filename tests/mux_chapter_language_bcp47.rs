@@ -66,12 +66,12 @@ fn mux_with_display(disp: ChapterDisplay) -> Vec<u8> {
         let f = std::fs::File::create(&tmp).expect("create tmp");
         let ws: Box<dyn WriteSeek> = Box::new(f);
         let mut mx = MkvMuxer::new_matroska(ws, &[pcm_stream()]).expect("muxer construct");
-        mx.add_chapter_full(MkvChapter {
-            time_start_ns: 0,
-            time_end_ns: Some(1_000_000),
-            display: vec![disp],
-            ..Default::default()
-        })
+        mx.add_chapter_full(
+            MkvChapter::default()
+                .with_time_start_ns(0)
+                .with_time_end_ns(Some(1_000_000))
+                .with_display(vec![disp]),
+        )
         .expect("add_chapter_full");
         mx.write_header().expect("write_header");
         mx.write_packet(&audio_packet()).expect("packet");
@@ -95,12 +95,13 @@ fn has_pair(bytes: &[u8], b0: u8, b1: u8) -> bool {
 
 #[test]
 fn bcp47_tag_roundtrips_and_suppresses_chaplanguage() {
-    let bytes = mux_with_display(ChapterDisplay {
-        title: "Intro".into(),
-        language: "eng".into(),
-        country: None,
-        language_bcp47: Some("en-US".into()),
-    });
+    let bytes = mux_with_display(
+        ChapterDisplay::default()
+            .with_title("Intro".into())
+            .with_language("eng".into())
+            .with_country(None)
+            .with_language_bcp47(Some("en-US".into())),
+    );
     assert!(
         has_pair(&bytes, 0x43, 0x7D),
         "ChapLanguageBCP47 must be on disk"
@@ -119,12 +120,13 @@ fn bcp47_tag_roundtrips_and_suppresses_chaplanguage() {
 
 #[test]
 fn no_bcp47_writes_chaplanguage_and_surfaces_none() {
-    let bytes = mux_with_display(ChapterDisplay {
-        title: "Verse".into(),
-        language: "jpn".into(),
-        country: Some("jp".into()),
-        language_bcp47: None,
-    });
+    let bytes = mux_with_display(
+        ChapterDisplay::default()
+            .with_title("Verse".into())
+            .with_language("jpn".into())
+            .with_country(Some("jp".into()))
+            .with_language_bcp47(None),
+    );
     assert!(
         has_pair(&bytes, 0x43, 0x7C),
         "ChapLanguage must be written when no BCP-47 tag is set"

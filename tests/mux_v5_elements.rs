@@ -124,36 +124,31 @@ fn no_v5_elements_keeps_doc_type_version_4() {
 #[test]
 fn full_v5_surface_round_trips_and_declares_version_5() {
     let bytes = mux(|mx| {
-        mx.add_chapter_full(MkvChapter {
-            time_start_ns: 0,
-            time_end_ns: Some(30_000_000_000),
-            skip_type: Some(ChapterSkipType::OpeningCredits),
-            ..Default::default()
-        })
+        mx.add_chapter_full(
+            MkvChapter::default()
+                .with_time_start_ns(0)
+                .with_time_end_ns(Some(30_000_000_000))
+                .with_skip_type(Some(ChapterSkipType::OpeningCredits)),
+        )
         .unwrap();
-        mx.add_chapter_full(MkvChapter {
-            time_start_ns: 30_000_000_000,
-            skip_type: None,
-            ..Default::default()
-        })
+        mx.add_chapter_full(
+            MkvChapter::default()
+                .with_time_start_ns(30_000_000_000)
+                .with_skip_type(None),
+        )
         .unwrap();
         mx.set_edition_displays(vec![
-            MkvEditionDisplay {
-                string: "Director's Cut".into(),
-                languages: vec!["en".into(), "en-US".into()],
-            },
-            MkvEditionDisplay {
-                string: "".into(),
-                languages: vec![],
-            },
+            MkvEditionDisplay::default()
+                .with_string("Director's Cut".into())
+                .with_languages(vec!["en".into(), "en-US".into()]),
+            MkvEditionDisplay::default()
+                .with_string("".into())
+                .with_languages(vec![]),
         ])
         .unwrap();
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                emphasis: Some(AudioEmphasis::CdAudio),
-                ..Default::default()
-            },
+            MkvTrackAudio::default().with_emphasis(Some(AudioEmphasis::CdAudio)),
         )
         .unwrap();
         let mut tag = MkvTag::global("MAPPING_NOTE", "v");
@@ -212,10 +207,7 @@ fn no_emphasis_hint_stays_v4_and_off_disk() {
     let dmx = demux(mux(|mx| {
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                emphasis: Some(AudioEmphasis::NoEmphasis),
-                ..Default::default()
-            },
+            MkvTrackAudio::default().with_emphasis(Some(AudioEmphasis::NoEmphasis)),
         )
         .unwrap();
     }));
@@ -236,10 +228,7 @@ fn closed_enumerations_rejected_at_queue_time() {
     assert_err(
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                emphasis: Some(AudioEmphasis::Reserved),
-                ..Default::default()
-            },
+            MkvTrackAudio::default().with_emphasis(Some(AudioEmphasis::Reserved)),
         ),
         "reserved emphasis",
     );
@@ -247,27 +236,20 @@ fn closed_enumerations_rejected_at_queue_time() {
     assert_err(
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                emphasis: Some(AudioEmphasis::Unknown(7)),
-                ..Default::default()
-            },
+            MkvTrackAudio::default().with_emphasis(Some(AudioEmphasis::Unknown(7))),
         ),
         "unassigned emphasis",
     );
     // ChapterSkipType 8+ is outside the closed 0..=7 enumeration.
     assert_err(
-        mx.add_chapter_full(MkvChapter {
-            skip_type: Some(ChapterSkipType::Unknown(8)),
-            ..Default::default()
-        }),
+        mx.add_chapter_full(
+            MkvChapter::default().with_skip_type(Some(ChapterSkipType::Unknown(8))),
+        ),
         "unknown skip type",
     );
     // Intermission (7) — the post-RFC addition — is writable.
-    mx.add_chapter_full(MkvChapter {
-        skip_type: Some(ChapterSkipType::Intermission),
-        ..Default::default()
-    })
-    .unwrap();
+    mx.add_chapter_full(MkvChapter::default().with_skip_type(Some(ChapterSkipType::Intermission)))
+        .unwrap();
 }
 
 #[test]
@@ -278,19 +260,15 @@ fn webm_rejects_all_v5_write_surfaces() {
         "webm edition displays",
     );
     assert_err(
-        mx.add_chapter_full(MkvChapter {
-            skip_type: Some(ChapterSkipType::EndCredits),
-            ..Default::default()
-        }),
+        mx.add_chapter_full(
+            MkvChapter::default().with_skip_type(Some(ChapterSkipType::EndCredits)),
+        ),
         "webm skip type",
     );
     assert_err(
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                emphasis: Some(AudioEmphasis::Fm50),
-                ..Default::default()
-            },
+            MkvTrackAudio::default().with_emphasis(Some(AudioEmphasis::Fm50)),
         ),
         "webm emphasis",
     );
@@ -311,10 +289,7 @@ fn webm_rejects_all_v5_write_surfaces() {
     let mut mx = webm_muxer();
     mx.set_track_audio(
         0,
-        MkvTrackAudio {
-            emphasis: Some(AudioEmphasis::NoEmphasis),
-            ..Default::default()
-        },
+        MkvTrackAudio::default().with_emphasis(Some(AudioEmphasis::NoEmphasis)),
     )
     .unwrap();
 }

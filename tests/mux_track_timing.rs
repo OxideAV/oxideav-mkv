@@ -133,11 +133,10 @@ fn all_three_children_roundtrip() {
     let dmx = demux_typed(mux_video(|mx| {
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                default_duration: Some(33_366_666),
-                default_decoded_field_duration: Some(16_683_333),
-                track_timestamp_scale: Some(2.0),
-            },
+            MkvTrackTiming::default()
+                .with_default_duration(Some(33_366_666))
+                .with_default_decoded_field_duration(Some(16_683_333))
+                .with_track_timestamp_scale(Some(2.0)),
         )
         .expect("set_track_timing");
     }));
@@ -155,10 +154,7 @@ fn nominal_frame_rate_from_default_duration() {
     let dmx = demux_typed(mux_video(|mx| {
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                default_duration: Some(41_708_333),
-                ..Default::default()
-            },
+            MkvTrackTiming::default().with_default_duration(Some(41_708_333)),
         )
         .expect("set_track_timing");
     }));
@@ -206,10 +202,7 @@ fn timestamp_scale_default_materialised_distinct_from_explicit() {
     let with = mux_video(|mx| {
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                track_timestamp_scale: Some(1.0),
-                ..Default::default()
-            },
+            MkvTrackTiming::default().with_track_timestamp_scale(Some(1.0)),
         )
         .unwrap();
     });
@@ -253,10 +246,7 @@ fn no_track_type_restriction() {
         let mut mx = MkvMuxer::new_matroska(ws, &[audio_stream()]).expect("muxer construct");
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                default_duration: Some(20_000_000),
-                ..Default::default()
-            },
+            MkvTrackTiming::default().with_default_duration(Some(20_000_000)),
         )
         .expect("set_track_timing on audio track must succeed");
         mx.write_header().expect("write_header");
@@ -317,14 +307,8 @@ fn rejects_out_of_range_values() {
     // DefaultDuration must be != 0.
     let mut mx = make();
     assert!(
-        mx.set_track_timing(
-            0,
-            MkvTrackTiming {
-                default_duration: Some(0),
-                ..Default::default()
-            }
-        )
-        .is_err()
+        mx.set_track_timing(0, MkvTrackTiming::default().with_default_duration(Some(0)))
+            .is_err()
     );
 
     // DefaultDecodedFieldDuration must be != 0.
@@ -332,10 +316,7 @@ fn rejects_out_of_range_values() {
     assert!(
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                default_decoded_field_duration: Some(0),
-                ..Default::default()
-            }
+            MkvTrackTiming::default().with_default_decoded_field_duration(Some(0))
         )
         .is_err()
     );
@@ -345,10 +326,7 @@ fn rejects_out_of_range_values() {
     assert!(
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                track_timestamp_scale: Some(0.0),
-                ..Default::default()
-            }
+            MkvTrackTiming::default().with_track_timestamp_scale(Some(0.0))
         )
         .is_err()
     );
@@ -356,10 +334,7 @@ fn rejects_out_of_range_values() {
     assert!(
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                track_timestamp_scale: Some(-1.0),
-                ..Default::default()
-            }
+            MkvTrackTiming::default().with_track_timestamp_scale(Some(-1.0))
         )
         .is_err()
     );
@@ -367,10 +342,7 @@ fn rejects_out_of_range_values() {
     assert!(
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                track_timestamp_scale: Some(f64::NAN),
-                ..Default::default()
-            }
+            MkvTrackTiming::default().with_track_timestamp_scale(Some(f64::NAN))
         )
         .is_err()
     );
@@ -394,11 +366,9 @@ fn last_write_wins() {
             .unwrap();
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                default_duration: Some(16_666_666),
-                track_timestamp_scale: Some(0.5),
-                ..Default::default()
-            },
+            MkvTrackTiming::default()
+                .with_default_duration(Some(16_666_666))
+                .with_track_timestamp_scale(Some(0.5)),
         )
         .unwrap();
     }));

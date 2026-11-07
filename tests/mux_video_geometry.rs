@@ -241,15 +241,14 @@ fn display_unit_other_forward_compat_roundtrip() {
     // a never-registered value with DisplayUnit::Other(v) must
     // round-trip verbatim.
     let bytes = mux_video(|mx| {
-        let g = MkvVideoGeometry {
-            crop_top: 0,
-            crop_bottom: 0,
-            crop_left: 0,
-            crop_right: 0,
-            display_width: Some(42),
-            display_height: Some(7),
-            display_unit: DisplayUnit::Other(42),
-        };
+        let g = MkvVideoGeometry::default()
+            .with_crop_top(0)
+            .with_crop_bottom(0)
+            .with_crop_left(0)
+            .with_crop_right(0)
+            .with_display_width(Some(42))
+            .with_display_height(Some(7))
+            .with_display_unit(DisplayUnit::Other(42));
         mx.set_video_geometry(0, g).expect("set_video_geometry");
     });
     let dmx = demux_typed(bytes);
@@ -265,15 +264,14 @@ fn display_unit_centimeters_roundtrip() {
     // demuxer does not derive defaults for the display dimensions when
     // they are absent. We supply explicit values here.
     let bytes = mux_video(|mx| {
-        let g = MkvVideoGeometry {
-            crop_top: 0,
-            crop_bottom: 0,
-            crop_left: 0,
-            crop_right: 0,
-            display_width: Some(40),
-            display_height: Some(22),
-            display_unit: DisplayUnit::Centimeters,
-        };
+        let g = MkvVideoGeometry::default()
+            .with_crop_top(0)
+            .with_crop_bottom(0)
+            .with_crop_left(0)
+            .with_crop_right(0)
+            .with_display_width(Some(40))
+            .with_display_height(Some(22))
+            .with_display_unit(DisplayUnit::Centimeters);
         mx.set_video_geometry(0, g).expect("set_video_geometry");
     });
     let dmx = demux_typed(bytes);
@@ -292,15 +290,14 @@ fn aspect_ratio_unit_with_absent_dimensions_yields_none() {
     // shape someone configuring DAR without explicit dimensions would
     // use, even though it is rarely useful in practice.
     let bytes = mux_video(|mx| {
-        let g = MkvVideoGeometry {
-            crop_top: 0,
-            crop_bottom: 0,
-            crop_left: 0,
-            crop_right: 0,
-            display_width: None,
-            display_height: None,
-            display_unit: DisplayUnit::DisplayAspectRatio,
-        };
+        let g = MkvVideoGeometry::default()
+            .with_crop_top(0)
+            .with_crop_bottom(0)
+            .with_crop_left(0)
+            .with_crop_right(0)
+            .with_display_width(None)
+            .with_display_height(None)
+            .with_display_unit(DisplayUnit::DisplayAspectRatio);
         mx.set_video_geometry(0, g).expect("set_video_geometry");
     });
     let dmx = demux_typed(bytes);
@@ -363,15 +360,14 @@ fn display_width_zero_rejected() {
     let f = std::fs::File::create(&tmp).expect("create tmp");
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[video_stream_1920x1080()]).expect("muxer construct");
-    let g = MkvVideoGeometry {
-        crop_top: 0,
-        crop_bottom: 0,
-        crop_left: 0,
-        crop_right: 0,
-        display_width: Some(0),
-        display_height: Some(1080),
-        display_unit: DisplayUnit::Pixels,
-    };
+    let g = MkvVideoGeometry::default()
+        .with_crop_top(0)
+        .with_crop_bottom(0)
+        .with_crop_left(0)
+        .with_crop_right(0)
+        .with_display_width(Some(0))
+        .with_display_height(Some(1080))
+        .with_display_unit(DisplayUnit::Pixels);
     let res = mx.set_video_geometry(0, g);
     let Err(err) = res else {
         panic!("expected display_width Some(0) to be rejected");
@@ -386,15 +382,14 @@ fn display_height_zero_rejected() {
     let f = std::fs::File::create(&tmp).expect("create tmp");
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[video_stream_1920x1080()]).expect("muxer construct");
-    let g = MkvVideoGeometry {
-        crop_top: 0,
-        crop_bottom: 0,
-        crop_left: 0,
-        crop_right: 0,
-        display_width: Some(1920),
-        display_height: Some(0),
-        display_unit: DisplayUnit::Pixels,
-    };
+    let g = MkvVideoGeometry::default()
+        .with_crop_top(0)
+        .with_crop_bottom(0)
+        .with_crop_left(0)
+        .with_crop_right(0)
+        .with_display_width(Some(1920))
+        .with_display_height(Some(0))
+        .with_display_unit(DisplayUnit::Pixels);
     let res = mx.set_video_geometry(0, g);
     let Err(err) = res else {
         panic!("expected display_height Some(0) to be rejected");
@@ -443,15 +438,14 @@ fn display_unit_pixels_default_keeps_element_off_disk() {
     // carry an explicit DisplayUnit stays byte-faithful to the common
     // case. The demuxer materialises the default regardless.
     let bytes = mux_video(|mx| {
-        let g = MkvVideoGeometry {
-            crop_top: 0,
-            crop_bottom: 0,
-            crop_left: 0,
-            crop_right: 0,
-            display_width: Some(1280),
-            display_height: Some(720),
-            display_unit: DisplayUnit::Pixels,
-        };
+        let g = MkvVideoGeometry::default()
+            .with_crop_top(0)
+            .with_crop_bottom(0)
+            .with_crop_left(0)
+            .with_crop_right(0)
+            .with_display_width(Some(1280))
+            .with_display_height(Some(720))
+            .with_display_unit(DisplayUnit::Pixels);
         mx.set_video_geometry(0, g).expect("set_video_geometry");
     });
     // DisplayUnit (0x54B2) is omitted for the Pixels default.

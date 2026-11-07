@@ -256,15 +256,14 @@ fn all_sub_elements_round_trip() {
     assert_eq!(p.codec_state, 0x1234);
     assert_eq!(p.references.len(), 1);
     let r = &p.references[0];
-    assert_eq!(
-        r,
-        &CueReference {
-            ref_time: 200,
-            ref_cluster: Some(0x1500),
-            ref_number: Some(2),
-            ref_codec_state: Some(0x99),
-        }
-    );
+    assert_eq!(r, &{
+        let mut cue_reference = CueReference::default();
+        cue_reference.ref_time = 200;
+        cue_reference.ref_cluster = Some(0x1500);
+        cue_reference.ref_number = Some(2);
+        cue_reference.ref_codec_state = Some(0x99);
+        cue_reference
+    });
 }
 
 #[test]

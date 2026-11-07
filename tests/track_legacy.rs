@@ -283,13 +283,11 @@ fn single_field_is_not_empty() {
 
     let leg = dmx.track_legacy(0).expect("legacy record present");
     assert!(!leg.is_empty());
-    assert_eq!(
-        leg,
-        &TrackLegacy {
-            codec_settings: Some("x".to_string()),
-            ..Default::default()
-        }
-    );
+    assert_eq!(leg, &{
+        let mut track_legacy = TrackLegacy::default();
+        track_legacy.codec_settings = Some("x".to_string());
+        track_legacy
+    });
 }
 
 /// An out-of-range `stream_index` returns `None` rather than panicking.

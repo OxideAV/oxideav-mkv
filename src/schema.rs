@@ -58,6 +58,7 @@ pub const NO_MAX_VER: u8 = u8::MAX;
 /// attribute strings (float ranges/defaults use the C hex-float
 /// spelling, e.g. `0x1.f4p+12` = 8000.0).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct ElementDef {
     /// Element ID with the VINT marker bits, as everywhere in [`crate::ids`].
     pub id: u32,
@@ -98,6 +99,48 @@ pub struct ElementDef {
     /// support table ([`crate::webm`]) is the authority for the strict
     /// WebM profile; this flag is the schema's corroborating signal.
     pub webm: bool,
+}
+
+impl ElementDef {
+    /// Build `ElementDef` from every field, in declaration order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: u32,
+        name: &'static str,
+        path: &'static str,
+        parent_id: Option<u32>,
+        element_type: ElementType,
+        min_occurs: u32,
+        max_occurs: Option<u32>,
+        range: Option<&'static str>,
+        length: Option<&'static str>,
+        default: Option<&'static str>,
+        min_ver: u8,
+        max_ver: u8,
+        recursive: bool,
+        recurring: bool,
+        unknown_size_allowed: bool,
+        webm: bool,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            path,
+            parent_id,
+            element_type,
+            min_occurs,
+            max_occurs,
+            range,
+            length,
+            default,
+            min_ver,
+            max_ver,
+            recursive,
+            recurring,
+            unknown_size_allowed,
+            webm,
+        }
+    }
 }
 
 impl ElementDef {
@@ -5076,6 +5119,7 @@ use crate::{ebml, ids};
 
 /// Why [`validate`] flagged an element occurrence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SchemaFindingKind {
     /// The element ID appears in neither [`SCHEMA`] nor
     /// [`EBML_SUPPLEMENT`]. Informational: RFC 8794 §11.1.1 lets a
@@ -5157,6 +5201,7 @@ impl SchemaFindingKind {
 
 /// One flagged occurrence from [`validate`].
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct SchemaFinding {
     /// Absolute file offset of the element's ID byte (for
     /// [`SchemaFindingKind::MissingMandatory`], the *parent's* ID
@@ -5169,6 +5214,13 @@ pub struct SchemaFinding {
     pub kind: SchemaFindingKind,
 }
 
+impl SchemaFinding {
+    /// Build `SchemaFinding` from every field, in declaration order.
+    pub fn new(offset: u64, id: u32, kind: SchemaFindingKind) -> Self {
+        Self { offset, id, kind }
+    }
+}
+
 /// Maximum number of findings recorded before the report switches to
 /// counting only.
 const MAX_SCHEMA_FINDINGS: usize = 4096;
@@ -5179,6 +5231,7 @@ const MAX_SCHEMA_DEPTH: usize = 64;
 
 /// The result of a [`validate`] walk.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SchemaReport {
     /// The EBML header's `DocType` string, when one was found.
     pub doc_type: Option<String>,

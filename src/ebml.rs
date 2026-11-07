@@ -117,7 +117,8 @@ pub fn write_element_id(id: u32) -> Vec<u8> {
 }
 
 /// Header of an EBML element, fully read.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ElementHeader {
     pub id: u32,
     /// Payload size; `VINT_UNKNOWN_SIZE` means "until parent ends".

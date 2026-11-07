@@ -200,11 +200,9 @@ fn roundtrip_bt2020_pq_hdr10() {
 #[test]
 fn roundtrip_max_cll_and_max_fall() {
     // §5.1.4.1.28.28 / §5.1.4.1.28.29 — light-level pair, no spec default.
-    let c = MkvVideoColour {
-        max_cll: Some(1000),
-        max_fall: Some(400),
-        ..MkvVideoColour::bt2020_pq()
-    };
+    let c = MkvVideoColour::bt2020_pq()
+        .with_max_cll(Some(1000))
+        .with_max_fall(Some(400));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -219,13 +217,11 @@ fn roundtrip_chroma_subsampling_quartet() {
     // §5.1.4.1.28.19..§5.1.4.1.28.22 — four chroma-subsampling
     // integers with no spec default. Set all four to distinct
     // values and round-trip them.
-    let c = MkvVideoColour {
-        chroma_subsampling_horz: Some(1),
-        chroma_subsampling_vert: Some(1),
-        cb_subsampling_horz: Some(0),
-        cb_subsampling_vert: Some(0),
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default()
+        .with_chroma_subsampling_horz(Some(1))
+        .with_chroma_subsampling_vert(Some(1))
+        .with_cb_subsampling_horz(Some(0))
+        .with_cb_subsampling_vert(Some(0));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -242,11 +238,9 @@ fn roundtrip_chroma_siting_explicit() {
     // §5.1.4.1.28.23 / .24 — table 13 / 14. Default `0`
     // (`Unspecified`) is omitted on disk; set to non-default values
     // for both axes and round-trip.
-    let c = MkvVideoColour {
-        chroma_siting_horz: ChromaSitingHorz::LeftCollocated,
-        chroma_siting_vert: ChromaSitingVert::TopCollocated,
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default()
+        .with_chroma_siting_horz(ChromaSitingHorz::LeftCollocated)
+        .with_chroma_siting_vert(ChromaSitingVert::TopCollocated);
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -260,11 +254,9 @@ fn roundtrip_chroma_siting_explicit() {
 fn roundtrip_chroma_siting_half() {
     // The shared `Half` value (`2`) across both axes — one element id
     // taking the same raw value on both children.
-    let c = MkvVideoColour {
-        chroma_siting_horz: ChromaSitingHorz::Half,
-        chroma_siting_vert: ChromaSitingVert::Half,
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default()
+        .with_chroma_siting_horz(ChromaSitingHorz::Half)
+        .with_chroma_siting_vert(ChromaSitingVert::Half);
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -278,10 +270,7 @@ fn roundtrip_chroma_siting_half() {
 fn roundtrip_matrix_other_passthrough() {
     // §27.13 leaves the registry open; `MatrixCoefficients::Other(99)`
     // must round-trip its wrapped value verbatim.
-    let c = MkvVideoColour {
-        matrix_coefficients: MatrixCoefficients::Other(99),
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default().with_matrix_coefficients(MatrixCoefficients::Other(99));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -292,10 +281,8 @@ fn roundtrip_matrix_other_passthrough() {
 
 #[test]
 fn roundtrip_transfer_other_passthrough() {
-    let c = MkvVideoColour {
-        transfer_characteristics: TransferCharacteristics::Other(50),
-        ..MkvVideoColour::default()
-    };
+    let c =
+        MkvVideoColour::default().with_transfer_characteristics(TransferCharacteristics::Other(50));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -309,10 +296,7 @@ fn roundtrip_transfer_other_passthrough() {
 
 #[test]
 fn roundtrip_primaries_other_passthrough() {
-    let c = MkvVideoColour {
-        primaries: Primaries::Other(123),
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default().with_primaries(Primaries::Other(123));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -326,10 +310,7 @@ fn roundtrip_primaries_p3_jedec_22() {
     // Table 17's gap between `12` and `22`. `EbuTech3213EJedecP22Phosphors`
     // is value `22` per the spec; the `to_raw` inverse must hit the same
     // integer the demuxer expects.
-    let c = MkvVideoColour {
-        primaries: Primaries::EbuTech3213EJedecP22Phosphors,
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default().with_primaries(Primaries::EbuTech3213EJedecP22Phosphors);
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -340,10 +321,7 @@ fn roundtrip_primaries_p3_jedec_22() {
 
 #[test]
 fn roundtrip_range_defined_by_matrix_and_transfer() {
-    let c = MkvVideoColour {
-        range: ColourRange::DefinedByMatrixAndTransfer,
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default().with_range(ColourRange::DefinedByMatrixAndTransfer);
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -354,10 +332,7 @@ fn roundtrip_range_defined_by_matrix_and_transfer() {
 
 #[test]
 fn roundtrip_range_other_passthrough() {
-    let c = MkvVideoColour {
-        range: ColourRange::Other(7),
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default().with_range(ColourRange::Other(7));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -369,11 +344,9 @@ fn roundtrip_range_other_passthrough() {
 #[test]
 fn roundtrip_chroma_siting_other_passthrough() {
     // §27.10 / §27.11 leave the chroma-siting registries open.
-    let c = MkvVideoColour {
-        chroma_siting_horz: ChromaSitingHorz::Other(50),
-        chroma_siting_vert: ChromaSitingVert::Other(70),
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default()
+        .with_chroma_siting_horz(ChromaSitingHorz::Other(50))
+        .with_chroma_siting_vert(ChromaSitingVert::Other(70));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).expect("set_video_colour");
     });
@@ -635,10 +608,8 @@ fn empty_master_on_disk_size_is_two_bytes() {
 #[test]
 fn matrix_coefficients_explicit_bt2020_ncl_round_trip() {
     // Pin the matrix-coefficient writer at value 9 (BT.2020 NCL).
-    let c = MkvVideoColour {
-        matrix_coefficients: MatrixCoefficients::BT2020NonConstantLuminance,
-        ..MkvVideoColour::default()
-    };
+    let c = MkvVideoColour::default()
+        .with_matrix_coefficients(MatrixCoefficients::BT2020NonConstantLuminance);
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
     });
@@ -658,10 +629,8 @@ fn matrix_coefficients_explicit_bt2020_ncl_round_trip() {
 #[test]
 fn roundtrip_mastering_metadata_bt2020_d65_hdr10() {
     use oxideav_mkv::mux::MkvMasteringMetadata;
-    let c = MkvVideoColour {
-        mastering_metadata: Some(MkvMasteringMetadata::bt2020_d65_hdr10()),
-        ..MkvVideoColour::bt2020_pq()
-    };
+    let c = MkvVideoColour::bt2020_pq()
+        .with_mastering_metadata(Some(MkvMasteringMetadata::bt2020_d65_hdr10()));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
     });
@@ -700,15 +669,10 @@ fn roundtrip_mastering_metadata_bt2020_d65_hdr10() {
 #[test]
 fn roundtrip_mastering_metadata_sparse_luminance_only() {
     use oxideav_mkv::mux::MkvMasteringMetadata;
-    let mm = MkvMasteringMetadata {
-        luminance_max: Some(4000.0),
-        luminance_min: Some(0.0001),
-        ..MkvMasteringMetadata::default()
-    };
-    let c = MkvVideoColour {
-        mastering_metadata: Some(mm),
-        ..MkvVideoColour::bt2020_pq()
-    };
+    let mm = MkvMasteringMetadata::default()
+        .with_luminance_max(Some(4000.0))
+        .with_luminance_min(Some(0.0001));
+    let c = MkvVideoColour::bt2020_pq().with_mastering_metadata(Some(mm));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
     });
@@ -738,9 +702,7 @@ fn omitted_mastering_metadata_yields_none() {
     // Use BT.2020 PQ so the Colour master itself still gets written —
     // the test is specifically about the sub-master being absent
     // beneath a present Colour master.
-    let c = MkvVideoColour {
-        ..MkvVideoColour::bt2020_pq()
-    };
+    let c = MkvVideoColour::bt2020_pq();
     assert!(c.mastering_metadata.is_none());
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
@@ -768,10 +730,8 @@ fn omitted_mastering_metadata_yields_none() {
 #[test]
 fn empty_mastering_metadata_writes_empty_master() {
     use oxideav_mkv::mux::MkvMasteringMetadata;
-    let c = MkvVideoColour {
-        mastering_metadata: Some(MkvMasteringMetadata::default()),
-        ..MkvVideoColour::bt2020_pq()
-    };
+    let c =
+        MkvVideoColour::bt2020_pq().with_mastering_metadata(Some(MkvMasteringMetadata::default()));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
     });
@@ -814,22 +774,18 @@ fn each_mastering_metadata_child_round_trips_independently() {
     use oxideav_mkv::mux::MkvMasteringMetadata;
     // Distinct values per slot so any field-id transposition shows up
     // as the wrong number landing on the wrong getter.
-    let mm = MkvMasteringMetadata {
-        primary_r_chromaticity_x: Some(0.111),
-        primary_r_chromaticity_y: Some(0.222),
-        primary_g_chromaticity_x: Some(0.333),
-        primary_g_chromaticity_y: Some(0.444),
-        primary_b_chromaticity_x: Some(0.555),
-        primary_b_chromaticity_y: Some(0.666),
-        white_point_chromaticity_x: Some(0.777),
-        white_point_chromaticity_y: Some(0.888),
-        luminance_max: Some(123.0),
-        luminance_min: Some(0.5),
-    };
-    let c = MkvVideoColour {
-        mastering_metadata: Some(mm),
-        ..MkvVideoColour::default()
-    };
+    let mm = MkvMasteringMetadata::default()
+        .with_primary_r_chromaticity_x(Some(0.111))
+        .with_primary_r_chromaticity_y(Some(0.222))
+        .with_primary_g_chromaticity_x(Some(0.333))
+        .with_primary_g_chromaticity_y(Some(0.444))
+        .with_primary_b_chromaticity_x(Some(0.555))
+        .with_primary_b_chromaticity_y(Some(0.666))
+        .with_white_point_chromaticity_x(Some(0.777))
+        .with_white_point_chromaticity_y(Some(0.888))
+        .with_luminance_max(Some(123.0))
+        .with_luminance_min(Some(0.5));
+    let c = MkvVideoColour::default().with_mastering_metadata(Some(mm));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
     });
@@ -859,12 +815,10 @@ fn each_mastering_metadata_child_round_trips_independently() {
 #[test]
 fn mastering_metadata_does_not_perturb_other_colour_children() {
     use oxideav_mkv::mux::MkvMasteringMetadata;
-    let c = MkvVideoColour {
-        max_cll: Some(4000),
-        max_fall: Some(800),
-        mastering_metadata: Some(MkvMasteringMetadata::bt2020_d65_hdr10()),
-        ..MkvVideoColour::bt2020_pq()
-    };
+    let c = MkvVideoColour::bt2020_pq()
+        .with_max_cll(Some(4000))
+        .with_max_fall(Some(800))
+        .with_mastering_metadata(Some(MkvMasteringMetadata::bt2020_d65_hdr10()));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
     });
@@ -898,10 +852,7 @@ fn accessor_returns_queued_mastering_metadata() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[video_stream()]).unwrap();
     let mm = MkvMasteringMetadata::bt2020_d65_hdr10();
-    let c = MkvVideoColour {
-        mastering_metadata: Some(mm),
-        ..MkvVideoColour::bt2020_pq()
-    };
+    let c = MkvVideoColour::bt2020_pq().with_mastering_metadata(Some(mm));
     mx.set_video_colour(0, c).unwrap();
     let got = mx.video_colour(0).expect("queued");
     assert_eq!(got.mastering_metadata, Some(mm));
@@ -915,17 +866,10 @@ fn accessor_returns_queued_mastering_metadata() {
 #[test]
 fn mastering_metadata_out_of_range_values_pass_through() {
     use oxideav_mkv::mux::MkvMasteringMetadata;
-    let mm = MkvMasteringMetadata {
-        // Deliberately outside [0.0, 1.0].
-        primary_r_chromaticity_x: Some(1.5),
-        // Deliberately negative.
-        luminance_min: Some(-1.0),
-        ..MkvMasteringMetadata::default()
-    };
-    let c = MkvVideoColour {
-        mastering_metadata: Some(mm),
-        ..MkvVideoColour::default()
-    };
+    let mm = MkvMasteringMetadata::default()
+        .with_primary_r_chromaticity_x(Some(1.5))
+        .with_luminance_min(Some(-1.0));
+    let c = MkvVideoColour::default().with_mastering_metadata(Some(mm));
     let bytes = mux_video(|mx| {
         mx.set_video_colour(0, c).unwrap();
     });

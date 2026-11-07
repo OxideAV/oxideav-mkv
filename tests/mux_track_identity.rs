@@ -128,11 +128,9 @@ fn name_and_codec_name_roundtrip() {
     let dmx = demux_typed(mux_with(video_stream(), |mx| {
         mx.set_track_identity(
             0,
-            MkvTrackIdentity {
-                name: Some("Main video".to_string()),
-                codec_name: Some("VP9".to_string()),
-                ..Default::default()
-            },
+            MkvTrackIdentity::default()
+                .with_name(Some("Main video".to_string()))
+                .with_codec_name(Some("VP9".to_string())),
         )
         .expect("set_track_identity");
     }));
@@ -146,12 +144,10 @@ fn flags_roundtrip() {
     let dmx = demux_typed(mux_with(video_stream(), |mx| {
         mx.set_track_identity(
             0,
-            MkvTrackIdentity {
-                flag_enabled: Some(false),
-                flag_default: Some(false),
-                flag_lacing: Some(true),
-                ..Default::default()
-            },
+            MkvTrackIdentity::default()
+                .with_flag_enabled(Some(false))
+                .with_flag_default(Some(false))
+                .with_flag_lacing(Some(true)),
         )
         .expect("set_track_identity");
     }));
@@ -169,10 +165,7 @@ fn language_matroska_override() {
     let dmx = demux_typed(mux_with(video_stream_with_language("eng"), |mx| {
         mx.set_track_identity(
             0,
-            MkvTrackIdentity {
-                language: Some("fre".to_string()),
-                ..Default::default()
-            },
+            MkvTrackIdentity::default().with_language(Some("fre".to_string())),
         )
         .expect("set_track_identity");
     }));
@@ -189,11 +182,9 @@ fn language_bcp47_supersedes() {
     let dmx = demux_typed(mux_with(video_stream_with_language("ger"), |mx| {
         mx.set_track_identity(
             0,
-            MkvTrackIdentity {
-                language: Some("ger".to_string()),
-                language_bcp47: Some("de-AT".to_string()),
-                ..Default::default()
-            },
+            MkvTrackIdentity::default()
+                .with_language(Some("ger".to_string()))
+                .with_language_bcp47(Some("de-AT".to_string())),
         )
         .expect("set_track_identity");
     }));
@@ -210,10 +201,7 @@ fn attachment_link_roundtrip() {
     let dmx = demux_typed(mux_with(video_stream(), |mx| {
         mx.set_track_identity(
             0,
-            MkvTrackIdentity {
-                attachment_link: Some(0x1234),
-                ..Default::default()
-            },
+            MkvTrackIdentity::default().with_attachment_link(Some(0x1234)),
         )
         .expect("set_track_identity");
     }));
@@ -226,16 +214,15 @@ fn full_record_roundtrip() {
     let dmx = demux_typed(mux_with(video_stream(), |mx| {
         mx.set_track_identity(
             0,
-            MkvTrackIdentity {
-                name: Some("Commentary".to_string()),
-                codec_name: Some("VP9 / WebM".to_string()),
-                language: Some("eng".to_string()),
-                language_bcp47: Some("en-GB".to_string()),
-                flag_enabled: Some(true),
-                flag_default: Some(false),
-                flag_lacing: Some(false),
-                attachment_link: Some(7),
-            },
+            MkvTrackIdentity::default()
+                .with_name(Some("Commentary".to_string()))
+                .with_codec_name(Some("VP9 / WebM".to_string()))
+                .with_language(Some("eng".to_string()))
+                .with_language_bcp47(Some("en-GB".to_string()))
+                .with_flag_enabled(Some(true))
+                .with_flag_default(Some(false))
+                .with_flag_lacing(Some(false))
+                .with_attachment_link(Some(7)),
         )
         .expect("set_track_identity");
     }));
@@ -273,23 +260,14 @@ fn rejects_empty_strings_and_zero_link() {
     let e = assert_err(
         mx.set_track_identity(
             0,
-            MkvTrackIdentity {
-                name: Some(String::new()),
-                ..Default::default()
-            },
+            MkvTrackIdentity::default().with_name(Some(String::new())),
         ),
         "empty name",
     );
     assert!(format!("{e}").contains("empty string"), "got: {e}");
 
     let e = assert_err(
-        mx.set_track_identity(
-            0,
-            MkvTrackIdentity {
-                attachment_link: Some(0),
-                ..Default::default()
-            },
-        ),
+        mx.set_track_identity(0, MkvTrackIdentity::default().with_attachment_link(Some(0))),
         "zero attachment_link",
     );
     assert!(format!("{e}").contains("not 0"), "got: {e}");

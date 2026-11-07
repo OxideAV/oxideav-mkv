@@ -112,29 +112,26 @@ fn omitted_call_surfaces_no_legacy() {
 fn full_legacy_record_round_trips() {
     let seg_a = vec![0x11u8; 16];
     let seg_b = vec![0x22u8; 16];
-    let leg = MkvTrackLegacy {
-        codec_settings: Some("crf=18 preset=slow".to_string()),
-        codec_info_urls: vec![
+    let leg = MkvTrackLegacy::default()
+        .with_codec_settings(Some("crf=18 preset=slow".to_string()))
+        .with_codec_info_urls(vec![
             "https://x.test/i1".to_string(),
             "https://x.test/i2".to_string(),
-        ],
-        codec_download_urls: vec!["https://x.test/d1".to_string()],
-        decode_all: Some(1),
-        min_cache: Some(2),
-        max_cache: Some(10),
-        track_offset: Some(-1_000_000),
-        gamma_value: Some(2.2),
-        frame_rate: Some(23.976),
-        // ChannelPositions is Audio-only; this is a video track, so leave it
-        // unset (covered by its own test).
-        channel_positions: None,
-        track_overlays: vec![7, 3, 5],
-        trick_track_uid: Some(0xDEAD),
-        trick_track_segment_uid: Some(seg_a.clone()),
-        trick_track_flag: Some(1),
-        trick_master_track_uid: Some(0xBEEF),
-        trick_master_track_segment_uid: Some(seg_b.clone()),
-    };
+        ])
+        .with_codec_download_urls(vec!["https://x.test/d1".to_string()])
+        .with_decode_all(Some(1))
+        .with_min_cache(Some(2))
+        .with_max_cache(Some(10))
+        .with_track_offset(Some(-1_000_000))
+        .with_gamma_value(Some(2.2))
+        .with_frame_rate(Some(23.976))
+        .with_channel_positions(None)
+        .with_track_overlays(vec![7, 3, 5])
+        .with_trick_track_uid(Some(0xDEAD))
+        .with_trick_track_segment_uid(Some(seg_a.clone()))
+        .with_trick_track_flag(Some(1))
+        .with_trick_master_track_uid(Some(0xBEEF))
+        .with_trick_master_track_segment_uid(Some(seg_b.clone()));
     let dmx = demux_typed(mux_with(move |mx| {
         mx.set_track_legacy(0, leg).expect("set_track_legacy");
     }));
@@ -179,11 +176,9 @@ fn full_legacy_record_round_trips() {
 
 #[test]
 fn explicit_zero_flags_round_trip_distinct_from_absence() {
-    let leg = MkvTrackLegacy {
-        decode_all: Some(0),
-        trick_track_flag: Some(0),
-        ..Default::default()
-    };
+    let leg = MkvTrackLegacy::default()
+        .with_decode_all(Some(0))
+        .with_trick_track_flag(Some(0));
     let dmx = demux_typed(mux_with(move |mx| {
         mx.set_track_legacy(0, leg).expect("set_track_legacy");
     }));
@@ -200,11 +195,9 @@ fn cache_and_offset_round_trip_including_signs_and_zero() {
     // RFC 9559 Appendix A.16 (MinCache) / A.17 (MaxCache) / A.18
     // (TrackOffset). MinCache=0 and a positive TrackOffset round-trip
     // distinct from absence; MaxCache stays absent.
-    let leg = MkvTrackLegacy {
-        min_cache: Some(0),
-        track_offset: Some(2_500_000),
-        ..Default::default()
-    };
+    let leg = MkvTrackLegacy::default()
+        .with_min_cache(Some(0))
+        .with_track_offset(Some(2_500_000));
     let dmx = demux_typed(mux_with(move |mx| {
         mx.set_track_legacy(0, leg).expect("set_track_legacy");
     }));
@@ -218,10 +211,7 @@ fn cache_and_offset_round_trip_including_signs_and_zero() {
 
 #[test]
 fn partial_record_only_writes_populated_fields() {
-    let leg = MkvTrackLegacy {
-        codec_settings: Some("x264 default".to_string()),
-        ..Default::default()
-    };
+    let leg = MkvTrackLegacy::default().with_codec_settings(Some("x264 default".to_string()));
     let dmx = demux_typed(mux_with(move |mx| {
         mx.set_track_legacy(0, leg).expect("set_track_legacy");
     }));
@@ -256,10 +246,7 @@ fn setter_rejects_after_write_header() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[video_stream()]).expect("muxer construct");
     mx.write_header().expect("write_header");
-    let leg = MkvTrackLegacy {
-        decode_all: Some(1),
-        ..Default::default()
-    };
+    let leg = MkvTrackLegacy::default().with_decode_all(Some(1));
     let e = assert_err(
         mx.set_track_legacy(0, leg),
         "set_track_legacy after write_header",
@@ -274,10 +261,7 @@ fn setter_rejects_out_of_range_stream() {
     let f = std::fs::File::create(&tmp).expect("create tmp");
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[video_stream()]).expect("muxer construct");
-    let leg = MkvTrackLegacy {
-        decode_all: Some(1),
-        ..Default::default()
-    };
+    let leg = MkvTrackLegacy::default().with_decode_all(Some(1));
     let e = assert_err(
         mx.set_track_legacy(9, leg),
         "set_track_legacy out-of-range stream",
@@ -292,10 +276,7 @@ fn setter_rejects_non_16_byte_segment_uid() {
     let f = std::fs::File::create(&tmp).expect("create tmp");
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[video_stream()]).expect("muxer construct");
-    let leg = MkvTrackLegacy {
-        trick_track_segment_uid: Some(vec![0xAB, 0xCD, 0xEF]),
-        ..Default::default()
-    };
+    let leg = MkvTrackLegacy::default().with_trick_track_segment_uid(Some(vec![0xAB, 0xCD, 0xEF]));
     let e = assert_err(
         mx.set_track_legacy(0, leg),
         "set_track_legacy short SegmentUID",
@@ -330,10 +311,7 @@ fn channel_positions_round_trips_in_audio_master() {
             MkvMuxer::new_matroska(ws, std::slice::from_ref(&audio)).expect("muxer construct");
         mx.set_track_legacy(
             0,
-            MkvTrackLegacy {
-                channel_positions: Some(vec![0x00, 0x5A, 0xB4]),
-                ..Default::default()
-            },
+            MkvTrackLegacy::default().with_channel_positions(Some(vec![0x00, 0x5A, 0xB4])),
         )
         .expect("set_track_legacy");
         mx.write_header().expect("write_header");

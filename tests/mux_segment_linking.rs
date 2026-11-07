@@ -99,26 +99,32 @@ fn uid(seed: u8) -> Vec<u8> {
 /// every field byte-for-byte equal, and the §5.1.2 element order is honoured.
 #[test]
 fn roundtrip_full_segment_linking() {
-    let linking = SegmentLinking {
-        segment_uuid: Some(uid(0)),
-        segment_filename: Some("part2.mkv".into()),
-        prev_uuid: Some(uid(0x40)),
-        prev_filename: Some("part1.mkv".into()),
-        next_uuid: Some(uid(0x80)),
-        next_filename: Some("part3.mkv".into()),
-        families: vec![uid(0xA0), uid(0xC0)],
-        chapter_translates: vec![
-            ChapterTranslate {
-                id: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                codec: 1,
-                edition_uids: vec![11, 22],
+    let linking = {
+        let mut segment_linking = SegmentLinking::default();
+        segment_linking.segment_uuid = Some(uid(0));
+        segment_linking.segment_filename = Some("part2.mkv".into());
+        segment_linking.prev_uuid = Some(uid(0x40));
+        segment_linking.prev_filename = Some("part1.mkv".into());
+        segment_linking.next_uuid = Some(uid(0x80));
+        segment_linking.next_filename = Some("part3.mkv".into());
+        segment_linking.families = vec![uid(0xA0), uid(0xC0)];
+        segment_linking.chapter_translates = vec![
+            {
+                let mut chapter_translate = ChapterTranslate::default();
+                chapter_translate.id = vec![0xDE, 0xAD, 0xBE, 0xEF];
+                chapter_translate.codec = 1;
+                chapter_translate.edition_uids = vec![11, 22];
+                chapter_translate
             },
-            ChapterTranslate {
-                id: vec![0x01],
-                codec: 0,
-                edition_uids: vec![],
+            {
+                let mut chapter_translate = ChapterTranslate::default();
+                chapter_translate.id = vec![0x01];
+                chapter_translate.codec = 0;
+                chapter_translate.edition_uids = vec![];
+                chapter_translate
             },
-        ],
+        ];
+        segment_linking
     };
 
     let bytes = mux_one_track(|mx| {
@@ -154,9 +160,10 @@ fn roundtrip_full_segment_linking() {
 /// `PrevUUID` without `SegmentUUID` is legal (no self-reference to check).
 #[test]
 fn roundtrip_prev_only_no_segment_uuid() {
-    let linking = SegmentLinking {
-        prev_uuid: Some(uid(7)),
-        ..SegmentLinking::default()
+    let linking = {
+        let mut segment_linking = SegmentLinking::default();
+        segment_linking.prev_uuid = Some(uid(7));
+        segment_linking
     };
     let bytes = mux_one_track(|mx| {
         mx.set_segment_linking(linking.clone()).expect("set");
@@ -191,9 +198,10 @@ fn rejects_after_write_header() {
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("construct");
     mx.write_header().expect("write_header");
     let err = mx
-        .set_segment_linking(SegmentLinking {
-            segment_uuid: Some(uid(0)),
-            ..SegmentLinking::default()
+        .set_segment_linking({
+            let mut segment_linking = SegmentLinking::default();
+            segment_linking.segment_uuid = Some(uid(0));
+            segment_linking
         })
         .map(|_| ())
         .expect_err("must reject after write_header");
@@ -208,9 +216,10 @@ fn rejects_off_length_uid() {
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("construct");
     let err = mx
-        .set_segment_linking(SegmentLinking {
-            segment_uuid: Some(vec![1, 2, 3]),
-            ..SegmentLinking::default()
+        .set_segment_linking({
+            let mut segment_linking = SegmentLinking::default();
+            segment_linking.segment_uuid = Some(vec![1, 2, 3]);
+            segment_linking
         })
         .map(|_| ())
         .expect_err("3-byte SegmentUUID must be rejected");
@@ -221,9 +230,10 @@ fn rejects_off_length_uid() {
     let ws2: Box<dyn WriteSeek> = Box::new(f2);
     let mut mx2 = MkvMuxer::new_matroska(ws2, &streams).expect("construct");
     let err2 = mx2
-        .set_segment_linking(SegmentLinking {
-            families: vec![vec![0u8; 8]],
-            ..SegmentLinking::default()
+        .set_segment_linking({
+            let mut segment_linking = SegmentLinking::default();
+            segment_linking.families = vec![vec![0u8; 8]];
+            segment_linking
         })
         .map(|_| ())
         .expect_err("8-byte SegmentFamily must be rejected");
@@ -240,10 +250,11 @@ fn rejects_self_referential_link() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("construct");
     let err = mx
-        .set_segment_linking(SegmentLinking {
-            segment_uuid: Some(uid(5)),
-            prev_uuid: Some(uid(5)),
-            ..SegmentLinking::default()
+        .set_segment_linking({
+            let mut segment_linking = SegmentLinking::default();
+            segment_linking.segment_uuid = Some(uid(5));
+            segment_linking.prev_uuid = Some(uid(5));
+            segment_linking
         })
         .map(|_| ())
         .expect_err("PrevUUID == SegmentUUID must be rejected");
@@ -253,10 +264,11 @@ fn rejects_self_referential_link() {
     let ws2: Box<dyn WriteSeek> = Box::new(f2);
     let mut mx2 = MkvMuxer::new_matroska(ws2, &streams).expect("construct");
     let err2 = mx2
-        .set_segment_linking(SegmentLinking {
-            segment_uuid: Some(uid(5)),
-            next_uuid: Some(uid(5)),
-            ..SegmentLinking::default()
+        .set_segment_linking({
+            let mut segment_linking = SegmentLinking::default();
+            segment_linking.segment_uuid = Some(uid(5));
+            segment_linking.next_uuid = Some(uid(5));
+            segment_linking
         })
         .map(|_| ())
         .expect_err("NextUUID == SegmentUUID must be rejected");
@@ -275,13 +287,16 @@ fn rejects_chapter_translate_rule_violations() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("construct");
     let err = mx
-        .set_segment_linking(SegmentLinking {
-            chapter_translates: vec![ChapterTranslate {
-                id: vec![0x01],
-                codec: 0,
-                edition_uids: vec![],
-            }],
-            ..SegmentLinking::default()
+        .set_segment_linking({
+            let mut segment_linking = SegmentLinking::default();
+            segment_linking.chapter_translates = vec![{
+                let mut chapter_translate = ChapterTranslate::default();
+                chapter_translate.id = vec![0x01];
+                chapter_translate.codec = 0;
+                chapter_translate.edition_uids = vec![];
+                chapter_translate
+            }];
+            segment_linking
         })
         .map(|_| ())
         .expect_err("ChapterTranslate without SegmentFamily must be rejected");
@@ -293,14 +308,17 @@ fn rejects_chapter_translate_rule_violations() {
     let ws2: Box<dyn WriteSeek> = Box::new(f2);
     let mut mx2 = MkvMuxer::new_matroska(ws2, &streams).expect("construct");
     let err2 = mx2
-        .set_segment_linking(SegmentLinking {
-            families: vec![uid(0)],
-            chapter_translates: vec![ChapterTranslate {
-                id: vec![],
-                codec: 0,
-                edition_uids: vec![],
-            }],
-            ..SegmentLinking::default()
+        .set_segment_linking({
+            let mut segment_linking = SegmentLinking::default();
+            segment_linking.families = vec![uid(0)];
+            segment_linking.chapter_translates = vec![{
+                let mut chapter_translate = ChapterTranslate::default();
+                chapter_translate.id = vec![];
+                chapter_translate.codec = 0;
+                chapter_translate.edition_uids = vec![];
+                chapter_translate
+            }];
+            segment_linking
         })
         .map(|_| ())
         .expect_err("empty ChapterTranslateID must be rejected");
@@ -319,9 +337,10 @@ fn queued_linking_is_introspectable() {
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("construct");
     assert!(mx.segment_linking().is_none());
-    mx.set_segment_linking(SegmentLinking {
-        segment_uuid: Some(uid(3)),
-        ..SegmentLinking::default()
+    mx.set_segment_linking({
+        let mut segment_linking = SegmentLinking::default();
+        segment_linking.segment_uuid = Some(uid(3));
+        segment_linking
     })
     .expect("set");
     assert_eq!(

@@ -190,14 +190,13 @@ fn single_track_translate_all_children() {
 
     let tts = dmx.track_translates(0);
     assert_eq!(tts.len(), 1, "one mapping");
-    assert_eq!(
-        tts[0],
-        TrackTranslate {
-            track_id: vec![0x01, 0x02, 0x03],
-            codec: 1,
-            edition_uids: vec![0xCAFE, 0xBEEF],
-        }
-    );
+    assert_eq!(tts[0], {
+        let mut track_translate = TrackTranslate::default();
+        track_translate.track_id = vec![0x01, 0x02, 0x03];
+        track_translate.codec = 1;
+        track_translate.edition_uids = vec![0xCAFE, 0xBEEF];
+        track_translate
+    });
 }
 
 /// A `TrackTranslate` with only the two mandatory children — empty
@@ -318,11 +317,10 @@ fn roundtrip_track_translates() {
         mx.set_track_translates(
             0,
             vec![
-                MkvTrackTranslate {
-                    track_id: vec![0x10, 0x20],
-                    codec: 1,
-                    edition_uids: vec![7, 9],
-                },
+                MkvTrackTranslate::default()
+                    .with_track_id(vec![0x10, 0x20])
+                    .with_codec(1)
+                    .with_edition_uids(vec![7, 9]),
                 MkvTrackTranslate::new(b"vts01".to_vec(), 0),
             ],
         )
@@ -402,11 +400,12 @@ fn setter_rejects_spec_violations() {
     assert!(matches!(
         mx.set_track_translates(
             0,
-            vec![MkvTrackTranslate {
-                track_id: vec![0x01],
-                codec: 0,
-                edition_uids: vec![0],
-            }]
+            vec![
+                MkvTrackTranslate::default()
+                    .with_track_id(vec![0x01])
+                    .with_codec(0)
+                    .with_edition_uids(vec![0])
+            ]
         ),
         Err(Error::InvalidData(_))
     ));

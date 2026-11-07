@@ -184,6 +184,7 @@ impl LacingMode {
 /// preserves every supplied child bit-exactly, including the
 /// `OutputSamplingFrequency` SBR signal.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct MkvTrackAudio {
     /// `SamplingFrequency` (RFC 9559 §5.1.4.1.29.1), Hz. `None` defers to
     /// the stream's `StreamInfo` `sample_rate`.
@@ -219,6 +220,46 @@ pub struct MkvTrackAudio {
 }
 
 impl MkvTrackAudio {
+    /// Set `sampling_frequency`.
+    #[must_use]
+    pub fn with_sampling_frequency(mut self, sampling_frequency: Option<f64>) -> Self {
+        self.sampling_frequency = sampling_frequency;
+        self
+    }
+
+    /// Set `output_sampling_frequency`.
+    #[must_use]
+    pub fn with_output_sampling_frequency(
+        mut self,
+        output_sampling_frequency: Option<f64>,
+    ) -> Self {
+        self.output_sampling_frequency = output_sampling_frequency;
+        self
+    }
+
+    /// Set `channels`.
+    #[must_use]
+    pub fn with_channels(mut self, channels: Option<u64>) -> Self {
+        self.channels = channels;
+        self
+    }
+
+    /// Set `bit_depth`.
+    #[must_use]
+    pub fn with_bit_depth(mut self, bit_depth: Option<u64>) -> Self {
+        self.bit_depth = bit_depth;
+        self
+    }
+
+    /// Set `emphasis`.
+    #[must_use]
+    pub fn with_emphasis(mut self, emphasis: Option<AudioEmphasis>) -> Self {
+        self.emphasis = emphasis;
+        self
+    }
+}
+
+impl MkvTrackAudio {
     /// Convenience constructor for the canonical HE-AAC SBR shape:
     /// a `core` sampling frequency with an explicit
     /// `OutputSamplingFrequency` of twice that rate (the SBR-doubling
@@ -246,6 +287,7 @@ impl MkvTrackAudio {
 /// typed accessor — a mux→demux pipeline preserves every supplied child
 /// bit-exactly.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct MkvTrackTiming {
     /// `DefaultDuration` (RFC 9559 §5.1.4.1.13), nanoseconds per frame.
     /// Range `not 0`; no spec default. `None` omits the element.
@@ -258,6 +300,32 @@ pub struct MkvTrackTiming {
     /// timestamp scale factor. Range `> 0x0p+0`; spec default `1.0`.
     /// `None` omits the element (the demuxer materialises `1.0`).
     pub track_timestamp_scale: Option<f64>,
+}
+
+impl MkvTrackTiming {
+    /// Set `default_duration`.
+    #[must_use]
+    pub fn with_default_duration(mut self, default_duration: Option<u64>) -> Self {
+        self.default_duration = default_duration;
+        self
+    }
+
+    /// Set `default_decoded_field_duration`.
+    #[must_use]
+    pub fn with_default_decoded_field_duration(
+        mut self,
+        default_decoded_field_duration: Option<u64>,
+    ) -> Self {
+        self.default_decoded_field_duration = default_decoded_field_duration;
+        self
+    }
+
+    /// Set `track_timestamp_scale`.
+    #[must_use]
+    pub fn with_track_timestamp_scale(mut self, track_timestamp_scale: Option<f64>) -> Self {
+        self.track_timestamp_scale = track_timestamp_scale;
+        self
+    }
 }
 
 impl MkvTrackTiming {
@@ -307,6 +375,7 @@ impl MkvTrackTiming {
 /// [`crate::demux::TrackCodecTiming`] typed accessor — a mux→demux pipeline
 /// preserves every supplied child bit-exactly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvTrackCodecTiming {
     /// `CodecDelay` (RFC 9559 §5.1.4.1.25), the codec's built-in delay in
     /// nanoseconds. Range unrestricted; spec default `0`. `None` omits the
@@ -319,6 +388,22 @@ pub struct MkvTrackCodecTiming {
     /// Opus track, keeps the auto-derived 80 ms recommendation); `Some(v)`
     /// writes it explicitly and overrides any auto value.
     pub seek_pre_roll: Option<u64>,
+}
+
+impl MkvTrackCodecTiming {
+    /// Set `codec_delay`.
+    #[must_use]
+    pub fn with_codec_delay(mut self, codec_delay: Option<u64>) -> Self {
+        self.codec_delay = codec_delay;
+        self
+    }
+
+    /// Set `seek_pre_roll`.
+    #[must_use]
+    pub fn with_seek_pre_roll(mut self, seek_pre_roll: Option<u64>) -> Self {
+        self.seek_pre_roll = seek_pre_roll;
+        self
+    }
 }
 
 impl MkvTrackCodecTiming {
@@ -352,6 +437,7 @@ impl MkvTrackCodecTiming {
 /// `language` field, when set, also overrides the `StreamInfo`-derived
 /// `Language` the muxer would otherwise emit from `CodecParameters::language`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvTrackIdentity {
     /// `Name` (RFC 9559 §5.1.4.1.18) — a human-readable track name. `None`
     /// omits the element (it has no spec default).
@@ -383,6 +469,64 @@ pub struct MkvTrackIdentity {
     /// of an attachment this codec uses. Range `not 0`; `None` omits the
     /// element; a `Some(0)` is rejected at queue time.
     pub attachment_link: Option<u64>,
+}
+
+impl MkvTrackIdentity {
+    /// Set `name`.
+    #[must_use]
+    pub fn with_name(mut self, name: Option<String>) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// Set `codec_name`.
+    #[must_use]
+    pub fn with_codec_name(mut self, codec_name: Option<String>) -> Self {
+        self.codec_name = codec_name;
+        self
+    }
+
+    /// Set `language`.
+    #[must_use]
+    pub fn with_language(mut self, language: Option<String>) -> Self {
+        self.language = language;
+        self
+    }
+
+    /// Set `language_bcp47`.
+    #[must_use]
+    pub fn with_language_bcp47(mut self, language_bcp47: Option<String>) -> Self {
+        self.language_bcp47 = language_bcp47;
+        self
+    }
+
+    /// Set `flag_enabled`.
+    #[must_use]
+    pub fn with_flag_enabled(mut self, flag_enabled: Option<bool>) -> Self {
+        self.flag_enabled = flag_enabled;
+        self
+    }
+
+    /// Set `flag_default`.
+    #[must_use]
+    pub fn with_flag_default(mut self, flag_default: Option<bool>) -> Self {
+        self.flag_default = flag_default;
+        self
+    }
+
+    /// Set `flag_lacing`.
+    #[must_use]
+    pub fn with_flag_lacing(mut self, flag_lacing: Option<bool>) -> Self {
+        self.flag_lacing = flag_lacing;
+        self
+    }
+
+    /// Set `attachment_link`.
+    #[must_use]
+    pub fn with_attachment_link(mut self, attachment_link: Option<u64>) -> Self {
+        self.attachment_link = attachment_link;
+        self
+    }
 }
 
 impl MkvTrackIdentity {
@@ -854,6 +998,7 @@ pub struct MkvMuxer {
 /// [`TrackTranslate`](crate::demux::TrackTranslate): a mux→demux pipeline
 /// round-trips every field verbatim.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvTrackTranslate {
     /// `TrackTranslateTrackID` (§5.1.4.1.27.1, binary, `minOccurs: 1`) — the
     /// value the chapter codec uses to name this track. Written verbatim; its
@@ -869,6 +1014,29 @@ pub struct MkvTrackTranslate {
     /// editions using `codec`" per the §5.1.4.1.27.3 usage note. Spec ranges
     /// each value "not 0"; a zero is rejected at queue time.
     pub edition_uids: Vec<u64>,
+}
+
+impl MkvTrackTranslate {
+    /// Set `track_id`.
+    #[must_use]
+    pub fn with_track_id(mut self, track_id: Vec<u8>) -> Self {
+        self.track_id = track_id;
+        self
+    }
+
+    /// Set `codec`.
+    #[must_use]
+    pub fn with_codec(mut self, codec: u64) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// Set `edition_uids`.
+    #[must_use]
+    pub fn with_edition_uids(mut self, edition_uids: Vec<u64>) -> Self {
+        self.edition_uids = edition_uids;
+        self
+    }
 }
 
 impl MkvTrackTranslate {
@@ -897,6 +1065,7 @@ impl MkvTrackTranslate {
 /// "default suppression" rule: a `Some(0)` `decode_all` / `trick_track_flag`
 /// is written as an explicit `0`, distinct from omission.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct MkvTrackLegacy {
     /// `CodecSettings` (Appendix A.19, utf-8) — a string describing the
     /// encoding settings used. `None` → element omitted.
@@ -950,6 +1119,126 @@ pub struct MkvTrackLegacy {
     /// `TrickMasterTrackSegmentUID` (Appendix A.32, binary). Written verbatim;
     /// `None` → omitted.
     pub trick_master_track_segment_uid: Option<Vec<u8>>,
+}
+
+impl MkvTrackLegacy {
+    /// Set `codec_settings`.
+    #[must_use]
+    pub fn with_codec_settings(mut self, codec_settings: Option<String>) -> Self {
+        self.codec_settings = codec_settings;
+        self
+    }
+
+    /// Set `codec_info_urls`.
+    #[must_use]
+    pub fn with_codec_info_urls(mut self, codec_info_urls: Vec<String>) -> Self {
+        self.codec_info_urls = codec_info_urls;
+        self
+    }
+
+    /// Set `codec_download_urls`.
+    #[must_use]
+    pub fn with_codec_download_urls(mut self, codec_download_urls: Vec<String>) -> Self {
+        self.codec_download_urls = codec_download_urls;
+        self
+    }
+
+    /// Set `decode_all`.
+    #[must_use]
+    pub fn with_decode_all(mut self, decode_all: Option<u64>) -> Self {
+        self.decode_all = decode_all;
+        self
+    }
+
+    /// Set `min_cache`.
+    #[must_use]
+    pub fn with_min_cache(mut self, min_cache: Option<u64>) -> Self {
+        self.min_cache = min_cache;
+        self
+    }
+
+    /// Set `max_cache`.
+    #[must_use]
+    pub fn with_max_cache(mut self, max_cache: Option<u64>) -> Self {
+        self.max_cache = max_cache;
+        self
+    }
+
+    /// Set `track_offset`.
+    #[must_use]
+    pub fn with_track_offset(mut self, track_offset: Option<i64>) -> Self {
+        self.track_offset = track_offset;
+        self
+    }
+
+    /// Set `gamma_value`.
+    #[must_use]
+    pub fn with_gamma_value(mut self, gamma_value: Option<f64>) -> Self {
+        self.gamma_value = gamma_value;
+        self
+    }
+
+    /// Set `frame_rate`.
+    #[must_use]
+    pub fn with_frame_rate(mut self, frame_rate: Option<f64>) -> Self {
+        self.frame_rate = frame_rate;
+        self
+    }
+
+    /// Set `channel_positions`.
+    #[must_use]
+    pub fn with_channel_positions(mut self, channel_positions: Option<Vec<u8>>) -> Self {
+        self.channel_positions = channel_positions;
+        self
+    }
+
+    /// Set `track_overlays`.
+    #[must_use]
+    pub fn with_track_overlays(mut self, track_overlays: Vec<u64>) -> Self {
+        self.track_overlays = track_overlays;
+        self
+    }
+
+    /// Set `trick_track_uid`.
+    #[must_use]
+    pub fn with_trick_track_uid(mut self, trick_track_uid: Option<u64>) -> Self {
+        self.trick_track_uid = trick_track_uid;
+        self
+    }
+
+    /// Set `trick_track_segment_uid`.
+    #[must_use]
+    pub fn with_trick_track_segment_uid(
+        mut self,
+        trick_track_segment_uid: Option<Vec<u8>>,
+    ) -> Self {
+        self.trick_track_segment_uid = trick_track_segment_uid;
+        self
+    }
+
+    /// Set `trick_track_flag`.
+    #[must_use]
+    pub fn with_trick_track_flag(mut self, trick_track_flag: Option<u64>) -> Self {
+        self.trick_track_flag = trick_track_flag;
+        self
+    }
+
+    /// Set `trick_master_track_uid`.
+    #[must_use]
+    pub fn with_trick_master_track_uid(mut self, trick_master_track_uid: Option<u64>) -> Self {
+        self.trick_master_track_uid = trick_master_track_uid;
+        self
+    }
+
+    /// Set `trick_master_track_segment_uid`.
+    #[must_use]
+    pub fn with_trick_master_track_segment_uid(
+        mut self,
+        trick_master_track_segment_uid: Option<Vec<u8>>,
+    ) -> Self {
+        self.trick_master_track_segment_uid = trick_master_track_segment_uid;
+        self
+    }
 }
 
 impl MkvTrackLegacy {
@@ -1012,6 +1301,7 @@ const MAX_FRAMES_PER_LACE: usize = 8;
 /// `ChapterTimeEnd`. The demuxer surfaces such an atom without an
 /// `end_ms` metadata key, matching ffprobe behaviour on real files.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MkvChapter {
     /// `ChapterTimeStart`, in nanoseconds.
     pub time_start_ns: u64,
@@ -1070,6 +1360,92 @@ pub struct MkvChapter {
     pub skip_type: Option<ChapterSkipType>,
 }
 
+impl MkvChapter {
+    /// Set `time_start_ns`.
+    #[must_use]
+    pub fn with_time_start_ns(mut self, time_start_ns: u64) -> Self {
+        self.time_start_ns = time_start_ns;
+        self
+    }
+
+    /// Set `time_end_ns`.
+    #[must_use]
+    pub fn with_time_end_ns(mut self, time_end_ns: Option<u64>) -> Self {
+        self.time_end_ns = time_end_ns;
+        self
+    }
+
+    /// Set `uid`.
+    #[must_use]
+    pub fn with_uid(mut self, uid: Option<u64>) -> Self {
+        self.uid = uid;
+        self
+    }
+
+    /// Set `string_uid`.
+    #[must_use]
+    pub fn with_string_uid(mut self, string_uid: Option<String>) -> Self {
+        self.string_uid = string_uid;
+        self
+    }
+
+    /// Set `hidden`.
+    #[must_use]
+    pub fn with_hidden(mut self, hidden: bool) -> Self {
+        self.hidden = hidden;
+        self
+    }
+
+    /// Set `enabled`.
+    #[must_use]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Set `segment_uuid`.
+    #[must_use]
+    pub fn with_segment_uuid(mut self, segment_uuid: Option<Vec<u8>>) -> Self {
+        self.segment_uuid = segment_uuid;
+        self
+    }
+
+    /// Set `segment_edition_uid`.
+    #[must_use]
+    pub fn with_segment_edition_uid(mut self, segment_edition_uid: Option<u64>) -> Self {
+        self.segment_edition_uid = segment_edition_uid;
+        self
+    }
+
+    /// Set `physical_equiv`.
+    #[must_use]
+    pub fn with_physical_equiv(mut self, physical_equiv: Option<u64>) -> Self {
+        self.physical_equiv = physical_equiv;
+        self
+    }
+
+    /// Set `display`.
+    #[must_use]
+    pub fn with_display(mut self, display: Vec<ChapterDisplay>) -> Self {
+        self.display = display;
+        self
+    }
+
+    /// Set `chap_processes`.
+    #[must_use]
+    pub fn with_chap_processes(mut self, chap_processes: Vec<MkvChapProcess>) -> Self {
+        self.chap_processes = chap_processes;
+        self
+    }
+
+    /// Set `skip_type`.
+    #[must_use]
+    pub fn with_skip_type(mut self, skip_type: Option<ChapterSkipType>) -> Self {
+        self.skip_type = skip_type;
+        self
+    }
+}
+
 impl Default for MkvChapter {
     fn default() -> Self {
         Self {
@@ -1097,6 +1473,7 @@ impl Default for MkvChapter {
 /// [`crate::demux::EditionDisplay`]: a human-readable edition name in one
 /// or more languages, the edition-level analogue of [`ChapterDisplay`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvEditionDisplay {
     /// `EditionString` (v5 `0x4521`, utf-8, mandatory — exactly one per
     /// `EditionDisplay`). Always written; an empty string is legal per
@@ -1108,6 +1485,22 @@ pub struct MkvEditionDisplay {
     /// fallback in the schema and none is synthesised). Each tag must be
     /// printable ASCII (the EBML `string` type); validated at queue time.
     pub languages: Vec<String>,
+}
+
+impl MkvEditionDisplay {
+    /// Set `string`.
+    #[must_use]
+    pub fn with_string(mut self, string: String) -> Self {
+        self.string = string;
+        self
+    }
+
+    /// Set `languages`.
+    #[must_use]
+    pub fn with_languages(mut self, languages: Vec<String>) -> Self {
+        self.languages = languages;
+        self
+    }
 }
 
 impl MkvEditionDisplay {
@@ -1125,6 +1518,7 @@ impl MkvEditionDisplay {
 /// [`crate::demux::ChapProcess`]. The container never executes a chapter
 /// command; it writes the raw payloads verbatim.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvChapProcess {
     /// `ChapProcessCodecID` (RFC 9559 §5.1.7.1.4.15) — `0` = Matroska
     /// Script, `1` = DVD-menu. Always written (mandatory; the demuxer
@@ -1139,9 +1533,33 @@ pub struct MkvChapProcess {
     pub commands: Vec<MkvChapProcessCommand>,
 }
 
+impl MkvChapProcess {
+    /// Set `codec_id`.
+    #[must_use]
+    pub fn with_codec_id(mut self, codec_id: u64) -> Self {
+        self.codec_id = codec_id;
+        self
+    }
+
+    /// Set `private`.
+    #[must_use]
+    pub fn with_private(mut self, private: Option<Vec<u8>>) -> Self {
+        self.private = private;
+        self
+    }
+
+    /// Set `commands`.
+    #[must_use]
+    pub fn with_commands(mut self, commands: Vec<MkvChapProcessCommand>) -> Self {
+        self.commands = commands;
+        self
+    }
+}
+
 /// One `ChapProcessCommand` master (RFC 9559 §5.1.7.1.4.17) — the
 /// write-side mirror of [`crate::demux::ChapProcessCommand`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvChapProcessCommand {
     /// `ChapProcessTime` (RFC 9559 §5.1.7.1.4.18) — `0` during the whole
     /// chapter, `1` before playback, `2` after. Always written.
@@ -1149,6 +1567,22 @@ pub struct MkvChapProcessCommand {
     /// `ChapProcessData` (RFC 9559 §5.1.7.1.4.19) — the command payload,
     /// written verbatim.
     pub data: Vec<u8>,
+}
+
+impl MkvChapProcessCommand {
+    /// Set `time`.
+    #[must_use]
+    pub fn with_time(mut self, time: u64) -> Self {
+        self.time = time;
+        self
+    }
+
+    /// Set `data`.
+    #[must_use]
+    pub fn with_data(mut self, data: Vec<u8>) -> Self {
+        self.data = data;
+        self
+    }
 }
 
 /// One `ChapterDisplay` row — a chapter title in one language.
@@ -1167,6 +1601,7 @@ pub struct MkvChapProcessCommand {
 /// ignored, so the muxer writes **only** `ChapLanguageBCP47` in that case
 /// (mirroring how `LanguageBCP47` / `TagLanguageBCP47` are handled).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ChapterDisplay {
     /// `ChapString` — UTF-8 title text.
     pub title: String,
@@ -1181,6 +1616,36 @@ pub struct ChapterDisplay {
     /// BCP 47 language tag. When `Some`, the muxer writes this element and
     /// suppresses `ChapLanguage`. Skipped when `None`.
     pub language_bcp47: Option<String>,
+}
+
+impl ChapterDisplay {
+    /// Set `title`.
+    #[must_use]
+    pub fn with_title(mut self, title: String) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// Set `language`.
+    #[must_use]
+    pub fn with_language(mut self, language: String) -> Self {
+        self.language = language;
+        self
+    }
+
+    /// Set `country`.
+    #[must_use]
+    pub fn with_country(mut self, country: Option<String>) -> Self {
+        self.country = country;
+        self
+    }
+
+    /// Set `language_bcp47`.
+    #[must_use]
+    pub fn with_language_bcp47(mut self, language_bcp47: Option<String>) -> Self {
+        self.language_bcp47 = language_bcp47;
+        self
+    }
 }
 
 impl ChapterDisplay {
@@ -1226,6 +1691,7 @@ impl ChapterDisplay {
 /// The on-disk order matches the demux side's parse order for clean
 /// round-tripping under the typed [`crate::demux::Attachment`] accessor.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct MkvAttachment {
     /// `FileName` (RFC 9559 §5.1.6.1.2). Mandatory on disk.
     pub filename: String,
@@ -1255,6 +1721,64 @@ pub struct MkvAttachment {
     /// legacy element. `None` → omitted; `Some(v)` written (including a
     /// present `0`).
     pub used_end_time: Option<u64>,
+}
+
+impl MkvAttachment {
+    /// Set `filename`.
+    #[must_use]
+    pub fn with_filename(mut self, filename: String) -> Self {
+        self.filename = filename;
+        self
+    }
+
+    /// Set `mime_type`.
+    #[must_use]
+    pub fn with_mime_type(mut self, mime_type: String) -> Self {
+        self.mime_type = mime_type;
+        self
+    }
+
+    /// Set `data`.
+    #[must_use]
+    pub fn with_data(mut self, data: Vec<u8>) -> Self {
+        self.data = data;
+        self
+    }
+
+    /// Set `uid`.
+    #[must_use]
+    pub fn with_uid(mut self, uid: Option<u64>) -> Self {
+        self.uid = uid;
+        self
+    }
+
+    /// Set `description`.
+    #[must_use]
+    pub fn with_description(mut self, description: Option<String>) -> Self {
+        self.description = description;
+        self
+    }
+
+    /// Set `referral`.
+    #[must_use]
+    pub fn with_referral(mut self, referral: Option<Vec<u8>>) -> Self {
+        self.referral = referral;
+        self
+    }
+
+    /// Set `used_start_time`.
+    #[must_use]
+    pub fn with_used_start_time(mut self, used_start_time: Option<u64>) -> Self {
+        self.used_start_time = used_start_time;
+        self
+    }
+
+    /// Set `used_end_time`.
+    #[must_use]
+    pub fn with_used_end_time(mut self, used_end_time: Option<u64>) -> Self {
+        self.used_end_time = used_end_time;
+        self
+    }
 }
 
 impl MkvAttachment {
@@ -1305,6 +1829,7 @@ impl MkvAttachment {
 ///   SimpleTag (0x67C8) × M           — see MkvSimpleTag
 /// ```
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct MkvTag {
     /// Scope of this tag — see [`MkvTagTargets`]. An all-default
     /// `MkvTagTargets` produces a bare `Targets` master (global scope).
@@ -1313,6 +1838,22 @@ pub struct MkvTag {
     /// scope (RFC 9559 §5.1.8.1.2, `minOccurs: 1`). Written in list
     /// order.
     pub simple_tags: Vec<MkvSimpleTag>,
+}
+
+impl MkvTag {
+    /// Set `targets`.
+    #[must_use]
+    pub fn with_targets(mut self, targets: MkvTagTargets) -> Self {
+        self.targets = targets;
+        self
+    }
+
+    /// Set `simple_tags`.
+    #[must_use]
+    pub fn with_simple_tags(mut self, simple_tags: Vec<MkvSimpleTag>) -> Self {
+        self.simple_tags = simple_tags;
+        self
+    }
 }
 
 impl MkvTag {
@@ -1341,6 +1882,7 @@ impl MkvTag {
 /// only the concrete non-zero UIDs it wants to scope to; a `0` in any
 /// list is dropped at write time.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct MkvTagTargets {
     /// `TargetTypeValue` (RFC 9559 §5.1.8.1.1.1, Table 33). `range: not
     /// 0`. `None` → element omitted (the demuxer surfaces `None`, which
@@ -1378,6 +1920,57 @@ pub struct MkvTagTargets {
 }
 
 impl MkvTagTargets {
+    /// Set `target_type_value`.
+    #[must_use]
+    pub fn with_target_type_value(mut self, target_type_value: Option<u64>) -> Self {
+        self.target_type_value = target_type_value;
+        self
+    }
+
+    /// Set `target_type`.
+    #[must_use]
+    pub fn with_target_type(mut self, target_type: Option<String>) -> Self {
+        self.target_type = target_type;
+        self
+    }
+
+    /// Set `track_uids`.
+    #[must_use]
+    pub fn with_track_uids(mut self, track_uids: Vec<u64>) -> Self {
+        self.track_uids = track_uids;
+        self
+    }
+
+    /// Set `edition_uids`.
+    #[must_use]
+    pub fn with_edition_uids(mut self, edition_uids: Vec<u64>) -> Self {
+        self.edition_uids = edition_uids;
+        self
+    }
+
+    /// Set `chapter_uids`.
+    #[must_use]
+    pub fn with_chapter_uids(mut self, chapter_uids: Vec<u64>) -> Self {
+        self.chapter_uids = chapter_uids;
+        self
+    }
+
+    /// Set `attachment_uids`.
+    #[must_use]
+    pub fn with_attachment_uids(mut self, attachment_uids: Vec<u64>) -> Self {
+        self.attachment_uids = attachment_uids;
+        self
+    }
+
+    /// Set `block_add_id_values`.
+    #[must_use]
+    pub fn with_block_add_id_values(mut self, block_add_id_values: Vec<u64>) -> Self {
+        self.block_add_id_values = block_add_id_values;
+        self
+    }
+}
+
+impl MkvTagTargets {
     /// `true` when this is the global scope — no UID lists and no
     /// informational `TargetType` / `TargetTypeValue`. Produces a bare
     /// `Targets` master on disk.
@@ -1412,6 +2005,7 @@ impl MkvTagTargets {
 /// (§5.1.8.1.2) — a `SimpleTag` MAY contain child `SimpleTag`s to model
 /// hierarchical metadata (e.g. a `TITLE` with a `SORT_WITH` sub-tag).
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct MkvSimpleTag {
     /// `TagName` (RFC 9559 §5.1.8.1.2.1, `minOccurs: 1`). Written
     /// verbatim — the demuxer preserves case. An empty name is rejected
@@ -1435,6 +2029,50 @@ pub struct MkvSimpleTag {
     /// Nested `SimpleTag`s (RFC 9559 §5.1.8.1.2 `recursive: True`).
     /// Empty for the common flat case.
     pub children: Vec<MkvSimpleTag>,
+}
+
+impl MkvSimpleTag {
+    /// Set `name`.
+    #[must_use]
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+
+    /// Set `value`.
+    #[must_use]
+    pub fn with_value(mut self, value: MkvSimpleTagValue) -> Self {
+        self.value = value;
+        self
+    }
+
+    /// Set `language`.
+    #[must_use]
+    pub fn with_language(mut self, language: String) -> Self {
+        self.language = language;
+        self
+    }
+
+    /// Set `language_bcp47`.
+    #[must_use]
+    pub fn with_language_bcp47(mut self, language_bcp47: Option<String>) -> Self {
+        self.language_bcp47 = language_bcp47;
+        self
+    }
+
+    /// Set `default`.
+    #[must_use]
+    pub fn with_default(mut self, default: bool) -> Self {
+        self.default = default;
+        self
+    }
+
+    /// Set `children`.
+    #[must_use]
+    pub fn with_children(mut self, children: Vec<MkvSimpleTag>) -> Self {
+        self.children = children;
+        self
+    }
 }
 
 impl MkvSimpleTag {
@@ -1521,6 +2159,7 @@ struct VideoInterlacingMux {
 ///   every other variant (including [`DisplayUnit::Other`] for §27.9
 ///   forward-compat values).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvVideoGeometry {
     /// `PixelCropTop` (RFC 9559 §5.1.4.1.28.9). Spec default `0`.
     pub crop_top: u64,
@@ -1540,6 +2179,57 @@ pub struct MkvVideoGeometry {
     /// `0` ([`DisplayUnit::Pixels`]); the muxer omits the element when set
     /// to `Pixels` and writes it explicitly otherwise.
     pub display_unit: DisplayUnit,
+}
+
+impl MkvVideoGeometry {
+    /// Set `crop_top`.
+    #[must_use]
+    pub fn with_crop_top(mut self, crop_top: u64) -> Self {
+        self.crop_top = crop_top;
+        self
+    }
+
+    /// Set `crop_bottom`.
+    #[must_use]
+    pub fn with_crop_bottom(mut self, crop_bottom: u64) -> Self {
+        self.crop_bottom = crop_bottom;
+        self
+    }
+
+    /// Set `crop_left`.
+    #[must_use]
+    pub fn with_crop_left(mut self, crop_left: u64) -> Self {
+        self.crop_left = crop_left;
+        self
+    }
+
+    /// Set `crop_right`.
+    #[must_use]
+    pub fn with_crop_right(mut self, crop_right: u64) -> Self {
+        self.crop_right = crop_right;
+        self
+    }
+
+    /// Set `display_width`.
+    #[must_use]
+    pub fn with_display_width(mut self, display_width: Option<u64>) -> Self {
+        self.display_width = display_width;
+        self
+    }
+
+    /// Set `display_height`.
+    #[must_use]
+    pub fn with_display_height(mut self, display_height: Option<u64>) -> Self {
+        self.display_height = display_height;
+        self
+    }
+
+    /// Set `display_unit`.
+    #[must_use]
+    pub fn with_display_unit(mut self, display_unit: DisplayUnit) -> Self {
+        self.display_unit = display_unit;
+        self
+    }
 }
 
 impl MkvVideoGeometry {
@@ -1618,6 +2308,7 @@ impl MkvVideoGeometry {
 /// so a value the demuxer parsed from a §27 open registry can be re-muxed
 /// verbatim.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct MkvVideoColour {
     /// `MatrixCoefficients` (RFC 9559 §5.1.4.1.28.17, Table 12). Default
     /// [`MatrixCoefficients::Unspecified`].
@@ -1665,6 +2356,112 @@ pub struct MkvVideoColour {
     pub mastering_metadata: Option<MkvMasteringMetadata>,
 }
 
+impl MkvVideoColour {
+    /// Set `matrix_coefficients`.
+    #[must_use]
+    pub fn with_matrix_coefficients(mut self, matrix_coefficients: MatrixCoefficients) -> Self {
+        self.matrix_coefficients = matrix_coefficients;
+        self
+    }
+
+    /// Set `bits_per_channel`.
+    #[must_use]
+    pub fn with_bits_per_channel(mut self, bits_per_channel: u64) -> Self {
+        self.bits_per_channel = bits_per_channel;
+        self
+    }
+
+    /// Set `chroma_subsampling_horz`.
+    #[must_use]
+    pub fn with_chroma_subsampling_horz(mut self, chroma_subsampling_horz: Option<u64>) -> Self {
+        self.chroma_subsampling_horz = chroma_subsampling_horz;
+        self
+    }
+
+    /// Set `chroma_subsampling_vert`.
+    #[must_use]
+    pub fn with_chroma_subsampling_vert(mut self, chroma_subsampling_vert: Option<u64>) -> Self {
+        self.chroma_subsampling_vert = chroma_subsampling_vert;
+        self
+    }
+
+    /// Set `cb_subsampling_horz`.
+    #[must_use]
+    pub fn with_cb_subsampling_horz(mut self, cb_subsampling_horz: Option<u64>) -> Self {
+        self.cb_subsampling_horz = cb_subsampling_horz;
+        self
+    }
+
+    /// Set `cb_subsampling_vert`.
+    #[must_use]
+    pub fn with_cb_subsampling_vert(mut self, cb_subsampling_vert: Option<u64>) -> Self {
+        self.cb_subsampling_vert = cb_subsampling_vert;
+        self
+    }
+
+    /// Set `chroma_siting_horz`.
+    #[must_use]
+    pub fn with_chroma_siting_horz(mut self, chroma_siting_horz: ChromaSitingHorz) -> Self {
+        self.chroma_siting_horz = chroma_siting_horz;
+        self
+    }
+
+    /// Set `chroma_siting_vert`.
+    #[must_use]
+    pub fn with_chroma_siting_vert(mut self, chroma_siting_vert: ChromaSitingVert) -> Self {
+        self.chroma_siting_vert = chroma_siting_vert;
+        self
+    }
+
+    /// Set `range`.
+    #[must_use]
+    pub fn with_range(mut self, range: ColourRange) -> Self {
+        self.range = range;
+        self
+    }
+
+    /// Set `transfer_characteristics`.
+    #[must_use]
+    pub fn with_transfer_characteristics(
+        mut self,
+        transfer_characteristics: TransferCharacteristics,
+    ) -> Self {
+        self.transfer_characteristics = transfer_characteristics;
+        self
+    }
+
+    /// Set `primaries`.
+    #[must_use]
+    pub fn with_primaries(mut self, primaries: Primaries) -> Self {
+        self.primaries = primaries;
+        self
+    }
+
+    /// Set `max_cll`.
+    #[must_use]
+    pub fn with_max_cll(mut self, max_cll: Option<u64>) -> Self {
+        self.max_cll = max_cll;
+        self
+    }
+
+    /// Set `max_fall`.
+    #[must_use]
+    pub fn with_max_fall(mut self, max_fall: Option<u64>) -> Self {
+        self.max_fall = max_fall;
+        self
+    }
+
+    /// Set `mastering_metadata`.
+    #[must_use]
+    pub fn with_mastering_metadata(
+        mut self,
+        mastering_metadata: Option<MkvMasteringMetadata>,
+    ) -> Self {
+        self.mastering_metadata = mastering_metadata;
+        self
+    }
+}
+
 /// `Colour > MasteringMetadata` payload (RFC 9559
 /// §5.1.4.1.28.30..§5.1.4.1.28.40) on the write side: the SMPTE ST 2086
 /// / CTA-861.3 mastering-display description that accompanies HDR
@@ -1696,6 +2493,7 @@ pub struct MkvVideoColour {
 /// `MasteringMetadata` element present" which leaves the demux-side
 /// accessor `None`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct MkvMasteringMetadata {
     /// `PrimaryRChromaticityX` (RFC 9559 §5.1.4.1.28.31, id `0x55D1`).
     /// CIE-1931 X coordinate of the mastering display's red primary,
@@ -1721,6 +2519,84 @@ pub struct MkvMasteringMetadata {
     /// `LuminanceMin` (RFC 9559 §5.1.4.1.28.40, id `0x55DA`), in cd/m²;
     /// spec range `>= 0`. Minimum luminance of the mastering display.
     pub luminance_min: Option<f64>,
+}
+
+impl MkvMasteringMetadata {
+    /// Set `primary_r_chromaticity_x`.
+    #[must_use]
+    pub fn with_primary_r_chromaticity_x(mut self, primary_r_chromaticity_x: Option<f64>) -> Self {
+        self.primary_r_chromaticity_x = primary_r_chromaticity_x;
+        self
+    }
+
+    /// Set `primary_r_chromaticity_y`.
+    #[must_use]
+    pub fn with_primary_r_chromaticity_y(mut self, primary_r_chromaticity_y: Option<f64>) -> Self {
+        self.primary_r_chromaticity_y = primary_r_chromaticity_y;
+        self
+    }
+
+    /// Set `primary_g_chromaticity_x`.
+    #[must_use]
+    pub fn with_primary_g_chromaticity_x(mut self, primary_g_chromaticity_x: Option<f64>) -> Self {
+        self.primary_g_chromaticity_x = primary_g_chromaticity_x;
+        self
+    }
+
+    /// Set `primary_g_chromaticity_y`.
+    #[must_use]
+    pub fn with_primary_g_chromaticity_y(mut self, primary_g_chromaticity_y: Option<f64>) -> Self {
+        self.primary_g_chromaticity_y = primary_g_chromaticity_y;
+        self
+    }
+
+    /// Set `primary_b_chromaticity_x`.
+    #[must_use]
+    pub fn with_primary_b_chromaticity_x(mut self, primary_b_chromaticity_x: Option<f64>) -> Self {
+        self.primary_b_chromaticity_x = primary_b_chromaticity_x;
+        self
+    }
+
+    /// Set `primary_b_chromaticity_y`.
+    #[must_use]
+    pub fn with_primary_b_chromaticity_y(mut self, primary_b_chromaticity_y: Option<f64>) -> Self {
+        self.primary_b_chromaticity_y = primary_b_chromaticity_y;
+        self
+    }
+
+    /// Set `white_point_chromaticity_x`.
+    #[must_use]
+    pub fn with_white_point_chromaticity_x(
+        mut self,
+        white_point_chromaticity_x: Option<f64>,
+    ) -> Self {
+        self.white_point_chromaticity_x = white_point_chromaticity_x;
+        self
+    }
+
+    /// Set `white_point_chromaticity_y`.
+    #[must_use]
+    pub fn with_white_point_chromaticity_y(
+        mut self,
+        white_point_chromaticity_y: Option<f64>,
+    ) -> Self {
+        self.white_point_chromaticity_y = white_point_chromaticity_y;
+        self
+    }
+
+    /// Set `luminance_max`.
+    #[must_use]
+    pub fn with_luminance_max(mut self, luminance_max: Option<f64>) -> Self {
+        self.luminance_max = luminance_max;
+        self
+    }
+
+    /// Set `luminance_min`.
+    #[must_use]
+    pub fn with_luminance_min(mut self, luminance_min: Option<f64>) -> Self {
+        self.luminance_min = luminance_min;
+        self
+    }
 }
 
 impl MkvMasteringMetadata {
@@ -1838,6 +2714,7 @@ impl MkvVideoColour {
 /// every getter returning the spec default, distinct from the
 /// call-was-omitted case (`None`).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct MkvProjection {
     /// `ProjectionType` (RFC 9559 §5.1.4.1.28.42, id `0x7671`). Default
     /// [`ProjectionType::Rectangular`]; written on disk only for
@@ -1856,6 +2733,43 @@ pub struct MkvProjection {
     /// `ProjectionPoseRoll` (RFC 9559 §5.1.4.1.28.46, id `0x7675`),
     /// degrees, range `[-180.0, 180.0]`, default `0.0`.
     pub pose_roll: f64,
+}
+
+impl MkvProjection {
+    /// Set `projection_type`.
+    #[must_use]
+    pub fn with_projection_type(mut self, projection_type: ProjectionType) -> Self {
+        self.projection_type = projection_type;
+        self
+    }
+
+    /// Set `private`.
+    #[must_use]
+    pub fn with_private(mut self, private: Option<Vec<u8>>) -> Self {
+        self.private = private;
+        self
+    }
+
+    /// Set `pose_yaw`.
+    #[must_use]
+    pub fn with_pose_yaw(mut self, pose_yaw: f64) -> Self {
+        self.pose_yaw = pose_yaw;
+        self
+    }
+
+    /// Set `pose_pitch`.
+    #[must_use]
+    pub fn with_pose_pitch(mut self, pose_pitch: f64) -> Self {
+        self.pose_pitch = pose_pitch;
+        self
+    }
+
+    /// Set `pose_roll`.
+    #[must_use]
+    pub fn with_pose_roll(mut self, pose_roll: f64) -> Self {
+        self.pose_roll = pose_roll;
+        self
+    }
 }
 
 impl MkvProjection {
@@ -1918,6 +2832,7 @@ impl MkvProjection {
 /// The muxer already pins `DocTypeVersion` to `4`, so emitting the
 /// `minver: 4` elements never violates the declared document version.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvTrackAudienceFlags {
     /// `FlagForced` (§5.1.4.1.6). Applies only to subtitles per the spec
     /// definition; the muxer still accepts it on any track type because
@@ -1938,6 +2853,50 @@ pub struct MkvTrackAudienceFlags {
     pub original: Option<bool>,
     /// `FlagCommentary` (§5.1.4.1.11) — track contains commentary.
     pub commentary: Option<bool>,
+}
+
+impl MkvTrackAudienceFlags {
+    /// Set `forced`.
+    #[must_use]
+    pub fn with_forced(mut self, forced: Option<bool>) -> Self {
+        self.forced = forced;
+        self
+    }
+
+    /// Set `hearing_impaired`.
+    #[must_use]
+    pub fn with_hearing_impaired(mut self, hearing_impaired: Option<bool>) -> Self {
+        self.hearing_impaired = hearing_impaired;
+        self
+    }
+
+    /// Set `visual_impaired`.
+    #[must_use]
+    pub fn with_visual_impaired(mut self, visual_impaired: Option<bool>) -> Self {
+        self.visual_impaired = visual_impaired;
+        self
+    }
+
+    /// Set `text_descriptions`.
+    #[must_use]
+    pub fn with_text_descriptions(mut self, text_descriptions: Option<bool>) -> Self {
+        self.text_descriptions = text_descriptions;
+        self
+    }
+
+    /// Set `original`.
+    #[must_use]
+    pub fn with_original(mut self, original: Option<bool>) -> Self {
+        self.original = original;
+        self
+    }
+
+    /// Set `commentary`.
+    #[must_use]
+    pub fn with_commentary(mut self, commentary: Option<bool>) -> Self {
+        self.commentary = commentary;
+        self
+    }
 }
 
 impl MkvTrackAudienceFlags {
@@ -2001,7 +2960,8 @@ impl MkvTrackAudienceFlags {
 /// written explicitly otherwise. `data` is the verbatim
 /// `BlockAdditional` payload (§5.1.3.5.2.2) — never interpreted by the
 /// muxer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct MkvBlockAddition {
     /// `BlockAddID` (RFC 9559 §5.1.3.5.2.3). Must be non-zero and at
     /// most the track's declared `MaxBlockAdditionID` — validated at
@@ -2010,6 +2970,22 @@ pub struct MkvBlockAddition {
     /// `BlockAdditional` (RFC 9559 §5.1.3.5.2.2) payload bytes, written
     /// verbatim.
     pub data: Vec<u8>,
+}
+
+impl MkvBlockAddition {
+    /// Set `id`.
+    #[must_use]
+    pub fn with_id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// Set `data`.
+    #[must_use]
+    pub fn with_data(mut self, data: Vec<u8>) -> Self {
+        self.data = data;
+        self
+    }
 }
 
 impl MkvBlockAddition {
@@ -2039,6 +3015,7 @@ impl MkvBlockAddition {
 /// `BlockAdditions`, `BlockDuration`, `ReferencePriority`, `ReferenceBlock`
 /// (one per entry), `CodecState`, `DiscardPadding`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BlockGroupOptions {
     /// `BlockAdditions` (§5.1.3.5.2) — validated exactly as
     /// [`MkvMuxer::write_packet_with_additions`] validates them.
@@ -2079,6 +3056,74 @@ pub struct BlockGroupOptions {
     pub reference_frame: Option<crate::demux::ReferenceFrame>,
 }
 
+impl BlockGroupOptions {
+    /// Set `additions`.
+    #[must_use]
+    pub fn with_additions(mut self, additions: Vec<MkvBlockAddition>) -> Self {
+        self.additions = additions;
+        self
+    }
+
+    /// Set `reference_blocks`.
+    #[must_use]
+    pub fn with_reference_blocks(mut self, reference_blocks: Vec<i64>) -> Self {
+        self.reference_blocks = reference_blocks;
+        self
+    }
+
+    /// Set `reference_priority`.
+    #[must_use]
+    pub fn with_reference_priority(mut self, reference_priority: u64) -> Self {
+        self.reference_priority = reference_priority;
+        self
+    }
+
+    /// Set `codec_state`.
+    #[must_use]
+    pub fn with_codec_state(mut self, codec_state: Option<Vec<u8>>) -> Self {
+        self.codec_state = codec_state;
+        self
+    }
+
+    /// Set `discard_padding`.
+    #[must_use]
+    pub fn with_discard_padding(mut self, discard_padding: Option<i64>) -> Self {
+        self.discard_padding = discard_padding;
+        self
+    }
+
+    /// Set `block_virtual`.
+    #[must_use]
+    pub fn with_block_virtual(mut self, block_virtual: Option<Vec<u8>>) -> Self {
+        self.block_virtual = block_virtual;
+        self
+    }
+
+    /// Set `reference_virtual`.
+    #[must_use]
+    pub fn with_reference_virtual(mut self, reference_virtual: Option<i64>) -> Self {
+        self.reference_virtual = reference_virtual;
+        self
+    }
+
+    /// Set `slices`.
+    #[must_use]
+    pub fn with_slices(mut self, slices: Vec<crate::demux::TimeSlice>) -> Self {
+        self.slices = slices;
+        self
+    }
+
+    /// Set `reference_frame`.
+    #[must_use]
+    pub fn with_reference_frame(
+        mut self,
+        reference_frame: Option<crate::demux::ReferenceFrame>,
+    ) -> Self {
+        self.reference_frame = reference_frame;
+        self
+    }
+}
+
 /// A `TrackOperation` (RFC 9559 §5.1.4.1.30) hint queued via
 /// [`MkvMuxer::set_track_operation`]: the recipe that turns the carrying
 /// `TrackEntry` into a *virtual* track assembled from other tracks in the
@@ -2107,6 +3152,7 @@ pub struct BlockGroupOptions {
 /// typed accessor — a mux→demux pipeline preserves every plane (with its
 /// type) and every join reference.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvTrackOperation {
     /// `TrackCombinePlanes` planes, in write order. Empty → no
     /// `TrackCombinePlanes` child is emitted.
@@ -2114,6 +3160,22 @@ pub struct MkvTrackOperation {
     /// `TrackJoinBlocks` source stream indices, in write order. Empty →
     /// no `TrackJoinBlocks` child is emitted.
     pub join_tracks: Vec<usize>,
+}
+
+impl MkvTrackOperation {
+    /// Set `combine_planes`.
+    #[must_use]
+    pub fn with_combine_planes(mut self, combine_planes: Vec<MkvTrackPlane>) -> Self {
+        self.combine_planes = combine_planes;
+        self
+    }
+
+    /// Set `join_tracks`.
+    #[must_use]
+    pub fn with_join_tracks(mut self, join_tracks: Vec<usize>) -> Self {
+        self.join_tracks = join_tracks;
+        self
+    }
 }
 
 impl MkvTrackOperation {
@@ -2165,12 +3227,23 @@ impl MkvTrackOperation {
 /// [`MkvTrackOperation::combine_planes`] list: a source video track plus
 /// the role it plays in the combined 3D track.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MkvTrackPlane {
     /// 0-indexed stream index of the source plane track, resolved to its
     /// `TrackPlaneUID` (= the track's `TrackUID`) at `write_header` time.
     pub stream_index: usize,
     /// `TrackPlaneType` (RFC 9559 §5.1.4.1.30.4).
     pub plane_type: TrackPlaneType,
+}
+
+impl MkvTrackPlane {
+    /// Build `MkvTrackPlane` from every field, in declaration order.
+    pub fn new(stream_index: usize, plane_type: TrackPlaneType) -> Self {
+        Self {
+            stream_index,
+            plane_type,
+        }
+    }
 }
 
 /// One Cues → CuePoint entry the muxer will emit in `write_trailer`.

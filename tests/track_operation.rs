@@ -196,9 +196,11 @@ fn combine_planes_resolves_to_stream_indices() {
 
     assert_eq!(
         op.planes[0].track,
-        TrackRef {
-            track_uid: UID_LEFT,
-            stream_index: Some(0),
+        {
+            let mut track_ref = TrackRef::default();
+            track_ref.track_uid = UID_LEFT;
+            track_ref.stream_index = Some(0);
+            track_ref
         },
         "left plane resolves to stream 0"
     );
@@ -206,9 +208,11 @@ fn combine_planes_resolves_to_stream_indices() {
 
     assert_eq!(
         op.planes[1].track,
-        TrackRef {
-            track_uid: UID_RIGHT,
-            stream_index: Some(1),
+        {
+            let mut track_ref = TrackRef::default();
+            track_ref.track_uid = UID_RIGHT;
+            track_ref.stream_index = Some(1);
+            track_ref
         },
         "right plane resolves to stream 1"
     );
@@ -256,9 +260,11 @@ fn join_blocks_with_dangling_reference() {
     assert_eq!(op.join_tracks[1].stream_index, Some(1), "UID_B -> stream 1");
     assert_eq!(
         op.join_tracks[2],
-        TrackRef {
-            track_uid: UID_DANGLING,
-            stream_index: None,
+        {
+            let mut track_ref = TrackRef::default();
+            track_ref.track_uid = UID_DANGLING;
+            track_ref.stream_index = None;
+            track_ref
         },
         "dangling UID kept with stream_index None"
     );

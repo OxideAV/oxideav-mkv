@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `with_<field>` setters on every muxer-side record: `MkvTrackAudio`, `MkvTrackTiming`, `MkvTrackCodecTiming`, `MkvTrackIdentity`, `MkvTrackTranslate`, `MkvTrackLegacy`, `MkvChapter`, `MkvEditionDisplay`, `MkvChapProcess`, `MkvChapProcessCommand`, `mux::ChapterDisplay`, `MkvAttachment`, `MkvTag`, `MkvTagTargets`, `MkvSimpleTag`, `MkvVideoGeometry`, `MkvVideoColour`, `MkvMasteringMetadata`, `MkvProjection`, `MkvTrackAudienceFlags`, `MkvBlockAddition`, `BlockGroupOptions`, `MkvTrackOperation` (setters that already existed are kept as they were).
+- `new(..)` (every field, in declaration order) on `TrackPlane`, `VirtualPacketOrigin`, `ContentEncoding`, `MkvTrackPlane`, `schema::ElementDef`, `schema::SchemaFinding`, `webm::WebmFinding`.
+- `Default` on `AcmFormat`, `CrcStatus`, `Tag`, `SimpleTag`, `TrackRef`, `BlockAdditionMapping`, `DocTypeExtension`, `EbmlHeader`, `Attachment`, `ebml::ElementHeader` and `MkvBlockAddition`.
+
+### Changed
+
+- `#[non_exhaustive]` on the growable enums `AesCipherMode`, `AlphaMode`, `AudioEmphasis`, `ChapterSkipType`, `ChromaSitingHorz`, `ChromaSitingVert`, `ColourRange`, `ContentCompAlgo`, `ContentEncAlgo`, `CueLieKind`, `DamageKind`, `DisplayUnit`, `FieldOrder`, `FlagInterlaced`, `MatrixCoefficients`, `OldStereoMode`, `Primaries`, `ProjectionType`, `SchemaFindingKind`, `SeekLieKind`, `StereoMode`, `TargetLevel`, `TrackPlaneType`, `TransferCharacteristics`, `VirtualPacketRole`, `WebmSupport`. `ebml`/`schema::ElementType` (the eight EBML element types), `LacingMode`, `SimpleTagValue` / `MkvSimpleTagValue`, `TargetUid` and `ContentEncodingTransform` stay exhaustive: the format fixes their value sets.
+- `#[non_exhaustive]` on every public record: demuxer side `Attachment`, `AvccRepack`, `BlockAdditionMapping`, `ChapProcess`, `ChapProcessCommand`, `Chapter`, `ChapterDisplay`, `ChapterTranslate`, `ClusterRecord`, `ContentEncoding`, `ContentEncodings`, `ContentSigning`, `CrcStatus`, `CuePoint`, `CueReference`, `CueTrackPositions`, `DocTypeExtension`, `EbmlHeader`, `Edition`, `EditionDisplay`, `SegmentLinking`, `SimpleTag`, `Tag`, `Targets`, `TrackLegacy`, `TrackOperation`, `TrackPlane`, `TrackRef`, `TrackTranslate`, `VirtualPacketOrigin`, `ebml::ElementHeader`, `schema::ElementDef`, `schema::SchemaFinding`, `schema::SchemaReport`, `webm::WebmFinding`, `webm::WebmConformanceReport`; muxer side every record listed under Added.
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.11...v0.0.12) - 2026-11-07
 
 ### Other

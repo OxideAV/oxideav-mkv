@@ -33,6 +33,7 @@
 /// `config_record` (not duplicated in `packetized`), matching the
 /// conventional V_MPEG4/ISO/AVC repack shape.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AvccRepack {
     /// Bytes of `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15
     /// §5.2.4.1). Empty when no SPS NAL unit was found in the input

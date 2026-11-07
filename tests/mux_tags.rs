@@ -187,10 +187,9 @@ fn global_string_tag_round_trips_flat_and_typed() {
 fn track_scoped_tag_resolves_to_stream_index() {
     // Two streams: a track-scoped tag on the second one (TrackUID = 2).
     let streams = [pcm_stream(0), pcm_stream(1)];
-    let tags = [MkvTag {
-        targets: MkvTagTargets::track(2),
-        simple_tags: vec![MkvSimpleTag::new("ARTIST", "Track Two Artist")],
-    }];
+    let tags = [MkvTag::default()
+        .with_targets(MkvTagTargets::track(2))
+        .with_simple_tags(vec![MkvSimpleTag::new("ARTIST", "Track Two Artist")])];
     let bytes = mux_with_tags(&streams, &tags);
 
     // Flat key uses the 0-indexed stream index (1) for TrackUID 2.
@@ -221,14 +220,13 @@ fn track_scoped_tag_resolves_to_stream_index() {
 #[test]
 fn target_type_and_value_round_trip() {
     let streams = [pcm_stream(0)];
-    let tags = [MkvTag {
-        targets: MkvTagTargets {
-            target_type_value: Some(50),
-            target_type: Some("ALBUM".into()),
-            ..Default::default()
-        },
-        simple_tags: vec![MkvSimpleTag::new("GENRE", "Ambient")],
-    }];
+    let tags = [MkvTag::default()
+        .with_targets(
+            MkvTagTargets::default()
+                .with_target_type_value(Some(50))
+                .with_target_type(Some("ALBUM".into())),
+        )
+        .with_simple_tags(vec![MkvSimpleTag::new("GENRE", "Ambient")])];
     let bytes = mux_with_tags(&streams, &tags);
 
     let typed = open_typed(bytes);
@@ -245,29 +243,24 @@ fn target_type_and_value_round_trip() {
 #[test]
 fn language_and_default_flag_round_trip() {
     let streams = [pcm_stream(0)];
-    let tags = [MkvTag {
-        targets: MkvTagTargets::default(),
-        simple_tags: vec![
-            // Non-default language, default flag cleared.
-            MkvSimpleTag {
-                name: "COMMENT".into(),
-                value: MkvSimpleTagValue::String("Kommentar".into()),
-                language: "ger".into(),
-                language_bcp47: None,
-                default: false,
-                children: Vec::new(),
-            },
-            // BCP-47 language wins over TagLanguage per spec.
-            MkvSimpleTag {
-                name: "COMMENT".into(),
-                value: MkvSimpleTagValue::String("Comment".into()),
-                language: "und".into(),
-                language_bcp47: Some("en-US".into()),
-                default: true,
-                children: Vec::new(),
-            },
-        ],
-    }];
+    let tags = [MkvTag::default()
+        .with_targets(MkvTagTargets::default())
+        .with_simple_tags(vec![
+            MkvSimpleTag::default()
+                .with_name("COMMENT".into())
+                .with_value(MkvSimpleTagValue::String("Kommentar".into()))
+                .with_language("ger".into())
+                .with_language_bcp47(None)
+                .with_default(false)
+                .with_children(Vec::new()),
+            MkvSimpleTag::default()
+                .with_name("COMMENT".into())
+                .with_value(MkvSimpleTagValue::String("Comment".into()))
+                .with_language("und".into())
+                .with_language_bcp47(Some("en-US".into()))
+                .with_default(true)
+                .with_children(Vec::new()),
+        ])];
     let bytes = mux_with_tags(&streams, &tags);
 
     let typed = open_typed(bytes);
@@ -287,10 +280,9 @@ fn language_and_default_flag_round_trip() {
 fn binary_tag_value_round_trips() {
     let streams = [pcm_stream(0)];
     let payload = b"\x89PNG\r\n\x1a\n thumbnail".to_vec();
-    let tags = [MkvTag {
-        targets: MkvTagTargets::default(),
-        simple_tags: vec![MkvSimpleTag::binary("THUMBNAIL", payload.clone())],
-    }];
+    let tags = [MkvTag::default()
+        .with_targets(MkvTagTargets::default())
+        .with_simple_tags(vec![MkvSimpleTag::binary("THUMBNAIL", payload.clone())])];
     let bytes = mux_with_tags(&streams, &tags);
 
     let typed = open_typed(bytes.clone());
@@ -358,10 +350,11 @@ fn add_tag_rejects_empty_simple_tags() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[pcm_stream(0)]).expect("construct");
     let err = mx
-        .add_tag(MkvTag {
-            targets: MkvTagTargets::default(),
-            simple_tags: Vec::new(),
-        })
+        .add_tag(
+            MkvTag::default()
+                .with_targets(MkvTagTargets::default())
+                .with_simple_tags(Vec::new()),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidData(_)));
 }
@@ -372,10 +365,11 @@ fn add_tag_rejects_empty_name() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[pcm_stream(0)]).expect("construct");
     let err = mx
-        .add_tag(MkvTag {
-            targets: MkvTagTargets::default(),
-            simple_tags: vec![MkvSimpleTag::new("", "value")],
-        })
+        .add_tag(
+            MkvTag::default()
+                .with_targets(MkvTagTargets::default())
+                .with_simple_tags(vec![MkvSimpleTag::new("", "value")]),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidData(_)));
 }
@@ -386,13 +380,11 @@ fn add_tag_rejects_zero_target_type_value() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[pcm_stream(0)]).expect("construct");
     let err = mx
-        .add_tag(MkvTag {
-            targets: MkvTagTargets {
-                target_type_value: Some(0),
-                ..Default::default()
-            },
-            simple_tags: vec![MkvSimpleTag::new("X", "y")],
-        })
+        .add_tag(
+            MkvTag::default()
+                .with_targets(MkvTagTargets::default().with_target_type_value(Some(0)))
+                .with_simple_tags(vec![MkvSimpleTag::new("X", "y")]),
+        )
         .unwrap_err();
     assert!(matches!(err, Error::InvalidData(_)));
 }
@@ -429,25 +421,24 @@ fn nested_simple_tags_round_trip() {
     // RFC 9559 §5.1.8.1.2 `recursive: True`: a SimpleTag carries child
     // SimpleTags. Build a TITLE with a SORT_WITH sub-tag two levels deep.
     let streams = [pcm_stream(0)];
-    let parent = MkvSimpleTag {
-        name: "TITLE".into(),
-        value: MkvSimpleTagValue::String("The Album".into()),
-        language: "und".into(),
-        language_bcp47: None,
-        default: true,
-        children: vec![MkvSimpleTag {
-            name: "SORT_WITH".into(),
-            value: MkvSimpleTagValue::String("Album, The".into()),
-            language: "und".into(),
-            language_bcp47: None,
-            default: true,
-            children: vec![MkvSimpleTag::new("DEPTH2", "leaf")],
-        }],
-    };
-    let tags = [MkvTag {
-        targets: MkvTagTargets::default(),
-        simple_tags: vec![parent],
-    }];
+    let parent = MkvSimpleTag::default()
+        .with_name("TITLE".into())
+        .with_value(MkvSimpleTagValue::String("The Album".into()))
+        .with_language("und".into())
+        .with_language_bcp47(None)
+        .with_default(true)
+        .with_children(vec![
+            MkvSimpleTag::default()
+                .with_name("SORT_WITH".into())
+                .with_value(MkvSimpleTagValue::String("Album, The".into()))
+                .with_language("und".into())
+                .with_language_bcp47(None)
+                .with_default(true)
+                .with_children(vec![MkvSimpleTag::new("DEPTH2", "leaf")]),
+        ]);
+    let tags = [MkvTag::default()
+        .with_targets(MkvTagTargets::default())
+        .with_simple_tags(vec![parent])];
     let bytes = mux_with_tags(&streams, &tags);
 
     let typed = open_typed(bytes);
@@ -480,21 +471,19 @@ fn name_only_parent_simple_tag_round_trips() {
     // legal as a parent node (RFC 9559 §5.1.8.1.2 — neither value element
     // has a minOccurs). It must survive with its children.
     let streams = [pcm_stream(0)];
-    let parent = MkvSimpleTag {
-        name: "ARTISTS".into(),
-        value: MkvSimpleTagValue::None,
-        language: "und".into(),
-        language_bcp47: None,
-        default: true,
-        children: vec![
+    let parent = MkvSimpleTag::default()
+        .with_name("ARTISTS".into())
+        .with_value(MkvSimpleTagValue::None)
+        .with_language("und".into())
+        .with_language_bcp47(None)
+        .with_default(true)
+        .with_children(vec![
             MkvSimpleTag::new("ARTIST", "Alice"),
             MkvSimpleTag::new("ARTIST", "Bob"),
-        ],
-    };
-    let tags = [MkvTag {
-        targets: MkvTagTargets::default(),
-        simple_tags: vec![parent],
-    }];
+        ]);
+    let tags = [MkvTag::default()
+        .with_targets(MkvTagTargets::default())
+        .with_simple_tags(vec![parent])];
     let bytes = mux_with_tags(&streams, &tags);
 
     let typed = open_typed(bytes);

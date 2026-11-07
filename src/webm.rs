@@ -38,6 +38,7 @@ use crate::{ebml, ids};
 
 /// WebM-guidelines support status for one element (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum WebmSupport {
     /// Listed as `Supported`: part of the WebM profile.
     Supported,
@@ -413,6 +414,7 @@ const MAX_FINDINGS: usize = 4096;
 
 /// One off-profile element occurrence found by [`scan`].
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct WebmFinding {
     /// Absolute file offset of the element's ID byte.
     pub offset: u64,
@@ -423,9 +425,21 @@ pub struct WebmFinding {
     pub support: WebmSupport,
 }
 
+impl WebmFinding {
+    /// Build `WebmFinding` from every field, in declaration order.
+    pub fn new(offset: u64, id: u32, support: WebmSupport) -> Self {
+        Self {
+            offset,
+            id,
+            support,
+        }
+    }
+}
+
 /// The result of a [`scan`]: per-status occurrence counts, the flagged
 /// occurrences, and the document's `DocType`.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct WebmConformanceReport {
     /// The EBML header's `DocType` string, when one was found.
     pub doc_type: Option<String>,

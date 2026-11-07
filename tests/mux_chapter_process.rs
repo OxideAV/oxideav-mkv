@@ -76,25 +76,27 @@ fn demux_typed(bytes: Vec<u8>) -> oxideav_mkv::demux::MkvDemuxer {
 
 #[test]
 fn full_atom_fields_round_trip() {
-    let bytes = mux_chapters(vec![MkvChapter {
-        time_start_ns: 1_000_000_000,
-        time_end_ns: Some(2_000_000_000),
-        uid: Some(0xABCD),
-        string_uid: Some("cue-7".into()),
-        hidden: true,
-        enabled: false,
-        segment_uuid: Some(vec![0x11; 16]),
-        segment_edition_uid: Some(42),
-        physical_equiv: Some(60),
-        display: vec![ChapterDisplay {
-            title: "Scene".into(),
-            language: "eng".into(),
-            country: None,
-            language_bcp47: None,
-        }],
-        chap_processes: Vec::new(),
-        skip_type: None,
-    }]);
+    let bytes = mux_chapters(vec![
+        MkvChapter::default()
+            .with_time_start_ns(1_000_000_000)
+            .with_time_end_ns(Some(2_000_000_000))
+            .with_uid(Some(0xABCD))
+            .with_string_uid(Some("cue-7".into()))
+            .with_hidden(true)
+            .with_enabled(false)
+            .with_segment_uuid(Some(vec![0x11; 16]))
+            .with_segment_edition_uid(Some(42))
+            .with_physical_equiv(Some(60))
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("Scene".into())
+                    .with_language("eng".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ])
+            .with_chap_processes(Vec::new())
+            .with_skip_type(None),
+    ]);
 
     let dmx = demux_typed(bytes);
     let editions = dmx.chapters();
@@ -114,40 +116,35 @@ fn full_atom_fields_round_trip() {
 
 #[test]
 fn chap_process_tree_round_trips() {
-    let bytes = mux_chapters(vec![MkvChapter {
-        time_start_ns: 0,
-        time_end_ns: None,
-        display: vec![ChapterDisplay {
-            title: "Menu".into(),
-            language: "und".into(),
-            country: None,
-            language_bcp47: None,
-        }],
-        chap_processes: vec![
-            // DVD-menu codec with private data and two timed commands.
-            MkvChapProcess {
-                codec_id: 1,
-                private: Some(vec![0xDE, 0xAD]),
-                commands: vec![
-                    MkvChapProcessCommand {
-                        time: 1,
-                        data: vec![0xCA, 0xFE],
-                    },
-                    MkvChapProcessCommand {
-                        time: 2,
-                        data: vec![0xBE, 0xEF, 0x00],
-                    },
-                ],
-            },
-            // Matroska-Script codec (id 0), no private, no commands.
-            MkvChapProcess {
-                codec_id: 0,
-                private: None,
-                commands: Vec::new(),
-            },
-        ],
-        ..Default::default()
-    }]);
+    let bytes = mux_chapters(vec![
+        MkvChapter::default()
+            .with_time_start_ns(0)
+            .with_time_end_ns(None)
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("Menu".into())
+                    .with_language("und".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ])
+            .with_chap_processes(vec![
+                MkvChapProcess::default()
+                    .with_codec_id(1)
+                    .with_private(Some(vec![0xDE, 0xAD]))
+                    .with_commands(vec![
+                        MkvChapProcessCommand::default()
+                            .with_time(1)
+                            .with_data(vec![0xCA, 0xFE]),
+                        MkvChapProcessCommand::default()
+                            .with_time(2)
+                            .with_data(vec![0xBE, 0xEF, 0x00]),
+                    ]),
+                MkvChapProcess::default()
+                    .with_codec_id(0)
+                    .with_private(None)
+                    .with_commands(Vec::new()),
+            ]),
+    ]);
 
     let dmx = demux_typed(bytes);
     let chapter = &dmx.chapters()[0].chapters[0];
@@ -172,17 +169,18 @@ fn chap_process_tree_round_trips() {
 fn default_chapter_enabled_and_no_optional_fields() {
     // A default-ish chapter: enabled (default true), not hidden, no
     // optional UIDs. The demuxer materialises the enabled default.
-    let bytes = mux_chapters(vec![MkvChapter {
-        time_start_ns: 0,
-        time_end_ns: Some(500_000_000),
-        display: vec![ChapterDisplay {
-            title: "Plain".into(),
-            language: "eng".into(),
-            country: None,
-            language_bcp47: None,
-        }],
-        ..Default::default()
-    }]);
+    let bytes = mux_chapters(vec![
+        MkvChapter::default()
+            .with_time_start_ns(0)
+            .with_time_end_ns(Some(500_000_000))
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("Plain".into())
+                    .with_language("eng".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ]),
+    ]);
 
     let dmx = demux_typed(bytes);
     let chapter = &dmx.chapters()[0].chapters[0];
@@ -203,10 +201,7 @@ fn zero_chapter_uid_is_rejected() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[pcm_stream()]).expect("muxer");
     let err = mx
-        .add_chapter_full(MkvChapter {
-            uid: Some(0),
-            ..Default::default()
-        })
+        .add_chapter_full(MkvChapter::default().with_uid(Some(0)))
         .expect_err("ChapterUID 0 must be rejected");
     let _ = std::fs::remove_file(&tmp);
     assert!(format!("{err}").contains("ChapterUID"));
@@ -219,10 +214,7 @@ fn non_16_byte_segment_uuid_is_rejected() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let mut mx = MkvMuxer::new_matroska(ws, &[pcm_stream()]).expect("muxer");
     let err = mx
-        .add_chapter_full(MkvChapter {
-            segment_uuid: Some(vec![0x00; 8]),
-            ..Default::default()
-        })
+        .add_chapter_full(MkvChapter::default().with_segment_uuid(Some(vec![0x00; 8])))
         .expect_err("8-byte SegmentUUID must be rejected");
     let _ = std::fs::remove_file(&tmp);
     assert!(format!("{err}").contains("ChapterSegmentUUID"));

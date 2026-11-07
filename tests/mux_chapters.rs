@@ -136,39 +136,36 @@ fn find_top_level(bytes: &[u8], target_id: u32) -> Option<(u64, u64)> {
 #[test]
 fn chapters_round_trip_through_demuxer() {
     let chapters = vec![
-        MkvChapter {
-            time_start_ns: 0,
-            time_end_ns: Some(1_000_000_000),
-            display: vec![ChapterDisplay {
-                title: "Intro".into(),
-                language: "eng".into(),
-                country: None,
-                language_bcp47: None,
-            }],
-            ..Default::default()
-        },
-        MkvChapter {
-            time_start_ns: 1_000_000_000,
-            time_end_ns: Some(2_000_000_000),
-            display: vec![ChapterDisplay {
-                title: "Verse".into(),
-                language: "eng".into(),
-                country: Some("us".into()),
-                language_bcp47: None,
-            }],
-            ..Default::default()
-        },
-        MkvChapter {
-            time_start_ns: 2_000_000_000,
-            time_end_ns: None,
-            display: vec![ChapterDisplay {
-                title: "Outro".into(),
-                language: "eng".into(),
-                country: None,
-                language_bcp47: None,
-            }],
-            ..Default::default()
-        },
+        MkvChapter::default()
+            .with_time_start_ns(0)
+            .with_time_end_ns(Some(1_000_000_000))
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("Intro".into())
+                    .with_language("eng".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ]),
+        MkvChapter::default()
+            .with_time_start_ns(1_000_000_000)
+            .with_time_end_ns(Some(2_000_000_000))
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("Verse".into())
+                    .with_language("eng".into())
+                    .with_country(Some("us".into()))
+                    .with_language_bcp47(None),
+            ]),
+        MkvChapter::default()
+            .with_time_start_ns(2_000_000_000)
+            .with_time_end_ns(None)
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("Outro".into())
+                    .with_language("eng".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ]),
     ];
     let bytes = mux_with_chapters_collect(&chapters);
 
@@ -265,17 +262,18 @@ fn no_chapter_calls_emits_no_chapters_element() {
 
 #[test]
 fn chapters_element_sits_before_first_cluster() {
-    let chapters = vec![MkvChapter {
-        time_start_ns: 0,
-        time_end_ns: Some(1_000_000_000),
-        display: vec![ChapterDisplay {
-            title: "Only".into(),
-            language: "eng".into(),
-            country: None,
-            language_bcp47: None,
-        }],
-        ..Default::default()
-    }];
+    let chapters = vec![
+        MkvChapter::default()
+            .with_time_start_ns(0)
+            .with_time_end_ns(Some(1_000_000_000))
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("Only".into())
+                    .with_language("eng".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ]),
+    ];
     let bytes = mux_with_chapters_collect(&chapters);
     let (chapters_off, _seg_start) =
         find_top_level(&bytes, ids::CHAPTERS).expect("Chapters present");
@@ -290,17 +288,18 @@ fn chapters_element_sits_before_first_cluster() {
 
 #[test]
 fn seek_head_chapters_entry_points_at_chapters_when_present() {
-    let chapters = vec![MkvChapter {
-        time_start_ns: 0,
-        time_end_ns: Some(2_000_000_000),
-        display: vec![ChapterDisplay {
-            title: "First".into(),
-            language: "eng".into(),
-            country: None,
-            language_bcp47: None,
-        }],
-        ..Default::default()
-    }];
+    let chapters = vec![
+        MkvChapter::default()
+            .with_time_start_ns(0)
+            .with_time_end_ns(Some(2_000_000_000))
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("First".into())
+                    .with_language("eng".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ]),
+    ];
     let bytes = mux_with_chapters_collect(&chapters);
 
     let (chapters_abs, seg_start) =
@@ -398,17 +397,18 @@ fn chapter_times_are_written_as_literal_nanoseconds() {
     // 324 004 500 (off by ~4 orders of magnitude).
     let start_ns: u64 = 3_600_050_000_000;
     let end_ns: u64 = 7_200_100_000_000;
-    let chapters = vec![MkvChapter {
-        time_start_ns: start_ns,
-        time_end_ns: Some(end_ns),
-        display: vec![ChapterDisplay {
-            title: "NsLiteral".into(),
-            language: "eng".into(),
-            country: None,
-            language_bcp47: None,
-        }],
-        ..Default::default()
-    }];
+    let chapters = vec![
+        MkvChapter::default()
+            .with_time_start_ns(start_ns)
+            .with_time_end_ns(Some(end_ns))
+            .with_display(vec![
+                ChapterDisplay::default()
+                    .with_title("NsLiteral".into())
+                    .with_language("eng".into())
+                    .with_country(None)
+                    .with_language_bcp47(None),
+            ]),
+    ];
     let bytes = mux_with_chapters_collect(&chapters);
     let (start, end) = first_atom_times(&bytes);
     assert_eq!(start, start_ns, "ChapterTimeStart must be literal ns");

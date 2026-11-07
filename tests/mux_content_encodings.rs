@@ -103,11 +103,11 @@ fn demux_typed(bytes: Vec<u8>) -> oxideav_mkv::demux::MkvDemuxer {
 }
 
 fn comp_step(order: u64, scope: u64, algo: ContentCompAlgo, settings: Vec<u8>) -> ContentEncoding {
-    ContentEncoding {
+    ContentEncoding::new(
         order,
-        scope: ContentEncodingScope(scope),
-        transform: ContentEncodingTransform::Compression { algo, settings },
-    }
+        ContentEncodingScope(scope),
+        ContentEncodingTransform::Compression { algo, settings },
+    )
 }
 
 fn enc_step(
@@ -117,16 +117,16 @@ fn enc_step(
     key_id: Vec<u8>,
     aes_cipher_mode: Option<AesCipherMode>,
 ) -> ContentEncoding {
-    ContentEncoding {
+    ContentEncoding::new(
         order,
-        scope: ContentEncodingScope(scope),
-        transform: ContentEncodingTransform::Encryption {
+        ContentEncodingScope(scope),
+        ContentEncodingTransform::Encryption {
             algo,
             key_id,
             aes_cipher_mode,
             signing: ContentSigning::default(),
         },
-    }
+    )
 }
 
 #[test]
@@ -134,13 +134,15 @@ fn roundtrip_header_stripping_compression() {
     // A single Block-scoped Header-Stripping step with stripped bytes.
     let stripped = vec![0x00, 0x00, 0x01, 0xB6];
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![comp_step(
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings = vec![comp_step(
                 0,
                 0x1,
                 ContentCompAlgo::HeaderStripping,
                 stripped.clone(),
-            )],
+            )];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc)
             .expect("set_track_content_encodings");
@@ -169,8 +171,11 @@ fn roundtrip_zlib_compression_no_settings() {
     // zlib with no settings: the empty ContentCompSettings stays off-disk
     // and the demuxer materialises the default empty Vec.
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())],
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings =
+                vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -190,14 +195,16 @@ fn roundtrip_aes_ctr_encryption() {
     // An AES-CTR encryption step with a key id and the nested cipher mode.
     let key_id = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![enc_step(
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings = vec![enc_step(
                 0,
                 0x1,
                 ContentEncAlgo::Aes,
                 key_id.clone(),
                 Some(AesCipherMode::Ctr),
-            )],
+            )];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -223,8 +230,11 @@ fn roundtrip_non_aes_encryption_no_aes_settings() {
     // A Twofish step carries no ContentEncAESSettings (Table 25 forbids it
     // on non-AES algos); the demuxer surfaces aes_cipher_mode == None.
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![enc_step(0, 0x1, ContentEncAlgo::Twofish, Vec::new(), None)],
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings =
+                vec![enc_step(0, 0x1, ContentEncAlgo::Twofish, Vec::new(), None)];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -251,8 +261,9 @@ fn roundtrip_multi_step_decode_order() {
     // into descending DECODE order (highest first), so encryption (1) comes
     // before compression (0) — §5.1.4.1.31.2.
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings = vec![
                 comp_step(0, 0x3, ContentCompAlgo::HeaderStripping, vec![0xAB, 0xCD]),
                 enc_step(
                     1,
@@ -261,7 +272,8 @@ fn roundtrip_multi_step_decode_order() {
                     vec![0x11],
                     Some(AesCipherMode::Cbc),
                 ),
-            ],
+            ];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -289,19 +301,15 @@ fn roundtrip_other_forward_compat_variants() {
     // Future registry values pass through verbatim on both the comp-algo
     // and enc-algo enums, and on the AES cipher mode.
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            // Other(7) on a non-AES algo would be rejected; but the
+            // cipher mode pin is AES-only, so leave it off here.
+            content_encodings.encodings = vec![
                 comp_step(0, 0x1, ContentCompAlgo::Other(42), vec![0x09]),
-                enc_step(
-                    1,
-                    0x2,
-                    ContentEncAlgo::Other(99),
-                    Vec::new(),
-                    // Other(7) on a non-AES algo would be rejected; but the
-                    // cipher mode pin is AES-only, so leave it off here.
-                    None,
-                ),
-            ],
+                enc_step(1, 0x2, ContentEncAlgo::Other(99), Vec::new(), None),
+            ];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -327,14 +335,16 @@ fn roundtrip_other_forward_compat_variants() {
 fn roundtrip_aes_other_cipher_mode() {
     // An AES algo with a forward-compat Other cipher mode (non-zero).
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![enc_step(
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings = vec![enc_step(
                 0,
                 0x1,
                 ContentEncAlgo::Aes,
                 vec![0x42],
                 Some(AesCipherMode::Other(7)),
-            )],
+            )];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -356,22 +366,26 @@ fn roundtrip_content_signing_quartet() {
     let sig = vec![0xDE, 0xAD, 0xBE, 0xEF];
     let sig_key = vec![0xCA, 0xFE];
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![ContentEncoding {
-                order: 0,
-                scope: ContentEncodingScope(0x1),
-                transform: ContentEncodingTransform::Encryption {
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings = vec![ContentEncoding::new(
+                0,
+                ContentEncodingScope(0x1),
+                ContentEncodingTransform::Encryption {
                     algo: ContentEncAlgo::Aes,
                     key_id: vec![0x01, 0x02],
                     aes_cipher_mode: Some(AesCipherMode::Ctr),
-                    signing: ContentSigning {
-                        signature: Some(sig.clone()),
-                        key_id: Some(sig_key.clone()),
-                        algo: Some(1),
-                        hash_algo: Some(2),
+                    signing: {
+                        let mut content_signing = ContentSigning::default();
+                        content_signing.signature = Some(sig.clone());
+                        content_signing.key_id = Some(sig_key.clone());
+                        content_signing.algo = Some(1);
+                        content_signing.hash_algo = Some(2);
+                        content_signing
                     },
                 },
-            }],
+            )];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -392,20 +406,23 @@ fn roundtrip_content_signing_partial() {
     // Only ContentSigAlgo present (a present zero) — the other three stay
     // None on read, and the zero is distinct from absence.
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![ContentEncoding {
-                order: 0,
-                scope: ContentEncodingScope(0x1),
-                transform: ContentEncodingTransform::Encryption {
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings = vec![ContentEncoding::new(
+                0,
+                ContentEncodingScope(0x1),
+                ContentEncodingTransform::Encryption {
                     algo: ContentEncAlgo::Twofish,
                     key_id: Vec::new(),
                     aes_cipher_mode: None,
-                    signing: ContentSigning {
-                        algo: Some(0),
-                        ..ContentSigning::default()
+                    signing: {
+                        let mut content_signing = ContentSigning::default();
+                        content_signing.algo = Some(0);
+                        content_signing
                     },
                 },
-            }],
+            )];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -438,8 +455,11 @@ fn omitting_call_keeps_master_off_disk() {
 #[test]
 fn on_disk_carries_element_when_called() {
     let bytes = mux_two_tracks(|mx| {
-        let enc = ContentEncodings {
-            encodings: vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())],
+        let enc = {
+            let mut content_encodings = ContentEncodings::default();
+            content_encodings.encodings =
+                vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())];
+            content_encodings
         };
         mx.set_track_content_encodings(0, enc).expect("set");
     });
@@ -465,8 +485,10 @@ fn rejects_after_write_header() {
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
     mx.write_header().expect("write_header");
-    let enc = ContentEncodings {
-        encodings: vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())],
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())];
+        content_encodings
     };
     let err = mx
         .set_track_content_encodings(0, enc)
@@ -483,8 +505,10 @@ fn rejects_out_of_range_stream() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
-    let enc = ContentEncodings {
-        encodings: vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())],
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = vec![comp_step(0, 0x1, ContentCompAlgo::Zlib, Vec::new())];
+        content_encodings
     };
     let err = mx
         .set_track_content_encodings(9, enc)
@@ -501,8 +525,10 @@ fn rejects_empty_chain() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
-    let enc = ContentEncodings {
-        encodings: Vec::new(),
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = Vec::new();
+        content_encodings
     };
     let err = mx
         .set_track_content_encodings(0, enc)
@@ -519,11 +545,13 @@ fn rejects_duplicate_order() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
-    let enc = ContentEncodings {
-        encodings: vec![
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = vec![
             comp_step(5, 0x1, ContentCompAlgo::Zlib, Vec::new()),
             comp_step(5, 0x2, ContentCompAlgo::Lzo1x, Vec::new()),
-        ],
+        ];
+        content_encodings
     };
     let err = mx
         .set_track_content_encodings(0, enc)
@@ -540,8 +568,10 @@ fn rejects_zero_scope() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
-    let enc = ContentEncodings {
-        encodings: vec![comp_step(0, 0x0, ContentCompAlgo::Zlib, Vec::new())],
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = vec![comp_step(0, 0x0, ContentCompAlgo::Zlib, Vec::new())];
+        content_encodings
     };
     let err = mx
         .set_track_content_encodings(0, enc)
@@ -558,14 +588,16 @@ fn rejects_cipher_mode_on_non_aes() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
-    let enc = ContentEncodings {
-        encodings: vec![enc_step(
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = vec![enc_step(
             0,
             0x1,
             ContentEncAlgo::Twofish,
             Vec::new(),
             Some(AesCipherMode::Ctr),
-        )],
+        )];
+        content_encodings
     };
     let err = mx
         .set_track_content_encodings(0, enc)
@@ -582,14 +614,16 @@ fn rejects_zero_aes_cipher_mode() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
-    let enc = ContentEncodings {
-        encodings: vec![enc_step(
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = vec![enc_step(
             0,
             0x1,
             ContentEncAlgo::Aes,
             Vec::new(),
             Some(AesCipherMode::Other(0)),
-        )],
+        )];
+        content_encodings
     };
     let err = mx
         .set_track_content_encodings(0, enc)
@@ -606,8 +640,10 @@ fn accessor_reads_back_queued_hint() {
     let ws: Box<dyn WriteSeek> = Box::new(f);
     let streams = vec![video_stream(0)];
     let mut mx = MkvMuxer::new_matroska(ws, &streams).expect("muxer");
-    let enc = ContentEncodings {
-        encodings: vec![comp_step(3, 0x1, ContentCompAlgo::Zlib, vec![0x01])],
+    let enc = {
+        let mut content_encodings = ContentEncodings::default();
+        content_encodings.encodings = vec![comp_step(3, 0x1, ContentCompAlgo::Zlib, vec![0x01])];
+        content_encodings
     };
     mx.set_track_content_encodings(0, enc).expect("set");
     let got = mx.content_encodings(0).expect("read back");

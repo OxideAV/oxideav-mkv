@@ -133,10 +133,11 @@ fn strict_webm_output_scans_conformant() {
         .expect("chapter");
     mx.add_tag(MkvTag::global("TITLE", "Strict"))
         .expect("tag global");
-    mx.add_tag(MkvTag {
-        targets: MkvTagTargets::track(1),
-        simple_tags: vec![MkvSimpleTag::new("ARTIST", "Nobody")],
-    })
+    mx.add_tag(
+        MkvTag::default()
+            .with_targets(MkvTagTargets::track(1))
+            .with_simple_tags(vec![MkvSimpleTag::new("ARTIST", "Nobody")]),
+    )
     .expect("tag track");
     mx.set_duration(std::time::Duration::from_secs(11))
         .expect("duration");
@@ -208,13 +209,7 @@ fn strict_webm_rejects_off_profile_setters() {
         "set_track_translates",
     );
     expect_webm_unsupported(
-        mx.set_track_legacy(
-            0,
-            MkvTrackLegacy {
-                min_cache: Some(1),
-                ..Default::default()
-            },
-        ),
+        mx.set_track_legacy(0, MkvTrackLegacy::default().with_min_cache(Some(1))),
         "set_track_legacy",
     );
     match mx.add_attachment(MkvAttachment::new(
@@ -226,9 +221,10 @@ fn strict_webm_rejects_off_profile_setters() {
         other => panic!("add_attachment must be rejected, got {other:?}"),
     }
     expect_webm_unsupported(
-        mx.set_segment_linking(oxideav_mkv::demux::SegmentLinking {
-            segment_uuid: Some(vec![7u8; 16]),
-            ..Default::default()
+        mx.set_segment_linking({
+            let mut segment_linking = oxideav_mkv::demux::SegmentLinking::default();
+            segment_linking.segment_uuid = Some(vec![7u8; 16]);
+            segment_linking
         }),
         "set_segment_linking",
     );
@@ -239,62 +235,35 @@ fn strict_webm_rejects_off_profile_setters() {
     expect_webm_unsupported(
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                default_decoded_field_duration: Some(20_833_333),
-                ..Default::default()
-            },
+            MkvTrackTiming::default().with_default_decoded_field_duration(Some(20_833_333)),
         ),
         "set_track_timing (DefaultDecodedFieldDuration)",
     );
     expect_webm_unsupported(
         mx.set_track_timing(
             0,
-            MkvTrackTiming {
-                track_timestamp_scale: Some(2.0),
-                ..Default::default()
-            },
+            MkvTrackTiming::default().with_track_timestamp_scale(Some(2.0)),
         ),
         "set_track_timing (TrackTimestampScale)",
     );
     expect_webm_unsupported(
-        mx.set_track_identity(
-            0,
-            MkvTrackIdentity {
-                attachment_link: Some(1),
-                ..Default::default()
-            },
-        ),
+        mx.set_track_identity(0, MkvTrackIdentity::default().with_attachment_link(Some(1))),
         "set_track_identity (AttachmentLink)",
     );
     // Off-profile chapter fields.
     for (what, ch) in [
-        (
-            "ChapterFlagHidden",
-            MkvChapter {
-                hidden: true,
-                ..Default::default()
-            },
-        ),
+        ("ChapterFlagHidden", MkvChapter::default().with_hidden(true)),
         (
             "ChapterFlagEnabled",
-            MkvChapter {
-                enabled: false,
-                ..Default::default()
-            },
+            MkvChapter::default().with_enabled(false),
         ),
         (
             "ChapterSegmentUUID",
-            MkvChapter {
-                segment_uuid: Some(vec![3u8; 16]),
-                ..Default::default()
-            },
+            MkvChapter::default().with_segment_uuid(Some(vec![3u8; 16])),
         ),
         (
             "ChapterPhysicalEquiv",
-            MkvChapter {
-                physical_equiv: Some(60),
-                ..Default::default()
-            },
+            MkvChapter::default().with_physical_equiv(Some(60)),
         ),
     ] {
         match mx.add_chapter_full(ch) {
@@ -306,30 +275,22 @@ fn strict_webm_rejects_off_profile_setters() {
     for (what, targets) in [
         (
             "TagEditionUID",
-            MkvTagTargets {
-                edition_uids: vec![1],
-                ..Default::default()
-            },
+            MkvTagTargets::default().with_edition_uids(vec![1]),
         ),
         (
             "TagChapterUID",
-            MkvTagTargets {
-                chapter_uids: vec![1],
-                ..Default::default()
-            },
+            MkvTagTargets::default().with_chapter_uids(vec![1]),
         ),
         (
             "TagAttachmentUID",
-            MkvTagTargets {
-                attachment_uids: vec![1],
-                ..Default::default()
-            },
+            MkvTagTargets::default().with_attachment_uids(vec![1]),
         ),
     ] {
-        match mx.add_tag(MkvTag {
-            targets,
-            simple_tags: vec![MkvSimpleTag::new("K", "V")],
-        }) {
+        match mx.add_tag(
+            MkvTag::default()
+                .with_targets(targets)
+                .with_simple_tags(vec![MkvSimpleTag::new("K", "V")]),
+        ) {
             Err(Error::Unsupported(msg)) => assert!(msg.contains(what), "{what}: {msg}"),
             other => panic!("{what}: expected rejection, got {other:?}"),
         }
@@ -337,10 +298,11 @@ fn strict_webm_rejects_off_profile_setters() {
     // In-profile equivalents still work.
     mx.add_chapter(0, None, "Plain chapter")
         .expect("plain chapter ok");
-    mx.add_tag(MkvTag {
-        targets: MkvTagTargets::track(1),
-        simple_tags: vec![MkvSimpleTag::new("K", "V")],
-    })
+    mx.add_tag(
+        MkvTag::default()
+            .with_targets(MkvTagTargets::track(1))
+            .with_simple_tags(vec![MkvSimpleTag::new("K", "V")]),
+    )
     .expect("track-scoped tag ok");
     mx.set_track_timing(0, MkvTrackTiming::from_frame_rate(25.0).unwrap())
         .expect("DefaultDuration ok");
@@ -357,24 +319,15 @@ fn strict_webm_rejects_block_group_extras_and_silent_tracks() {
     for (what, opts) in [
         (
             "ReferencePriority",
-            BlockGroupOptions {
-                reference_priority: 5,
-                ..Default::default()
-            },
+            BlockGroupOptions::default().with_reference_priority(5),
         ),
         (
             "CodecState",
-            BlockGroupOptions {
-                codec_state: Some(vec![1, 2]),
-                ..Default::default()
-            },
+            BlockGroupOptions::default().with_codec_state(Some(vec![1, 2])),
         ),
         (
             "BlockVirtual",
-            BlockGroupOptions {
-                block_virtual: Some(vec![0x81, 0, 0, 0]),
-                ..Default::default()
-            },
+            BlockGroupOptions::default().with_block_virtual(Some(vec![0x81, 0, 0, 0])),
         ),
     ] {
         match mx.write_packet_with_block_group(&video_packet(0, 0, true), &opts) {
@@ -385,10 +338,7 @@ fn strict_webm_rejects_block_group_extras_and_silent_tracks() {
     // In-profile group options pass.
     mx.write_packet_with_block_group(
         &video_packet(0, 0, true),
-        &BlockGroupOptions {
-            discard_padding: Some(1_000_000),
-            ..Default::default()
-        },
+        &BlockGroupOptions::default().with_discard_padding(Some(1_000_000)),
     )
     .expect("DiscardPadding is in-profile");
 
@@ -416,11 +366,8 @@ fn lenient_webm_restores_matroska_surface() {
         vec![1, 2, 3],
     ))
     .expect("attachment ok when lenient");
-    mx.add_chapter_full(MkvChapter {
-        hidden: true,
-        ..Default::default()
-    })
-    .expect("hidden chapter ok when lenient");
+    mx.add_chapter_full(MkvChapter::default().with_hidden(true))
+        .expect("hidden chapter ok when lenient");
     mx.set_max_block_addition_id(0, 2)
         .expect("max block addition ok");
     mx.write_header().expect("header");
@@ -469,11 +416,11 @@ fn matroska_muxer_rejects_webm_lenient_and_keeps_full_surface() {
         vec![1],
     ))
     .expect("attachment ok on matroska");
-    mx.add_chapter_full(MkvChapter {
-        hidden: true,
-        physical_equiv: Some(60),
-        ..Default::default()
-    })
+    mx.add_chapter_full(
+        MkvChapter::default()
+            .with_hidden(true)
+            .with_physical_equiv(Some(60)),
+    )
     .expect("full chapter ok on matroska");
     drop(mx);
     let _ = std::fs::remove_file(tmp);

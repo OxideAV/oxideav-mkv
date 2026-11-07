@@ -129,19 +129,12 @@ fn roundtrip_combine_planes_stereo_3d() {
 fn roundtrip_combine_planes_with_background_and_other() {
     // Three planes including a `Background` and a forward-compat
     // `Other(u64)` plane type (§27.17 leaves the registry open).
-    let op = MkvTrackOperation {
-        combine_planes: vec![
-            MkvTrackPlane {
-                stream_index: 1,
-                plane_type: TrackPlaneType::Background,
-            },
-            MkvTrackPlane {
-                stream_index: 2,
-                plane_type: TrackPlaneType::Other(42),
-            },
-        ],
-        join_tracks: Vec::new(),
-    };
+    let op = MkvTrackOperation::default()
+        .with_combine_planes(vec![
+            MkvTrackPlane::new(1, TrackPlaneType::Background),
+            MkvTrackPlane::new(2, TrackPlaneType::Other(42)),
+        ])
+        .with_join_tracks(Vec::new());
     let bytes = mux_three_tracks(|mx| {
         mx.set_track_operation(0, op).expect("set_track_operation");
     });
@@ -172,13 +165,9 @@ fn roundtrip_join_blocks() {
 fn roundtrip_combine_and_join_coexist() {
     // The spec lets a single TrackOperation carry both a
     // TrackCombinePlanes and a TrackJoinBlocks.
-    let op = MkvTrackOperation {
-        combine_planes: vec![MkvTrackPlane {
-            stream_index: 1,
-            plane_type: TrackPlaneType::LeftEye,
-        }],
-        join_tracks: vec![2],
-    };
+    let op = MkvTrackOperation::default()
+        .with_combine_planes(vec![MkvTrackPlane::new(1, TrackPlaneType::LeftEye)])
+        .with_join_tracks(vec![2]);
     let bytes = mux_three_tracks(|mx| {
         mx.set_track_operation(0, op).expect("set_track_operation");
     });

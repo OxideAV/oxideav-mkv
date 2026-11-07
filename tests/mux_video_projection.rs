@@ -147,11 +147,9 @@ fn roundtrip_cubemap() {
     let bytes = mux_video(|mx| {
         mx.set_video_projection(
             0,
-            MkvProjection {
-                projection_type: ProjectionType::Cubemap,
-                private: Some(private.clone()),
-                ..Default::default()
-            },
+            MkvProjection::default()
+                .with_projection_type(ProjectionType::Cubemap)
+                .with_private(Some(private.clone())),
         )
         .unwrap();
     });
@@ -173,10 +171,7 @@ fn roundtrip_projection_type_other_passthrough() {
     let bytes = mux_video(|mx| {
         mx.set_video_projection(
             0,
-            MkvProjection {
-                projection_type: ProjectionType::Other(99),
-                ..Default::default()
-            },
+            MkvProjection::default().with_projection_type(ProjectionType::Other(99)),
         )
         .unwrap();
     });

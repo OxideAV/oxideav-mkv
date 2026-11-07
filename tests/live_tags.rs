@@ -133,10 +133,7 @@ fn write_live_tags_validation() {
 
     // Malformed tag (no SimpleTag): rejected after header too.
     live.write_header().unwrap();
-    let empty = MkvTag {
-        simple_tags: Vec::new(),
-        ..MkvTag::global("A", "b")
-    };
+    let empty = MkvTag::global("A", "b").with_simple_tags(Vec::new());
     assert!(live.write_live_tags(&[empty]).is_err());
     // A valid call still works afterwards.
     live.write_live_tags(&[MkvTag::global("A", "b")]).unwrap();

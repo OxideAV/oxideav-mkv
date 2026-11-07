@@ -197,12 +197,10 @@ fn vp9_features_list_states_the_layout() {
 fn vp9_colour_element_completes_a_partial_features_list() {
     // Profile 3 alone says neither depth nor subsampling exactly; the
     // Colour element's BitsPerChannel + ChromaSubsampling* do.
-    let colour = MkvVideoColour {
-        bits_per_channel: 10,
-        chroma_subsampling_horz: Some(0),
-        chroma_subsampling_vert: Some(1),
-        ..MkvVideoColour::default()
-    };
+    let colour = MkvVideoColour::default()
+        .with_bits_per_channel(10)
+        .with_chroma_subsampling_horz(Some(0))
+        .with_chroma_subsampling_vert(Some(1));
     let d = remux(
         "vp9_420p.webm",
         vec![1, 1, 3],

@@ -145,13 +145,12 @@ fn explicit_hint_overrides_streaminfo_children() {
     let dmx = demux_typed(mux_audio(|mx| {
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                sampling_frequency: Some(44_100.0),
-                output_sampling_frequency: None,
-                channels: Some(6),
-                bit_depth: Some(24),
-                emphasis: None,
-            },
+            MkvTrackAudio::default()
+                .with_sampling_frequency(Some(44_100.0))
+                .with_output_sampling_frequency(None)
+                .with_channels(Some(6))
+                .with_bit_depth(Some(24))
+                .with_emphasis(None),
         )
         .expect("set_track_audio");
     }));
@@ -170,13 +169,12 @@ fn output_sampling_frequency_sbr_roundtrip() {
     let dmx = demux_typed(mux_audio(|mx| {
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                sampling_frequency: Some(22_050.0),
-                output_sampling_frequency: Some(44_100.0),
-                channels: None,
-                bit_depth: None,
-                emphasis: None,
-            },
+            MkvTrackAudio::default()
+                .with_sampling_frequency(Some(22_050.0))
+                .with_output_sampling_frequency(Some(44_100.0))
+                .with_channels(None)
+                .with_bit_depth(None)
+                .with_emphasis(None),
         )
         .expect("set_track_audio");
     }));
@@ -231,13 +229,12 @@ fn output_sampling_frequency_element_only_when_set() {
     let with_hint_no_osf = mux_audio(|mx| {
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                sampling_frequency: Some(44_100.0),
-                output_sampling_frequency: None,
-                channels: None,
-                bit_depth: None,
-                emphasis: None,
-            },
+            MkvTrackAudio::default()
+                .with_sampling_frequency(Some(44_100.0))
+                .with_output_sampling_frequency(None)
+                .with_channels(None)
+                .with_bit_depth(None)
+                .with_emphasis(None),
         )
         .unwrap();
     });
@@ -280,13 +277,12 @@ fn unset_streaminfo_fields_fall_back_to_spec_defaults() {
         let mut mx = MkvMuxer::new_matroska(ws, &[stream]).expect("muxer construct");
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                sampling_frequency: None,
-                output_sampling_frequency: Some(96_000.0),
-                channels: None,
-                bit_depth: None,
-                emphasis: None,
-            },
+            MkvTrackAudio::default()
+                .with_sampling_frequency(None)
+                .with_output_sampling_frequency(Some(96_000.0))
+                .with_channels(None)
+                .with_bit_depth(None)
+                .with_emphasis(None),
         )
         .expect("set_track_audio");
         mx.write_header().expect("write_header");
@@ -315,13 +311,12 @@ fn last_write_wins() {
         mx.set_track_audio(0, MkvTrackAudio::sbr(22_050.0)).unwrap();
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                sampling_frequency: Some(96_000.0),
-                output_sampling_frequency: None,
-                channels: Some(8),
-                bit_depth: None,
-                emphasis: None,
-            },
+            MkvTrackAudio::default()
+                .with_sampling_frequency(Some(96_000.0))
+                .with_output_sampling_frequency(None)
+                .with_channels(Some(8))
+                .with_bit_depth(None)
+                .with_emphasis(None),
         )
         .unwrap();
     }));
@@ -391,10 +386,7 @@ fn rejects_out_of_range_values() {
     assert!(
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                sampling_frequency: Some(0.0),
-                ..Default::default()
-            }
+            MkvTrackAudio::default().with_sampling_frequency(Some(0.0))
         )
         .is_err()
     );
@@ -404,10 +396,7 @@ fn rejects_out_of_range_values() {
     assert!(
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                output_sampling_frequency: Some(-1.0),
-                ..Default::default()
-            }
+            MkvTrackAudio::default().with_output_sampling_frequency(Some(-1.0))
         )
         .is_err()
     );
@@ -415,10 +404,7 @@ fn rejects_out_of_range_values() {
     assert!(
         mx.set_track_audio(
             0,
-            MkvTrackAudio {
-                output_sampling_frequency: Some(f64::NAN),
-                ..Default::default()
-            }
+            MkvTrackAudio::default().with_output_sampling_frequency(Some(f64::NAN))
         )
         .is_err()
     );
@@ -426,27 +412,15 @@ fn rejects_out_of_range_values() {
     // Channels must be != 0.
     let mut mx = make();
     assert!(
-        mx.set_track_audio(
-            0,
-            MkvTrackAudio {
-                channels: Some(0),
-                ..Default::default()
-            }
-        )
-        .is_err()
+        mx.set_track_audio(0, MkvTrackAudio::default().with_channels(Some(0)))
+            .is_err()
     );
 
     // BitDepth must be != 0.
     let mut mx = make();
     assert!(
-        mx.set_track_audio(
-            0,
-            MkvTrackAudio {
-                bit_depth: Some(0),
-                ..Default::default()
-            }
-        )
-        .is_err()
+        mx.set_track_audio(0, MkvTrackAudio::default().with_bit_depth(Some(0)))
+            .is_err()
     );
 }
 
