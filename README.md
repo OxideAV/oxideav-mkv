@@ -2296,6 +2296,111 @@ id and lands exactly on the buffer end, and a no-panic / no-backward-seek
 guarantee over arbitrary byte streams and every prefix of a well-formed
 tree.
 
+## Throughput
+
+`cargo bench --bench throughput` (dependency-free; medians) self-muxes
+two shapes and times each stage: an A/V file with large video Blocks
+(40 KiB, 30 per second) interleaved with small audio Blocks (160 bytes
+every 20 ms) — 120 s, 9600 packets, 141.6 MiB — and an audio-only file
+cut into one Cluster per Block, 200 000 Clusters, with the `Cues` at
+the end, at the front, or absent.
+
+**Where the time went.** A counting reader / writer around the file
+showed, before any change:
+
+| stage | calls to the file | time inside those calls |
+|-------|-------------------|-------------------------|
+| demux, A/V file | 9.7 reads + 2.0 seeks per packet | 76 % |
+| demux, one Block per Cluster | 16 reads + 10 seeks per packet | 90 % |
+| open, 200 000 CuePoints | 4.0 M reads + 2.2 M seeks | 92 % |
+| mux, A/V file | 1 write + 1 position query per packet | 73 % |
+| mux, one Block per Cluster | 4 writes + 3 position queries per packet | 89 % |
+
+Parsing was never the cost: every octet group of an element ID or size,
+every "where am I?", every hop over a `Void` was its own system call.
+What was left after that, on the demux side, was copying each Block
+twice (element body into a buffer, then the frame out of it).
+
+**What changed.** The demuxer reads through a window of the input held
+in memory and tracks the position itself (4 KiB after a jump, doubling
+to 64 KiB while reads stay sequential, so a seek probe does not pull in
+a whole window); the muxer collects output in a 64 KiB buffer and
+tracks the write position. An unlaced Block's payload is read from the
+input straight into the buffer the packet owns — one copy, and none
+after it — and is written from the caller's packet without passing
+through an intermediate buffer. Blocks of streams the consumer
+deselected with `set_active_streams` are stepped over unread. After:
+1.3 reads per packet on the A/V file, 0.005 reads per packet at one
+Block per Cluster, 96 reads to open the 200 000-CuePoint file.
+
+**Before → after** (aarch64 macOS, SSD, a machine shared with other
+builds: each figure is the median of three runs of the bench, each run
+itself a median of three, the two versions interleaved; packets/s in
+brackets):
+
+| stage | before | after | |
+|-------|--------|-------|---|
+| demux ← file, A/V | 71.0 ms, 1994 MiB/s (135 k) | 15.6 ms, 9077 MiB/s (615 k) | 4.6× |
+| demux ← memory, A/V | 15.2 ms (632 k) | 4.8 ms (2.0 M) | 3.2× |
+| demux ← file, one Block per Cluster, Cues at the end | 4291 ms (47 k) | 76.4 ms (2.6 M) | 56× |
+| demux ← file, one Block per Cluster, no Cues | 1909 ms (105 k) | 33.5 ms (6.0 M) | 57× |
+| open, 200 000 CuePoints at the end | 2302 ms | 44.4 ms | 52× |
+| open, 200 000 CuePoints at the front | 2077 ms | 42.0 ms | 50× |
+| open, no Cues | 0.06 ms | 0.01 ms | |
+| mux → file, A/V | 54.6 ms, 2593 MiB/s (176 k) | 35.5 ms, 3989 MiB/s (270 k) | 1.5× |
+| mux → memory, A/V | 21.7 ms (442 k) | 13.1 ms (733 k) | 1.7× |
+| mux → file, one Block per Cluster, Cues at the end | 1613 ms (124 k) | 137 ms (1.46 M) | 12× |
+| mux → file, one Block per Cluster, live layout | 1582 ms (126 k) | 353 ms (567 k) | 4.5× |
+
+The muxed bytes are identical before and after in all four files (the
+bench prints an FNV-1a fingerprint of each; `tests/io_paths.rs` checks
+that no output buffer size changes a byte in any layout). The live
+layout gains less because it hands the sink every packet as soon as it
+is written — one write per packet is its contract. The open time with
+an index is now the parse of the index itself (about 0.2 µs per
+CuePoint); without one, open reads the track headers and nothing else.
+
+**The trade-off.** The window and the buffer are 64 KiB each. The
+muxer's buffer is adjustable: `MkvMuxer::with_output_buffer(0)` writes
+every element through as before (one write per element, a position
+query per Block), for a sink that must see each element at once in a
+non-live layout. The default is the faster one.
+
+## Bounds on hostile input
+
+- **Sizes before allocation.** Every element body is read through a
+  reader bounded by the bytes the input has; a Block payload is checked
+  against the input length (measured, and re-measured only when the
+  declared end lies past the last measure) before its buffer is
+  allocated, so a declared size of 2^40 costs an error and no memory.
+- **Sizes against the parent.** A Block declared to run past its bounded
+  Cluster or its BlockGroup is refused before it is read or stepped
+  over; it can neither take the following elements as payload nor leave
+  the reader beyond them.
+- **Depth.** The two recursive elements are capped (`SimpleTag` 16
+  levels, `ChapterAtom` 64); nothing else recurses.
+- **Counts.** What grows with the number of elements rather than with
+  the bytes being handed out is capped: 65 536 Cluster records and
+  per-Cluster CRC checks, 4 194 304 CuePoints, 65 536 Seek entries,
+  16 MiB of retained `EncryptedBlock` payload, 4096 retained damage
+  events (`damage_events_total()` keeps counting), 4096 audit findings.
+  A stream that never ends, or one made of nothing but empty Clusters,
+  therefore reads in constant memory.
+- **Resynchronisation.** After damage the resilient reader scans
+  forward for the next vetted Top-Level element (in practice the next
+  Cluster ID) from one byte past the failure and never before the last
+  accepted recovery point, so the scan work over a whole input is
+  linear in its length however many candidates fail. A Block whose
+  element is whole but whose contents do not parse costs that Block
+  only.
+- **Seek work.** A Cues-less seek is capped at 96 probes; the key-frame
+  search after any seek at 65 536 elements and 64 index landings.
+
+`tests/io_paths.rs` pins the forged-size refusal, the record cap on a
+70 000-Cluster file and the damage-event cap on 5000 damaged Clusters;
+`tests/streaming_shapes.rs` sweeps 6000 generated lace bodies through
+both open modes.
+
 ## Fuzzing
 
 A cargo-fuzz harness for the demuxer lives in `fuzz/`. It drives

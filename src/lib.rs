@@ -28,6 +28,7 @@
 
 mod aac;
 pub mod avc;
+mod bufio;
 pub mod codec_id;
 pub mod demux;
 // Internal EBML walker plumbing (VINT/element primitives) — exposed for the

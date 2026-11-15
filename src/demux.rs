@@ -78,10 +78,13 @@ pub fn open_resilient_typed(
 }
 
 fn open_typed_impl(
-    mut input: Box<dyn ReadSeek>,
+    input: Box<dyn ReadSeek>,
     codecs: &dyn CodecResolver,
     resilient: bool,
 ) -> Result<MkvDemuxer> {
+    // Every read, seek and position query below goes through a window
+    // of the input held in memory (see `bufio`).
+    let mut input = Box::new(crate::bufio::BufInput::new(input));
     // Validate EBML header.
     let hdr = read_element_header(&mut *input)?;
     if hdr.id != ids::EBML_HEADER {
@@ -169,6 +172,7 @@ fn open_typed_impl(
     // mode), handed to the demuxer so `damage_events()` reports open-time
     // recoveries alongside the stream-time ones.
     let mut damage_events: Vec<DamageEvent> = Vec::new();
+    let mut damage_events_total: u64 = 0;
     let segment_data_end = if seg.size == VINT_UNKNOWN_SIZE {
         // Unknown segment size — use file end.
         let cur = input.stream_position()?;
@@ -185,12 +189,16 @@ fn open_typed_impl(
             let file_end = input.seek(SeekFrom::End(0))?;
             input.seek(SeekFrom::Start(cur))?;
             if declared_end > file_end {
-                damage_events.push(DamageEvent {
-                    kind: DamageKind::SegmentTruncated,
-                    offset: file_end,
-                    resumed_at: None,
-                    bytes_skipped: declared_end - file_end,
-                });
+                push_open_damage(
+                    &mut damage_events,
+                    &mut damage_events_total,
+                    DamageEvent {
+                        kind: DamageKind::SegmentTruncated,
+                        offset: file_end,
+                        resumed_at: None,
+                        bytes_skipped: declared_end - file_end,
+                    },
+                );
                 file_end
             } else {
                 declared_end
@@ -279,22 +287,30 @@ fn open_typed_impl(
                     segment_data_end,
                 )? {
                     Some(off) => {
-                        damage_events.push(DamageEvent {
-                            kind: DamageKind::GarbageData,
-                            offset: walk_pos,
-                            resumed_at: Some(off),
-                            bytes_skipped: off - walk_pos,
-                        });
+                        push_open_damage(
+                            &mut damage_events,
+                            &mut damage_events_total,
+                            DamageEvent {
+                                kind: DamageKind::GarbageData,
+                                offset: walk_pos,
+                                resumed_at: Some(off),
+                                bytes_skipped: off - walk_pos,
+                            },
+                        );
                         input.seek(SeekFrom::Start(off))?;
                         continue;
                     }
                     None => {
-                        damage_events.push(DamageEvent {
-                            kind: DamageKind::UnrecoverableTail,
-                            offset: walk_pos,
-                            resumed_at: None,
-                            bytes_skipped: segment_data_end.saturating_sub(walk_pos),
-                        });
+                        push_open_damage(
+                            &mut damage_events,
+                            &mut damage_events_total,
+                            DamageEvent {
+                                kind: DamageKind::UnrecoverableTail,
+                                offset: walk_pos,
+                                resumed_at: None,
+                                bytes_skipped: segment_data_end.saturating_sub(walk_pos),
+                            },
+                        );
                         break;
                     }
                 }
@@ -426,21 +442,29 @@ fn open_typed_impl(
             };
             match resume {
                 Some(off) => {
-                    damage_events.push(DamageEvent {
-                        kind: DamageKind::DamagedMaster(e.id),
-                        offset: walk_pos,
-                        resumed_at: Some(off),
-                        bytes_skipped: off.saturating_sub(walk_pos),
-                    });
+                    push_open_damage(
+                        &mut damage_events,
+                        &mut damage_events_total,
+                        DamageEvent {
+                            kind: DamageKind::DamagedMaster(e.id),
+                            offset: walk_pos,
+                            resumed_at: Some(off),
+                            bytes_skipped: off.saturating_sub(walk_pos),
+                        },
+                    );
                     input.seek(SeekFrom::Start(off))?;
                 }
                 None => {
-                    damage_events.push(DamageEvent {
-                        kind: DamageKind::UnrecoverableTail,
-                        offset: walk_pos,
-                        resumed_at: None,
-                        bytes_skipped: segment_data_end.saturating_sub(walk_pos),
-                    });
+                    push_open_damage(
+                        &mut damage_events,
+                        &mut damage_events_total,
+                        DamageEvent {
+                            kind: DamageKind::UnrecoverableTail,
+                            offset: walk_pos,
+                            resumed_at: None,
+                            bytes_skipped: segment_data_end.saturating_sub(walk_pos),
+                        },
+                    );
                     break;
                 }
             }
@@ -1286,6 +1310,9 @@ fn open_typed_impl(
         stream_params_generation: 0,
         incomplete_tail: None,
         seek_precision: SeekPrecision::default(),
+        active_streams: None,
+        damage_events_total,
+        encrypted_bytes_kept: 0,
     };
     demuxer.layouts_from_first_frames();
     Ok(demuxer)
@@ -3192,7 +3219,7 @@ fn parse_seek_head(r: &mut dyn ReadSeek, end: u64, out: &mut Vec<SeekEntry>) -> 
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::SEEK => {
+            ids::SEEK if out.len() < MAX_SEEK_ENTRIES => {
                 let seek_end = r.stream_position()?.saturating_add(e.size);
                 out.push(parse_seek(r, seek_end)?);
             }
@@ -8120,7 +8147,10 @@ fn parse_cues(
     while r.stream_position()? < end {
         let e = read_element_header(r)?;
         match e.id {
-            ids::CUE_POINT => {
+            // Past the cap the rest of the index is stepped over: the
+            // seek then works from the entries kept, as it would from a
+            // sparser index.
+            ids::CUE_POINT if typed.len() < MAX_CUE_POINTS => {
                 let body_end = r.stream_position()?.saturating_add(e.size);
                 parse_cue_point(r, body_end, out, typed)?;
             }
@@ -8129,6 +8159,29 @@ fn parse_cues(
     }
     Ok(())
 }
+
+/// `CuePoint`s kept from one `Cues` element. An index is a few bytes
+/// per entry on disk and several times that in memory, so the count —
+/// not just the byte size — is bounded: four million entries is a cue
+/// every second for a month and a half.
+const MAX_CUE_POINTS: usize = 1 << 22;
+
+/// `Seek` entries kept across the Segment's SeekHeads (the schema allows
+/// two SeekHeads; real ones hold a handful of entries).
+const MAX_SEEK_ENTRIES: usize = 1 << 16;
+
+/// Cluster records ([`MkvDemuxer::cluster_records`]) and per-Cluster
+/// CRC-32 checks kept. Both grow by one per Cluster read, and a stream
+/// may never end (or may be nothing but empty Clusters), so past this
+/// many the walk goes on without recording.
+const MAX_CLUSTER_RECORDS: usize = 1 << 16;
+
+/// Bytes of `EncryptedBlock` payload kept on the Cluster records.
+const MAX_ENCRYPTED_BLOCK_BYTES: u64 = 16 << 20;
+
+/// [`DamageEvent`]s kept; the count of all of them is
+/// [`MkvDemuxer::damage_events_total`].
+const MAX_DAMAGE_EVENTS: usize = 4096;
 
 fn parse_cue_point(
     r: &mut dyn ReadSeek,
@@ -9387,7 +9440,7 @@ struct QueuedPacket {
 /// (returning this struct directly so consumers can call typed accessors
 /// like [`MkvDemuxer::tags`] that the trait does not expose).
 pub struct MkvDemuxer {
-    input: Box<dyn ReadSeek>,
+    input: Box<crate::bufio::BufInput>,
     /// The parsed EBML header (RFC 8794 §11.2) — `DocType`, the version trio,
     /// and any `DocTypeExtension` declarations. See [`MkvDemuxer::ebml_header`].
     ebml_header: EbmlHeader,
@@ -9705,6 +9758,15 @@ pub struct MkvDemuxer {
     incomplete_tail: Option<u64>,
     /// Landing rule of `seek_to` — see [`MkvDemuxer::set_seek_precision`].
     seek_precision: SeekPrecision,
+    /// Per-stream "the consumer reads this stream" flags from
+    /// [`Demuxer::set_active_streams`]; `None` until the hint is given
+    /// (every stream is read).
+    active_streams: Option<Vec<bool>>,
+    /// Every recovery performed, including those past the
+    /// [`MAX_DAMAGE_EVENTS`] kept in `damage_events`.
+    damage_events_total: u64,
+    /// `EncryptedBlock` payload bytes held on the Cluster records.
+    encrypted_bytes_kept: u64,
 }
 
 /// One Segment (EBML Document) of the input — see
@@ -9827,6 +9889,14 @@ struct SegmentCtx {
     chain: Option<ChainState>,
 }
 
+/// Open-time counterpart of [`MkvDemuxer::record_damage`].
+fn push_open_damage(events: &mut Vec<DamageEvent>, total: &mut u64, event: DamageEvent) {
+    *total += 1;
+    if events.len() < MAX_DAMAGE_EVENTS {
+        events.push(event);
+    }
+}
+
 /// A duration in nanoseconds as a whole number of samples at
 /// `sample_rate` (nearest).
 fn ns_to_samples(ns: u64, sample_rate: u32) -> u64 {
@@ -9902,6 +9972,21 @@ impl Demuxer for MkvDemuxer {
 
     fn metadata(&self) -> &[(String, String)] {
         &self.metadata
+    }
+
+    /// Blocks of streams outside `indices` are stepped over in the
+    /// input — their payload is never read — instead of being handed
+    /// out for the caller to drop. Applies to Blocks read after the
+    /// call; while TrackOperation application is on, every stream stays
+    /// active (a virtual track's packets are copies of its sources').
+    fn set_active_streams(&mut self, indices: &[u32]) {
+        let mut active = vec![false; self.streams.len()];
+        for &i in indices {
+            if let Some(slot) = active.get_mut(i as usize) {
+                *slot = true;
+            }
+        }
+        self.active_streams = Some(active);
     }
 
     fn duration_micros(&self) -> Option<i64> {
@@ -10033,7 +10118,7 @@ impl MkvDemuxer {
                     Ok(_) => Some(self.input.stream_position()?),
                     Err(_) => None,
                 };
-                self.damage_events.push(DamageEvent {
+                self.record_damage(DamageEvent {
                     kind: DamageKind::CueLie,
                     offset: abs,
                     resumed_at,
@@ -10552,6 +10637,13 @@ impl MkvDemuxer {
         &self.damage_events
     }
 
+    /// How many recoveries were performed in all. [`Self::damage_events`]
+    /// keeps the first 4096 of them; an input that is damage from end to
+    /// end keeps being counted here without the list growing with it.
+    pub fn damage_events_total(&self) -> u64 {
+        self.damage_events_total
+    }
+
     /// Audit every claim the `Cues` element makes about this Segment and
     /// report the lies (RFC 9559 §5.1.5.1) — the whole-index counterpart
     /// of the per-seek trust-but-verify check the resilient `seek_to`
@@ -10999,7 +11091,9 @@ impl MkvDemuxer {
     /// forward seek that revisits the same Cluster reuses the existing
     /// row instead of pushing a duplicate.
     fn register_cluster_record(&mut self, body_start: u64) {
-        if self.cluster_record_by_offset.contains_key(&body_start) {
+        if self.cluster_record_by_offset.contains_key(&body_start)
+            || self.cluster_records.len() >= MAX_CLUSTER_RECORDS
+        {
             return;
         }
         let idx = self.cluster_records.len();
@@ -11053,7 +11147,11 @@ impl MkvDemuxer {
     /// missing — see [`Self::set_cluster_position`] for the why. The bytes
     /// are recorded verbatim; the container never decrypts them.
     fn push_cluster_encrypted_block(&mut self, body_start: u64, bytes: Vec<u8>) {
-        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start) {
+        if let Some(&idx) = self.cluster_record_by_offset.get(&body_start)
+            && self.encrypted_bytes_kept.saturating_add(bytes.len() as u64)
+                <= MAX_ENCRYPTED_BLOCK_BYTES
+        {
+            self.encrypted_bytes_kept += bytes.len() as u64;
             self.cluster_records[idx].encrypted_blocks.push(bytes);
         }
     }
@@ -12145,7 +12243,9 @@ impl MkvDemuxer {
         if is_unknown_size {
             return Ok(());
         }
-        if self.validated_cluster_starts.contains(&body_start) {
+        if self.validated_cluster_starts.contains(&body_start)
+            || self.validated_cluster_starts.len() >= MAX_CLUSTER_RECORDS
+        {
             return Ok(());
         }
         let status =
@@ -12182,7 +12282,7 @@ impl MkvDemuxer {
         match found {
             Some(off) => {
                 self.resync_floor = off.saturating_add(1);
-                self.damage_events.push(DamageEvent {
+                self.record_damage(DamageEvent {
                     kind: DamageKind::ClusterStream,
                     offset: failed_at,
                     resumed_at: Some(off),
@@ -12192,7 +12292,7 @@ impl MkvDemuxer {
                 Ok(())
             }
             None => {
-                self.damage_events.push(DamageEvent {
+                self.record_damage(DamageEvent {
                     kind: DamageKind::UnrecoverableTail,
                     offset: failed_at,
                     resumed_at: None,
@@ -12668,6 +12768,11 @@ impl MkvDemuxer {
     /// the reader on that element, so a later call reads it again once
     /// the writer has caught up. `None` when the last call returned a
     /// packet or ended at a real end.
+    ///
+    /// The offset is where the walk resumes. That is past the current
+    /// end of the input when the walk was stepping over an element (a
+    /// `Void`, an element it does not read) whose declared end has not
+    /// been written yet: the walk then waits for the element after it.
     pub fn incomplete_tail(&self) -> Option<u64> {
         self.incomplete_tail
     }
@@ -12785,6 +12890,15 @@ impl MkvDemuxer {
         self.tag_metadata_entries = new_entries;
         self.tags = new_typed;
         Ok(())
+    }
+
+    /// Record a recovery: kept up to [`MAX_DAMAGE_EVENTS`], counted
+    /// always.
+    fn record_damage(&mut self, event: DamageEvent) {
+        self.damage_events_total += 1;
+        if self.damage_events.len() < MAX_DAMAGE_EVENTS {
+            self.damage_events.push(event);
+        }
     }
 
     /// The input is in the shape a writer leaves while it is still
@@ -13285,22 +13399,39 @@ impl MkvDemuxer {
                         self.push_cluster_encrypted_block(body_start, bytes);
                     }
                     ids::SIMPLE_BLOCK => {
-                        let bytes = read_bytes(&mut *self.input, e.size as usize)?;
-                        if let Err(err) = self.queue_block_packets(&bytes, cluster_timecode, false)
-                        {
-                            // The element itself was whole (its bytes
-                            // were all there); only what is inside does
-                            // not parse. A resilient reader loses that
-                            // Block and nothing else.
-                            if !self.resilient {
+                        let block_end = self.input.stream_position()?.saturating_add(e.size);
+                        let limit = (!unknown_size).then_some(body_end);
+                        // A SimpleBlock never carries BlockAdditions or
+                        // the BlockGroup meta children (RFC 9559
+                        // §5.1.3.5.2).
+                        let queued = match self.read_block(e.size, limit) {
+                            Ok(Some(block)) => self.queue_block_packets_with(
+                                block,
+                                cluster_timecode,
+                                false,
+                                None,
+                                None,
+                                None,
+                            ),
+                            Ok(None) => Ok(()),
+                            Err(err) => Err(err),
+                        };
+                        if let Err(err) = queued {
+                            // Bytes that are not there (yet), or a Block
+                            // declared past the end of its Cluster, are
+                            // the stream's problem, not this Block's.
+                            if !self.resilient || is_short_read(&err) || block_end > body_end {
                                 return Err(err);
                             }
-                            let end = self.input.stream_position()?;
-                            self.damage_events.push(DamageEvent {
+                            // The element itself was whole; only what is
+                            // inside does not parse. A resilient reader
+                            // loses that Block and nothing else.
+                            self.input.seek(SeekFrom::Start(block_end))?;
+                            self.record_damage(DamageEvent {
                                 kind: DamageKind::DamagedBlock,
                                 offset: pos,
-                                resumed_at: Some(end),
-                                bytes_skipped: end.saturating_sub(pos),
+                                resumed_at: Some(block_end),
+                                bytes_skipped: block_end.saturating_sub(pos),
                             });
                         }
                     }
@@ -13317,7 +13448,7 @@ impl MkvDemuxer {
                                 return Err(err);
                             }
                             self.input.seek(SeekFrom::Start(bg_end))?;
-                            self.damage_events.push(DamageEvent {
+                            self.record_damage(DamageEvent {
                                 kind: DamageKind::DamagedBlock,
                                 offset: pos,
                                 resumed_at: Some(bg_end),
@@ -13350,7 +13481,7 @@ impl MkvDemuxer {
     }
 
     fn parse_block_group(&mut self, end: u64, cluster_timecode: i64) -> Result<()> {
-        let mut block_bytes: Option<Vec<u8>> = None;
+        let mut block: Option<BlockRead> = None;
         let mut duration: Option<i64> = None;
         let mut is_keyframe = true;
         let mut additions: Option<std::sync::Arc<Vec<BlockAddition>>> = None;
@@ -13359,7 +13490,9 @@ impl MkvDemuxer {
             let e = read_element_header(&mut *self.input)?;
             match e.id {
                 ids::BLOCK => {
-                    block_bytes = Some(read_bytes(&mut *self.input, e.size as usize)?);
+                    let block_end = self.input.stream_position()?.saturating_add(e.size);
+                    block = self.read_block(e.size, Some(end))?;
+                    self.input.seek(SeekFrom::Start(block_end))?;
                 }
                 ids::BLOCK_DURATION => {
                     duration = Some(read_uint(&mut *self.input, e.size as usize)? as i64);
@@ -13419,7 +13552,7 @@ impl MkvDemuxer {
                 _ => skip(&mut *self.input, e.size)?,
             }
         }
-        if let Some(b) = block_bytes {
+        if let Some(b) = block {
             // For BlockGroup, the lacing flags are in the same place as
             // SimpleBlock (the "keyframe" bit doesn't exist in plain Block —
             // keyframe-ness is inferred from absence of ReferenceBlock).
@@ -13429,7 +13562,7 @@ impl MkvDemuxer {
                 Some(std::sync::Arc::new(meta))
             };
             self.queue_block_packets_with(
-                &b,
+                b,
                 cluster_timecode,
                 is_keyframe,
                 duration,
@@ -13440,60 +13573,92 @@ impl MkvDemuxer {
         Ok(())
     }
 
-    fn queue_block_packets(
-        &mut self,
-        bytes: &[u8],
-        cluster_timecode: i64,
-        _hint: bool,
-    ) -> Result<()> {
-        // SimpleBlock: keyframe bit is bit 7 of flags byte (RFC 9559
-        // §10.2 `KEY`, set when the Block contains only keyframes) and is
-        // the packet's keyframe flag as written — a SimpleBlock without
-        // it is a non-RAP (§10.4). BlockGroup/Block has the same
-        // layout but no keyframe bit; its caller defaults to keyframe and
-        // a `ReferenceBlock` clears it.
-        // A SimpleBlock can never carry BlockAdditions (the element lives
-        // only on BlockGroup, RFC 9559 §5.1.3.5.2) nor the BlockGroup meta
-        // children (ReferenceBlock / ReferencePriority / CodecState /
-        // DiscardPadding).
-        self.queue_block_packets_with(bytes, cluster_timecode, false, None, None, None)
+    /// Read the fixed head of a Block / SimpleBlock body of `size` bytes
+    /// (RFC 9559 §10.1 / §10.2) and then its data — unless the Block is
+    /// for a track nobody reads, in which case the data is stepped over
+    /// without being read. `None`: nothing to hand out.
+    ///
+    /// `limit` is the end of the enclosing element when that is known
+    /// (a bounded Cluster, a BlockGroup): a Block declared to run past
+    /// it is refused before anything is read or skipped, so a forged
+    /// size can neither swallow the elements that follow as payload nor
+    /// park the reader beyond them.
+    fn read_block(&mut self, size: u64, limit: Option<u64>) -> Result<Option<BlockRead>> {
+        let start = self.input.stream_position()?;
+        let end = start.saturating_add(size);
+        if limit.is_some_and(|l| end > l) || !self.input.has_bytes_to(end)? {
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "MKV: Block runs past the end of its parent or of the input",
+            )));
+        }
+        let (track_number, width) = read_vint(&mut *self.input, false).map_err(malformed)?;
+        if (width as u64).saturating_add(3) > size {
+            // The element is too short to hold a Block head: its
+            // contents are malformed, not missing.
+            return Err(Error::invalid("MKV: Block shorter than its header"));
+        }
+        let mut rest = [0u8; 3];
+        self.input.read_exact(&mut rest)?;
+        let stream_idx = match self.track_index_by_number.get(&track_number) {
+            Some(&i) if self.stream_wanted(i) => i,
+            // Unknown track, or a stream the consumer said it will not
+            // read: skip the payload.
+            _ => {
+                self.input.seek(SeekFrom::Start(end))?;
+                return Ok(None);
+            }
+        };
+        let body = self.input.read_vec(size - width as u64 - 3)?;
+        Ok(Some(BlockRead {
+            stream_idx,
+            timecode_offset: i16::from_be_bytes([rest[0], rest[1]]) as i64,
+            flags: rest[2],
+            body,
+        }))
+    }
+
+    /// Whether Blocks of this stream are read at all — see
+    /// [`Demuxer::set_active_streams`].
+    fn stream_wanted(&self, stream_idx: u32) -> bool {
+        match &self.active_streams {
+            None => true,
+            // A virtual track's packets are copies of its sources'.
+            Some(_) if self.apply_track_operations => true,
+            Some(active) => active.get(stream_idx as usize).copied().unwrap_or(false),
+        }
     }
 
     fn queue_block_packets_with(
         &mut self,
-        bytes: &[u8],
+        block: BlockRead,
         cluster_timecode: i64,
         default_keyframe: bool,
         explicit_duration: Option<i64>,
         additions: Option<std::sync::Arc<Vec<BlockAddition>>>,
         meta: Option<std::sync::Arc<BlockGroupMeta>>,
     ) -> Result<()> {
-        let mut cur = std::io::Cursor::new(bytes);
-        let (track_number, _) = crate::ebml::read_vint(&mut cur, false)?;
-        let mut tc_buf = [0u8; 2];
-        cur.read_exact(&mut tc_buf)?;
-        let timecode_offset = i16::from_be_bytes(tc_buf) as i64;
-        let mut flags_buf = [0u8; 1];
-        cur.read_exact(&mut flags_buf)?;
-        let flags = flags_buf[0];
+        let BlockRead {
+            stream_idx,
+            timecode_offset,
+            flags,
+            body,
+        } = block;
+        // SimpleBlock: bit 7 of the flags is `KEY` (RFC 9559 §10.2, set
+        // when the Block holds only key frames) and is the packet's
+        // keyframe flag as written. A Block inside a BlockGroup has no
+        // such bit; its caller passes `default_keyframe` (cleared by a
+        // `ReferenceBlock`).
         let lacing = (flags >> 1) & 0x03;
-        let keyframe_flag = flags & 0x80 != 0;
+        let keyframe = flags & 0x80 != 0 || default_keyframe;
 
-        let stream_idx = match self.track_index_by_number.get(&track_number) {
-            Some(i) => *i,
-            None => return Ok(()), // Skip frames for unknown tracks.
-        };
-
-        // Frame data starts at current cur position.
-        let body_start = cur.position() as usize;
-        let body = &bytes[body_start..];
-
+        // An unlaced Block is one frame: the data read from the input is
+        // the packet payload as it is, never copied again.
         let frames = match lacing {
-            0 => vec![body.to_vec()],
-            1 => parse_xiph_lacing(body)?,
-            2 => parse_fixed_lacing(body)?,
-            3 => parse_ebml_lacing(body)?,
-            _ => unreachable!(),
+            0 => Frames::One(body),
+            1 => Frames::Many(parse_xiph_lacing(&body).map_err(malformed)?),
+            2 => Frames::Many(parse_fixed_lacing(&body).map_err(malformed)?),
+            _ => Frames::Many(parse_ebml_lacing(&body).map_err(malformed)?),
         };
 
         let pts_base = cluster_timecode + timecode_offset;
@@ -13522,18 +13687,7 @@ impl MkvDemuxer {
             }),
             _ => false,
         };
-        // Header-Stripping (RFC 9559 §5.1.4.1.31.6 algo 3) prefix for this
-        // stream, prepended to each de-laced frame so the packet carries the
-        // original (un-stripped) bytes. Block scope (§5.1.4.1.31.3 bit 0x1) is
-        // "all frame contents, excluding lacing data" — i.e. each frame after
-        // lacing is split, which is exactly `f` here. Empty when the track has
-        // no reversible Header-Stripping chain (the common case).
-        let strip_prefix = self
-            .header_strip_prefixes
-            .get(stream_idx as usize)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        for (i, f) in frames.into_iter().enumerate() {
+        let emit = |d: &mut Self, i: usize, f: Vec<u8>| {
             let pts = pts_base.saturating_add(per_frame.unwrap_or(0).saturating_mul(i as i64));
             // A chained Segment's ticks go onto the first Segment's
             // timeline and scale.
@@ -13541,9 +13695,21 @@ impl MkvDemuxer {
                 Some(c) => (c.timestamp(pts), per_frame.map(|d| c.duration(d))),
                 None => (pts, per_frame),
             };
-            self.max_end_out = self
+            d.max_end_out = d
                 .max_end_out
                 .max(pts.saturating_add(per_frame.unwrap_or(0).max(0)));
+            // Header-Stripping (RFC 9559 §5.1.4.1.31.6 algo 3) prefix for
+            // this stream, prepended to each de-laced frame so the packet
+            // carries the original (un-stripped) bytes. Block scope
+            // (§5.1.4.1.31.3 bit 0x1) is "all frame contents, excluding
+            // lacing data" — each frame after the lace is split. Empty
+            // when the track has no reversible Header-Stripping chain
+            // (the common case).
+            let strip_prefix = d
+                .header_strip_prefixes
+                .get(stream_idx as usize)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let frame_bytes = if strip_prefix.is_empty() {
                 f
             } else {
@@ -13552,12 +13718,12 @@ impl MkvDemuxer {
                 restored.extend_from_slice(&f);
                 restored
             };
-            let mut pkt = Packet::new(stream_idx, self.time_base, frame_bytes);
+            let mut pkt = Packet::new(stream_idx, d.time_base, frame_bytes);
             pkt.pts = Some(pts);
             pkt.dts = Some(pts);
             pkt.duration = per_frame;
             pkt.flags.discard = all_padding;
-            pkt.flags.keyframe = keyframe_flag || default_keyframe;
+            pkt.flags.keyframe = keyframe;
             // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta
             // children attach to the Block as a whole; every frame de-laced
             // from a laced Block shares the same additions / meta (the spec
@@ -13574,35 +13740,89 @@ impl MkvDemuxer {
             // references SHOULD be stored in 'coding order'"), which a
             // PTS re-sort would break. The Block's side channels attach to
             // the Block itself, so each copy shares them.
-            let synth: Vec<QueuedPacket> = if self.apply_track_operations {
-                self.virtual_consumers
+            let consumers = if d.apply_track_operations {
+                d.virtual_consumers
                     .get(stream_idx as usize)
                     .map(Vec::as_slice)
                     .unwrap_or(&[])
-                    .iter()
-                    .map(|&origin| {
-                        let mut vp = pkt.clone();
-                        vp.stream_index = origin.virtual_stream;
-                        QueuedPacket {
-                            packet: vp,
-                            additions: additions.clone(),
-                            meta: meta.clone(),
-                            origin: Some(origin),
-                        }
-                    })
-                    .collect()
             } else {
-                Vec::new()
+                &[]
             };
-            self.out_queue.push_back(QueuedPacket {
+            if consumers.is_empty() {
+                d.out_queue.push_back(QueuedPacket {
+                    packet: pkt,
+                    additions: additions.clone(),
+                    meta: meta.clone(),
+                    origin: None,
+                });
+                return;
+            }
+            let synth: Vec<QueuedPacket> = consumers
+                .iter()
+                .map(|&origin| {
+                    let mut vp = pkt.clone();
+                    vp.stream_index = origin.virtual_stream;
+                    QueuedPacket {
+                        packet: vp,
+                        additions: additions.clone(),
+                        meta: meta.clone(),
+                        origin: Some(origin),
+                    }
+                })
+                .collect();
+            d.out_queue.push_back(QueuedPacket {
                 packet: pkt,
                 additions: additions.clone(),
                 meta: meta.clone(),
                 origin: None,
             });
-            self.out_queue.extend(synth);
+            d.out_queue.extend(synth);
+        };
+        match frames {
+            Frames::One(f) => emit(self, 0, f),
+            Frames::Many(list) => {
+                for (i, f) in list.into_iter().enumerate() {
+                    emit(self, i, f);
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// An error met while parsing bytes that were all read: running out of
+/// them means the contents are malformed, not that the input is short —
+/// which matters to callers that treat a short input as "not written
+/// yet".
+fn malformed(e: Error) -> Error {
+    if is_short_read(&e) {
+        Error::invalid("MKV: Block contents end before its lace or header does")
+    } else {
+        e
+    }
+}
+
+/// A Block / SimpleBlock as read from the input: the stream it belongs
+/// to, the fixed head, and the data after it (the frame, or the lace).
+struct BlockRead {
+    stream_idx: u32,
+    timecode_offset: i64,
+    flags: u8,
+    body: Vec<u8>,
+}
+
+/// The frames of one Block.
+enum Frames {
+    One(Vec<u8>),
+    Many(Vec<Vec<u8>>),
+}
+
+impl Frames {
+    fn len(&self) -> usize {
+        match self {
+            Frames::One(_) => 1,
+            Frames::Many(v) => v.len(),
+        }
     }
 }
 

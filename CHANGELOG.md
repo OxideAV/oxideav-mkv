@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, and `Index`, the previous landing rule), and
   `tests/seek_exact.rs`, an exhaustive every-track / every-target check
   of the landing on self-muxed files with and without `Cues`.
+- `Demuxer::set_active_streams` is honoured: Blocks of streams the
+  consumer will not read are stepped over without their payload being
+  read.
+- `MkvMuxer::with_output_buffer` / `output_buffer` (default 64 KiB, `0`
+  writes through). The live layout hands the sink everything at the end
+  of every call and never seeks it, so a forward-only sink works.
+- `MkvDemuxer::damage_events_total`.
 - Priming and trim for consumers behind the `Demuxer` trait:
   `track:<stream>:codec_delay_ns` / `priming_samples` /
   `seek_pre_roll_ns` metadata entries, `TrackCodecTiming::priming_samples`
@@ -39,8 +46,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PacketFlags::discard` on a Block that is `DiscardPadding` from end to
   end.
 
+### Performance
+
+- Demuxer and muxer go through an in-memory window / buffer with a
+  self-tracked position (`src/bufio.rs`) instead of issuing one system
+  call per EBML octet group, position query and short hop; Block
+  payloads are read straight into the packet buffer (one copy, none
+  after it) and written straight from it. Output bytes are unchanged
+  (fingerprinted by the bench). Numbers in the README's Throughput
+  section.
+
 ### Changed
 
+- A Block declared to run past its bounded Cluster (or its BlockGroup,
+  or the input) is refused before it is read; it used to be read as far
+  as the bytes went, swallowing the elements after it.
+- Retention is capped where it grew with the element count rather than
+  with what is being read: 65 536 Cluster records / per-Cluster CRC
+  checks, 4 194 304 CuePoints, 65 536 Seek entries, 16 MiB of
+  `EncryptedBlock` payload, 4096 damage events (all are still counted).
 - `seek_to` lands on the last key frame of the requested track at or
   before the target and returns its timestamp. It used to stop at the
   index landing: the Block a `CuePoint` names, or without `Cues` the

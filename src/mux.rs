@@ -25,7 +25,7 @@
 //! packets were muxed). Timestamps are converted to milliseconds using the
 //! standard 1 ms `TIMECODE_SCALE`.
 
-use std::io::Write;
+use std::io::{Seek, Write};
 
 use oxideav_core::{Error, MediaType, Packet, Result, StreamInfo};
 use oxideav_core::{Muxer, WriteSeek};
@@ -560,7 +560,7 @@ impl MkvTrackIdentity {
 }
 
 pub struct MkvMuxer {
-    output: Box<dyn WriteSeek>,
+    output: Box<crate::bufio::BufOutput>,
     streams: Vec<StreamInfo>,
     /// Per-stream `CodecID` / `CodecPrivate` plan, resolved at open time
     /// by [`codec_id::plan_track_codec`] (a stream with no registered
@@ -3302,7 +3302,7 @@ impl MkvMuxer {
         let stream_track_numbers: Vec<u64> = (0..streams.len() as u64).map(|i| i + 1).collect();
         let n = streams.len();
         Ok(MkvMuxer {
-            output,
+            output: Box::new(crate::bufio::BufOutput::new(output)),
             streams: streams.to_vec(),
             track_codecs,
             track_numbers: stream_track_numbers,
@@ -3795,6 +3795,48 @@ impl MkvMuxer {
     /// was called.
     pub fn live_streaming(&self) -> bool {
         self.live_streaming
+    }
+
+    /// Size of the muxer's output buffer in bytes (default 64 KiB).
+    ///
+    /// Element headers and Block payloads are collected in memory and
+    /// handed to the sink in large sequential writes, and the muxer
+    /// tracks the write position itself instead of asking the sink
+    /// before every Block. The bytes written are the same at every size;
+    /// what changes is when the sink sees them:
+    ///
+    /// * the default layout holds back at most `bytes` of output until
+    ///   the buffer fills, [`Muxer::write_trailer`] runs, or the muxer is
+    ///   dropped;
+    /// * the live layout ([`MkvMuxer::with_live_streaming`]) hands the
+    ///   sink everything it has at the end of every `write_header`,
+    ///   `write_packet*` and `write_live_tags` call, whatever the size —
+    ///   a packet is on the wire when the call that wrote it returns —
+    ///   and never calls `seek` on the sink apart from one position
+    ///   query before the first byte (a sink that cannot answer it is
+    ///   taken to start at offset 0), so a forward-only sink behind a
+    ///   `Seek` shim works.
+    ///
+    /// `0` writes through: every element goes to the sink as its own
+    /// write, the behaviour before the buffer existed. May be called at
+    /// any time.
+    pub fn with_output_buffer(&mut self, bytes: usize) -> Result<&mut Self> {
+        self.output.set_capacity(bytes)?;
+        Ok(self)
+    }
+
+    /// Read-only accessor: the output buffer size in effect — see
+    /// [`MkvMuxer::with_output_buffer`].
+    pub fn output_buffer(&self) -> usize {
+        self.output.capacity()
+    }
+
+    /// Live layout: nothing stays in the output buffer between calls.
+    fn deliver_if_live(&mut self) -> Result<()> {
+        if self.live_streaming {
+            self.output.write_out()?;
+        }
+        Ok(())
     }
 
     /// Set the per-track `Video > FlagInterlaced` (RFC 9559 §5.1.4.1.28.1)
@@ -5751,6 +5793,7 @@ impl MkvMuxer {
         self.cluster_open = false;
         let bytes = build_tags_element(tags, self.webm_strict);
         self.output.write_all(&bytes)?;
+        self.deliver_if_live()?;
         Ok(())
     }
 
@@ -7173,6 +7216,7 @@ impl Muxer for MkvMuxer {
 
         self.segment_data_start = base_pos + segment_data_start_in_buf;
         self.output.write_all(&all)?;
+        self.deliver_if_live()?;
         self.header_written = true;
         Ok(())
     }
@@ -7273,13 +7317,14 @@ impl MkvMuxer {
         let track_number = self.track_numbers[stream_idx];
         let stream_time_base = self.streams[stream_idx].time_base;
         let media_type = self.streams[stream_idx].params.media_type;
-        let codec = self.streams[stream_idx].params.codec_id.as_str().to_owned();
+        let is_opus = self.streams[stream_idx].params.codec_id.as_str() == "opus";
 
         // Effective per-packet pts. If the source set one, use it; otherwise
         // derive from accumulated stream_pts and codec-specific durations.
-        let derived_duration: Option<i64> = match codec.as_str() {
-            "opus" => opus_packet_duration_samples(&packet.data).map(|s| s as i64),
-            _ => packet.duration,
+        let derived_duration: Option<i64> = if is_opus {
+            opus_packet_duration_samples(&packet.data).map(|s| s as i64)
+        } else {
+            packet.duration
         };
         let effective_pts = match packet.pts {
             Some(v) => v,
@@ -7473,15 +7518,19 @@ impl MkvMuxer {
             // Fast path: emit a standalone SimpleBlock with lacing
             // bits = 00 (RFC 9559 §10.3.1). Matches the
             // pre-with_block_lacing behaviour byte-for-byte.
-            let block_bytes = build_simple_block(
+            // The element head and the frame go out as two writes so
+            // the frame is never copied into an intermediate buffer.
+            let mut head = [0u8; 24];
+            let head_len = simple_block_head(
+                &mut head,
                 track_number,
                 timecode_offset as i16,
                 packet.flags.keyframe,
-                LacingMode::None,
-                std::slice::from_ref(&packet.data),
+                packet.data.len(),
             );
-            self.output.write_all(&block_bytes)?;
-            self.cluster_bytes += block_bytes.len() as u64;
+            self.output.write_all(&head[..head_len])?;
+            self.output.write_all(&packet.data)?;
+            self.cluster_bytes += (head_len + packet.data.len()) as u64;
             // One SimpleBlock written to the open Cluster — advances the
             // 1-based `CueBlockNumber` counter (RFC 9559 §5.1.5.1.2.5).
             self.cluster_block_count += 1;
@@ -7492,6 +7541,7 @@ impl MkvMuxer {
         // BlockGroup on the same track can derive its ReferenceBlock
         // (§5.1.3.5.5) relative value.
         self.last_block_pts_ms[stream_idx] = Some(pts_ms);
+        self.deliver_if_live()?;
         Ok(())
     }
 
@@ -8093,6 +8143,36 @@ fn build_simple_block(
     out.extend_from_slice(&write_vint(body.len() as u64, 0));
     out.extend_from_slice(&body);
     out
+}
+
+/// The bytes of an unlaced `SimpleBlock` element in front of its frame:
+/// element ID, element size, track number VINT, signed 16-bit timestamp
+/// and the flags octet (RFC 9559 §10.2) — byte for byte what
+/// [`build_simple_block`] emits ahead of the frame data. Written into
+/// `out`; returns the length.
+fn simple_block_head(
+    out: &mut [u8; 24],
+    track: u64,
+    tc_offset: i16,
+    keyframe: bool,
+    frame_len: usize,
+) -> usize {
+    let track_vint = write_vint(track, 0);
+    let body_len = track_vint.len() + 3 + frame_len;
+    let size_vint = write_vint(body_len as u64, 0);
+    let id = write_element_id(ids::SIMPLE_BLOCK);
+    let mut n = 0;
+    for part in [
+        &id[..],
+        &size_vint[..],
+        &track_vint[..],
+        &tc_offset.to_be_bytes()[..],
+    ] {
+        out[n..n + part.len()].copy_from_slice(part);
+        n += part.len();
+    }
+    out[n] = if keyframe { 0x80 } else { 0 };
+    n + 1
 }
 
 /// Build a `BlockGroup` element (RFC 9559 §5.1.3.5) carrying one unlaced

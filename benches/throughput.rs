@@ -29,7 +29,16 @@ use oxideav_mkv::mux::MkvMuxer;
 
 const VIDEO_BLOCK: usize = 40 * 1024;
 const AUDIO_BLOCK: usize = 160;
-const RUNS: usize = 5;
+
+/// Repetitions per stage (`OXIDEAV_MKV_BENCH_RUNS`, default 5); the
+/// median is reported.
+fn runs() -> usize {
+    std::env::var("OXIDEAV_MKV_BENCH_RUNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(5)
+}
 
 fn av_streams() -> Vec<StreamInfo> {
     let mut vp = CodecParameters::video(CodecId::new("ffv1"));
@@ -124,11 +133,16 @@ enum IndexLayout {
 }
 
 fn mux_index_file(clusters: u64, layout: IndexLayout) -> Vec<u8> {
+    let shared = SharedVec::default();
+    mux_index_to(Box::new(shared.clone()), clusters, layout);
+    shared.take()
+}
+
+fn mux_index_to(out: Box<dyn WriteSeek>, clusters: u64, layout: IndexLayout) {
     let streams = vec![av_streams().remove(1)];
     let mut streams = streams;
     streams[0].index = 0;
-    let shared = SharedVec::default();
-    let mut mux = MkvMuxer::new_matroska(Box::new(shared.clone()), &streams).unwrap();
+    let mut mux = MkvMuxer::new_matroska(out, &streams).unwrap();
     mux.with_cluster_limits(19, 1024).unwrap();
     match layout {
         IndexLayout::End => {}
@@ -149,8 +163,6 @@ fn mux_index_file(clusters: u64, layout: IndexLayout) -> Vec<u8> {
         mux.write_packet(&p).unwrap();
     }
     mux.write_trailer().unwrap();
-    drop(mux);
-    shared.take()
 }
 
 /// An in-memory `Write + Seek` sink whose bytes outlive the muxer.
@@ -226,7 +238,7 @@ fn main() {
 
     // --- mux ---------------------------------------------------------
     let mut to_file = Vec::new();
-    for _ in 0..RUNS {
+    for _ in 0..runs() {
         let f = std::fs::File::create(&path).unwrap();
         let t = Instant::now();
         mux_av(Box::new(f), &packets);
@@ -241,7 +253,7 @@ fn main() {
     );
     report("mux -> file", median(to_file), total, n_packets);
     let mut to_mem = Vec::new();
-    for _ in 0..RUNS {
+    for _ in 0..runs() {
         let sink = SharedVec::default();
         let t = Instant::now();
         mux_av(Box::new(sink.clone()), &packets);
@@ -253,7 +265,7 @@ fn main() {
 
     // --- demux -------------------------------------------------------
     let mut from_file = Vec::new();
-    for _ in 0..RUNS {
+    for _ in 0..runs() {
         let f = std::fs::File::open(&path).unwrap();
         let t = Instant::now();
         let rs: Box<dyn ReadSeek> = Box::new(f);
@@ -264,7 +276,7 @@ fn main() {
     }
     report("demux <- file", median(from_file), total, n_packets);
     let mut from_mem = Vec::new();
-    for _ in 0..RUNS {
+    for _ in 0..runs() {
         let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file_bytes.clone()));
         let t = Instant::now();
         let mut dmx = oxideav_mkv::demux::open(rs, &NullCodecResolver).unwrap();
@@ -286,11 +298,24 @@ fn main() {
         (IndexLayout::Front, "Cues at the front"),
         (IndexLayout::Live, "no Cues (live layout)"),
     ] {
+        let mut muxes = Vec::new();
+        for _ in 0..runs() {
+            let f = std::fs::File::create(&path).unwrap();
+            let t = Instant::now();
+            mux_index_to(Box::new(f), clusters, layout);
+            muxes.push(t.elapsed());
+        }
         let bytes = mux_index_file(clusters, layout);
-        std::fs::write(&path, &bytes).unwrap();
+        assert!(std::fs::read(&path).unwrap() == bytes);
+        report(
+            "  mux -> file, one block per Cluster",
+            median(muxes),
+            bytes.len() as u64,
+            clusters,
+        );
         let mut opens = Vec::new();
         let mut cue_count = 0;
-        for _ in 0..RUNS {
+        for _ in 0..runs() {
             let f = std::fs::File::open(&path).unwrap();
             let t = Instant::now();
             let dmx = oxideav_mkv::demux::open_typed(Box::new(f), &NullCodecResolver).unwrap();
@@ -305,7 +330,7 @@ fn main() {
         );
         // Demux throughput on the one-block-per-Cluster shape.
         let mut drains = Vec::new();
-        for _ in 0..RUNS {
+        for _ in 0..runs() {
             let f = std::fs::File::open(&path).unwrap();
             let t = Instant::now();
             let mut dmx = oxideav_mkv::demux::open(Box::new(f), &NullCodecResolver).unwrap();
