@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.12...v0.0.13) - 2026-11-15
+
+### Other
+
+- elements overrunning their parent are damage; CRC probe and resync scan stop re-reading
+- mux_roundtrip target and streaming seeds; three fixes they found
+- buffered EBML I/O, single-copy Block payloads; bounds on retained state
+- seek lands on the track's key frame; priming and trim for trait consumers
+- concatenated Segments, growing files, lace timestamps; throughput bench
+- interpolated probe placement for the Cues-less seek ([#9](https://github.com/OxideAV/oxideav-mkv/pull/9))
+- API hygiene: #[non_exhaustive] on growable enums + every public record, with_* setters / constructors / Default
+
 ### Added
 
 - Concatenated Segments (RFC 9559 §4.5 / §23.2, RFC 8794 §9): the packet
