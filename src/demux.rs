@@ -247,6 +247,9 @@ fn open_typed_impl(
     // §6.2). Populated as each Top-Level master with a leading CRC-32
     // child is walked; surfaced via `MkvDemuxer::crc_status`.
     let mut crc_status: Vec<CrcStatus> = Vec::new();
+    // Where the packet walk starts when the Segment holds no Cluster yet
+    // and the pre-Cluster walk stopped short of the Segment end.
+    let mut park_at: Option<u64> = None;
 
     while input.stream_position()? < segment_data_end {
         let walk_pos = input.stream_position()?;
@@ -254,6 +257,16 @@ fn open_typed_impl(
             Ok(e) => e,
             Err(err) => {
                 if !resilient {
+                    // A capture still being written (unknown-size
+                    // Segment) may stop inside the header of its next
+                    // Top-Level element: that is where the data ends so
+                    // far, and the packet walk resumes from there once
+                    // more has been written.
+                    if seg.size == VINT_UNKNOWN_SIZE && is_short_read(&err) {
+                        input.seek(SeekFrom::Start(walk_pos))?;
+                        park_at = Some(walk_pos);
+                        break;
+                    }
                     return Err(err);
                 }
                 // Garbage where a Top-Level element header should be —
@@ -1135,7 +1148,7 @@ fn open_typed_impl(
     // (the reader is parked at the Segment end), and `seek_to` fails
     // with `Error::Unsupported` since there is nothing to land on.
     input.seek(SeekFrom::Start(
-        first_cluster_offset.unwrap_or(segment_data_end),
+        first_cluster_offset.or(park_at).unwrap_or(segment_data_end),
     ))?;
 
     // Segment\Info\Duration is in Matroska timecode ticks (timecode_scale ns
@@ -1216,6 +1229,35 @@ fn open_typed_impl(
         attachment_uid_to_index,
         edition_uid_to_index,
         tag_metadata_entries,
+        segment_index: 0,
+        segments: vec![SegmentRecord {
+            document_offset: 0,
+            data_offset: segment_data_start,
+            unknown_size: seg.size == VINT_UNKNOWN_SIZE,
+            timestamp_scale_ns: timecode_scale_ns,
+            start_ns: 0,
+            duration_ns: (info.duration.is_finite() && info.duration > 0.0)
+                .then_some((info.duration * timecode_scale_ns as f64) as u64),
+            track_map: tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.number, Some(i as u32)))
+                .collect(),
+        }],
+        chain: None,
+        first_segment: None,
+        chain_refused_at: None,
+        stream_track_identity: tracks
+            .iter()
+            .map(|t| (t.codec_id_string.clone(), t.track_type))
+            .collect(),
+        default_duration_ns: tracks
+            .iter()
+            .map(|t| t.timing_raw.default_duration.filter(|&d| d > 0))
+            .collect(),
+        max_end_out: 0,
+        stream_params_generation: 0,
+        incomplete_tail: None,
     };
     demuxer.layouts_from_first_frames();
     Ok(demuxer)
@@ -1263,6 +1305,11 @@ pub enum DamageKind {
     /// — the walk scanned forward and resumed at the next recognisable
     /// Top-Level element ID.
     GarbageData,
+    /// A `SimpleBlock` or `BlockGroup` whose element was whole but whose
+    /// contents do not parse (a lace whose sizes overrun the Block, a
+    /// truncated Block header, a malformed child). Only that Block was
+    /// dropped; the walk went on with the next element of the Cluster.
+    DamagedBlock,
     /// A corrupt element inside the Cluster stream made `next_packet`
     /// resynchronise on a later Top-Level element (usually the next
     /// `Cluster` — the resynchronisation unit RFC 9559 §5.1.3.2
@@ -9249,6 +9296,12 @@ enum ClusterState {
         body_start: u64,
         body_end: u64,
         cluster_timecode: i64,
+        /// The Cluster used the unknown-size VINT: it ends at the next
+        /// Top-Level (or Root-Level) element, and `body_end` is only the
+        /// input length measured so far — re-measured when the walk
+        /// reaches it, so a file that is still being written keeps
+        /// yielding Blocks.
+        unknown_size: bool,
     },
 }
 
@@ -9565,6 +9618,164 @@ pub struct MkvDemuxer {
     /// element — removed and re-added when a mid-stream `Tags` resets
     /// the tag state per RFC 9559 §23.2.
     tag_metadata_entries: Vec<(String, String)>,
+    /// 0-based index of the Segment (EBML Document) the Cluster walk is
+    /// in — see [`MkvDemuxer::current_segment`].
+    segment_index: usize,
+    /// One record per EBML Document met so far — see
+    /// [`MkvDemuxer::segments`].
+    segments: Vec<SegmentRecord>,
+    /// Timestamp mapping of the Segment being read onto the first
+    /// Segment's timeline; `None` while reading the first Segment (its
+    /// ticks are the stream time base as they are).
+    chain: Option<ChainState>,
+    /// The first Segment's walk context, saved when the walk moves on to
+    /// a chained Segment so seeks and index audits (which address the
+    /// first Segment) can put it back.
+    first_segment: Option<Box<SegmentCtx>>,
+    /// A Root-Level position that was probed for a chained document and
+    /// held something else — not probed again.
+    chain_refused_at: Option<u64>,
+    /// Per-stream Matroska `CodecID` string and `TrackType` of the first
+    /// Segment, the identity a chained Segment's tracks are matched on.
+    stream_track_identity: Vec<(String, u64)>,
+    /// Per-stream `DefaultDuration` (RFC 9559 §5.1.4.1.13) in
+    /// nanoseconds for the Segment being read.
+    default_duration_ns: Vec<Option<u64>>,
+    /// Furthest packet end (`pts + duration`) handed out so far, in the
+    /// stream time base — where a chained Segment's timeline starts.
+    max_end_out: i64,
+    /// Bumped each time a chained Segment changed a stream's parameters —
+    /// see [`MkvDemuxer::stream_params_generation`].
+    stream_params_generation: u64,
+    /// Offset of the unfinished element the last `next_packet` stopped
+    /// in front of — see [`MkvDemuxer::incomplete_tail`].
+    incomplete_tail: Option<u64>,
+}
+
+/// One Segment (EBML Document) of the input — see
+/// [`MkvDemuxer::segments`].
+///
+/// A Matroska file is one EBML Document or an EBML Stream of several
+/// concatenated ones (RFC 9559 §4.5, RFC 8794 §9); RFC 9559 §23.2 names
+/// concatenated Segments as the livestreaming shape that allows a change
+/// of codec parameters or resolution mid-stream. The demuxer reads them
+/// as one continuous packet sequence: each later Segment's timestamps
+/// are converted from its own `TimestampScale` into the stream time base
+/// (the first Segment's scale) and shifted to start where the previous
+/// Segment ended.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct SegmentRecord {
+    document_offset: u64,
+    data_offset: u64,
+    unknown_size: bool,
+    timestamp_scale_ns: u64,
+    start_ns: u64,
+    duration_ns: Option<u64>,
+    track_map: Vec<(u64, Option<u32>)>,
+}
+
+impl SegmentRecord {
+    /// Absolute offset of the document's EBML Header.
+    pub fn document_offset(&self) -> u64 {
+        self.document_offset
+    }
+
+    /// Absolute offset of the first byte of the Segment's data (the
+    /// origin of its Segment Positions, RFC 9559 §16).
+    pub fn data_offset(&self) -> u64 {
+        self.data_offset
+    }
+
+    /// The Segment element used the unknown-size VINT (RFC 9559 §23.2).
+    pub fn unknown_size(&self) -> bool {
+        self.unknown_size
+    }
+
+    /// `Info\TimestampScale` of this Segment (RFC 9559 §5.1.2.9),
+    /// nanoseconds per Segment Tick; the spec default `1_000_000` when
+    /// the element is absent or not read yet.
+    pub fn timestamp_scale_ns(&self) -> u64 {
+        self.timestamp_scale_ns
+    }
+
+    /// Where this Segment's timestamp zero sits on the demuxer's
+    /// timeline, in nanoseconds. `0` for the first Segment; for a later
+    /// one, the end of everything read before it (the furthest packet
+    /// end, or the previous Segment's declared `Duration` when that is
+    /// later).
+    pub fn start_ns(&self) -> u64 {
+        self.start_ns
+    }
+
+    /// `Info\Duration` of this Segment in nanoseconds, when declared.
+    pub fn duration_ns(&self) -> Option<u64> {
+        self.duration_ns
+    }
+
+    /// `(TrackNumber, stream index)` for every `TrackEntry` of this
+    /// Segment, in document order. A track of a later Segment maps onto
+    /// the stream of the first Segment with the same `TrackType` and
+    /// `CodecID` — the same `TrackNumber` when there is one, else the
+    /// first such stream not yet taken; `None` when no stream fits (a
+    /// track the first Segment did not have, or one whose codec
+    /// changed), in which case its Blocks are not handed out.
+    pub fn track_map(&self) -> &[(u64, Option<u32>)] {
+        &self.track_map
+    }
+}
+
+/// Timestamp mapping of a chained Segment onto the first Segment's
+/// timeline (the stream time base).
+#[derive(Clone, Copy, Debug)]
+struct ChainState {
+    /// Start of the Segment on the demuxer's timeline, nanoseconds.
+    offset_ns: u64,
+    /// The Segment's own `TimestampScale`.
+    scale_ns: u64,
+    /// The first Segment's `TimestampScale` (the stream time base).
+    base_scale_ns: u64,
+}
+
+impl ChainState {
+    /// A timestamp in this Segment's ticks, as stream-time-base ticks
+    /// (nearest, RFC 9559 §11.3).
+    fn timestamp(&self, ticks: i64) -> i64 {
+        let ns = (self.offset_ns as i128)
+            .saturating_add((ticks as i128).saturating_mul(self.scale_ns as i128));
+        Self::to_base(ns, self.base_scale_ns)
+    }
+
+    /// A duration in this Segment's ticks, as stream-time-base ticks.
+    fn duration(&self, ticks: i64) -> i64 {
+        Self::to_base(
+            (ticks as i128).saturating_mul(self.scale_ns as i128),
+            self.base_scale_ns,
+        )
+    }
+
+    fn to_base(ns: i128, base: u64) -> i64 {
+        let base = base.max(1) as i128;
+        let q = (ns.saturating_add(base / 2)).div_euclid(base);
+        q.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    }
+}
+
+/// The per-Segment part of the demuxer's walk state.
+#[derive(Clone, Debug)]
+struct SegmentCtx {
+    segment_index: usize,
+    segment_data_start: u64,
+    segment_data_end: u64,
+    segment_unknown_size: bool,
+    track_index_by_number: std::collections::HashMap<u64, u32>,
+    chain: Option<ChainState>,
+}
+
+/// `true` for the error a read past the end of the input produces — the
+/// bytes are not there (yet), as opposed to being there and malformed.
+fn is_short_read(e: &Error) -> bool {
+    matches!(e, Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 impl Demuxer for MkvDemuxer {
@@ -9594,12 +9805,27 @@ impl Demuxer for MkvDemuxer {
                 .stream_position()
                 .unwrap_or(self.segment_data_end);
             match self.advance() {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.incomplete_tail = None;
+                }
                 // `Error::Eof` is `advance`'s clean end-of-Segment signal,
                 // not damage — always propagate.
                 Err(Error::Eof) => return Err(Error::Eof),
                 Err(e) => {
                     if !self.resilient {
+                        // A file that is still being written (unknown-size
+                        // Segment or Cluster, RFC 9559 §23.2) ends wherever
+                        // the writer has got to — usually inside an
+                        // element. That is the end of the data *so far*,
+                        // not damage: step back to the start of the
+                        // unfinished element and report a clean end. A
+                        // later call re-reads it, so a reader following a
+                        // growing file picks up where it stopped.
+                        if self.live_shape() && is_short_read(&e) {
+                            self.input.seek(SeekFrom::Start(before))?;
+                            self.incomplete_tail = Some(before);
+                            return Err(Error::Eof);
+                        }
                         return Err(e);
                     }
                     // Damaged Cluster stream — resynchronise on the next
@@ -9630,6 +9856,9 @@ impl Demuxer for MkvDemuxer {
                 "MKV: stream index {stream_index} out of range"
             )));
         }
+        // Seek targets address the first Segment (chained Segments carry
+        // no index, RFC 9559 §23.2).
+        self.return_to_first_segment();
         if self.cues.is_empty() {
             // RFC 9559 §23.2: a stream with neither a SeekHead list nor a
             // Cues list at its beginning SHOULD be considered
@@ -9939,6 +10168,10 @@ impl MkvDemuxer {
     /// index or Segment content — hostile content becomes findings, not
     /// errors.
     pub fn audit_cues(&mut self) -> Result<CueAuditReport> {
+        self.with_first_segment(Self::audit_cues_first_segment)
+    }
+
+    fn audit_cues_first_segment(&mut self) -> Result<CueAuditReport> {
         let pos0 = self.input.stream_position()?;
         let mut report = CueAuditReport::default();
         let entries: Vec<CueEntry> = self.cues.clone();
@@ -10067,6 +10300,10 @@ impl MkvDemuxer {
     /// [`TargetOutOfSegment`]: SeekLieKind::TargetOutOfSegment
     /// [`TargetMismatch`]: SeekLieKind::TargetMismatch
     pub fn audit_seek_head(&mut self) -> Result<SeekHeadAuditReport> {
+        self.with_first_segment(Self::audit_seek_head_first_segment)
+    }
+
+    fn audit_seek_head_first_segment(&mut self) -> Result<SeekHeadAuditReport> {
         let pos0 = self.input.stream_position()?;
         let mut report = SeekHeadAuditReport::default();
         let claims: Vec<(Option<u32>, u64, bool)> = self
@@ -11350,6 +11587,7 @@ impl MkvDemuxer {
             body_start,
             body_end,
             cluster_timecode,
+            unknown_size: is_unknown_size,
         };
         Ok(())
     }
@@ -11439,6 +11677,7 @@ impl MkvDemuxer {
             body_start,
             body_end,
             cluster_timecode,
+            unknown_size: is_unknown_size,
         };
         Ok(())
     }
@@ -11972,6 +12211,41 @@ impl MkvDemuxer {
         self.last_seek_strategy
     }
 
+    /// Every Segment (EBML Document) the demuxer has met so far, in
+    /// input order: the first one from `open`, each chained one from the
+    /// moment the packet walk reaches it. See [`SegmentRecord`].
+    pub fn segments(&self) -> &[SegmentRecord] {
+        &self.segments
+    }
+
+    /// 0-based index into [`Self::segments`] of the Segment the packet
+    /// walk is in.
+    pub fn current_segment(&self) -> usize {
+        self.segment_index
+    }
+
+    /// A counter that moves each time a chained Segment's `Tracks`
+    /// changed the parameters of a stream (picture size, sample rate,
+    /// channel count, codec configuration record) — RFC 9559 §23.2
+    /// places such changes at a Segment boundary. [`Demuxer::streams`]
+    /// reflects the Segment being read; a consumer compares this counter
+    /// between packets to learn when to look again.
+    pub fn stream_params_generation(&self) -> u64 {
+        self.stream_params_generation
+    }
+
+    /// Offset of the unfinished element the most recent
+    /// [`Demuxer::next_packet`] stopped in front of, when it ended on
+    /// one: the input has the shape of a file that is still being
+    /// written (unknown-size Segment or Cluster) and stops partway
+    /// through an element. `next_packet` reported `Error::Eof` and left
+    /// the reader on that element, so a later call reads it again once
+    /// the writer has caught up. `None` when the last call returned a
+    /// packet or ended at a real end.
+    pub fn incomplete_tail(&self) -> Option<u64> {
+        self.incomplete_tail
+    }
+
     /// Opt in to hunting for a `Cues` element the open did not find —
     /// one stored after the Cluster run without a SeekHead entry
     /// pointing at it (RFC 9559 §6.4 says it SHOULD be stored before the
@@ -11989,6 +12263,10 @@ impl MkvDemuxer {
     /// Strict demuxers surface an I/O or parse error met on the walk;
     /// resilient ones report `Ok(false)` instead.
     pub fn scan_for_cues(&mut self) -> Result<bool> {
+        self.with_first_segment(Self::scan_for_cues_first_segment)
+    }
+
+    fn scan_for_cues_first_segment(&mut self) -> Result<bool> {
         if !self.cues.is_empty() {
             return Ok(true);
         }
@@ -12083,15 +12361,356 @@ impl MkvDemuxer {
         Ok(())
     }
 
+    /// The input is in the shape a writer leaves while it is still
+    /// writing: the Segment, or the Cluster being read, has the
+    /// unknown-size VINT (RFC 9559 §23.2).
+    fn live_shape(&self) -> bool {
+        self.segment_unknown_size
+            || matches!(
+                self.cluster_state,
+                ClusterState::InCluster {
+                    unknown_size: true,
+                    ..
+                }
+            )
+    }
+
+    /// Re-measure the input behind an unknown-size Segment; `true` when
+    /// it has grown past the end recorded so far (which is then moved).
+    /// The reader position is kept.
+    fn input_grew(&mut self) -> Result<bool> {
+        if !self.segment_unknown_size {
+            return Ok(false);
+        }
+        let cur = self.input.stream_position()?;
+        let end = self.input.seek(SeekFrom::End(0))?;
+        self.input.seek(SeekFrom::Start(cur))?;
+        if end > self.segment_data_end {
+            self.segment_data_end = end;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn capture_segment_ctx(&self) -> SegmentCtx {
+        SegmentCtx {
+            segment_index: self.segment_index,
+            segment_data_start: self.segment_data_start,
+            segment_data_end: self.segment_data_end,
+            segment_unknown_size: self.segment_unknown_size,
+            track_index_by_number: self.track_index_by_number.clone(),
+            chain: self.chain,
+        }
+    }
+
+    fn apply_segment_ctx(&mut self, ctx: SegmentCtx) {
+        self.segment_index = ctx.segment_index;
+        self.segment_data_start = ctx.segment_data_start;
+        self.segment_data_end = ctx.segment_data_end;
+        self.segment_unknown_size = ctx.segment_unknown_size;
+        self.track_index_by_number = ctx.track_index_by_number;
+        self.chain = ctx.chain;
+    }
+
+    /// Put the first Segment's walk context back (seeks address the
+    /// first Segment). No-op while still reading it.
+    fn return_to_first_segment(&mut self) {
+        if self.segment_index != 0
+            && let Some(first) = self.first_segment.as_deref().cloned()
+        {
+            self.apply_segment_ctx(first);
+            self.cluster_state = ClusterState::Idle;
+        }
+    }
+
+    /// Run `f` with the first Segment's context in place, then restore
+    /// the context of the Segment being read (index audits and the Cues
+    /// hunt address the first Segment and restore the reader position
+    /// themselves).
+    fn with_first_segment<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.segment_index == 0 {
+            return f(self);
+        }
+        let Some(first) = self.first_segment.as_deref().cloned() else {
+            return f(self);
+        };
+        let current = self.capture_segment_ctx();
+        self.apply_segment_ctx(first);
+        let out = f(self);
+        self.apply_segment_ctx(current);
+        out
+    }
+
+    /// Try to start reading the EBML Document whose header is at `pos`
+    /// (the reader is positioned there). `Ok(true)`: the walk context
+    /// now describes that document's Segment and the reader stands on
+    /// its first child. `Ok(false)`: nothing readable as a Matroska
+    /// document is there (yet); the reader is back at `pos`.
+    fn enter_chained_document(&mut self, pos: u64) -> Result<bool> {
+        if self.chain_refused_at == Some(pos) {
+            return Ok(false);
+        }
+        let (data_start, size) = match self.read_chained_headers() {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                self.chain_refused_at = Some(pos);
+                self.input.seek(SeekFrom::Start(pos))?;
+                return Ok(false);
+            }
+            // Short or unreadable: may simply not be written yet.
+            Err(_) => {
+                self.input.seek(SeekFrom::Start(pos))?;
+                return Ok(false);
+            }
+        };
+        if self.first_segment.is_none() {
+            self.first_segment = Some(Box::new(self.capture_segment_ctx()));
+        }
+        let base_scale_ns = self.timecode_scale_ns.max(1);
+        let unknown_size = size == VINT_UNKNOWN_SIZE;
+        // A document met before (a seek went back to the first Segment
+        // and the walk came forward again) keeps its place on the
+        // timeline; a new one starts where everything read so far ends.
+        let index = match self.segments.iter().position(|r| r.document_offset == pos) {
+            Some(i) => i,
+            None => {
+                let declared_end = self
+                    .segments
+                    .last()
+                    .map_or(0, |r| r.start_ns.saturating_add(r.duration_ns.unwrap_or(0)));
+                let read_end = (self.max_end_out.max(0) as u64).saturating_mul(base_scale_ns);
+                self.segments.push(SegmentRecord {
+                    document_offset: pos,
+                    data_offset: data_start,
+                    unknown_size,
+                    timestamp_scale_ns: 1_000_000,
+                    start_ns: declared_end.max(read_end),
+                    duration_ns: None,
+                    track_map: Vec::new(),
+                });
+                self.segments.len() - 1
+            }
+        };
+        let cur = self.input.stream_position()?;
+        let input_end = self.input.seek(SeekFrom::End(0))?;
+        self.input.seek(SeekFrom::Start(cur))?;
+        self.segment_index = index;
+        self.segment_data_start = data_start;
+        self.segment_unknown_size = unknown_size;
+        self.segment_data_end = if unknown_size {
+            input_end
+        } else if self.resilient {
+            data_start.saturating_add(size).min(input_end)
+        } else {
+            data_start.saturating_add(size)
+        };
+        // No Block of the new Segment maps to a stream until its Tracks
+        // element has been read.
+        self.track_index_by_number.clear();
+        self.chain = Some(ChainState {
+            offset_ns: self.segments[index].start_ns,
+            scale_ns: self.segments[index].timestamp_scale_ns,
+            base_scale_ns,
+        });
+        self.cluster_state = ClusterState::Idle;
+        Ok(true)
+    }
+
+    /// Read an EBML Header (RFC 8794 §11.2) and the Segment header that
+    /// follows it. `Some((segment data start, segment size))` for a
+    /// Matroska / WebM document.
+    fn read_chained_headers(&mut self) -> Result<Option<(u64, u64)>> {
+        let hdr = read_element_header(&mut *self.input)?;
+        if hdr.id != ids::EBML_HEADER || hdr.size == VINT_UNKNOWN_SIZE {
+            return Ok(None);
+        }
+        let end = self.input.stream_position()?.saturating_add(hdr.size);
+        let mut doc_type = String::from("matroska");
+        while self.input.stream_position()? < end {
+            let e = read_element_header(&mut *self.input)?;
+            if e.id == ids::EBML_DOC_TYPE {
+                doc_type = read_string(&mut *self.input, e.size as usize)?;
+            } else {
+                skip(&mut *self.input, e.size)?;
+            }
+        }
+        if doc_type != "matroska" && doc_type != "webm" {
+            return Ok(None);
+        }
+        self.input.seek(SeekFrom::Start(end))?;
+        // Global elements (Void, RFC 8794 §11.3.2) may sit at Root Level.
+        for _ in 0..16 {
+            let seg = read_element_header(&mut *self.input)?;
+            if seg.id == ids::SEGMENT {
+                return Ok(Some((self.input.stream_position()?, seg.size)));
+            }
+            if seg.id != ids::VOID || seg.size == VINT_UNKNOWN_SIZE {
+                return Ok(None);
+            }
+            skip(&mut *self.input, seg.size)?;
+        }
+        Ok(None)
+    }
+
+    /// `Info` of a chained Segment: its `TimestampScale` and `Duration`.
+    fn apply_chained_info(&mut self, size: u64) -> Result<()> {
+        let end = self.input.stream_position()?.saturating_add(size);
+        let mut info = SegmentInfo::default();
+        let mut scratch = Vec::new();
+        parse_info(&mut *self.input, end, &mut info, &mut scratch)?;
+        self.input.seek(SeekFrom::Start(end))?;
+        let scale = if info.timecode_scale == 0 {
+            1_000_000
+        } else {
+            info.timecode_scale
+        };
+        if let Some(c) = self.chain.as_mut() {
+            c.scale_ns = scale;
+        }
+        if let Some(r) = self.segments.get_mut(self.segment_index) {
+            r.timestamp_scale_ns = scale;
+            r.duration_ns = (info.duration.is_finite() && info.duration > 0.0)
+                .then_some((info.duration * scale as f64) as u64);
+        }
+        Ok(())
+    }
+
+    /// `Tracks` of a chained Segment: map each `TrackEntry` onto a
+    /// stream of the first Segment and refresh that stream's parameters.
+    fn apply_chained_tracks(&mut self, size: u64) -> Result<()> {
+        let end = self.input.stream_position()?.saturating_add(size);
+        let mut tracks: Vec<TrackEntry> = Vec::new();
+        parse_tracks(&mut *self.input, end, &mut tracks)?;
+        self.input.seek(SeekFrom::Start(end))?;
+        let n = self.streams.len();
+        let mut taken = vec![false; n];
+        let mut map: Vec<(u64, Option<u32>)> = Vec::with_capacity(tracks.len());
+        let fits = |d: &Self, idx: usize, t: &TrackEntry| {
+            d.stream_track_identity
+                .get(idx)
+                .is_some_and(|(codec, kind)| *codec == t.codec_id_string && *kind == t.track_type)
+        };
+        // Same TrackNumber first, then any free stream of the same kind
+        // and codec.
+        for t in &tracks {
+            let by_number = self
+                .track_number_by_index
+                .iter()
+                .position(|&num| num == t.number)
+                .filter(|&idx| !taken[idx] && fits(self, idx, t));
+            if let Some(idx) = by_number {
+                taken[idx] = true;
+            }
+            map.push((t.number, by_number.map(|i| i as u32)));
+        }
+        for (t, slot) in tracks.iter().zip(map.iter_mut()) {
+            if slot.1.is_none()
+                && let Some(idx) = (0..n).find(|&idx| !taken[idx] && fits(self, idx, t))
+            {
+                taken[idx] = true;
+                slot.1 = Some(idx as u32);
+            }
+        }
+        let mut changed = false;
+        self.track_index_by_number.clear();
+        for (t, &(number, mapped)) in tracks.iter().zip(map.iter()) {
+            let Some(idx) = mapped else { continue };
+            self.track_index_by_number.insert(number, idx);
+            let i = idx as usize;
+            if let Some(slot) = self.default_duration_ns.get_mut(i) {
+                *slot = t.timing_raw.default_duration.filter(|&d| d > 0);
+            }
+            let params = &mut self.streams[i].params;
+            let before = (
+                params.width,
+                params.height,
+                params.sample_rate,
+                params.channels,
+                params.extradata.clone(),
+            );
+            let stripped = strip_compat_header(&t.codec_id_string, &t.codec_private);
+            params.extradata = match params.codec_id.as_str() {
+                "flac" if stripped.starts_with(b"fLaC") => stripped[4..].to_vec(),
+                _ => stripped,
+            };
+            if t.track_type == ids::TRACK_TYPE_VIDEO {
+                params.width = Some(t.width as u32);
+                params.height = Some(t.height as u32);
+                if let Some((w, h)) = video_config::cropped_dimensions_from_config(
+                    params.codec_id.as_str(),
+                    &params.extradata,
+                ) {
+                    params.width = Some(w);
+                    params.height = Some(h);
+                }
+                if let Some(dd) = t.timing_raw.default_duration {
+                    params.frame_rate = video_config::frame_rate_from_default_duration(dd);
+                }
+            }
+            if t.track_type == ids::TRACK_TYPE_AUDIO {
+                params.sample_rate = Some(t.sample_rate.round() as u32);
+                params.channels = Some(t.channels as u16);
+            }
+            changed |= before
+                != (
+                    params.width,
+                    params.height,
+                    params.sample_rate,
+                    params.channels,
+                    params.extradata.clone(),
+                );
+        }
+        if changed {
+            self.stream_params_generation += 1;
+        }
+        if let Some(r) = self.segments.get_mut(self.segment_index) {
+            r.track_map = map;
+        }
+        Ok(())
+    }
+
     fn advance(&mut self) -> Result<()> {
         match self.cluster_state {
             ClusterState::Idle => {
                 let pos = self.input.stream_position()?;
                 if pos >= self.segment_data_end {
+                    // The end of an unknown-size Segment is only the
+                    // input length measured so far; the end of a bounded
+                    // one may be followed by another EBML Document (RFC
+                    // 8794 §9 EBML Stream, RFC 9559 §23.2 concatenated
+                    // Segments).
+                    if self.segment_unknown_size && self.input_grew()? {
+                        return Ok(());
+                    }
+                    if !self.segment_unknown_size && self.enter_chained_document(pos)? {
+                        return Ok(());
+                    }
                     return Err(Error::Eof);
                 }
                 let e = read_element_header(&mut *self.input)?;
                 match e.id {
+                    ids::EBML_HEADER => {
+                        // Root-Level EBML Header inside an unknown-size
+                        // Segment: the next EBML Document starts here
+                        // (RFC 8794 §9).
+                        self.input.seek(SeekFrom::Start(pos))?;
+                        if self.enter_chained_document(pos)? {
+                            return Ok(());
+                        }
+                        // Not a Matroska document — nothing more to read.
+                        self.input.seek(SeekFrom::Start(pos))?;
+                        self.segment_data_end = pos;
+                        self.segment_unknown_size = false;
+                        self.chain_refused_at = Some(pos);
+                        Err(Error::Eof)
+                    }
+                    ids::INFO if self.segment_index > 0 && e.size != VINT_UNKNOWN_SIZE => {
+                        self.apply_chained_info(e.size)
+                    }
+                    ids::TRACKS if self.segment_index > 0 && e.size != VINT_UNKNOWN_SIZE => {
+                        self.apply_chained_tracks(e.size)
+                    }
                     ids::CLUSTER => {
                         let body_start = self.input.stream_position()?;
                         let is_unknown_size = e.size == VINT_UNKNOWN_SIZE;
@@ -12112,10 +12731,16 @@ impl MkvDemuxer {
                         // child-element walk below sees the same bytes.
                         self.validate_cluster_crc(body_start, body_end, is_unknown_size)?;
                         self.register_cluster_record(body_start);
+                        if self.first_cluster_offset.is_none() && self.segment_index == 0 {
+                            // Opened before the writer had produced a
+                            // Cluster: this is the first one.
+                            self.first_cluster_offset = Some(pos);
+                        }
                         self.cluster_state = ClusterState::InCluster {
                             body_start,
                             body_end,
                             cluster_timecode: 0,
+                            unknown_size: is_unknown_size,
                         };
                         Ok(())
                     }
@@ -12149,9 +12774,33 @@ impl MkvDemuxer {
                 body_start,
                 body_end,
                 cluster_timecode,
+                unknown_size,
             } => {
                 let pos = self.input.stream_position()?;
                 if pos >= body_end {
+                    // An unknown-size Cluster has no end of its own: what
+                    // was recorded is the input length when it was
+                    // opened. If the input has grown since (a capture
+                    // still being written), keep walking the same
+                    // Cluster.
+                    // Cluster — and stay in it when it has not: the next
+                    // bytes to arrive belong to this Cluster until a
+                    // Top-Level element says otherwise.
+                    if unknown_size
+                        && self.segment_unknown_size
+                        && body_end >= self.segment_data_end
+                    {
+                        if !self.input_grew()? {
+                            return Err(Error::Eof);
+                        }
+                        if let ClusterState::InCluster {
+                            ref mut body_end, ..
+                        } = self.cluster_state
+                        {
+                            *body_end = self.segment_data_end;
+                        }
+                        return Ok(());
+                    }
                     self.cluster_state = ClusterState::Idle;
                     return Ok(());
                 }
@@ -12211,11 +12860,44 @@ impl MkvDemuxer {
                     }
                     ids::SIMPLE_BLOCK => {
                         let bytes = read_bytes(&mut *self.input, e.size as usize)?;
-                        self.queue_block_packets(&bytes, cluster_timecode, false)?;
+                        if let Err(err) = self.queue_block_packets(&bytes, cluster_timecode, false)
+                        {
+                            // The element itself was whole (its bytes
+                            // were all there); only what is inside does
+                            // not parse. A resilient reader loses that
+                            // Block and nothing else.
+                            if !self.resilient {
+                                return Err(err);
+                            }
+                            let end = self.input.stream_position()?;
+                            self.damage_events.push(DamageEvent {
+                                kind: DamageKind::DamagedBlock,
+                                offset: pos,
+                                resumed_at: Some(end),
+                                bytes_skipped: end.saturating_sub(pos),
+                            });
+                        }
                     }
                     ids::BLOCK_GROUP => {
                         let bg_end = self.input.stream_position()?.saturating_add(e.size);
-                        self.parse_block_group(bg_end, cluster_timecode)?;
+                        if let Err(err) = self.parse_block_group(bg_end, cluster_timecode) {
+                            // Same as above, when the BlockGroup lies
+                            // wholly inside the Cluster and the input.
+                            if !self.resilient
+                                || is_short_read(&err)
+                                || bg_end > body_end
+                                || bg_end > self.segment_data_end
+                            {
+                                return Err(err);
+                            }
+                            self.input.seek(SeekFrom::Start(bg_end))?;
+                            self.damage_events.push(DamageEvent {
+                                kind: DamageKind::DamagedBlock,
+                                offset: pos,
+                                resumed_at: Some(bg_end),
+                                bytes_skipped: bg_end.saturating_sub(pos),
+                            });
+                        }
                     }
                     // An unknown-size Cluster (body_end == segment_data_end)
                     // terminates when a sibling Segment-child element is
@@ -12228,7 +12910,9 @@ impl MkvDemuxer {
                     | ids::CHAPTERS
                     | ids::SEEK_HEAD
                     | ids::INFO
-                    | ids::TRACKS => {
+                    | ids::TRACKS
+                    | ids::EBML_HEADER
+                    | ids::SEGMENT => {
                         self.input.seek(SeekFrom::Start(pos))?;
                         self.cluster_state = ClusterState::Idle;
                     }
@@ -12388,7 +13072,21 @@ impl MkvDemuxer {
 
         let pts_base = cluster_timecode + timecode_offset;
         let n_frames = frames.len() as i64;
-        let per_frame = explicit_duration.map(|d| d / n_frames.max(1));
+        // Frame duration in this Segment's ticks: the Block's own
+        // `BlockDuration` split over its frames when it has one, else the
+        // track's `DefaultDuration` (RFC 9559 §5.1.4.1.13, nanoseconds
+        // per frame). It also spaces the frames of a lace, whose
+        // timestamps the Block does not carry (§10.3.5: the frames are
+        // contiguous).
+        let per_frame = explicit_duration.map(|d| d / n_frames.max(1)).or_else(|| {
+            let ns = (*self.default_duration_ns.get(stream_idx as usize)?)?;
+            let scale = self
+                .chain
+                .map_or(self.timecode_scale_ns, |c| c.scale_ns)
+                .max(1);
+            i64::try_from(ns.saturating_add(scale / 2) / scale).ok()
+        });
+        let chain = self.chain;
         // Header-Stripping (RFC 9559 §5.1.4.1.31.6 algo 3) prefix for this
         // stream, prepended to each de-laced frame so the packet carries the
         // original (un-stripped) bytes. Block scope (§5.1.4.1.31.3 bit 0x1) is
@@ -12401,7 +13099,16 @@ impl MkvDemuxer {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         for (i, f) in frames.into_iter().enumerate() {
-            let pts = pts_base + per_frame.unwrap_or(0) * i as i64;
+            let pts = pts_base.saturating_add(per_frame.unwrap_or(0).saturating_mul(i as i64));
+            // A chained Segment's ticks go onto the first Segment's
+            // timeline and scale.
+            let (pts, per_frame) = match chain {
+                Some(c) => (c.timestamp(pts), per_frame.map(|d| c.duration(d))),
+                None => (pts, per_frame),
+            };
+            self.max_end_out = self
+                .max_end_out
+                .max(pts.saturating_add(per_frame.unwrap_or(0).max(0)));
             let frame_bytes = if strip_prefix.is_empty() {
                 f
             } else {
@@ -12544,6 +13251,13 @@ fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         cur.read_exact(&mut buf)?;
         buf[0] as usize + 1
     };
+    // A lace of one frame carries no sizes at all ("lacing size of each
+    // frame except the last one", RFC 9559 §10.3.3) — the frame is the
+    // rest of the body. §10.3 forbids a writer from lacing a single
+    // frame; a reader still has to take it for what it says.
+    if n_frames == 1 {
+        return Ok(vec![body[1..].to_vec()]);
+    }
     let mut sizes = Vec::with_capacity(n_frames);
     // First size: full VINT.
     let (first, _) = crate::ebml::read_vint(&mut cur, false)?;

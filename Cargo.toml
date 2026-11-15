@@ -18,3 +18,7 @@ oxideav-core = "0.1"
 
 [dev-dependencies]
 oxideav-basic = "0.0"
+
+[[bench]]
+name = "throughput"
+harness = false

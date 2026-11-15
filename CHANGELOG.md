@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Concatenated Segments (RFC 9559 §4.5 / §23.2, RFC 8794 §9): the packet
+  walk continues into a Matroska / WebM EBML Document that follows the
+  Segment, converting each later Segment's `TimestampScale` to the stream
+  time base, shifting it to start where the previous one ended, and
+  mapping its tracks onto the first Segment's streams (`TrackType` +
+  `CodecID`, same `TrackNumber` first). `MkvDemuxer::segments()`
+  (`SegmentRecord`), `current_segment()` and
+  `stream_params_generation()` describe the chain.
+- Files that are still being written: on an unknown-size Segment or
+  Cluster, an input that stops inside an element ends the walk with a
+  clean `Error::Eof` and `MkvDemuxer::incomplete_tail()`; a later
+  `next_packet` re-measures the input and continues. `open` succeeds on
+  a capture that has no Cluster yet.
+- `DamageKind::DamagedBlock`: on the resilient path a `SimpleBlock` /
+  `BlockGroup` whose contents do not parse (lace sizes overrunning the
+  Block, malformed child) costs that one Block instead of the rest of
+  its Cluster.
+- `tests/streaming_shapes.rs` and a dependency-free throughput bench
+  (`cargo bench --bench throughput`).
+
+### Changed
+
+- Frames of a lace are spaced by the track's `DefaultDuration` when the
+  Block carries no `BlockDuration` (they used to share one timestamp),
+  and `DefaultDuration` is the packet duration of Blocks that state
+  none.
+
+### Fixed
+
+- An EBML lace of one frame was split into two (a size VINT was read
+  where the format has none).
+- An unknown-size Cluster is also ended by a Root-Level EBML Header or
+  Segment element.
+
 ### Changed
 
 - Cues-less `seek_to` places its probes by interpolation (#9): the probe

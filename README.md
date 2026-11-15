@@ -2024,6 +2024,14 @@ never rewrites a header to match.
 
 ## What's NOT implemented
 
+- Concatenated Segments are read forward only: `seek_to`, the Cues /
+  SeekHead audits and `scan_for_cues` address the first Segment, and the
+  per-track typed accessors (`track_audio`, `video_colour`, ...) keep
+  describing the first Segment's `Tracks`. A chained Segment's `Tags`,
+  `Chapters` and `Attachments` are not surfaced (RFC 9559 §23.2 bars the
+  latter two from continuous Segments), and a `ContentEncodings` chain
+  that differs from the first Segment's is not re-derived.
+
 - CRC-32 validation covers Top-Level master elements parsed up front and
   every `Cluster` the demuxer opens through `next_packet` / `seek_to`; a
   `Cues` element found after the final Cluster (through its SeekHead entry
@@ -2146,6 +2154,55 @@ registry's Element Names, no `Reserved` ID may be defined, and every ID
 must sit inside the Section 27.1 valid VINT ID classes. The census is
 what backs the "every element in the RFC 9559 element-ID registry is
 read and written" claim.
+
+## Live streams, growing files, concatenated Segments
+
+`tests/streaming_shapes.rs` builds each of these from the element
+definitions and pins what the demuxer does with it.
+
+- **Unknown sizes.** A Segment and its Clusters may all carry the
+  unknown-size VINT (RFC 9559 §23.2); an unknown-size Cluster inside a
+  bounded Segment ends at the next Top-Level element or at the Segment
+  end. `Void` and stray `CRC-32` elements are stepped over at every
+  level of the tree.
+- **A file that is still being written.** When the Segment (or the
+  Cluster being read) has the unknown size and the input stops partway
+  through an element, `next_packet` reports a clean `Error::Eof`, steps
+  back to the start of that element, and exposes its offset through
+  `MkvDemuxer::incomplete_tail()`. A later `next_packet` re-measures the
+  input and carries on, so a reader following a growing capture gets
+  every packet exactly once (pinned by feeding a live-layout mux to the
+  demuxer 1, 3, 7 and 64 bytes at a time, and by cutting it at every
+  byte). `open` succeeds as soon as the track headers are there, before
+  the first Cluster exists. A bounded Cluster cut short in a bounded
+  Segment is still an error on the strict path (that is damage, not a
+  running writer); the resilient path keeps its prefix as before.
+- **Concatenated Segments** (RFC 9559 §4.5 / §23.2, RFC 8794 §9). When
+  another Matroska / WebM EBML Document follows the Segment — after its
+  declared end, or as the EBML Header that ends an unknown-size Cluster
+  — the packet walk continues into it. Each later Segment's timestamps
+  are converted from its own `TimestampScale` to the stream time base
+  (the first Segment's scale, nearest tick) and shifted to start where
+  the previous Segment ended (its `Duration` when declared, else the
+  furthest packet end). Its tracks map onto the first Segment's streams
+  by `TrackType` + `CodecID`, the same `TrackNumber` first; a mapped
+  stream's `StreamInfo` takes the new picture size / sample rate /
+  channel count / codec configuration record and
+  `stream_params_generation()` moves. A track with no matching stream is
+  not handed out. `segments()` lists every document met (offsets, scale,
+  start on the timeline, track map) and `current_segment()` says which
+  one the walk is in. Seeks address the first Segment; reading on from
+  there walks the same chain again with every Segment keeping its place.
+  A following EBML Document of another DocType ends the stream.
+- **Lacing** (§10.3). All three kinds de-lace; the frames of a lace are
+  spaced by `BlockDuration / frames` when the BlockGroup has one, else
+  by the track's `DefaultDuration`, else they share the Block's
+  timestamp (the lace says no more). A one-frame lace is read as the one
+  frame it describes. A track's `DefaultDuration` is also the packet
+  duration of Blocks that state none; Block timestamps are always taken
+  as written. A lace whose sizes do not fit the Block is refused — on
+  the resilient path that costs the one Block (`DamageKind::DamagedBlock`),
+  the next element of the same Cluster is read normally.
 
 ## Robustness
 
