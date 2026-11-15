@@ -128,6 +128,60 @@ fuzz_target!(|data: &[u8]| {
         for rec in tdmx.cluster_records() {
             let _ = rec.silent_track_numbers.len();
         }
+        // Concatenated Segments: the walk may have moved into later
+        // documents. The chain bookkeeping must describe where it is.
+        let segments = tdmx.segments();
+        assert!(!segments.is_empty() && tdmx.current_segment() < segments.len());
+        for pair in segments.windows(2) {
+            assert!(
+                pair[1].document_offset() > pair[0].document_offset(),
+                "documents are met in input order"
+            );
+            assert!(pair[1].start_ns() >= pair[0].start_ns(), "timeline order");
+        }
+        for seg in segments {
+            for &(_, stream) in seg.track_map() {
+                assert!(stream.is_none_or(|i| i < n_streams), "track map in range");
+            }
+        }
+        // The resume point of a walk that ran out of input is where the
+        // next element starts — past the end of the input when the walk
+        // was stepping over an element whose declared end is not there —
+        // and never before the first Segment's data.
+        if let Some(tail) = tdmx.incomplete_tail() {
+            assert!(
+                tail >= segments[0].data_offset(),
+                "resume point before the Segment"
+            );
+        }
+        let _ = tdmx.stream_params_generation();
+    }
+
+    // Active-stream pass: with only stream 0 active, nothing else may be
+    // handed out (application of TrackOperations is off here), and a
+    // key-frame seek must leave the demuxer readable.
+    let rs_active: Box<dyn ReadSeek> = Box::new(Cursor::new(data.to_vec()));
+    if let Ok(mut admx) = oxideav_mkv::demux::open_typed(rs_active, &NullCodecResolver) {
+        admx.set_active_streams(&[0]);
+        for _ in 0..MAX_PACKETS_PER_INPUT {
+            match admx.next_packet() {
+                Ok(pkt) => assert_eq!(pkt.stream_index, 0, "inactive stream handed out"),
+                Err(_) => break,
+            }
+        }
+        for target in [0i64, 40, i64::MAX] {
+            if admx.seek_to(0, target).is_ok() {
+                for _ in 0..4 {
+                    match admx.next_packet() {
+                        Ok(pkt) => assert_eq!(pkt.stream_index, 0),
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        admx.set_seek_precision(oxideav_mkv::demux::SeekPrecision::Index);
+        let _ = admx.seek_to(0, 40);
+        let _ = admx.next_packet();
     }
 
     // Third pass through the *resilient* demuxer (`open_resilient_typed`),
@@ -150,7 +204,10 @@ fuzz_target!(|data: &[u8]| {
                 Err(e) => panic!("resilient next_packet leaked a non-Eof error: {e}"),
             }
         }
-        // Damage events must be well-formed: recovery never moves backwards.
+        // Damage events must be well-formed: recovery never moves
+        // backwards, and the list is capped while the counter is exact.
+        assert!(rdmx.damage_events().len() <= 4096, "damage event cap");
+        assert!(rdmx.damage_events_total() >= rdmx.damage_events().len() as u64);
         for ev in rdmx.damage_events() {
             if let Some(resumed) = ev.resumed_at() {
                 assert!(resumed >= ev.offset(), "resync moved backwards");

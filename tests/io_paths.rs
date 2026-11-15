@@ -596,3 +596,47 @@ fn live_muxes_appended_to_one_sink_read_as_one_stream() {
         assert_eq!(*generations.last().unwrap(), 1);
     }
 }
+
+#[test]
+fn a_cluster_timestamp_at_the_top_of_its_range_does_not_overflow() {
+    // Timestamp is an unsigned integer of up to 8 octets; a Block adds a
+    // signed 16-bit offset to it. Found by the `demux` fuzz target
+    // (`fuzz/corpus/demux/regression_cluster_timestamp_overflow.bin`):
+    // the sum overflowed `i64`.
+    let mut clusters = Vec::new();
+    for ts in [i64::MAX as u64 - 5, i64::MAX as u64, u64::MAX] {
+        let mut body = el(ids::TIMECODE, &ts.to_be_bytes());
+        body.extend(el(ids::SIMPLE_BLOCK, &[0x81, 0x7F, 0xFF, 0x80, 1]));
+        body.extend(el(ids::SIMPLE_BLOCK, &[0x81, 0x80, 0x00, 0x80, 2]));
+        clusters.extend(el(ids::CLUSTER, &body));
+    }
+    for resilient in [false, true] {
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(one_track_file(clusters.clone())));
+        let mut dmx = if resilient {
+            oxideav_mkv::demux::open_resilient_typed(rs, &NullCodecResolver).unwrap()
+        } else {
+            oxideav_mkv::demux::open_typed(rs, &NullCodecResolver).unwrap()
+        };
+        let mut pts = Vec::new();
+        while let Ok(p) = dmx.next_packet() {
+            pts.push(p.pts.unwrap());
+        }
+        assert_eq!(
+            pts,
+            vec![
+                i64::MAX,
+                i64::MAX - 5 - 32768,
+                i64::MAX,
+                i64::MAX - 32768,
+                i64::MAX,
+                i64::MAX - 32768
+            ]
+        );
+        // Seeking around such timestamps is arithmetic on the same
+        // values.
+        for target in [0, i64::MAX - 40_000, i64::MAX] {
+            let _ = dmx.seek_to(0, target);
+            let _ = dmx.next_packet();
+        }
+    }
+}

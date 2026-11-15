@@ -38,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `MkvMuxer::with_output_buffer` / `output_buffer` (default 64 KiB, `0`
   writes through). The live layout hands the sink everything at the end
   of every call and never seeks it, so a forward-only sink works.
-- `MkvDemuxer::damage_events_total`.
+- `MkvDemuxer::damage_events_total`; a second fuzz target
+  (`mux_roundtrip`) that muxes a fuzz-chosen schedule and layout, reads
+  it back strict and resilient, and checks seek landings.
 - Priming and trim for consumers behind the `Demuxer` trait:
   `track:<stream>:codec_delay_ns` / `priming_samples` /
   `seek_pre_roll_ns` metadata entries, `TrackCodecTiming::priming_samples`
@@ -78,6 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- EBML lacing: a size VINT with all value bits set was read as the
+  Element Data Size "unknown" marker instead of the value RFC 9559
+  Table 37 gives it (the top of each width's range: a frame 64, 8192,
+  ... bytes longer than the one before). The muxer writes exactly that
+  encoding, so such a lace did not survive a round trip. Found by the
+  new `mux_roundtrip` fuzz target.
+- A Cluster `Timestamp` near the top of its unsigned range overflowed
+  the signed packet timestamp when a Block offset was added (a panic in
+  builds with overflow checks); it is clamped and the sum saturates.
+  Found by the `demux` fuzz target from the new streaming seeds.
 - An EBML lace of one frame was split into two (a size VINT was read
   where the format has none).
 - An unknown-size Cluster is also ended by a Root-Level EBML Header or

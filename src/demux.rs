@@ -10182,13 +10182,15 @@ impl MkvDemuxer {
     ///
     /// So: read Block headers forward from the landing (payloads are
     /// stepped over, nothing is queued) up to the target, remembering the
-    /// last key frame of the track; if there is none, repeat from the
-    /// index landing before this one. The reader is left on the Block
-    /// found and its timestamp is returned. When the search comes up
-    /// empty — the target lies before the track's first key frame — the
-    /// track's first key frame after the landing is used; and when that
-    /// fails too (a track without Blocks, an unreadable stretch, the work
-    /// budget spent), the index landing stands exactly as
+    /// last key frame of the track; if there is none, repeat from an
+    /// earlier index landing — 1, 2, 4, ... ticks before the first one,
+    /// and finally from the first Cluster. The reader is left on the
+    /// Block found and its timestamp is returned. When the whole stretch
+    /// from the first Cluster to the target holds no key frame of the
+    /// track — the target lies before its first one — the track's first
+    /// key frame is used; and when the search ends without an answer (a
+    /// track without key frames, an unreadable stretch, the work budget
+    /// spent), the index landing stands exactly as
     /// [`SeekPrecision::Index`] would have left it.
     fn refine_to_key_frame(&mut self, stream_index: u32, pts: i64, landed: i64) -> i64 {
         // A virtual track (TrackOperation) has no Blocks of its own.
@@ -10205,34 +10207,71 @@ impl MkvDemuxer {
         let index_strategy = self.last_seek_strategy;
         let mut budget = KEY_FRAME_SEARCH_ELEMENTS;
         let mut found: Option<KeyFrameHit> = None;
-        let mut landed_ticks = self.stream_pts_to_ticks(stream_index, landed);
-        for _ in 0..KEY_FRAME_SEARCH_BACKSTEPS {
-            // Every pass runs up to the target itself: Clusters need not
-            // be stored in Timestamp order, so the answer may lie past
-            // the landing a pass before this one started from.
+        let first_cluster = self.first_cluster_offset;
+        // Where the pass about to run starts. Progress is judged on this
+        // byte offset, never on timestamps: Clusters may share a
+        // Timestamp, and a target before the first index entry is
+        // answered with that first entry.
+        let mut start = index_landing.0;
+        let landed_ticks = self.stream_pts_to_ticks(stream_index, landed);
+        // Ticks to step back from the index landing; doubled after every
+        // pass that finds nothing, so a sparse track is reached in a few
+        // passes whose total work is about twice the last one's.
+        let mut back: u64 = 1;
+        // The search has covered everything from the first Cluster to
+        // the target.
+        let mut exhaustive = false;
+        for _ in 0..KEY_FRAME_SEARCH_PASSES {
+            // Every pass runs up to the target itself.
             found = self.scan_for_key_frame(track, target, false, &mut budget);
-            if found.is_some() || budget == 0 || landed_ticks == 0 {
+            if found.is_some() || budget == 0 {
                 break;
             }
-            // Nothing between this landing and the target: start again
-            // from the index landing before it.
-            let earlier = landed_ticks - 1;
-            let earlier_pts = self.ticks_to_stream_pts(stream_index, earlier);
-            match self.seek_by_index(stream_index, earlier_pts) {
-                Ok(l) => {
-                    let l = self.stream_pts_to_ticks(stream_index, l);
-                    if l >= landed_ticks {
+            if start.is_some() && start == first_cluster {
+                exhaustive = true;
+                break;
+            }
+            // Find an earlier place to start from.
+            let mut next: Option<u64> = None;
+            while next.is_none() && back != 0 && landed_ticks.checked_sub(back).is_some() {
+                let earlier = self.ticks_to_stream_pts(stream_index, landed_ticks - back);
+                back = back.saturating_mul(2);
+                if self.seek_by_index(stream_index, earlier).is_ok()
+                    && let Ok(pos) = self.input.stream_position()
+                    && start.is_none_or(|s| pos < s)
+                {
+                    next = Some(pos);
+                }
+                if back > landed_ticks {
+                    back = 0;
+                }
+            }
+            match next.or(first_cluster.filter(|&f| start.is_none_or(|s| f < s))) {
+                Some(pos) if next.is_some() => start = Some(pos),
+                // The index has nothing earlier: start at the first
+                // Cluster.
+                Some(first) => {
+                    if self.input.seek(SeekFrom::Start(first)).is_err() {
                         break;
                     }
-                    landed_ticks = l;
+                    self.reset_after_seek();
+                    start = Some(first);
                 }
-                Err(_) => break,
+                None => {
+                    // The last pass already began at or before the first
+                    // Cluster.
+                    exhaustive = true;
+                    break;
+                }
             }
         }
-        if found.is_none() && budget > 0 {
-            // The target is before the track's first key frame: land on
-            // that one.
-            if self.seek_by_index(stream_index, pts).is_ok() {
+        if found.is_none() && exhaustive && budget > 0 {
+            // No key frame of the track at or before the target: the
+            // target is before its first one. Land on that.
+            if let Some(first) = first_cluster
+                && self.input.seek(SeekFrom::Start(first)).is_ok()
+            {
+                self.reset_after_seek();
                 found = self.scan_for_key_frame(track, u64::MAX, true, &mut budget);
             }
         }
@@ -10465,10 +10504,10 @@ impl MkvDemuxer {
 /// children alike), over all its passes.
 const KEY_FRAME_SEARCH_ELEMENTS: u32 = 1 << 16;
 
-/// Index landings one [`SeekPrecision::KeyFrame`] seek may step back
-/// through before giving the track up as having no key frame at or
-/// before the target.
-const KEY_FRAME_SEARCH_BACKSTEPS: u32 = 64;
+/// Passes one [`SeekPrecision::KeyFrame`] seek may make, each from an
+/// earlier starting point (the distance back doubles), before giving
+/// the search up.
+const KEY_FRAME_SEARCH_PASSES: u32 = 72;
 
 /// A key frame Block found by [`MkvDemuxer::scan_for_key_frame`].
 #[derive(Clone, Copy)]
@@ -12086,7 +12125,7 @@ impl MkvDemuxer {
             // Compute the position right after the child (id+size+body).
             let child_body_start = self.input.stream_position()?;
             if child.id == ids::TIMECODE {
-                cluster_timecode = read_uint(&mut *self.input, child.size as usize)? as i64;
+                cluster_timecode = cluster_ticks(read_uint(&mut *self.input, child.size as usize)?);
             }
             let next = child_body_start.saturating_add(child.size);
             if next > body_end || next <= pos {
@@ -12168,7 +12207,7 @@ impl MkvDemuxer {
             };
             let child_body_start = self.input.stream_position()?;
             if child.id == ids::TIMECODE {
-                cluster_timecode = read_uint(&mut *self.input, child.size as usize)? as i64;
+                cluster_timecode = cluster_ticks(read_uint(&mut *self.input, child.size as usize)?);
             }
             if child.id == ids::SIMPLE_BLOCK || child.id == ids::BLOCK_GROUP {
                 block_count += 1;
@@ -13347,7 +13386,7 @@ impl MkvDemuxer {
                 let e = read_element_header(&mut *self.input)?;
                 match e.id {
                     ids::TIMECODE => {
-                        let v = read_uint(&mut *self.input, e.size as usize)? as i64;
+                        let v = cluster_ticks(read_uint(&mut *self.input, e.size as usize)?);
                         if let ClusterState::InCluster {
                             ref mut cluster_timecode,
                             ..
@@ -13661,7 +13700,9 @@ impl MkvDemuxer {
             _ => Frames::Many(parse_ebml_lacing(&body).map_err(malformed)?),
         };
 
-        let pts_base = cluster_timecode + timecode_offset;
+        // A Cluster Timestamp is an unsigned 64-bit count on disk; the
+        // sum is kept inside `i64` whatever the file claims.
+        let pts_base = cluster_timecode.saturating_add(timecode_offset);
         let n_frames = frames.len() as i64;
         // Frame duration in this Segment's ticks: the Block's own
         // `BlockDuration` split over its frames when it has one, else the
@@ -13790,6 +13831,13 @@ impl MkvDemuxer {
     }
 }
 
+/// A Cluster `Timestamp` (RFC 9559 §5.1.3.1, an unsigned integer of up
+/// to 8 octets) as the signed tick count packet timestamps use,
+/// clamped rather than wrapped into the negative range.
+fn cluster_ticks(raw: u64) -> i64 {
+    raw.min(i64::MAX as u64) as i64
+}
+
 /// An error met while parsing bytes that were all read: running out of
 /// them means the contents are malformed, not that the input is short —
 /// which matters to callers that treat a short input as "not written
@@ -13916,7 +13964,7 @@ fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     }
     let mut sizes = Vec::with_capacity(n_frames);
     // First size: full VINT.
-    let (first, _) = crate::ebml::read_vint(&mut cur, false)?;
+    let (first, _) = read_lace_vint(&mut cur)?;
     sizes.push(first as i64);
     // Remaining sizes: signed deltas (raw VINT minus mid-of-range bias).
     // `n_frames` is `body[0] + 1` so it is at least 1; guard the
@@ -13924,7 +13972,7 @@ fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     // doesn't underflow the range below.
     let delta_count = n_frames.saturating_sub(2);
     for _ in 0..delta_count {
-        let (raw, w) = crate::ebml::read_vint(&mut cur, false)?;
+        let (raw, w) = read_lace_vint(&mut cur)?;
         let bias = ((1i64) << (7 * w as i64 - 1)) - 1;
         let signed = (raw as i64) - bias;
         let prev = *sizes.last().unwrap();
@@ -13964,4 +14012,28 @@ fn parse_ebml_lacing(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         i = end;
     }
     Ok(frames)
+}
+
+/// Read a VINT inside an EBML lace (RFC 9559 §10.3.3): the value with
+/// the length marker removed, exactly as stored.
+///
+/// Unlike an Element Data Size, a lace size has no "unknown" encoding:
+/// the all-ones pattern is an ordinary value — Table 37 puts it at the
+/// top of each width's signed range (`1111 1111` is +2^6, the two-octet
+/// all-ones +2^13, and so on), so a frame 64 bytes longer than the one
+/// before it is written exactly that way.
+fn read_lace_vint(cur: &mut std::io::Cursor<&[u8]>) -> Result<(u64, usize)> {
+    let mut first = [0u8; 1];
+    cur.read_exact(&mut first)?;
+    if first[0] == 0 {
+        return Err(Error::invalid("MKV ebml lacing: VINT wider than 8 octets"));
+    }
+    let width = first[0].leading_zeros() as usize + 1;
+    let mut value = (first[0] as u64) & (0xFF >> width);
+    let mut rest = [0u8; 7];
+    cur.read_exact(&mut rest[..width - 1])?;
+    for &b in &rest[..width - 1] {
+        value = (value << 8) | b as u64;
+    }
+    Ok((value, width))
 }

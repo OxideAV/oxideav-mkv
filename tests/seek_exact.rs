@@ -268,3 +268,102 @@ fn index_precision_stops_where_the_index_points() {
         "index landings start inside groups of pictures"
     );
 }
+
+#[test]
+fn clusters_sharing_a_timestamp_do_not_hide_the_key_frame() {
+    // Two Clusters at tick 0 — the key frame closes the first, the
+    // frames that depend on it open the second. A Cluster search lands
+    // on the last Cluster at or before the target, i.e. the second; the
+    // key frame is in the one before it, which no earlier Timestamp
+    // leads to. Found by the `mux_roundtrip` fuzz target
+    // (`fuzz/corpus/mux_roundtrip/regression_seek_equal_cluster_timestamps.bin`).
+    let streams: Vec<StreamInfo> = streams().into_iter().take(1).collect();
+    let sink = Sink::default();
+    let mut m = MkvMuxer::new_matroska(Box::new(sink.clone()), &streams).unwrap();
+    m.with_cluster_limits(1000, 1024).unwrap();
+    m.with_live_streaming().unwrap();
+    m.write_header().unwrap();
+    // (pts, key): 700-byte frames against a 1024-byte budget put two
+    // Blocks in each Cluster.
+    let frames = [
+        (0, false),
+        (0, true),
+        (0, false),
+        (0, false),
+        (40, false),
+        (80, true),
+    ];
+    for (i, &(pts, key)) in frames.iter().enumerate() {
+        let mut p = Packet::new(0, streams[0].time_base, vec![i as u8; 700]);
+        p.pts = Some(pts);
+        p.flags.keyframe = key;
+        m.write_packet(&p).unwrap();
+    }
+    m.write_trailer().unwrap();
+    drop(m);
+    let bytes = sink.0.lock().unwrap().get_ref().clone();
+    let mut dmx = open(&bytes, true);
+    assert_eq!(drain(&mut dmx).len(), frames.len());
+    for target in [0i64, 11, 40, 79] {
+        assert_eq!(dmx.seek_to(0, target).unwrap(), 0, "target {target}");
+        let tail = drain(&mut dmx);
+        assert_eq!(
+            tail[0],
+            (0, 0, true, 1),
+            "target {target}: lands on the key frame"
+        );
+        assert_eq!(tail.len(), 5);
+    }
+    assert_eq!(dmx.seek_to(0, 80).unwrap(), 80);
+    assert_eq!(drain(&mut dmx), vec![(0, 80, true, 5)]);
+}
+
+#[test]
+fn clusters_sharing_a_later_timestamp_do_not_hide_the_key_frame() {
+    // The same shape away from tick 0: the Clusters at tick 58 are the
+    // first of the file, so "one tick earlier" is answered with the
+    // first Cluster and its Timestamp — which is not lower. Progress has
+    // to be judged on where the search starts, not on the Timestamp it
+    // reports. Second `mux_roundtrip` finding
+    // (`regression_seek_equal_cluster_timestamps_nonzero.bin`).
+    let streams: Vec<StreamInfo> = streams().into_iter().take(2).collect();
+    let sink = Sink::default();
+    let mut m = MkvMuxer::new_matroska(Box::new(sink.clone()), &streams).unwrap();
+    m.with_cluster_limits(20, 1024).unwrap();
+    m.with_live_streaming().unwrap();
+    m.write_header().unwrap();
+    // (stream, pts, bytes): three audio frames fill the first Cluster,
+    // the video frames that follow open a second one at the same tick.
+    let frames = [
+        (1u32, 58i64, 400usize),
+        (1, 58, 300),
+        (1, 58, 330),
+        (0, 58, 5),
+        (0, 75, 600),
+        (0, 75, 300),
+    ];
+    for (i, &(stream, pts, len)) in frames.iter().enumerate() {
+        let mut p = Packet::new(stream, streams[0].time_base, vec![i as u8; len]);
+        p.pts = Some(pts);
+        p.flags.keyframe = true;
+        m.write_packet(&p).unwrap();
+    }
+    m.write_trailer().unwrap();
+    drop(m);
+    let bytes = sink.0.lock().unwrap().get_ref().clone();
+    let mut dmx = open(&bytes, true);
+    assert_eq!(drain(&mut dmx).len(), frames.len());
+    for target in [58i64, 60, 90, 5000] {
+        assert_eq!(dmx.seek_to(1, target).unwrap(), 58, "target {target}");
+        let tail = drain(&mut dmx);
+        assert_eq!(
+            tail[0],
+            (1, 58, true, 2),
+            "target {target}: the last audio frame"
+        );
+        assert_eq!(tail.len(), 4);
+    }
+    // Before the first frame: the track's first key frame.
+    assert_eq!(dmx.seek_to(1, 3).unwrap(), 58);
+    assert_eq!(drain(&mut dmx).len(), frames.len());
+}

@@ -2218,18 +2218,24 @@ that lists one key frame per Cluster and track when the Cluster holds
 several, a Cluster search that knows only Cluster Timestamps, and a
 Cluster that starts in the middle of a group of pictures. When no key
 frame lies between the landing and the target, the search starts again
-from the index landing before it (bounded: 64 landings, 65 536 elements
-per seek); a `CuePoint` that names garbage, a truncated Block or a
-frame that is not a key frame is thereby corrected rather than handed
-out. From the landing on, `next_packet` returns the file's packets in
-storage order.
+from an earlier index landing — 1, 2, 4, ... ticks back, then from the
+first Cluster — judging progress by where a pass starts in the file,
+not by the Timestamp the index reports (Clusters may share one). A
+`CuePoint` that names garbage, a truncated Block or a frame that is not
+a key frame is thereby corrected rather than handed out. The work is
+bounded at 65 536 elements per seek; a search that ends without an
+answer (a track with no key frame, the budget spent) leaves the index
+landing in place. From the landing on, `next_packet` returns the file's
+packets in storage order.
 
 `tests/seek_exact.rs` checks this exhaustively — every track, every
 target tick from before the first packet to past the last — on
 self-muxed files with the index at the end, at the front, and absent,
 with Clusters cut every few Blocks, every 100 ms, and at the default
 budget, a video track with one key frame in eight and reordered
-timestamps, an all-key-frame audio track and a sparse subtitle track.
+timestamps, an all-key-frame audio track and a sparse subtitle track —
+plus the two shapes the `mux_roundtrip` fuzz target found: Clusters
+sharing a Timestamp, with the key frame in the earlier one.
 
 The extra reads are a few per Block between the index landing and the
 target. A transport that bills every positioned read can keep the
@@ -2394,7 +2400,7 @@ non-live layout. The default is the faster one.
   element is whole but whose contents do not parse costs that Block
   only.
 - **Seek work.** A Cues-less seek is capped at 96 probes; the key-frame
-  search after any seek at 65 536 elements and 64 index landings.
+  search after any seek at 65 536 elements over at most 72 passes.
 
 `tests/io_paths.rs` pins the forged-size refusal, the record cap on a
 70 000-Cluster file and the damage-event cap on 5000 damaged Clusters;
@@ -2403,7 +2409,18 @@ both open modes.
 
 ## Fuzzing
 
-A cargo-fuzz harness for the demuxer lives in `fuzz/`. It drives
+Two cargo-fuzz targets live in `fuzz/`. `mux_roundtrip` turns its input
+into a stream set, a layout (index at the end, at the front in reserved
+space, or the live layout), a lacing mode, Cluster budgets and a packet
+schedule, muxes it twice (buffered and write-through — the bytes must
+match), reads it back through the strict and the resilient demuxer
+(every packet's bytes on its stream in write order; without lacing also
+its timestamp and key flag; no damage events on the muxer's own output),
+and then seeks: on every stream with a key frame, `seek_to` must return
+the timestamp of the last key frame at or before the target and the
+stream's next packet must be that key frame.
+
+The `demux` target feeds arbitrary bytes to the demuxer. It drives
 `demux::open`, drains up to 256 packets via `next_packet`, and exercises
 the `seek_to` cluster pre-open path — over arbitrary bytes — against the
 contract that no call panics, aborts, integer-overflows (in a debug

@@ -38,3 +38,9 @@ name = "demux"
 path = "fuzz_targets/demux.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "mux_roundtrip"
+path = "fuzz_targets/mux_roundtrip.rs"
+test = false
+doc = false

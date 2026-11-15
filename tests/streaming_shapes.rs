@@ -626,14 +626,18 @@ fn fixed_lace(frames: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-#[test]
-fn laced_frames_are_spaced_by_default_duration_or_block_duration() {
+fn fixed_frames() -> [Vec<u8>; 3] {
+    [vec![1; 4], vec![2; 4], vec![3; 4]]
+}
+
+/// One Block of each lacing kind, plus a laced Block in a BlockGroup
+/// with a BlockDuration.
+fn laced_cluster_children() -> Vec<u8> {
     let frames = three_frames();
-    let fixed: [Vec<u8>; 3] = [vec![1; 4], vec![2; 4], vec![3; 4]];
-    let children = cat(&[
+    cat(&[
         simple_block(1, 0, KEY | LACE_XIPH, &xiph_lace(&frames)),
         simple_block(1, 60, KEY | LACE_EBML, &ebml_lace(&frames)),
-        simple_block(1, 120, KEY | LACE_FIXED, &fixed_lace(&fixed)),
+        simple_block(1, 120, KEY | LACE_FIXED, &fixed_lace(&fixed_frames())),
         // BlockDuration covers the whole Block: 30 ticks over 3 frames.
         el(
             ids::BLOCK_GROUP,
@@ -645,7 +649,14 @@ fn laced_frames_are_spaced_by_default_duration_or_block_duration() {
                 uint(ids::BLOCK_DURATION, 30),
             ]),
         ),
-    ]);
+    ])
+}
+
+#[test]
+fn laced_frames_are_spaced_by_default_duration_or_block_duration() {
+    let frames = three_frames();
+    let fixed = fixed_frames();
+    let children = laced_cluster_children();
     // DefaultDuration 20 ms.
     let mut dmx = open_strict(lace_file(Some(20_000_000), children.clone()));
     let rows = drain(&mut dmx);
@@ -680,6 +691,62 @@ fn laced_frames_are_spaced_by_default_duration_or_block_duration() {
     );
     assert_eq!(rows[0].2, None);
     assert_eq!(rows[11].2, Some(10));
+}
+
+#[test]
+fn ebml_lace_sizes_at_the_top_of_a_width_round_trip() {
+    use oxideav_mkv::mux::{LacingMode, MkvMuxer};
+    // Table 37: each width's signed range ends on the all-ones pattern
+    // (+2^6 in one octet, +2^13 in two). A reader that takes all-ones
+    // for the Element Data Size "unknown" marker cannot read a frame 64
+    // (or 8192) bytes longer than its predecessor. Found by the
+    // `mux_roundtrip` fuzz target; `fuzz/corpus/mux_roundtrip/
+    // regression_ebml_lace_delta_all_ones.bin` is the minimised input.
+    let tb = TimeBase::new(1, 1000);
+    let mut ap = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    ap.sample_rate = Some(48_000);
+    ap.channels = Some(2);
+    ap.sample_format = Some(SampleFormat::S16);
+    let streams = vec![StreamInfo {
+        index: 0,
+        time_base: tb,
+        duration: None,
+        start_time: Some(0),
+        params: ap,
+    }];
+    // Deltas: +64, -63 (the bottom of one octet), +8192, -8191, +63, +65.
+    let sizes = [10usize, 74, 11, 8203, 12, 75, 140, 3];
+    let path = std::env::temp_dir().join(format!("oxideav-mkv-lace-{}.mkv", std::process::id()));
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut mux = MkvMuxer::new_matroska(Box::new(f), &streams).unwrap();
+        mux.with_block_lacing(LacingMode::Ebml).unwrap();
+        mux.write_header().unwrap();
+        for (i, &n) in sizes.iter().enumerate() {
+            let mut p = Packet::new(0, tb, vec![i as u8 + 1; n]);
+            p.pts = Some(i as i64);
+            p.flags.keyframe = true;
+            mux.write_packet(&p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    // The lace is on disk the way the table says: a one-octet all-ones
+    // delta follows the first size.
+    assert!(
+        bytes.windows(3).any(|w| w == [0x8A, 0xFF, 0x80]),
+        "10, +64, -63"
+    );
+    let mut dmx = open_strict(bytes);
+    let rows = drain(&mut dmx);
+    assert_eq!(
+        rows.iter().map(|r| r.4.len()).collect::<Vec<_>>(),
+        sizes.to_vec()
+    );
+    for (i, r) in rows.iter().enumerate() {
+        assert!(r.4.iter().all(|&b| b == i as u8 + 1), "frame {i} bytes");
+    }
 }
 
 #[test]
@@ -1052,4 +1119,40 @@ fn codec_delay_pre_roll_and_discard_padding_reach_the_consumer() {
             (60, Some(20), true, (0, 960)),
         ]
     );
+}
+
+// ---------------------------------------------------------------------
+// Fuzz seeds
+// ---------------------------------------------------------------------
+
+/// The streaming shapes above are also the demux fuzz target's seeds, so
+/// mutation starts from concatenated Segments, laces of every kind and a
+/// capture cut inside its last Block. The files under
+/// `fuzz/corpus/demux/` must be what the builders here produce (run with
+/// `OXIDEAV_MKV_WRITE_SEEDS=1` to regenerate them after changing a
+/// builder).
+#[test]
+fn fuzz_seeds_match_their_builders() {
+    let cut = {
+        let mut live = chained_file();
+        live.truncate(live.len() - 7);
+        live
+    };
+    let seeds: [(&str, Vec<u8>); 3] = [
+        ("seed_chained_segments.mkv", chained_file()),
+        (
+            "seed_laces.mkv",
+            lace_file(Some(20_000_000), laced_cluster_children()),
+        ),
+        ("seed_live_cut.mkv", cut),
+    ];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/demux");
+    for (name, bytes) in seeds {
+        let path = dir.join(name);
+        if std::env::var_os("OXIDEAV_MKV_WRITE_SEEDS").is_some() {
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        let on_disk = std::fs::read(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(on_disk == bytes, "{name} differs from its builder");
+    }
 }
