@@ -485,7 +485,7 @@ fn concatenated_segments_read_as_one_timeline() {
 
     // A seek goes back to the first Segment; reading on from there walks
     // the same chain again and keeps every Segment where it was.
-    dmx.seek_to(0, 0).expect("seek to the start");
+    dmx.seek_to(1, 0).expect("seek to the start");
     assert_eq!(dmx.current_segment(), 0);
     let again = tags(&drain(&mut dmx));
     assert_eq!(again, want);
@@ -960,4 +960,96 @@ fn a_capture_cut_anywhere_ends_cleanly_in_strict_mode() {
             assert_eq!(got.len(), expect.len());
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Priming, pre-roll and end trim
+// ---------------------------------------------------------------------
+
+#[test]
+fn codec_delay_pre_roll_and_discard_padding_reach_the_consumer() {
+    use oxideav_mkv::mux::{BlockGroupOptions, MkvMuxer, MkvTrackCodecTiming};
+
+    let tb = TimeBase::new(1, 1000);
+    let mut ap = CodecParameters::audio(CodecId::new("pcm_s16le"));
+    ap.sample_rate = Some(48_000);
+    ap.channels = Some(2);
+    ap.sample_format = Some(SampleFormat::S16);
+    let streams = vec![StreamInfo {
+        index: 0,
+        time_base: tb,
+        duration: None,
+        start_time: Some(0),
+        params: ap,
+    }];
+    let path = std::env::temp_dir().join(format!("oxideav-mkv-priming-{}.mkv", std::process::id()));
+    {
+        let f = std::fs::File::create(&path).unwrap();
+        let mut mux = MkvMuxer::new_matroska(Box::new(f), &streams).unwrap();
+        // 312 samples of priming at 48 kHz, 80 ms of pre-roll.
+        mux.set_track_codec_timing(
+            0,
+            MkvTrackCodecTiming::new(Some(6_500_000), Some(80_000_000)),
+        )
+        .unwrap();
+        mux.write_header().unwrap();
+        let packet = |i: i64| {
+            let mut p = Packet::new(0, tb, vec![i as u8; 16]);
+            p.pts = Some(i * 20);
+            p.duration = Some(20);
+            p.flags.keyframe = true;
+            p
+        };
+        mux.write_packet(&packet(0)).unwrap();
+        mux.write_packet(&packet(1)).unwrap();
+        // The last frame carrying sound: 13.5 ms of it is padding.
+        mux.write_packet_with_block_group(
+            &packet(2),
+            &BlockGroupOptions::default().with_discard_padding(Some(13_500_000)),
+        )
+        .unwrap();
+        // A frame that is padding from end to end.
+        mux.write_packet_with_block_group(
+            &packet(3),
+            &BlockGroupOptions::default().with_discard_padding(Some(20_000_000)),
+        )
+        .unwrap();
+        mux.write_trailer().unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let mut dmx = open_strict(bytes);
+
+    let meta = |key: &str| {
+        dmx.metadata()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(meta("track:0:codec_delay_ns").as_deref(), Some("6500000"));
+    assert_eq!(meta("track:0:priming_samples").as_deref(), Some("312"));
+    assert_eq!(
+        meta("track:0:seek_pre_roll_ns").as_deref(),
+        Some("80000000")
+    );
+    let timing = *dmx.track_codec_timing(0).unwrap();
+    assert_eq!(timing.priming_samples(48_000), 312);
+    assert_eq!(timing.seek_pre_roll_samples(48_000), 3840);
+
+    let mut seen = Vec::new();
+    while let Ok(p) = dmx.next_packet() {
+        let trim = dmx
+            .block_group_meta()
+            .map_or((0, 0), |m| m.trim_samples(48_000));
+        seen.push((p.pts.unwrap(), p.duration, p.flags.discard, trim));
+    }
+    assert_eq!(
+        seen,
+        vec![
+            (0, None, false, (0, 0)),
+            (20, None, false, (0, 0)),
+            (40, Some(20), false, (0, 648)),
+            (60, Some(20), true, (0, 960)),
+        ]
+    );
 }

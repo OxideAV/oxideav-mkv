@@ -729,7 +729,11 @@ fn virtual_seek_without_application_is_unsupported() {
         Err(oxideav_core::Error::Unsupported { .. }) => {}
         other => panic!("expected Unsupported, got {other:?}"),
     }
-    // The source tracks seek fine either way.
+    // The source tracks seek fine either way. The fixture's cue at 25
+    // names a Block that is not a key frame: the index lands on it, the
+    // default precision goes back to the key frame it depends on.
+    assert_eq!(dmx.seek_to(0, 25).expect("source seek"), 0);
+    dmx.set_seek_precision(oxideav_mkv::demux::SeekPrecision::Index);
     assert_eq!(dmx.seek_to(0, 25).expect("source seek"), 25);
 }
 

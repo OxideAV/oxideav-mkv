@@ -27,7 +27,7 @@
 use std::io::Cursor;
 
 use oxideav_core::{Demuxer, ReadSeek};
-use oxideav_mkv::demux::{CueLieKind, DamageKind, MkvDemuxer};
+use oxideav_mkv::demux::{CueLieKind, DamageKind, MkvDemuxer, SeekPrecision};
 use oxideav_mkv::ebml::{write_element_id, write_vint};
 use oxideav_mkv::ids;
 
@@ -442,9 +442,20 @@ fn strict_seek_stays_trusting_on_a_lying_offset() {
     cues[2].offset = Some(probe.cluster_offsets[0] + 3);
     let built = build(&TIMES, &cues, None, false);
 
+    // That contract is the index-precision one: the landing is the
+    // index's word and nothing checks it.
     let mut dmx = open_strict(&built.bytes);
+    dmx.set_seek_precision(SeekPrecision::Index);
     let landed = dmx.seek_to(0, 200_000).expect("strict seek trusts the cue");
     assert_eq!(landed, 200_000, "strict returns the cue's own claim");
+    // The default key-frame precision reads Block headers from the
+    // landing; finding none where the cue points, it starts again from
+    // the cue before and walks forward to the target — which reaches
+    // the key frame the lying cue should have named.
+    let mut exact = open_strict(&built.bytes);
+    assert_eq!(exact.seek_to(0, 200_000).expect("seek"), 200_000);
+    assert_eq!(exact.next_packet().expect("pkt").pts, Some(200_000));
+    assert!(exact.damage_events().is_empty());
     assert!(dmx.damage_events().is_empty());
     // An error surface is equally within the strict contract — only a
     // packet claiming to be the truthfully-promised one would be wrong.
@@ -550,8 +561,13 @@ fn truncated_file_flags_cluster_truncated_then_out_of_segment() {
     // Landing on a truncated Cluster is not a seek lie — the surviving
     // prefix is still the right place.
     let n_before = rdmx.damage_events().len();
+    rdmx.set_seek_precision(SeekPrecision::Index);
     let landed = rdmx.seek_to(0, 200_000).expect("seek");
     assert_eq!(landed, 200_000);
+    // The Block the cue names did not survive the cut, so the key frame
+    // at or before the target is the one in the Cluster before.
+    rdmx.set_seek_precision(SeekPrecision::KeyFrame);
+    assert_eq!(rdmx.seek_to(0, 200_000).expect("seek"), 100_000);
     assert!(
         !rdmx.damage_events()[n_before..]
             .iter()
@@ -758,7 +774,11 @@ fn forged_max_cue_position_never_panics() {
 
     // Strict: trusts, saturates, parks past EoF — Ok seek, then a clean
     // end (or error), never a panic.
+    let mut exact = open_strict(&built.bytes);
+    assert_eq!(exact.seek_to(0, 200_000).expect("exact seek"), 200_000);
+    assert_eq!(exact.next_packet().expect("pkt").pts, Some(200_000));
     let mut dmx = open_strict(&built.bytes);
+    dmx.set_seek_precision(SeekPrecision::Index);
     let landed = dmx.seek_to(0, 200_000).expect("strict seek");
     assert_eq!(landed, 200_000);
     assert!(

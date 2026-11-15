@@ -2204,6 +2204,53 @@ definitions and pins what the demuxer does with it.
   the resilient path that costs the one Block (`DamageKind::DamagedBlock`),
   the next element of the same Cluster is read normally.
 
+## Seek landing
+
+`seek_to(stream, pts)` lands on the last key frame of that track at or
+before the target and returns that key frame's timestamp; a target
+before the track's first key frame lands on the first. The index gets
+the reader close — a `CuePoint` (trust-but-verified on the resilient
+path), or without usable `Cues` the Cluster search — and then Block
+headers are read forward from that landing up to the target, payloads
+stepped over and nothing queued, remembering the track's last key
+frame. That closes the three gaps an index landing leaves: an index
+that lists one key frame per Cluster and track when the Cluster holds
+several, a Cluster search that knows only Cluster Timestamps, and a
+Cluster that starts in the middle of a group of pictures. When no key
+frame lies between the landing and the target, the search starts again
+from the index landing before it (bounded: 64 landings, 65 536 elements
+per seek); a `CuePoint` that names garbage, a truncated Block or a
+frame that is not a key frame is thereby corrected rather than handed
+out. From the landing on, `next_packet` returns the file's packets in
+storage order.
+
+`tests/seek_exact.rs` checks this exhaustively — every track, every
+target tick from before the first packet to past the last — on
+self-muxed files with the index at the end, at the front, and absent,
+with Clusters cut every few Blocks, every 100 ms, and at the default
+budget, a video track with one key frame in eight and reordered
+timestamps, an all-key-frame audio track and a sparse subtitle track.
+
+The extra reads are a few per Block between the index landing and the
+target. A transport that bills every positioned read can keep the
+index-level landing with
+`MkvDemuxer::set_seek_precision(SeekPrecision::Index)`: one jump for a
+`Cues` seek, ~log2(Clusters) probes without `Cues`, at the price of a
+landing that may precede the key frame or start inside a group of
+pictures.
+
+Priming and trim reach a consumer two ways. `CodecDelay` and
+`SeekPreRoll` are listed in `metadata()` as `track:<stream>:codec_delay_ns`,
+`track:<stream>:priming_samples` (audio, at the stream's sample rate)
+and `track:<stream>:seek_pre_roll_ns` when the file states a non-zero
+value, next to the typed `TrackCodecTiming` (`priming_samples(rate)`,
+`seek_pre_roll_samples(rate)`). `DiscardPadding` stays on
+`block_group_meta()` (`trim_samples(rate)` gives the samples to drop
+from the start and the end of the Block), and a Block whose
+`DiscardPadding` covers its whole `BlockDuration` comes out with
+`PacketFlags::discard` set. Packet timestamps are the Block timestamps
+as written; subtracting `CodecDelay` (§11.2) is left to the consumer.
+
 ## Robustness
 
 `tests/injection_robustness.rs` pins eighteen attacker-shaped byte

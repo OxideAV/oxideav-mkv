@@ -791,6 +791,33 @@ fn open_typed_impl(
     // touching Info- / Chapters- / Attachments-derived entries.
     let tag_metadata_entries: Vec<(String, String)> = metadata[metadata_len_before_tags..].to_vec();
 
+    // Priming and pre-roll (RFC 9559 §5.1.4.1.25 / §5.1.4.1.26) in the
+    // flat metadata view, for consumers behind the `Demuxer` trait:
+    // `CodecDelay` is how much decoded output at the start of the track
+    // is not to be presented, `SeekPreRoll` how much has to be decoded
+    // after a seek before output is valid. Only values the file states
+    // (and that are not zero) are listed.
+    for (t, stream) in tracks.iter().zip(streams.iter()) {
+        let idx = stream.index;
+        if let Some(delay) = t.codec_timing_raw.0.filter(|&d| d > 0) {
+            metadata.push((format!("track:{idx}:codec_delay_ns"), delay.to_string()));
+            if let Some(samples) = stream
+                .params
+                .sample_rate
+                .filter(|&r| r > 0)
+                .map(|r| ns_to_samples(delay, r))
+            {
+                metadata.push((format!("track:{idx}:priming_samples"), samples.to_string()));
+            }
+        }
+        if let Some(pre_roll) = t.codec_timing_raw.1.filter(|&d| d > 0) {
+            metadata.push((
+                format!("track:{idx}:seek_pre_roll_ns"),
+                pre_roll.to_string(),
+            ));
+        }
+    }
+
     // Resolve each track's `TrackOperation` (RFC 9559 §5.1.4.1.30): map the
     // raw `TrackPlaneUID` / `TrackJoinUID` references onto stream indices via
     // the same `TrackUID -> index` table the tag resolver uses. Indexed by
@@ -1258,6 +1285,7 @@ fn open_typed_impl(
         max_end_out: 0,
         stream_params_generation: 0,
         incomplete_tail: None,
+        seek_precision: SeekPrecision::default(),
     };
     demuxer.layouts_from_first_frames();
     Ok(demuxer)
@@ -4453,6 +4481,18 @@ impl BlockGroupMeta {
         self.discard_padding
     }
 
+    /// `DiscardPadding` as samples to trim at `sample_rate` (nearest):
+    /// `(from the start, from the end)` of the Block's decoded output —
+    /// a positive element value pads the end, a negative one the start
+    /// (§5.1.3.5.7). `(0, 0)` when the element is absent.
+    pub fn trim_samples(&self, sample_rate: u32) -> (u64, u64) {
+        match self.discard_padding {
+            Some(ns) if ns > 0 => (0, ns_to_samples(ns as u64, sample_rate)),
+            Some(ns) if ns < 0 => (ns_to_samples(ns.unsigned_abs(), sample_rate), 0),
+            _ => (0, 0),
+        }
+    }
+
     /// `BlockVirtual` (RFC 9559 Appendix A.3) — the verbatim bytes of a
     /// reclaimed data-less Block stored where the real Block would be in
     /// display order. `None` when the `BlockGroup` has no `BlockVirtual`
@@ -5222,6 +5262,18 @@ impl TrackCodecTiming {
     /// [`seek_pre_roll`](Self::seek_pre_roll)).
     pub fn seek_pre_roll_explicit(&self) -> Option<u64> {
         self.seek_pre_roll_explicit
+    }
+
+    /// `CodecDelay` as a number of samples at `sample_rate` (nearest) —
+    /// the decoded samples at the start of the track that are not to be
+    /// presented (the encoder's priming).
+    pub fn priming_samples(&self, sample_rate: u32) -> u64 {
+        ns_to_samples(self.codec_delay(), sample_rate)
+    }
+
+    /// `SeekPreRoll` as a number of samples at `sample_rate` (nearest).
+    pub fn seek_pre_roll_samples(&self, sample_rate: u32) -> u64 {
+        ns_to_samples(self.seek_pre_roll(), sample_rate)
     }
 
     /// `true` when this track carried neither element — i.e. both `CodecDelay`
@@ -9283,6 +9335,7 @@ fn parse_projection(r: &mut dyn ReadSeek, end: u64, p: &mut RawProjection) -> Re
 
 // --- Demuxer state machine ------------------------------------------------
 
+#[derive(Clone, Copy)]
 enum ClusterState {
     /// Not inside a cluster; the next read must start with a Cluster header.
     Idle,
@@ -9650,6 +9703,8 @@ pub struct MkvDemuxer {
     /// Offset of the unfinished element the last `next_packet` stopped
     /// in front of — see [`MkvDemuxer::incomplete_tail`].
     incomplete_tail: Option<u64>,
+    /// Landing rule of `seek_to` — see [`MkvDemuxer::set_seek_precision`].
+    seek_precision: SeekPrecision,
 }
 
 /// One Segment (EBML Document) of the input — see
@@ -9772,6 +9827,13 @@ struct SegmentCtx {
     chain: Option<ChainState>,
 }
 
+/// A duration in nanoseconds as a whole number of samples at
+/// `sample_rate` (nearest).
+fn ns_to_samples(ns: u64, sample_rate: u32) -> u64 {
+    let n = (ns as u128 * sample_rate as u128 + 500_000_000) / 1_000_000_000;
+    n.min(u64::MAX as u128) as u64
+}
+
 /// `true` for the error a read past the end of the input produces — the
 /// bytes are not there (yet), as opposed to being there and malformed.
 fn is_short_read(e: &Error) -> bool {
@@ -9851,6 +9913,19 @@ impl Demuxer for MkvDemuxer {
     }
 
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        let landed = self.seek_by_index(stream_index, pts)?;
+        match self.seek_precision {
+            SeekPrecision::Index => Ok(landed),
+            SeekPrecision::KeyFrame => Ok(self.refine_to_key_frame(stream_index, pts, landed)),
+        }
+    }
+}
+
+impl MkvDemuxer {
+    /// The index-level seek: land where the `Cues` entry (or, without
+    /// usable `Cues`, the Cluster search) says. Returns the `CueTime` /
+    /// Cluster `Timestamp` landed on, in the stream time base.
+    fn seek_by_index(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
         if stream_index as usize >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "MKV: stream index {stream_index} out of range"
@@ -10009,6 +10084,357 @@ impl Demuxer for MkvDemuxer {
         // Convert the landed ticks back into the stream's time base.
         Ok(self.ticks_to_stream_pts(stream_index, cue_time))
     }
+
+    /// Second half of a [`SeekPrecision::KeyFrame`] seek. The index has
+    /// put the reader on a `CuePoint`'s Block or at the start of a
+    /// Cluster; neither is promised to be the answer `seek_to` owes its
+    /// caller — the last key frame of the track at or before the target
+    /// (RFC 9559 §10.4: a seek goes to the Cluster, reads its Timestamp
+    /// and starts from the BlockGroup or SimpleBlock that is a RAP). An
+    /// index usually lists one key frame per Cluster and track, a
+    /// Cluster search none at all, and a Cluster need not begin on a key
+    /// frame of every track.
+    ///
+    /// So: read Block headers forward from the landing (payloads are
+    /// stepped over, nothing is queued) up to the target, remembering the
+    /// last key frame of the track; if there is none, repeat from the
+    /// index landing before this one. The reader is left on the Block
+    /// found and its timestamp is returned. When the search comes up
+    /// empty — the target lies before the track's first key frame — the
+    /// track's first key frame after the landing is used; and when that
+    /// fails too (a track without Blocks, an unreadable stretch, the work
+    /// budget spent), the index landing stands exactly as
+    /// [`SeekPrecision::Index`] would have left it.
+    fn refine_to_key_frame(&mut self, stream_index: u32, pts: i64, landed: i64) -> i64 {
+        // A virtual track (TrackOperation) has no Blocks of its own.
+        if self
+            .track_operations
+            .get(stream_index as usize)
+            .is_some_and(|op| op.is_some())
+        {
+            return landed;
+        }
+        let track = self.track_number_by_index[stream_index as usize];
+        let target = self.stream_pts_to_ticks(stream_index, pts);
+        let index_landing = (self.input.stream_position().ok(), self.cluster_state);
+        let index_strategy = self.last_seek_strategy;
+        let mut budget = KEY_FRAME_SEARCH_ELEMENTS;
+        let mut found: Option<KeyFrameHit> = None;
+        let mut landed_ticks = self.stream_pts_to_ticks(stream_index, landed);
+        for _ in 0..KEY_FRAME_SEARCH_BACKSTEPS {
+            // Every pass runs up to the target itself: Clusters need not
+            // be stored in Timestamp order, so the answer may lie past
+            // the landing a pass before this one started from.
+            found = self.scan_for_key_frame(track, target, false, &mut budget);
+            if found.is_some() || budget == 0 || landed_ticks == 0 {
+                break;
+            }
+            // Nothing between this landing and the target: start again
+            // from the index landing before it.
+            let earlier = landed_ticks - 1;
+            let earlier_pts = self.ticks_to_stream_pts(stream_index, earlier);
+            match self.seek_by_index(stream_index, earlier_pts) {
+                Ok(l) => {
+                    let l = self.stream_pts_to_ticks(stream_index, l);
+                    if l >= landed_ticks {
+                        break;
+                    }
+                    landed_ticks = l;
+                }
+                Err(_) => break,
+            }
+        }
+        if found.is_none() && budget > 0 {
+            // The target is before the track's first key frame: land on
+            // that one.
+            if self.seek_by_index(stream_index, pts).is_ok() {
+                found = self.scan_for_key_frame(track, u64::MAX, true, &mut budget);
+            }
+        }
+        self.last_seek_strategy = index_strategy;
+        match found {
+            Some(hit) if self.input.seek(SeekFrom::Start(hit.offset)).is_ok() => {
+                self.reset_after_seek();
+                self.register_cluster_record(hit.body_start);
+                self.cluster_state = ClusterState::InCluster {
+                    body_start: hit.body_start,
+                    body_end: hit.body_end,
+                    cluster_timecode: hit.cluster_timecode,
+                    unknown_size: hit.unknown_size,
+                };
+                self.ticks_to_stream_pts(stream_index, hit.timestamp)
+            }
+            _ => {
+                // Put the index landing back.
+                if let (Some(pos), state) = index_landing
+                    && self.input.seek(SeekFrom::Start(pos)).is_ok()
+                {
+                    self.reset_after_seek();
+                    self.cluster_state = state;
+                } else {
+                    let _ = self.seek_by_index(stream_index, pts);
+                }
+                landed
+            }
+        }
+    }
+
+    /// Walk Block headers forward from the reader's position and Cluster
+    /// state, without queuing anything, and report the last key frame of
+    /// `track` whose timestamp is at or before `limit` (or, with
+    /// `first`, the first key frame met). The walk ends at the first
+    /// Block of the track past `limit`; at a Block of any track, or a
+    /// Cluster Timestamp, more than one second past it (Blocks carry
+    /// signed offsets, so a Cluster whose Timestamp is past the limit
+    /// may still hold Blocks before it, and tracks interleave with some
+    /// skew — but not without bound, which is what lets a sparse track
+    /// stop); at the end of the Segment; on anything unreadable; or when
+    /// `budget` (elements examined) runs out.
+    fn scan_for_key_frame(
+        &mut self,
+        track: u64,
+        limit: u64,
+        first: bool,
+        budget: &mut u32,
+    ) -> Option<KeyFrameHit> {
+        let mut best: Option<KeyFrameHit> = None;
+        // (body_start, body_end, timecode, unknown_size) of the Cluster
+        // the walk is in.
+        let mut cluster: Option<(u64, u64, i64, bool)> = match self.cluster_state {
+            ClusterState::InCluster {
+                body_start,
+                body_end,
+                cluster_timecode,
+                unknown_size,
+            } => Some((body_start, body_end, cluster_timecode, unknown_size)),
+            ClusterState::Idle => None,
+        };
+        let seg_end = self.segment_data_end;
+        // One second in Segment Ticks.
+        let slack = (1_000_000_000 / self.timecode_scale_ns.max(1)).max(1);
+        let far = limit.saturating_add(slack);
+        // `None`: stop the walk. `Some(())`: go on.
+        let step = |d: &mut Self,
+                    cluster: &mut Option<(u64, u64, i64, bool)>,
+                    best: &mut Option<KeyFrameHit>|
+         -> Option<()> {
+            let pos = d.input.stream_position().ok()?;
+            let Some((body_start, body_end, timecode, unknown_size)) = *cluster else {
+                if pos >= seg_end {
+                    return None;
+                }
+                let e = read_element_header(&mut *d.input).ok()?;
+                let body = d.input.stream_position().ok()?;
+                if e.id == ids::CLUSTER {
+                    let unknown = e.size == VINT_UNKNOWN_SIZE;
+                    let end = if unknown {
+                        seg_end
+                    } else {
+                        body.saturating_add(e.size).min(seg_end)
+                    };
+                    *cluster = Some((body, end, 0, unknown));
+                    return Some(());
+                }
+                if e.size == VINT_UNKNOWN_SIZE || e.id == ids::EBML_HEADER {
+                    return None;
+                }
+                d.input
+                    .seek(SeekFrom::Start(body.saturating_add(e.size)))
+                    .ok()?;
+                return Some(());
+            };
+            if pos >= body_end {
+                *cluster = None;
+                return Some(());
+            }
+            let e = read_element_header(&mut *d.input).ok()?;
+            let body = d.input.stream_position().ok()?;
+            if e.size == VINT_UNKNOWN_SIZE {
+                // Only a Cluster may leave its size open: a sibling
+                // Cluster ends this one, anything else ends the walk.
+                if e.id != ids::CLUSTER {
+                    return None;
+                }
+            }
+            let next = body.saturating_add(e.size);
+            // (track, timestamp offset, key frame) of the Block met.
+            let mut block: Option<(u64, i64, bool)> = None;
+            match e.id {
+                ids::TIMECODE => {
+                    let ts = read_uint(&mut *d.input, e.size as usize).ok()?;
+                    if ts > far && !first {
+                        return None;
+                    }
+                    *cluster = Some((
+                        body_start,
+                        body_end,
+                        ts.min(i64::MAX as u64) as i64,
+                        unknown_size,
+                    ));
+                }
+                ids::SIMPLE_BLOCK => {
+                    let (t, rel, flags) = read_block_head(&mut *d.input, e.size)?;
+                    block = Some((t, rel, flags & 0x80 != 0));
+                }
+                ids::BLOCK_GROUP => {
+                    let mut head: Option<(u64, i64)> = None;
+                    let mut referenced = false;
+                    let mut at = body;
+                    while at < next {
+                        d.input.seek(SeekFrom::Start(at)).ok()?;
+                        let c = read_element_header(&mut *d.input).ok()?;
+                        let c_body = d.input.stream_position().ok()?;
+                        if c.size == VINT_UNKNOWN_SIZE {
+                            return None;
+                        }
+                        match c.id {
+                            ids::BLOCK => {
+                                let (t, rel, _) = read_block_head(&mut *d.input, c.size)?;
+                                head = Some((t, rel));
+                            }
+                            ids::REFERENCE_BLOCK => referenced = true,
+                            _ => {}
+                        }
+                        let c_next = c_body.saturating_add(c.size);
+                        if c_next <= at {
+                            return None;
+                        }
+                        at = c_next;
+                    }
+                    block = head.map(|(t, rel)| (t, rel, !referenced));
+                }
+                ids::CLUSTER
+                | ids::CUES
+                | ids::TAGS
+                | ids::ATTACHMENTS
+                | ids::CHAPTERS
+                | ids::SEEK_HEAD
+                | ids::INFO
+                | ids::TRACKS
+                | ids::SEGMENT => {
+                    // A Top-Level element ends an unknown-size Cluster.
+                    d.input.seek(SeekFrom::Start(pos)).ok()?;
+                    *cluster = None;
+                    return Some(());
+                }
+                ids::EBML_HEADER => return None,
+                _ => {}
+            }
+            if let Some((_, rel, _)) = block
+                && timecode.saturating_add(rel).max(0) as u64 > far
+                && !first
+            {
+                return None;
+            }
+            if let Some((t, rel, key)) = block
+                && t == track
+            {
+                let ts = timecode.saturating_add(rel).max(0) as u64;
+                if ts > limit && !first {
+                    return None;
+                }
+                if key {
+                    *best = Some(KeyFrameHit {
+                        offset: pos,
+                        body_start,
+                        body_end,
+                        cluster_timecode: timecode,
+                        unknown_size,
+                        timestamp: ts,
+                    });
+                    if first {
+                        return None;
+                    }
+                }
+            }
+            if next <= pos {
+                return None;
+            }
+            d.input.seek(SeekFrom::Start(next)).ok()?;
+            Some(())
+        };
+        while *budget > 0 {
+            *budget -= 1;
+            if step(self, &mut cluster, &mut best).is_none() {
+                break;
+            }
+        }
+        best
+    }
+
+    /// How [`Demuxer::seek_to`] lands — see [`SeekPrecision`]. The
+    /// default is [`SeekPrecision::KeyFrame`].
+    pub fn set_seek_precision(&mut self, precision: SeekPrecision) {
+        self.seek_precision = precision;
+    }
+
+    /// The landing rule in effect — see
+    /// [`MkvDemuxer::set_seek_precision`].
+    pub fn seek_precision(&self) -> SeekPrecision {
+        self.seek_precision
+    }
+}
+
+/// Elements one [`SeekPrecision::KeyFrame`] seek may examine while
+/// looking for the key frame (Block headers, Cluster headers and
+/// children alike), over all its passes.
+const KEY_FRAME_SEARCH_ELEMENTS: u32 = 1 << 16;
+
+/// Index landings one [`SeekPrecision::KeyFrame`] seek may step back
+/// through before giving the track up as having no key frame at or
+/// before the target.
+const KEY_FRAME_SEARCH_BACKSTEPS: u32 = 64;
+
+/// A key frame Block found by [`MkvDemuxer::scan_for_key_frame`].
+#[derive(Clone, Copy)]
+struct KeyFrameHit {
+    /// Offset of the `SimpleBlock` / `BlockGroup` element.
+    offset: u64,
+    body_start: u64,
+    body_end: u64,
+    cluster_timecode: i64,
+    unknown_size: bool,
+    /// Absolute timestamp in Segment Ticks.
+    timestamp: u64,
+}
+
+/// The fixed part of a Block / SimpleBlock body (RFC 9559 §10.1 /
+/// §10.2): track number, timestamp relative to the Cluster, flags.
+fn read_block_head(r: &mut dyn ReadSeek, size: u64) -> Option<(u64, i64, u8)> {
+    let (track, width) = read_vint(r, false).ok()?;
+    if size < width as u64 + 3 {
+        return None;
+    }
+    let mut rest = [0u8; 3];
+    r.read_exact(&mut rest).ok()?;
+    Some((
+        track,
+        i16::from_be_bytes([rest[0], rest[1]]) as i64,
+        rest[2],
+    ))
+}
+
+/// Where [`Demuxer::seek_to`] leaves the reader — see
+/// [`MkvDemuxer::set_seek_precision`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SeekPrecision {
+    /// On the last key frame of the requested track at or before the
+    /// target (the track's first key frame for an earlier target), and
+    /// that key frame's timestamp is what `seek_to` returns. After the
+    /// index (or the Cluster search) has landed, Block headers are read
+    /// forward up to the target — a few positioned reads per Block that
+    /// lies between the landing and the target.
+    #[default]
+    KeyFrame,
+    /// Where the index says and no further: on the Block the `CuePoint`
+    /// names (the start of its Cluster when it names none), or — without
+    /// usable `Cues` — at the start of the last Cluster whose Timestamp
+    /// is at or before the target. Costs the fewest reads, which is what
+    /// an expensive transport (one request per positioned read) wants;
+    /// the first packet of the track may then be earlier than its last
+    /// key frame before the target, or not a key frame at all.
+    Index,
 }
 
 impl MkvDemuxer {
@@ -13087,6 +13513,15 @@ impl MkvDemuxer {
             i64::try_from(ns.saturating_add(scale / 2) / scale).ok()
         });
         let chain = self.chain;
+        // `DiscardPadding` (§5.1.3.5.7) covering the Block's whole stated
+        // duration: nothing of it is to be presented.
+        let all_padding = match (&meta, explicit_duration) {
+            (Some(m), Some(d)) if d > 0 => m.discard_padding.is_some_and(|pad| {
+                let scale = chain.map_or(self.timecode_scale_ns, |c| c.scale_ns);
+                pad.unsigned_abs() as u128 >= d as u128 * scale as u128
+            }),
+            _ => false,
+        };
         // Header-Stripping (RFC 9559 §5.1.4.1.31.6 algo 3) prefix for this
         // stream, prepended to each de-laced frame so the packet carries the
         // original (un-stripped) bytes. Block scope (§5.1.4.1.31.3 bit 0x1) is
@@ -13121,6 +13556,7 @@ impl MkvDemuxer {
             pkt.pts = Some(pts);
             pkt.dts = Some(pts);
             pkt.duration = per_frame;
+            pkt.flags.discard = all_padding;
             pkt.flags.keyframe = keyframe_flag || default_keyframe;
             // BlockAdditions (RFC 9559 §5.1.3.5.2) and the BlockGroup meta
             // children attach to the Block as a whole; every frame de-laced

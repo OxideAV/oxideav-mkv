@@ -112,6 +112,13 @@ fn live_layout_omits_seek_head_and_cues() {
     let rs: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(live));
     let mut dmx =
         oxideav_mkv::demux::open_resilient_typed(rs, &oxideav_core::NullCodecResolver).unwrap();
+    // The Cluster search lands on the 6 s Cluster; the seek then moves on
+    // to the last key frame at or before the target inside it.
+    let landed = dmx.seek_to(0, 7000).expect("resilient live seek");
+    assert_eq!(landed, 7000, "the key frame at the target");
+    assert_eq!(drain(&mut dmx), vec![7000, 8000, 9000, 10000, 11000, 12000]);
+    // Index precision stops at the Cluster.
+    dmx.set_seek_precision(oxideav_mkv::demux::SeekPrecision::Index);
     let landed = dmx.seek_to(0, 7000).expect("resilient live seek");
     assert_eq!(landed, 6000, "snaps to the 6 s cluster");
     assert_eq!(

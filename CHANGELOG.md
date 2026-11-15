@@ -28,9 +28,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its Cluster.
 - `tests/streaming_shapes.rs` and a dependency-free throughput bench
   (`cargo bench --bench throughput`).
+- `MkvDemuxer::set_seek_precision` / `SeekPrecision` (`KeyFrame`, the
+  default, and `Index`, the previous landing rule), and
+  `tests/seek_exact.rs`, an exhaustive every-track / every-target check
+  of the landing on self-muxed files with and without `Cues`.
+- Priming and trim for consumers behind the `Demuxer` trait:
+  `track:<stream>:codec_delay_ns` / `priming_samples` /
+  `seek_pre_roll_ns` metadata entries, `TrackCodecTiming::priming_samples`
+  / `seek_pre_roll_samples`, `BlockGroupMeta::trim_samples`, and
+  `PacketFlags::discard` on a Block that is `DiscardPadding` from end to
+  end.
 
 ### Changed
 
+- `seek_to` lands on the last key frame of the requested track at or
+  before the target and returns its timestamp. It used to stop at the
+  index landing: the Block a `CuePoint` names, or without `Cues` the
+  start of a Cluster — which could precede the wanted key frame by up to
+  a Cluster, or (for a Cluster starting inside a group of pictures) not
+  be a key frame at all. `SeekPrecision::Index` keeps the old landing.
 - Frames of a lace are spaced by the track's `DefaultDuration` when the
   Block carries no `BlockDuration` (they used to share one timestamp),
   and `DefaultDuration` is the packet duration of Blocks that state

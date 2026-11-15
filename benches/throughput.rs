@@ -14,9 +14,8 @@
 //!   in the live layout (no index at all).
 //!
 //! Reported: mux MiB/s and packets/s (to a file on disk and to memory),
-//! demux MiB/s and packets/s (from a file on disk and from memory, owned
-//! packets and shared-buffer packets), and open time for the three index
-//! layouts. The muxed bytes are fingerprinted (FNV-1a) so a change that
+//! demux MiB/s and packets/s (from a file on disk and from memory), and
+//! open time for the three index layouts. The muxed bytes are fingerprinted (FNV-1a) so a change that
 //! claims identical output can be checked against an earlier run.
 
 use std::io::{Cursor, Write};
@@ -179,24 +178,17 @@ impl std::io::Seek for SharedVec {
     }
 }
 
-fn drain(dmx: &mut dyn Demuxer, shared: bool) -> (u64, u64) {
+fn drain(dmx: &mut dyn Demuxer) -> (u64, u64) {
     let (mut n, mut bytes) = (0u64, 0u64);
     loop {
-        let len = if shared {
-            match dmx.next_shared_packet() {
-                Ok(p) => p.data.len(),
-                Err(Error::Eof) => return (n, bytes),
-                Err(e) => panic!("demux: {e}"),
+        match dmx.next_packet() {
+            Ok(p) => {
+                n += 1;
+                bytes += p.data.len() as u64;
             }
-        } else {
-            match dmx.next_packet() {
-                Ok(p) => p.data.len(),
-                Err(Error::Eof) => return (n, bytes),
-                Err(e) => panic!("demux: {e}"),
-            }
-        };
-        n += 1;
-        bytes += len as u64;
+            Err(Error::Eof) => return (n, bytes),
+            Err(e) => panic!("demux: {e}"),
+        }
     }
 }
 
@@ -260,40 +252,27 @@ fn main() {
     drop(packets);
 
     // --- demux -------------------------------------------------------
-    for shared in [false, true] {
-        let kind = if shared { "shared" } else { "owned" };
-        let mut from_file = Vec::new();
-        for _ in 0..RUNS {
-            let f = std::fs::File::open(&path).unwrap();
-            let t = Instant::now();
-            let rs: Box<dyn ReadSeek> = Box::new(f);
-            let mut dmx = oxideav_mkv::demux::open(rs, &NullCodecResolver).unwrap();
-            let (n, _) = drain(&mut *dmx, shared);
-            from_file.push(t.elapsed());
-            assert_eq!(n, n_packets);
-        }
-        report(
-            &format!("demux <- file ({kind} packets)"),
-            median(from_file),
-            total,
-            n_packets,
-        );
-        let mut from_mem = Vec::new();
-        for _ in 0..RUNS {
-            let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file_bytes.clone()));
-            let t = Instant::now();
-            let mut dmx = oxideav_mkv::demux::open(rs, &NullCodecResolver).unwrap();
-            let (n, _) = drain(&mut *dmx, shared);
-            from_mem.push(t.elapsed());
-            assert_eq!(n, n_packets);
-        }
-        report(
-            &format!("demux <- memory ({kind} packets)"),
-            median(from_mem),
-            total,
-            n_packets,
-        );
+    let mut from_file = Vec::new();
+    for _ in 0..RUNS {
+        let f = std::fs::File::open(&path).unwrap();
+        let t = Instant::now();
+        let rs: Box<dyn ReadSeek> = Box::new(f);
+        let mut dmx = oxideav_mkv::demux::open(rs, &NullCodecResolver).unwrap();
+        let (n, _) = drain(&mut *dmx);
+        from_file.push(t.elapsed());
+        assert_eq!(n, n_packets);
     }
+    report("demux <- file", median(from_file), total, n_packets);
+    let mut from_mem = Vec::new();
+    for _ in 0..RUNS {
+        let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file_bytes.clone()));
+        let t = Instant::now();
+        let mut dmx = oxideav_mkv::demux::open(rs, &NullCodecResolver).unwrap();
+        let (n, _) = drain(&mut *dmx);
+        from_mem.push(t.elapsed());
+        assert_eq!(n, n_packets);
+    }
+    report("demux <- memory", median(from_mem), total, n_packets);
     drop(file_bytes);
     let _ = std::fs::remove_file(&path);
 
@@ -330,7 +309,7 @@ fn main() {
             let f = std::fs::File::open(&path).unwrap();
             let t = Instant::now();
             let mut dmx = oxideav_mkv::demux::open(Box::new(f), &NullCodecResolver).unwrap();
-            let (n, _) = drain(&mut *dmx, false);
+            let (n, _) = drain(&mut *dmx);
             drains.push(t.elapsed());
             assert_eq!(n, clusters);
         }
