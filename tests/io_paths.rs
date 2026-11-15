@@ -640,3 +640,179 @@ fn a_cluster_timestamp_at_the_top_of_its_range_does_not_overflow() {
         }
     }
 }
+
+#[test]
+fn resynchronisation_work_is_linear_in_the_damage() {
+    // A good Cluster, a damaged stretch, a good Cluster. The stretch is
+    // built to be as expensive as damage gets for a scanner that looks
+    // for Cluster IDs: it is nothing but Cluster IDs, each followed by
+    // bytes that do not make a Cluster. Whatever the reader does with
+    // each candidate, the total it reads must stay proportional to the
+    // input, and the Cluster after the damage must come out.
+    let good = |ts: u64, tag: u8| {
+        el(
+            ids::CLUSTER,
+            &[
+                uint(ids::TIMECODE, ts),
+                el(ids::SIMPLE_BLOCK, &[0x81, 0, 0, 0x80, tag]),
+            ]
+            .concat(),
+        )
+    };
+    for (name, unit) in [
+        // Cluster ID, then a size VINT and children that are garbage.
+        (
+            "id + junk",
+            vec![0x1F, 0x43, 0xB6, 0x75, 0x84, 0xFE, 0xFE, 0xFE, 0xFE],
+        ),
+        // Back-to-back Cluster IDs.
+        ("ids only", vec![0x1F, 0x43, 0xB6, 0x75]),
+        // Cluster ID, a plausible size, a Timestamp, then junk.
+        (
+            "id + timestamp",
+            vec![
+                0x1F, 0x43, 0xB6, 0x75, 0x90, 0xE7, 0x81, 0x05, 0xFE, 0xFE, 0x00, 0x00,
+            ],
+        ),
+    ] {
+        let mut sizes = Vec::new();
+        for repeats in [20_000usize, 80_000] {
+            let mut clusters = good(0, 0x11);
+            for _ in 0..repeats {
+                clusters.extend_from_slice(&unit);
+            }
+            clusters.extend(good(5000, 0x33));
+            let file = one_track_file(clusters);
+            let len = file.len() as u64;
+            let read = Arc::new(AtomicU64::new(0));
+            let mut dmx = oxideav_mkv::demux::open_resilient_typed(
+                Box::new(Counting {
+                    inner: Cursor::new(file),
+                    bytes: read.clone(),
+                }),
+                &NullCodecResolver,
+            )
+            .unwrap();
+            let mut tags = Vec::new();
+            loop {
+                match dmx.next_packet() {
+                    Ok(p) => tags.push(p.data[0]),
+                    Err(Error::Eof) => break,
+                    Err(e) => panic!("{name}: {e}"),
+                }
+            }
+            assert_eq!(tags.first(), Some(&0x11), "{name}");
+            assert_eq!(
+                tags.last(),
+                Some(&0x33),
+                "{name}: the Cluster after the damage"
+            );
+            let read = read.load(Ordering::Relaxed);
+            sizes.push((len, read));
+        }
+        // Four times the damage, about four times the reading — not
+        // sixteen.
+        let (small, large) = (sizes[0], sizes[1]);
+        let ratio = large.1 as f64 / small.1 as f64;
+        assert!(
+            ratio < 6.0,
+            "{name}: {} bytes read for {} of input, {} for {} — ratio {ratio:.1}",
+            small.1,
+            small.0,
+            large.1,
+            large.0
+        );
+        assert!(
+            large.1 < 4 * large.0,
+            "{name}: {} bytes read for a {}-byte input",
+            large.1,
+            large.0
+        );
+    }
+}
+
+/// A file of bounded Clusters (4 Blocks of 16 KiB each), with or
+/// without a leading CRC-32 child (RFC 8794 §11.3.1) on every Cluster.
+fn bounded_cluster_file(clusters: usize, with_crc: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in 0..clusters {
+        let mut rest = uint(ids::TIMECODE, c as u64 * 40);
+        for b in 0..4u8 {
+            let mut block = vec![0x81, 0, b, 0x80];
+            block.extend(std::iter::repeat_n(
+                (c as u8).wrapping_mul(7) ^ b,
+                16 * 1024,
+            ));
+            rest.extend(el(ids::SIMPLE_BLOCK, &block));
+        }
+        let mut body = Vec::new();
+        if with_crc {
+            body.extend(el(
+                ids::CRC32,
+                &oxideav_mkv::ebml::crc32_ieee(&rest).to_le_bytes(),
+            ));
+        }
+        body.extend(rest);
+        out.extend(el(ids::CLUSTER, &body));
+    }
+    one_track_file(out)
+}
+
+#[test]
+fn a_bounded_cluster_is_read_once_unless_it_has_a_crc_to_check() {
+    for with_crc in [false, true] {
+        let file = bounded_cluster_file(48, with_crc);
+        let len = file.len() as u64;
+        let read = Arc::new(AtomicU64::new(0));
+        let mut dmx = oxideav_mkv::demux::open_typed(
+            Box::new(Counting {
+                inner: Cursor::new(file),
+                bytes: read.clone(),
+            }),
+            &NullCodecResolver,
+        )
+        .unwrap();
+        let mut n = 0;
+        while let Ok(p) = dmx.next_packet() {
+            assert_eq!(p.data.len(), 16 * 1024);
+            n += 1;
+        }
+        assert_eq!(n, 48 * 4);
+        let read = read.load(Ordering::Relaxed);
+        let statuses = dmx.crc_status();
+        if with_crc {
+            // Checked: every Cluster's CRC matches, at the price of
+            // reading it twice (plus some read-ahead that the second
+            // pass does not use).
+            assert_eq!(statuses.len(), 48);
+            assert!(
+                statuses
+                    .iter()
+                    .all(|s| s.is_valid() && s.element_id == ids::CLUSTER)
+            );
+            assert!(read < len * 26 / 10, "{read} bytes read for {len}");
+        } else {
+            // Nothing to check: looking for the CRC-32 child must not
+            // cost a pass over the Cluster.
+            assert!(statuses.is_empty());
+            assert!(read < len * 11 / 10, "{read} bytes read for {len}");
+        }
+    }
+}
+
+#[test]
+fn a_corrupt_cluster_fails_its_crc_and_still_demuxes() {
+    let mut file = bounded_cluster_file(3, true);
+    // Flip one payload byte in the last Cluster.
+    let at = file.len() - 100;
+    file[at] ^= 0x55;
+    let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(file));
+    let mut dmx = oxideav_mkv::demux::open_typed(rs, &NullCodecResolver).unwrap();
+    let mut n = 0;
+    while dmx.next_packet().is_ok() {
+        n += 1;
+    }
+    assert_eq!(n, 12);
+    let valid: Vec<bool> = dmx.crc_status().iter().map(|s| s.is_valid()).collect();
+    assert_eq!(valid, vec![true, true, false]);
+}

@@ -13,6 +13,13 @@
 //!   once with the index at the end, once with it at the front, and once
 //!   in the live layout (no index at all).
 //!
+//! * **bounded-Cluster file** — the muxer writes Clusters of unknown
+//!   size, most other writers give each Cluster its size, and some add a
+//!   `CRC-32` child. This shape is built by hand: 1 s Clusters of the
+//!   same video and audio Blocks, sized, with and without the checksum.
+//!
+//! `OXIDEAV_MKV_BENCH_ONLY=bounded` runs that last shape alone.
+//!
 //! Reported: mux MiB/s and packets/s (to a file on disk and to memory),
 //! demux MiB/s and packets/s (from a file on disk and from memory), and
 //! open time for the three index layouts. The muxed bytes are fingerprinted (FNV-1a) so a change that
@@ -190,6 +197,106 @@ impl std::io::Seek for SharedVec {
     }
 }
 
+fn el(id: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = oxideav_mkv::ebml::write_element_id(id);
+    out.extend_from_slice(&oxideav_mkv::ebml::write_vint(body.len() as u64, 0));
+    out.extend_from_slice(body);
+    out
+}
+
+fn el_uint(id: u32, v: u64) -> Vec<u8> {
+    let n = ((64 - v.leading_zeros()).div_ceil(8) as usize).max(1);
+    el(id, &v.to_be_bytes()[8 - n..])
+}
+
+/// `seconds` one-second Clusters with known sizes, each holding 30 video
+/// Blocks and 50 audio Blocks of the A/V shape; `with_crc` puts a
+/// `CRC-32` child (RFC 8794 §11.3.1) at the head of every Cluster.
+/// Returns the file and its packet count.
+fn bounded_cluster_file(seconds: u64, with_crc: bool) -> (Vec<u8>, u64) {
+    use oxideav_mkv::ids;
+    let track = |number: u64, kind: u64, codec: &str| {
+        el(
+            ids::TRACK_ENTRY,
+            &[
+                el_uint(ids::TRACK_NUMBER, number),
+                el_uint(ids::TRACK_UID, number),
+                el_uint(ids::TRACK_TYPE, kind),
+                el(ids::CODEC_ID, codec.as_bytes()),
+            ]
+            .concat(),
+        )
+    };
+    let mut segment = el(ids::INFO, &el_uint(ids::TIMECODE_SCALE, 1_000_000));
+    segment.extend(el(
+        ids::TRACKS,
+        &[
+            track(1, ids::TRACK_TYPE_VIDEO, "V_FFV1"),
+            track(2, ids::TRACK_TYPE_AUDIO, "A_PCM/INT/LIT"),
+        ]
+        .concat(),
+    ));
+    let mut packets = 0u64;
+    let mut video = vec![0u8; VIDEO_BLOCK];
+    let mut audio = vec![0u8; AUDIO_BLOCK];
+    for s in 0..seconds {
+        let mut rest = el_uint(ids::TIMECODE, s * 1000);
+        let (mut v, mut a) = (0u64, 0u64);
+        while v < 30 || a < 50 {
+            let (track, ms, payload) = if v < 30 && v * 1000 / 30 <= a * 20 {
+                fill(&mut video, s * 100 + v);
+                v += 1;
+                (1u8, (v - 1) * 1000 / 30, &video)
+            } else {
+                fill(&mut audio, s * 100 + 50 + a);
+                a += 1;
+                (2u8, (a - 1) * 20, &audio)
+            };
+            let mut block = vec![0x80 | track, (ms >> 8) as u8, ms as u8, 0x80];
+            block.extend_from_slice(payload);
+            rest.extend(el(ids::SIMPLE_BLOCK, &block));
+            packets += 1;
+        }
+        let mut body = Vec::new();
+        if with_crc {
+            body.extend(el(
+                ids::CRC32,
+                &oxideav_mkv::ebml::crc32_ieee(&rest).to_le_bytes(),
+            ));
+        }
+        body.extend(rest);
+        segment.extend(el(ids::CLUSTER, &body));
+    }
+    let mut file = el(ids::EBML_HEADER, &el(ids::EBML_DOC_TYPE, b"matroska"));
+    file.extend(oxideav_mkv::ebml::write_element_id(ids::SEGMENT));
+    file.extend(oxideav_mkv::ebml::write_vint(segment.len() as u64, 8));
+    file.extend(segment);
+    (file, packets)
+}
+
+fn bench_bounded(seconds: u64, path: &std::path::Path) {
+    for (with_crc, name) in [(false, "sized Clusters"), (true, "sized Clusters + CRC-32")] {
+        let (bytes, n_packets) = bounded_cluster_file(seconds, with_crc);
+        std::fs::write(path, &bytes).unwrap();
+        let mut times = Vec::new();
+        for _ in 0..runs() {
+            let f = std::fs::File::open(path).unwrap();
+            let t = Instant::now();
+            let mut dmx = oxideav_mkv::demux::open(Box::new(f), &NullCodecResolver).unwrap();
+            let (n, _) = drain(&mut *dmx);
+            times.push(t.elapsed());
+            assert_eq!(n, n_packets);
+        }
+        report(
+            &format!("demux <- file, {name}"),
+            median(times),
+            bytes.len() as u64,
+            n_packets,
+        );
+    }
+    let _ = std::fs::remove_file(path);
+}
+
 fn drain(dmx: &mut dyn Demuxer) -> (u64, u64) {
     let (mut n, mut bytes) = (0u64, 0u64);
     loop {
@@ -235,6 +342,10 @@ fn main() {
         .collect();
     let n_packets = packets.len() as u64;
     let path = std::env::temp_dir().join(format!("oxideav-mkv-bench-{}.mkv", std::process::id()));
+    if std::env::var("OXIDEAV_MKV_BENCH_ONLY").as_deref() == Ok("bounded") {
+        bench_bounded(seconds, &path);
+        return;
+    }
 
     // --- mux ---------------------------------------------------------
     let mut to_file = Vec::new();
@@ -287,6 +398,7 @@ fn main() {
     report("demux <- memory", median(from_mem), total, n_packets);
     drop(file_bytes);
     let _ = std::fs::remove_file(&path);
+    bench_bounded(seconds, &path);
 
     // --- open time vs index layout ------------------------------------
     let clusters: u64 = std::env::var("OXIDEAV_MKV_BENCH_CLUSTERS")

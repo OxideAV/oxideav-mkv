@@ -75,7 +75,10 @@ to register every codec the build enables.
   unknown-size Segment/Cluster both supported.
 - **Seeking, tiered** (`seek_to`, strict and resilient alike; which tier
   landed is readable through `MkvDemuxer::seek_strategy() ->
-  Option<SeekStrategy>`):
+  Option<SeekStrategy>`). The tiers below are how the index gets the
+  reader close; by default `seek_to` then moves on to the requested
+  track's last key frame at or before the target (*Seek landing* below;
+  `SeekPrecision::Index` stops at the tier's own landing):
   1. `SeekStrategy::Cues` — a `Cues` index stored before the first Cluster
      or reached through a `SeekHead` entry (RFC 9559 §6.4): one jump to the
      `CueClusterPosition` of the last `CuePoint` at or before the target.
@@ -2325,7 +2328,11 @@ showed, before any change:
 Parsing was never the cost: every octet group of an element ID or size,
 every "where am I?", every hop over a `Void` was its own system call.
 What was left after that, on the demux side, was copying each Block
-twice (element body into a buffer, then the frame out of it).
+twice (element body into a buffer, then the frame out of it) — and, for
+files whose Clusters state their size (the muxer here writes them
+open-ended; most other writers do not), reading every Cluster twice:
+the check for a leading `CRC-32` child loaded the whole Cluster body
+into memory before looking at its first byte.
 
 **What changed.** The demuxer reads through a window of the input held
 in memory and tracks the position itself (4 KiB after a jump, doubling
@@ -2335,7 +2342,10 @@ tracks the write position. An unlaced Block's payload is read from the
 input straight into the buffer the packet owns — one copy, and none
 after it — and is written from the caller's packet without passing
 through an intermediate buffer. Blocks of streams the consumer
-deselected with `set_active_streams` are stepped over unread. After:
+deselected with `set_active_streams` are stepped over unread. The
+`CRC-32` check looks at the first child (16 bytes at most) and only
+when there is a checksum reads the body — in pieces, never held whole,
+through a CRC that consumes eight bytes per step. After:
 1.3 reads per packet on the A/V file, 0.005 reads per packet at one
 Block per Cluster, 96 reads to open the 200 000-CuePoint file.
 
@@ -2350,6 +2360,8 @@ brackets):
 | demux ← memory, A/V | 15.2 ms (632 k) | 4.8 ms (2.0 M) | 3.2× |
 | demux ← file, one Block per Cluster, Cues at the end | 4291 ms (47 k) | 76.4 ms (2.6 M) | 56× |
 | demux ← file, one Block per Cluster, no Cues | 1909 ms (105 k) | 33.5 ms (6.0 M) | 57× |
+| demux ← file, A/V, sized Clusters | 82.9 ms (116 k) | 14.7 ms (653 k) | 5.6× |
+| demux ← file, A/V, sized Clusters each with a `CRC-32` | 395 ms (24 k) | 102 ms (94 k) | 3.9× |
 | open, 200 000 CuePoints at the end | 2302 ms | 44.4 ms | 52× |
 | open, 200 000 CuePoints at the front | 2077 ms | 42.0 ms | 50× |
 | open, no Cues | 0.06 ms | 0.01 ms | |
@@ -2362,7 +2374,10 @@ The muxed bytes are identical before and after in all four files (the
 bench prints an FNV-1a fingerprint of each; `tests/io_paths.rs` checks
 that no output buffer size changes a byte in any layout). The live
 layout gains less because it hands the sink every packet as soon as it
-is written — one write per packet is its contract. The open time with
+is written — one write per packet is its contract. A checksummed
+Cluster still costs a second pass over its bytes (that is what checking
+it means); the pass is now the CRC's speed, about 1.6 GiB/s here, and
+holds 64 KiB instead of the Cluster. The open time with
 an index is now the parse of the index itself (about 0.2 µs per
 CuePoint); without one, open reads the track headers and nothing else.
 
@@ -2382,7 +2397,16 @@ non-live layout. The default is the faster one.
 - **Sizes against the parent.** A Block declared to run past its bounded
   Cluster or its BlockGroup is refused before it is read or stepped
   over; it can neither take the following elements as payload nor leave
-  the reader beyond them.
+  the reader beyond them. On the resilient path the same holds for
+  every element the packet walk steps over: one that claims to run past
+  its Cluster or the Segment is damage, and the walk resynchronises on
+  the next Cluster instead of following the size out of the file (which
+  used to end the stream without a word).
+- **Checksums.** A `CRC-32` check never holds the element: the body is
+  hashed in 64 KiB pieces. A Cluster declared to run past the Segment
+  is not checked, and the bytes re-read for Cluster checks are budgeted
+  at twice the Segment's size, so Clusters forged to overlap cannot
+  have the same bytes hashed once per Cluster header.
 - **Depth.** The two recursive elements are capped (`SimpleTag` 16
   levels, `ChapterAtom` 64); nothing else recurses.
 - **Counts.** What grows with the number of elements rather than with
@@ -2395,10 +2419,14 @@ non-live layout. The default is the faster one.
 - **Resynchronisation.** After damage the resilient reader scans
   forward for the next vetted Top-Level element (in practice the next
   Cluster ID) from one byte past the failure and never before the last
-  accepted recovery point, so the scan work over a whole input is
-  linear in its length however many candidates fail. A Block whose
-  element is whole but whose contents do not parse costs that Block
-  only.
+  accepted recovery point. The scan takes 512 bytes first and doubles
+  while it finds nothing, so dense damage — a recovery point every few
+  bytes — is not paid for a full chunk at a time: on inputs made of
+  nothing but Cluster IDs followed by junk, in three variations, the
+  whole demux reads less than four times the input, and four times the
+  damage costs four times the reading (`tests/io_paths.rs`). A Block
+  whose element is whole but whose contents do not parse costs that
+  Block only.
 - **Seek work.** A Cues-less seek is capped at 96 probes; the key-frame
   search after any seek at 65 536 elements over at most 72 passes.
 

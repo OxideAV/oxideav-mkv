@@ -57,9 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after it) and written straight from it. Output bytes are unchanged
   (fingerprinted by the bench). Numbers in the README's Throughput
   section.
+- The check for a leading `CRC-32` child no longer reads the whole
+  element body before looking at its first byte. A sized Cluster without
+  a checksum is read once instead of twice (and no longer held in
+  memory); one with a checksum is hashed in 64 KiB pieces by a CRC that
+  takes eight bytes per step. Demuxing an A/V file with sized Clusters:
+  82.9 -> 14.7 ms; with a `CRC-32` on each: 395 -> 102 ms.
 
 ### Changed
 
+- Outside the live layout the muxer may hold back up to 64 KiB of
+  output until the buffer fills, `write_trailer` runs or the muxer is
+  dropped (`with_output_buffer(0)` restores write-through). The bytes
+  are the same.
 - A Block declared to run past its bounded Cluster (or its BlockGroup,
   or the input) is refused before it is read; it used to be read as far
   as the bytes went, swallowing the elements after it.
@@ -86,6 +96,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ... bytes longer than the one before). The muxer writes exactly that
   encoding, so such a lace did not survive a round trip. Found by the
   new `mux_roundtrip` fuzz target.
+- Resilient path: an element the packet walk steps over whose declared
+  size runs past its Cluster or the Segment (a corrupt size, or bytes
+  that are no element) carried the reader past the end of the data and
+  ended the stream silently, with everything after it lost. It is now
+  damage: the walk resynchronises on the next Cluster and records the
+  event.
+- Resilient path: each resynchronisation read a full 64 KiB chunk, so a
+  stretch of dense damage was read thousands of times over (5 GB of
+  reads for a 1 MB input in the new test); the scan starts at 512 bytes
+  and doubles.
+- A Cluster with a forged size made the `CRC-32` probe read the rest of
+  the input into memory, once per such Cluster header.
 - A Cluster `Timestamp` near the top of its unsigned range overflowed
   the signed packet timestamp when a Block offset was added (a panic in
   builds with overflow checks); it is clamped and the sum saturates.

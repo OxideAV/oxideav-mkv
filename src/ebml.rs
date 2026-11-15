@@ -259,38 +259,122 @@ pub fn skip<R: Seek + ?Sized>(r: &mut R, n: u64) -> Result<()> {
 /// The table is built once on first call rather than stored as a literal,
 /// so no numeric table is transcribed into source.
 pub fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = Crc32::new();
+    crc.update(data);
+    crc.finish()
+}
+
+/// The same CRC-32, fed in pieces — so an element body can be checked
+/// while it is read, without holding it in memory.
+pub(crate) struct Crc32 {
+    /// The shift register (before the final complement).
+    register: u32,
+}
+
+impl Crc32 {
+    pub(crate) fn new() -> Self {
+        Self {
+            register: 0xFFFF_FFFF,
+        }
+    }
+
+    pub(crate) fn update(&mut self, data: &[u8]) {
+        let t = crc_tables();
+        let mut crc = self.register;
+        // Eight input bytes per step: the register is folded into the
+        // first four, and each of the eight bytes then contributes the
+        // register it would leave behind after the bytes that follow it
+        // in the group — which is what `t[k]` tabulates.
+        let (groups, tail) = data.as_chunks::<8>();
+        for g in groups {
+            let lo = crc ^ u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+            crc = t[7][(lo & 0xFF) as usize]
+                ^ t[6][((lo >> 8) & 0xFF) as usize]
+                ^ t[5][((lo >> 16) & 0xFF) as usize]
+                ^ t[4][(lo >> 24) as usize]
+                ^ t[3][g[4] as usize]
+                ^ t[2][g[5] as usize]
+                ^ t[1][g[6] as usize]
+                ^ t[0][g[7] as usize];
+        }
+        for &b in tail {
+            crc = t[0][((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+        }
+        self.register = crc;
+    }
+
+    pub(crate) fn finish(self) -> u32 {
+        self.register ^ 0xFFFF_FFFF
+    }
+}
+
+/// `t[k][n]`: the register left by the byte `n` followed by `k` zero
+/// bytes, starting from a zero register. `t[0]` is the usual
+/// byte-at-a-time table; each further one is the previous advanced by
+/// one zero byte. Built on first use from the polynomial alone.
+fn crc_tables() -> &'static [[u32; 256]; 8] {
     use std::sync::OnceLock;
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        let mut n = 0usize;
-        while n < 256 {
+    static TABLES: OnceLock<[[u32; 256]; 8]> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut t = [[0u32; 256]; 8];
+        for (n, slot) in t[0].iter_mut().enumerate() {
             let mut c = n as u32;
-            let mut k = 0;
-            while k < 8 {
+            for _ in 0..8 {
                 c = if c & 1 != 0 {
                     0xEDB8_8320 ^ (c >> 1)
                 } else {
                     c >> 1
                 };
-                k += 1;
             }
-            t[n] = c;
-            n += 1;
+            *slot = c;
+        }
+        for k in 1..8 {
+            for n in 0..256 {
+                let prev = t[k - 1][n];
+                t[k][n] = t[0][(prev & 0xFF) as usize] ^ (prev >> 8);
+            }
         }
         t
-    });
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFF_FFFF
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn crc32_in_pieces_matches_the_bitwise_definition() {
+        // The definition, one bit at a time.
+        fn bitwise(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        0xEDB8_8320 ^ (crc >> 1)
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        // The check value every description of this CRC quotes.
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+        let data: Vec<u8> = (0..5000u32).map(|i| (i * 7 + (i >> 3)) as u8).collect();
+        for len in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 1000, 5000] {
+            assert_eq!(crc32_ieee(&data[..len]), bitwise(&data[..len]), "len {len}");
+        }
+        // Any split into pieces gives the same value.
+        for cut in [0usize, 1, 3, 8, 13, 4096, 4999] {
+            let mut c = Crc32::new();
+            c.update(&data[..cut]);
+            c.update(&data[cut..cut.max(2500)]);
+            c.update(&data[cut.max(2500)..]);
+            assert_eq!(c.finish(), bitwise(&data), "cut {cut}");
+        }
+    }
 
     #[test]
     fn vint_round_trip_small() {

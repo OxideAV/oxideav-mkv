@@ -17,8 +17,8 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::codec_id::{ACM_CODEC_ID, AcmFormat, VFW_CODEC_ID, from_matroska, strip_compat_header};
 use crate::ebml::{
-    VINT_UNKNOWN_SIZE, crc32_ieee, read_bytes, read_element_header, read_float, read_int,
-    read_string, read_uint, read_vint, skip,
+    VINT_UNKNOWN_SIZE, read_bytes, read_element_header, read_float, read_int, read_string,
+    read_uint, read_vint, skip,
 };
 use crate::ids;
 
@@ -1313,6 +1313,7 @@ fn open_typed_impl(
         active_streams: None,
         damage_events_total,
         encrypted_bytes_kept: 0,
+        crc_bytes_checked: 0,
     };
     demuxer.layouts_from_first_frames();
     Ok(demuxer)
@@ -1791,16 +1792,24 @@ const CLUSTER_FIRST_CHILD_IDS: [u32; 8] = [
 ///
 /// The reader position on return is unspecified; the caller seeks.
 fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<Option<u64>> {
-    const CHUNK: usize = 64 * 1024;
+    // The scan looks at a little first and doubles what it takes each
+    // time it finds nothing: in a stretch of dense damage the next
+    // recovery point is usually a few bytes on, and a scan that pulled a
+    // full-size chunk for each one would read the input thousands of
+    // times over.
+    const FIRST_CHUNK: usize = 512;
+    const MAX_CHUNK: usize = 64 * 1024;
     if from >= end {
         return Ok(None);
     }
     let mut base = from;
-    let mut buf = vec![0u8; CHUNK];
+    let mut chunk = FIRST_CHUNK;
+    let mut buf = vec![0u8; chunk];
     // 3-byte carry so a candidate ID straddling two chunks is still seen.
     let mut carry: Vec<u8> = Vec::new();
     while base < end {
-        let want = ((end - base) as usize).min(CHUNK - carry.len());
+        buf.resize(chunk, 0);
+        let want = ((end - base) as usize).min(chunk - carry.len());
         r.seek(SeekFrom::Start(base))?;
         let mut filled = 0usize;
         while filled < want {
@@ -1836,6 +1845,7 @@ fn scan_top_level_element(r: &mut dyn ReadSeek, from: u64, end: u64) -> Result<O
         let keep = window_len.min(3);
         carry = buf[window_len - keep..window_len].to_vec();
         base = window_start + window_len as u64;
+        chunk = (chunk * 2).min(MAX_CHUNK);
     }
     Ok(None)
 }
@@ -2731,52 +2741,96 @@ fn validate_top_level_crc(
     body_start: u64,
     body_end: u64,
 ) -> Result<Option<CrcStatus>> {
+    let Some(child) = peek_crc_child(r, body_start, body_end)? else {
+        return Ok(None);
+    };
+    let computed = hash_range(r, child.data_start, body_end);
+    // Always rewind for the caller, whatever the outcome.
+    r.seek(SeekFrom::Start(body_start))?;
+    Ok(Some(CrcStatus {
+        element_id,
+        stored: child.stored,
+        computed: computed?,
+    }))
+}
+
+/// A leading `CRC-32` child (RFC 8794 §11.3.1) of a master element.
+struct CrcChild {
+    /// The value stored in it.
+    stored: u32,
+    /// Where the data it covers starts: the byte after the child.
+    data_start: u64,
+}
+
+/// Look at the first child of the master whose body is
+/// `[body_start, body_end)`: is it a `CRC-32` element? Reads at most 16
+/// bytes — a master without one (most Clusters) costs nothing more — and
+/// leaves the reader at `body_start`.
+fn peek_crc_child(
+    r: &mut dyn ReadSeek,
+    body_start: u64,
+    body_end: u64,
+) -> Result<Option<CrcChild>> {
     let len = body_end.saturating_sub(body_start);
+    r.seek(SeekFrom::Start(body_start))?;
     // A CRC-32 child is 2 header bytes (id 0xBF + size 0x84) + 4 value
     // bytes. Anything shorter cannot carry one.
     if len < 6 {
-        r.seek(SeekFrom::Start(body_start))?;
         return Ok(None);
     }
+    let mut head = [0u8; 16];
+    let want = len.min(head.len() as u64) as usize;
+    let got = read_fully(r, &mut head[..want]);
     r.seek(SeekFrom::Start(body_start))?;
-    let body = read_bytes(r, len as usize)?;
-    // Always rewind for the caller before returning, regardless of outcome.
-    r.seek(SeekFrom::Start(body_start))?;
-
-    let mut cur = std::io::Cursor::new(&body[..]);
-    let (id, _) = match read_vint(&mut cur, true) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+    let head = &head[..got];
+    let mut cur = std::io::Cursor::new(head);
+    let Ok((id, _)) = read_vint(&mut cur, true) else {
+        return Ok(None);
     };
     if id != ids::CRC32 as u64 {
         return Ok(None);
     }
-    let (size, _) = match read_vint(&mut cur, false) {
-        Ok(v) => v,
-        Err(_) => return Ok(None),
+    // A CRC-32 element is fixed at 4 bytes; a different size is
+    // malformed — treat as "no CRC to check" rather than erroring.
+    let Ok((4, _)) = read_vint(&mut cur, false) else {
+        return Ok(None);
     };
-    if size != 4 {
-        // A CRC-32 element is fixed at 4 bytes; a different size is
-        // malformed — treat as "no CRC to check" rather than erroring.
+    let at = cur.position() as usize;
+    let Some(value) = head.get(at..at + 4) else {
+        return Ok(None);
+    };
+    if at as u64 + 4 > len {
         return Ok(None);
     }
-    let header_len = cur.position() as usize;
-    if header_len + 4 > body.len() {
-        return Ok(None);
-    }
-    let stored = u32::from_le_bytes([
-        body[header_len],
-        body[header_len + 1],
-        body[header_len + 2],
-        body[header_len + 3],
-    ]);
-    let rest = &body[header_len + 4..];
-    let computed = crc32_ieee(rest);
-    Ok(Some(CrcStatus {
-        element_id,
-        stored,
-        computed,
+    Ok(Some(CrcChild {
+        stored: u32::from_le_bytes([value[0], value[1], value[2], value[3]]),
+        data_start: body_start + at as u64 + 4,
     }))
+}
+
+/// IEEE CRC-32 of the input bytes `[start, end)`, read in pieces — the
+/// range is never held in memory. A range the input cannot supply in
+/// full is an error.
+fn hash_range(r: &mut dyn ReadSeek, start: u64, end: u64) -> Result<u32> {
+    r.seek(SeekFrom::Start(start))?;
+    let mut crc = crate::ebml::Crc32::new();
+    let mut left = end.saturating_sub(start);
+    // Whole-window pieces are read straight from the input (no
+    // read-ahead past the range, which the caller is about to leave).
+    let mut buf = vec![0u8; 64 * 1024];
+    while left > 0 {
+        let want = left.min(buf.len() as u64) as usize;
+        let got = read_fully(r, &mut buf[..want]);
+        crc.update(&buf[..got]);
+        left -= got as u64;
+        if got < want {
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("EBML: element ends {left} bytes past the input (CRC-32 check)"),
+            )));
+        }
+    }
+    Ok(crc.finish())
 }
 
 #[derive(Default)]
@@ -9767,6 +9821,8 @@ pub struct MkvDemuxer {
     damage_events_total: u64,
     /// `EncryptedBlock` payload bytes held on the Cluster records.
     encrypted_bytes_kept: u64,
+    /// Bytes of Cluster body read for CRC-32 checks so far.
+    crc_bytes_checked: u64,
 }
 
 /// One Segment (EBML Document) of the input — see
@@ -12287,18 +12343,42 @@ impl MkvDemuxer {
         {
             return Ok(());
         }
-        let status =
-            match validate_top_level_crc(&mut *self.input, ids::CLUSTER, body_start, body_end) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Make sure the reader is at body_start even on error.
-                    self.input.seek(SeekFrom::Start(body_start))?;
-                    return Ok(());
-                }
-            };
+        // A Cluster that says it runs past the Segment is not all there:
+        // nothing to check it against.
+        if body_end > self.segment_data_end {
+            return Ok(());
+        }
+        // Most Clusters carry no CRC-32: this look costs a few bytes that
+        // the walk is about to read anyway.
+        let child = match peek_crc_child(&mut *self.input, body_start, body_end) {
+            Ok(Some(child)) => child,
+            Ok(None) => return Ok(()),
+            Err(_) => {
+                self.input.seek(SeekFrom::Start(body_start))?;
+                return Ok(());
+            }
+        };
+        // Checking reads the Cluster a second time. Honest files have
+        // each byte in one Cluster, so the total stays within the
+        // Segment's size; Clusters forged to overlap could otherwise
+        // have the same bytes hashed once per Cluster header.
+        let len = body_end - body_start;
+        let span = self
+            .segment_data_end
+            .saturating_sub(self.segment_data_start);
+        if self.crc_bytes_checked.saturating_add(len) > span.saturating_mul(2) {
+            return Ok(());
+        }
+        self.crc_bytes_checked += len;
         self.validated_cluster_starts.insert(body_start);
-        if let Some(s) = status {
-            self.crc_status.push(s);
+        let computed = hash_range(&mut *self.input, child.data_start, body_end);
+        self.input.seek(SeekFrom::Start(body_start))?;
+        if let Ok(computed) = computed {
+            self.crc_status.push(CrcStatus {
+                element_id: ids::CLUSTER,
+                stored: child.stored,
+                computed,
+            });
         }
         Ok(())
     }
@@ -13308,7 +13388,11 @@ impl MkvDemuxer {
                         // present (RFC 8794 §11.3.1, RFC 9559 §6.2). The
                         // helper rewinds the reader to `body_start` so the
                         // child-element walk below sees the same bytes.
-                        self.validate_cluster_crc(body_start, body_end, is_unknown_size)?;
+                        self.validate_cluster_crc(
+                            body_start,
+                            body_start.saturating_add(e.size),
+                            is_unknown_size,
+                        )?;
                         self.register_cluster_record(body_start);
                         if self.first_cluster_offset.is_none() && self.segment_index == 0 {
                             // Opened before the writer had produced a
@@ -13337,16 +13421,9 @@ impl MkvDemuxer {
                         self.apply_mid_stream_tags(e.size)?;
                         Ok(())
                     }
-                    ids::CUES | ids::ATTACHMENTS | ids::CHAPTERS => {
-                        // Skip — not packet data.
-                        skip(&mut *self.input, e.size)?;
-                        Ok(())
-                    }
-                    _ => {
-                        // Unknown element at top level — skip it.
-                        skip(&mut *self.input, e.size)?;
-                        Ok(())
-                    }
+                    // Not packet data (Cues / Attachments / Chapters), or
+                    // an element this reader does not know: step over it.
+                    _ => self.step_over(e.size, self.segment_data_end),
                 }
             }
             ClusterState::InCluster {
@@ -13512,11 +13589,36 @@ impl MkvDemuxer {
                         self.input.seek(SeekFrom::Start(pos))?;
                         self.cluster_state = ClusterState::Idle;
                     }
-                    _ => skip(&mut *self.input, e.size)?,
+                    _ => self.step_over(e.size, body_end)?,
                 }
                 Ok(())
             }
         }
+    }
+
+    /// Step over the body (`size` bytes from the reader's position) of
+    /// an element the packet walk does not read.
+    ///
+    /// A resilient reader first checks the size against `parent_end`: an
+    /// element cannot run past its parent, so one that claims to (or
+    /// claims an unknown size, which only Segment and Cluster may) is
+    /// damage — a corrupt size, or bytes that are not an element at all
+    /// — and stepping over it would carry the reader past everything
+    /// that could still be recovered. It is reported as an error
+    /// instead, and the caller resynchronises on the next Cluster.
+    ///
+    /// The strict reader takes the size as written, as it always has.
+    fn step_over(&mut self, size: u64, parent_end: u64) -> Result<()> {
+        if self.resilient {
+            let end = self.input.stream_position()?.saturating_add(size);
+            if size == VINT_UNKNOWN_SIZE || end > parent_end {
+                return Err(Error::invalid(
+                    "MKV: element runs past the end of its parent",
+                ));
+            }
+        }
+        skip(&mut *self.input, size)?;
+        Ok(())
     }
 
     fn parse_block_group(&mut self, end: u64, cluster_timecode: i64) -> Result<()> {
