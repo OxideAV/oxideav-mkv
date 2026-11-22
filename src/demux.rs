@@ -1342,6 +1342,10 @@ fn open_typed_impl(
         max_end_out: 0,
         stream_params_generation: 0,
         incomplete_tail: None,
+        cluster_map: std::collections::BTreeMap::new(),
+        walk_cluster: None,
+        walk_log: Vec::new(),
+        walk_contiguous: false,
         codec_delay_ticks: tracks
             .iter()
             .map(|t| {
@@ -1966,6 +1970,17 @@ const CLUSTER_CHILD_IDS: [u32; 12] = [
 /// Number of leading Cluster children the in-window vet walks.
 const PROBE_VET_CHILDREN: usize = 8;
 
+/// Most Clusters the Cues-less seek remembers (about 3 MiB of map).
+const MAX_CLUSTER_MAP: usize = 65_536;
+
+/// A Cluster the demuxer has seen: where it is, and the (Timestamp,
+/// offset) of the next Cluster when the two were found back to back.
+#[derive(Clone, Copy, Debug)]
+struct KnownCluster {
+    at: ClusterProbe,
+    successor: Option<(u64, u64)>,
+}
+
 /// One confirmed `Cluster` located by a bisection probe.
 #[derive(Clone, Copy, Debug)]
 struct ClusterProbe {
@@ -2249,6 +2264,72 @@ fn probe_cluster_from(
         chunk = (chunk * 2).min(PROBE_CHUNK_MAX);
     }
     Ok(None)
+}
+
+/// What follows a Cluster, as [`walk_to_successor`] found it.
+enum Successor {
+    /// The next Cluster.
+    Cluster(ClusterProbe),
+    /// Nothing before the limit: the Cluster is the last one there.
+    Nothing,
+    /// The walk met something it could not step over.
+    Unknown,
+}
+
+/// Most elements [`walk_to_successor`] steps over.
+const SUCCESSOR_WALK_BUDGET: usize = 65_536;
+
+/// Find the Cluster after `lo` by stepping over `lo`'s children — each
+/// one a header read and a hop over its body — instead of searching
+/// `lo`'s bytes for a Cluster ID. For an unknown-size Cluster that is
+/// the difference between a few hundred small reads and reading the
+/// whole Cluster. Top-Level elements between the two Clusters are
+/// stepped over as well. `limit` bounds the walk (a Cluster starting at
+/// or past it is not looked at).
+fn walk_to_successor(
+    r: &mut dyn ReadSeek,
+    lo: ClusterProbe,
+    limit: u64,
+    end: u64,
+    tolerate_overrun: bool,
+) -> Result<Successor> {
+    r.seek(SeekFrom::Start(lo.offset))?;
+    let Ok(head) = read_element_header(&mut *r) else {
+        return Ok(Successor::Unknown);
+    };
+    if head.id != ids::CLUSTER {
+        return Ok(Successor::Unknown);
+    }
+    let mut pos = r.stream_position()?;
+    if head.size != VINT_UNKNOWN_SIZE {
+        pos = pos.saturating_add(head.size);
+    }
+    for _ in 0..SUCCESSOR_WALK_BUDGET {
+        if pos >= limit.min(end) {
+            return Ok(Successor::Nothing);
+        }
+        r.seek(SeekFrom::Start(pos))?;
+        let Ok(e) = read_element_header(&mut *r) else {
+            return Ok(Successor::Unknown);
+        };
+        if e.id == ids::CLUSTER {
+            return Ok(
+                match vet_cluster_via_reader(r, pos, end, tolerate_overrun)? {
+                    Some(c) => Successor::Cluster(c),
+                    None => Successor::Unknown,
+                },
+            );
+        }
+        if e.size == VINT_UNKNOWN_SIZE {
+            return Ok(Successor::Unknown);
+        }
+        let body = r.stream_position()?;
+        match body.checked_add(e.size) {
+            Some(next) if next <= end => pos = next,
+            _ => return Ok(Successor::Unknown),
+        }
+    }
+    Ok(Successor::Unknown)
 }
 
 /// Byte offset at which an interpolated Cues-less seek probe starts.
@@ -9883,6 +9964,25 @@ pub struct MkvDemuxer {
     /// Offset of the unfinished element the last `next_packet` stopped
     /// in front of — see [`MkvDemuxer::incomplete_tail`].
     incomplete_tail: Option<u64>,
+    /// Clusters of the first Segment met so far — by the Cues-less
+    /// seek's probes and by the packet walk — keyed by (Timestamp,
+    /// offset of the Element ID), each with the key of the Cluster that
+    /// follows it when that is known. A later Cues-less seek starts
+    /// from these instead of searching the file again. Bounded by
+    /// [`MAX_CLUSTER_MAP`].
+    cluster_map: std::collections::BTreeMap<(u64, u64), KnownCluster>,
+    /// The Cluster the packet walk is in (offset of its Element ID, end
+    /// of its body when sized), until its Timestamp is read.
+    walk_cluster: Option<(u64, Option<u64>)>,
+    /// Clusters the packet walk has passed since the last Cues-less
+    /// seek, in walk order; the flag says the entry follows the one
+    /// before it in the file (no seek in between). Appending here keeps
+    /// the walk cheap; a Cues-less seek folds the log into
+    /// `cluster_map`. Only kept for a file without Cues, and bounded by
+    /// [`MAX_CLUSTER_MAP`].
+    walk_log: Vec<(ClusterProbe, bool)>,
+    /// The next logged Cluster follows the previous log entry.
+    walk_contiguous: bool,
     /// Per-stream `CodecDelay` (RFC 9559 §5.1.4.1.25) in this Segment's
     /// ticks, rounded to nearest: what §11.2 subtracts from every Block
     /// timestamp of the track.
@@ -10201,19 +10301,17 @@ impl MkvDemuxer {
         // Find last cue entry for this track with time <= target_ticks.
         // Cues are sorted by (track, time); use a manual scan of the
         // contiguous track block to keep the code obvious and panic-free.
-        let mut best: Option<&CueEntry> = None;
-        for c in self.cues.iter().filter(|c| c.track == track_number) {
-            if c.time <= target_ticks {
-                best = Some(c);
-            } else {
-                break;
-            }
-        }
-        // If target is before the first cue, fall back to the first cue
-        // for this track (seek returns the actual landed pts).
-        if best.is_none() {
-            best = self.cues.iter().find(|c| c.track == track_number);
-        }
+        // The entries are sorted by (track, time): two binary searches
+        // bound the track's rows, a third finds the last one at or
+        // before the target — the first row for a target before it
+        // (seek returns the actual landed pts).
+        let rows = {
+            let start = self.cues.partition_point(|c| c.track < track_number);
+            let end = self.cues.partition_point(|c| c.track <= track_number);
+            &self.cues[start..end]
+        };
+        let at = rows.partition_point(|c| c.time <= target_ticks);
+        let best: Option<&CueEntry> = rows.get(at.saturating_sub(1));
         // Copy the fields out so the immutable borrow of `self.cues` can
         // be released before we re-borrow `self` mutably to drive the
         // input reader.
@@ -10253,11 +10351,22 @@ impl MkvDemuxer {
                             "MKV: no Cues entries for track {track_number} (stream {stream_index})"
                         )));
                     }
+                    // Per indexed track (the rows are sorted by track,
+                    // then time), its last row at or before the target;
+                    // the latest of those.
                     let mut near: Option<&CueEntry> = None;
-                    for c in &self.cues {
-                        if c.time <= target_ticks && near.is_none_or(|n| c.time >= n.time) {
+                    let mut start = 0;
+                    while let Some(first) = self.cues.get(start) {
+                        let track = first.track;
+                        let len = self.cues[start..].partition_point(|c| c.track <= track);
+                        let rows = &self.cues[start..start + len];
+                        let at = rows.partition_point(|c| c.time <= target_ticks);
+                        if let Some(c) = at.checked_sub(1).and_then(|i| rows.get(i))
+                            && near.is_none_or(|n| c.time >= n.time)
+                        {
                             near = Some(c);
                         }
+                        start += len.max(1);
                     }
                     match near.or_else(|| self.cues.iter().min_by_key(|c| c.time)) {
                         Some(c) => (c.time, c.cluster_offset, None, None),
@@ -10699,6 +10808,33 @@ impl MkvDemuxer {
     /// [`MkvDemuxer::set_timestamps_as_written`].
     pub fn timestamps_as_written(&self) -> bool {
         self.timestamps_as_written
+    }
+
+    /// Remember a Cluster of the first Segment, and — when `previous`
+    /// names the Cluster found immediately before it — that the two are
+    /// neighbours.
+    fn learn_cluster(&mut self, at: ClusterProbe, previous: Option<(u64, u64)>) {
+        let key = (at.timestamp, at.offset);
+        if self.cluster_map.len() < MAX_CLUSTER_MAP || self.cluster_map.contains_key(&key) {
+            self.cluster_map.entry(key).or_insert(KnownCluster {
+                at,
+                successor: None,
+            });
+        }
+        if let Some(previous) = previous {
+            self.link_clusters(previous, key);
+        }
+    }
+
+    /// Record that the Cluster `next` directly follows `previous` (both
+    /// must already be known).
+    fn link_clusters(&mut self, previous: (u64, u64), next: (u64, u64)) {
+        if previous.1 < next.1
+            && self.cluster_map.contains_key(&next)
+            && let Some(k) = self.cluster_map.get_mut(&previous)
+        {
+            k.successor = Some(next);
+        }
     }
 
     /// How [`Demuxer::seek_to`] lands — see [`SeekPrecision`]. The
@@ -12798,6 +12934,14 @@ impl MkvDemuxer {
             // linear walk (which also tolerates garbage) give its verdict.
             return self.seek_by_cluster_scan(stream_index, pts);
         };
+        self.learn_cluster(first, None);
+        // What the packet walk passed since the last search.
+        let log = std::mem::take(&mut self.walk_log);
+        let mut previous: Option<(u64, u64)> = None;
+        for (at, follows) in log {
+            self.learn_cluster(at, previous.filter(|_| follows));
+            previous = Some((at.timestamp, at.offset));
+        }
         // Best landing so far: the last confirmed Cluster at or before
         // the target. The first Cluster seeds it so a target before the
         // run lands there (parity with the Cues path's first-cue
@@ -12807,6 +12951,29 @@ impl MkvDemuxer {
         // Timestamp after the target (or `hi_off` is the Segment end).
         let mut hi_off = end;
         let mut hi_ts: Option<u64> = None;
+        // Clusters met before — by earlier seeks or by the packet walk —
+        // tighten both brackets without a read. (They are trusted the
+        // way a probe's findings are: only while they agree with the
+        // storage order the search assumes.)
+        if let Some(known) = self
+            .cluster_map
+            .range(..=(target, u64::MAX))
+            .next_back()
+            .map(|(_, k)| k.at)
+            .filter(|k| k.offset >= lo.offset && k.timestamp >= lo.timestamp)
+        {
+            lo = known;
+        }
+        if let Some(known) = self
+            .cluster_map
+            .range((target.saturating_add(1), 0)..)
+            .next()
+            .map(|(_, k)| k.at)
+            .filter(|k| k.offset > lo.offset)
+        {
+            hi_off = known.offset;
+            hi_ts = Some(known.timestamp);
+        }
         let mut probes: u32 = 0;
         // Interpolation guard: an interpolated probe that fails to at
         // least halve the unexplored range hands the next step to plain
@@ -12814,15 +12981,77 @@ impl MkvDemuxer {
         // bound however uneven the bitrate (or however wrong a declared
         // Duration) is.
         let mut interpolate = true;
+        // The nearest Cluster known above the target (`hi_off` itself
+        // moves below it as probes find stretches without a Cluster).
+        let mut hi_cluster: Option<(u64, u64)> = hi_ts.map(|t| (t, hi_off));
+        // A probe above `lo` found no Cluster: what is left to search
+        // is `lo`'s own body.
+        let mut empty_above_lo = false;
         while target > lo.timestamp {
             // Unexplored byte range: after `lo` (its body end when the
             // size is known, else the byte after its ID — the probe then
             // walks through lo's own body) and before `hi_off`.
             let lo_next = lo.next.unwrap_or_else(|| lo.offset.saturating_add(1));
-            if lo_next >= hi_off || probes >= BISECT_MAX_PROBES {
+            if lo_next >= hi_off {
+                // Everything between `lo` and the Cluster above it has
+                // been looked at: they are neighbours.
+                if let Some(h) = hi_cluster {
+                    self.link_clusters((lo.timestamp, lo.offset), h);
+                }
                 break;
             }
+            if probes >= BISECT_MAX_PROBES {
+                break;
+            }
+            // The Cluster after `lo` is already known: no read.
+            if let Some(next) = self
+                .cluster_map
+                .get(&(lo.timestamp, lo.offset))
+                .and_then(|k| k.successor)
+                .and_then(|key| self.cluster_map.get(&key))
+                .map(|k| k.at)
+                .filter(|n| n.offset > lo.offset && n.timestamp >= lo.timestamp)
+            {
+                if next.offset >= hi_off || next.timestamp > target {
+                    // `lo` is the last Cluster at or before the target.
+                    break;
+                }
+                lo = next;
+                empty_above_lo = false;
+                continue;
+            }
             probes += 1;
+            // An unknown-size `lo` with nothing found above it: step
+            // through its children to the Cluster that follows instead
+            // of reading its body for a Cluster ID — far fewer bytes,
+            // but one small read per Block, the same kind of reading
+            // the key-frame pass does next. `SeekPrecision::Index`, the
+            // mode for transports that bill each positioned read, keeps
+            // the few large reads.
+            if lo.next.is_none() && empty_above_lo && self.seek_precision == SeekPrecision::KeyFrame
+            {
+                match walk_to_successor(&mut *self.input, lo, hi_off, end, tolerate_overrun)? {
+                    Successor::Cluster(c)
+                        if c.offset > lo.offset && c.timestamp >= lo.timestamp =>
+                    {
+                        self.learn_cluster(c, Some((lo.timestamp, lo.offset)));
+                        if c.timestamp > target {
+                            break;
+                        }
+                        lo = c;
+                        empty_above_lo = false;
+                        continue;
+                    }
+                    Successor::Nothing => {
+                        if let Some(h) = hi_cluster {
+                            self.link_clusters((lo.timestamp, lo.offset), h);
+                        }
+                        break;
+                    }
+                    // Not walkable (or out of order): search as before.
+                    _ => {}
+                }
+            }
             let gap = hi_off - lo_next;
             // Narrow gaps: step forward from `lo`, so the last Cluster(s)
             // between `lo` and `hi` are read in order (the element at a
@@ -12862,9 +13091,15 @@ impl MkvDemuxer {
             )? {
                 None => {
                     if from == lo_next {
-                        // Nothing after `lo` before `hi`: `lo` is the landing.
+                        // Nothing after `lo` before `hi`: `lo` is the
+                        // landing, and `hi` (when it is a Cluster) the
+                        // one that follows it.
+                        if let Some(h) = hi_cluster {
+                            self.link_clusters((lo.timestamp, lo.offset), h);
+                        }
                         break;
                     }
+                    empty_above_lo = true;
                     // `[from, hi_off)` holds no Cluster — the answer, if
                     // any, is in `[lo_next, from)`.
                     hi_off = from;
@@ -12878,11 +13113,16 @@ impl MkvDemuxer {
                         // walk it.
                         return self.seek_by_cluster_scan(stream_index, pts);
                     }
+                    // A scan that started right behind `lo` found the
+                    // Cluster that follows it.
+                    self.learn_cluster(c, (from == lo_next).then_some((lo.timestamp, lo.offset)));
                     if c.timestamp <= target {
                         lo = c;
+                        empty_above_lo = false;
                     } else {
                         hi_off = c.offset;
                         hi_ts = Some(c.timestamp);
+                        hi_cluster = Some((c.timestamp, c.offset));
                     }
                 }
             }
@@ -12999,6 +13239,10 @@ impl MkvDemuxer {
     /// seek.
     fn reset_after_seek(&mut self) {
         self.cluster_state = ClusterState::Idle;
+        // The walk resumes somewhere else: its next Cluster does not
+        // follow the last one it read.
+        self.walk_cluster = None;
+        self.walk_contiguous = false;
         self.out_queue.clear();
         self.last_block_additions = None;
         self.last_block_group_meta = None;
@@ -13553,6 +13797,13 @@ impl MkvDemuxer {
                             is_unknown_size,
                         )?;
                         self.register_cluster_record(body_start);
+                        self.walk_cluster = (self.segment_index == 0
+                            && self.cues.is_empty()
+                            && self.walk_log.len() < MAX_CLUSTER_MAP)
+                            .then_some((
+                                pos,
+                                (!is_unknown_size).then_some(body_start.saturating_add(e.size)),
+                            ));
                         if self.first_cluster_offset.is_none() && self.segment_index == 0 {
                             // Opened before the writer had produced a
                             // Cluster: this is the first one.
@@ -13629,6 +13880,17 @@ impl MkvDemuxer {
                         } = self.cluster_state
                         {
                             *cluster_timecode = v;
+                        }
+                        // What the walk passes, a later Cues-less seek
+                        // need not search for.
+                        if let Some((offset, next)) = self.walk_cluster.take() {
+                            let at = ClusterProbe {
+                                offset,
+                                timestamp: v.max(0) as u64,
+                                next,
+                            };
+                            self.walk_log.push((at, self.walk_contiguous));
+                            self.walk_contiguous = true;
                         }
                     }
                     ids::POSITION => {

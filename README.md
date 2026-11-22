@@ -2567,6 +2567,59 @@ every element through as before (one write per element, a position
 query per Block), for a sink that must see each element at once in a
 non-live layout. The default is the faster one.
 
+### Seeks, measured (r494)
+
+The bench also times `seek_to` plus the first packet after it: 2000
+targets in a fixed pseudo-random order over the file, resilient path.
+Same machine, shared with four other builds; medians of three bench
+runs.
+
+| file | index | before | after | |
+|------|-------|--------|-------|---|
+| A/V, 141.6 MiB, 24 Clusters | Cues | 76 µs | 71 µs | |
+| A/V, 141.6 MiB, 24 Clusters | none (live layout) | 10 146 µs | 105 µs | 97× |
+| one Block per Cluster, 200 000 Clusters | Cues | 62–69 µs | 1.8–2.1 µs | 33× |
+| one Block per Cluster, 200 000 Clusters | none | 490 µs | 226 µs | 2.2× |
+
+What was wrong, worst first:
+
+- **Without Cues, every seek searched the file again**, and the last
+  step — from the Cluster below the target to the one after it — read
+  that whole Cluster looking for the next Cluster ID when Clusters have
+  no size (a live capture: megabytes per seek). The demuxer now keeps a
+  map of the Clusters it has met (found by seeks, or passed by the
+  packet walk — at most 65 536 entries, about 3 MiB), with their
+  neighbours, so a later seek starts from the nearest known Clusters
+  and often needs no read at all; and the last step walks the Cluster's
+  children (a header read and a hop each) instead of reading its body.
+  On a 194 MiB live capture with 5-second Clusters of 22 KiB frames, a
+  first seek reads 10–17 MiB (it was 15–26 MiB) and a repeat of it
+  0.1–1.7 MiB (it was 15–26 MiB again). The walk is one small read per
+  Block; `SeekPrecision::Index`, the mode for transports that bill each
+  positioned read, keeps the few large reads instead.
+- **With Cues, every seek scanned the whole index**: a linear pass over
+  the entries of all tracks to find the track's last entry at or before
+  the target. The entries are sorted by (track, time); three binary
+  searches do it. 200 000 CuePoints: 62 µs → 2 µs per seek.
+- The muxer indexed one key frame per Cluster and track. RFC 9559 §22.1
+  asks for every video key frame, every subtitle frame, and audio "once
+  every 500 milliseconds at most"; it now writes that, so a reader that
+  seeks by the index alone lands on the right key frame instead of the
+  first of a 5-second Cluster.
+
+A `CRC-32`-checked Cluster costs a second pass at the CRC's speed; that
+pass now takes sixteen bytes per step instead of eight (74 → 68 ms on
+the 141.6 MiB file with every Cluster checksummed, about 2.5 GiB/s for
+the checksum itself).
+
+Throughput elsewhere is where the previous round left it (this round's
+medians, same bench: mux → file 26–29 ms, demux ← file 10–13 ms, demux
+← memory 3.4–4.4 ms, open with 200 000 CuePoints 24–27 ms); the sized
+Clusters and the measured `Duration` cost one 8-byte patch per Cluster
+and two at the end. Peak memory for a full copy of a 194 MiB file
+(`examples/remux`): 7.1 MiB resident, 4.3 MiB for the live-layout
+source.
+
 ## Bounds on hostile input
 
 - **Sizes before allocation.** Every element body is read through a

@@ -281,23 +281,34 @@ impl Crc32 {
     pub(crate) fn update(&mut self, data: &[u8]) {
         let t = crc_tables();
         let mut crc = self.register;
-        // Eight input bytes per step: the register is folded into the
-        // first four, and each of the eight bytes then contributes the
+        // Sixteen input bytes per step: the register is folded into the
+        // first four, and each of the sixteen bytes then contributes the
         // register it would leave behind after the bytes that follow it
-        // in the group — which is what `t[k]` tabulates.
-        let (groups, tail) = data.as_chunks::<8>();
+        // in the group — which is what `t[k]` tabulates. The lookups of
+        // one step do not depend on each other, so the processor runs
+        // them side by side; only the fold is serial, once per sixteen
+        // bytes.
+        let (groups, rest) = data.as_chunks::<16>();
         for g in groups {
             let lo = crc ^ u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
-            crc = t[7][(lo & 0xFF) as usize]
-                ^ t[6][((lo >> 8) & 0xFF) as usize]
-                ^ t[5][((lo >> 16) & 0xFF) as usize]
-                ^ t[4][(lo >> 24) as usize]
-                ^ t[3][g[4] as usize]
-                ^ t[2][g[5] as usize]
-                ^ t[1][g[6] as usize]
-                ^ t[0][g[7] as usize];
+            crc = t[15][(lo & 0xFF) as usize]
+                ^ t[14][((lo >> 8) & 0xFF) as usize]
+                ^ t[13][((lo >> 16) & 0xFF) as usize]
+                ^ t[12][(lo >> 24) as usize]
+                ^ t[11][g[4] as usize]
+                ^ t[10][g[5] as usize]
+                ^ t[9][g[6] as usize]
+                ^ t[8][g[7] as usize]
+                ^ t[7][g[8] as usize]
+                ^ t[6][g[9] as usize]
+                ^ t[5][g[10] as usize]
+                ^ t[4][g[11] as usize]
+                ^ t[3][g[12] as usize]
+                ^ t[2][g[13] as usize]
+                ^ t[1][g[14] as usize]
+                ^ t[0][g[15] as usize];
         }
-        for &b in tail {
+        for &b in rest {
             crc = t[0][((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
         }
         self.register = crc;
@@ -312,11 +323,11 @@ impl Crc32 {
 /// bytes, starting from a zero register. `t[0]` is the usual
 /// byte-at-a-time table; each further one is the previous advanced by
 /// one zero byte. Built on first use from the polynomial alone.
-fn crc_tables() -> &'static [[u32; 256]; 8] {
+fn crc_tables() -> &'static [[u32; 256]; 16] {
     use std::sync::OnceLock;
-    static TABLES: OnceLock<[[u32; 256]; 8]> = OnceLock::new();
+    static TABLES: OnceLock<[[u32; 256]; 16]> = OnceLock::new();
     TABLES.get_or_init(|| {
-        let mut t = [[0u32; 256]; 8];
+        let mut t = [[0u32; 256]; 16];
         for (n, slot) in t[0].iter_mut().enumerate() {
             let mut c = n as u32;
             for _ in 0..8 {
@@ -328,7 +339,7 @@ fn crc_tables() -> &'static [[u32; 256]; 8] {
             }
             *slot = c;
         }
-        for k in 1..8 {
+        for k in 1..16 {
             for n in 0..256 {
                 let prev = t[k - 1][n];
                 t[k][n] = t[0][(prev & 0xFF) as usize] ^ (prev >> 8);

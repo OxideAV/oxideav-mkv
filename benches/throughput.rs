@@ -311,6 +311,38 @@ fn drain(dmx: &mut dyn Demuxer) -> (u64, u64) {
     }
 }
 
+/// Time `seek_to` + the first packet after it, over 2000 targets spread
+/// across `duration_ms` in a fixed pseudo-random order, on the resilient
+/// path (which also seeks the live shape, by Cluster search).
+fn bench_seeks(label: &str, path: &std::path::Path, duration_ms: u64) {
+    const SEEKS: u64 = 2000;
+    let mut runs_ = Vec::new();
+    let mut strategy = None;
+    for _ in 0..runs() {
+        let f = std::fs::File::open(path).unwrap();
+        let mut dmx =
+            oxideav_mkv::demux::open_resilient_typed(Box::new(f), &NullCodecResolver).unwrap();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let t = Instant::now();
+        for _ in 0..SEEKS {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let target = (x % duration_ms.max(1)) as i64;
+            let landed = dmx.seek_to(0, target).unwrap();
+            assert!(landed <= target);
+            let p = dmx.next_packet().unwrap();
+            std::hint::black_box(p);
+        }
+        runs_.push(t.elapsed());
+        strategy = dmx.seek_strategy();
+    }
+    println!(
+        "{label:<44} {:>9.2} us/seek  ({strategy:?})",
+        median(runs_).as_secs_f64() * 1e6 / SEEKS as f64
+    );
+}
+
 fn report(label: &str, t: Duration, bytes: u64, packets: u64) {
     let s = t.as_secs_f64();
     println!(
@@ -372,6 +404,19 @@ fn main() {
         assert_eq!(sink.take().len() as u64, total);
     }
     report("mux -> memory", median(to_mem), total, n_packets);
+    // The same packets in the live layout: a file without an index,
+    // for the Cluster-search seeks below.
+    let live_path = path.with_extension("live.mkv");
+    {
+        let f = std::fs::File::create(&live_path).unwrap();
+        let mut mux = MkvMuxer::new_matroska(Box::new(f), &av_streams()).unwrap();
+        mux.with_live_streaming().unwrap();
+        mux.write_header().unwrap();
+        for p in &packets {
+            mux.write_packet(p).unwrap();
+        }
+        mux.write_trailer().unwrap();
+    }
     drop(packets);
 
     // --- demux -------------------------------------------------------
@@ -397,6 +442,11 @@ fn main() {
     }
     report("demux <- memory", median(from_mem), total, n_packets);
     drop(file_bytes);
+    // Seeks on the A/V file: through its Cues, and with the index
+    // ignored (the Cluster search of a file that has none).
+    bench_seeks("  seek, A/V file", &path, seconds * 1000);
+    bench_seeks("  seek, A/V file, no index", &live_path, seconds * 1000);
+    let _ = std::fs::remove_file(&live_path);
     let _ = std::fs::remove_file(&path);
     bench_bounded(seconds, &path);
 
@@ -456,6 +506,7 @@ fn main() {
             bytes.len() as u64,
             clusters,
         );
+        bench_seeks("  seek, one block per Cluster", &path, clusters * 20);
     }
     let _ = std::fs::remove_file(&path);
 }

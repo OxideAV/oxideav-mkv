@@ -137,6 +137,19 @@ writes:
 
 ### Performance
 
+- Cues-less seeks keep a map of the Clusters met so far (by seeks and
+  by the packet walk) and step from an unsized Cluster to its successor
+  through its children instead of reading its body: 10.1 ms → 0.1 ms
+  per seek on a 141.6 MiB live-layout file, 490 µs → 226 µs at 200 000
+  one-Block Clusters.
+- Cues seeks find the track's entry by binary search instead of a pass
+  over the whole index: 62 µs → 2 µs per seek at 200 000 CuePoints.
+- The muxer indexes every video key frame and audio every 500 ms
+  (RFC 9559 §22.1) instead of one entry per Cluster and track.
+- CRC-32 takes sixteen bytes per step (about 10 % on a checksummed
+  Cluster).
+- The bench times seeks (`seek, …` rows).
+
 - Demuxer and muxer go through an in-memory window / buffer with a
   self-tracked position (`src/bufio.rs`) instead of issuing one system
   call per EBML octet group, position query and short hop; Block

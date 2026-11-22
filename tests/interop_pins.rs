@@ -790,3 +790,99 @@ fn a_track_the_index_does_not_list_can_be_sought() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// Index density, and seeks without an index
+// ---------------------------------------------------------------------
+
+#[test]
+fn the_index_lists_every_video_key_frame_and_audio_every_half_second() {
+    let streams = [stream(0, video("ffv1")), stream(1, audio("ac3"))];
+    let mut packets = Vec::new();
+    // 4 s in one Cluster: a video key frame every 400 ms, audio every
+    // 32 ms.
+    for ms in (0..4000).step_by(8) {
+        if ms % 40 == 0 {
+            packets.push(packet(0, ms, None, ms % 400 == 0, vec![1; 20]));
+        }
+        if ms % 32 == 0 {
+            packets.push(packet(1, ms, None, true, vec![2; 10]));
+        }
+    }
+    let bytes = mux_with(&streams, |_| {}, &packets);
+    let dmx = open(bytes);
+    let times = |track: u64| -> Vec<u64> {
+        dmx.cue_points()
+            .iter()
+            .filter(|c| c.track_positions.iter().any(|t| t.track == track))
+            .map(|c| c.time)
+            .collect()
+    };
+    // RFC 9559 §22.1: each key frame of a video track ...
+    assert_eq!(times(1), (0..4000).step_by(400).collect::<Vec<u64>>());
+    // ... and audio "once every 500 milliseconds at most".
+    let audio_cues = times(2);
+    assert_eq!(audio_cues[0], 0);
+    assert!(audio_cues.windows(2).all(|w| w[1] - w[0] >= 500));
+    assert!(audio_cues.windows(2).all(|w| w[1] - w[0] < 532));
+    assert_eq!(audio_cues.len(), 8);
+}
+
+#[test]
+fn repeated_seeks_without_an_index_land_the_same_and_read_less() {
+    // Counts the bytes the demuxer asks its input for.
+    struct Counting(Cursor<Vec<u8>>, Arc<Mutex<u64>>);
+    impl std::io::Read for Counting {
+        fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(b)?;
+            *self.1.lock().unwrap() += n as u64;
+            Ok(n)
+        }
+    }
+    impl std::io::Seek for Counting {
+        fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(p)
+        }
+    }
+    // A live-layout file: no Cues, unsized Clusters of 1 s, each 200 KiB.
+    let packets: Vec<Packet> = (0..400)
+        .map(|i| packet(0, i * 50, None, i % 5 == 0, vec![i as u8; 10_000]))
+        .collect();
+    let bytes = mux_with(
+        &[stream(0, video("ffv1"))],
+        |m| {
+            m.with_live_streaming().unwrap();
+            m.with_cluster_limits(1000, 64 << 20).unwrap();
+        },
+        &packets,
+    );
+    let read = Arc::new(Mutex::new(0u64));
+    let rs: Box<dyn ReadSeek> = Box::new(Counting(Cursor::new(bytes), read.clone()));
+    let mut dmx = open_resilient_typed(rs, &NullCodecResolver).unwrap();
+    let targets = [19_990i64, 3_120, 11_000, 15_260, 7_777, 240];
+    let pass = |dmx: &mut MkvDemuxer| -> (Vec<(i64, Option<i64>)>, u64) {
+        let before = *read.lock().unwrap();
+        let landings = targets
+            .iter()
+            .map(|&t| {
+                let landed = dmx.seek_to(0, t).unwrap();
+                (landed, dmx.next_packet().unwrap().pts)
+            })
+            .collect();
+        (landings, *read.lock().unwrap() - before)
+    };
+    let (first, first_bytes) = pass(&mut dmx);
+    let (second, second_bytes) = pass(&mut dmx);
+    // The last key frame at or before each target (one every 250 ms).
+    let want: Vec<(i64, Option<i64>)> = targets
+        .iter()
+        .map(|t| (t / 250 * 250, Some(t / 250 * 250)))
+        .collect();
+    assert_eq!(first, want);
+    assert_eq!(second, want);
+    // The second pass starts from the Clusters the first one found.
+    assert!(
+        second_bytes * 2 < first_bytes,
+        "first pass read {first_bytes} bytes, second {second_bytes}"
+    );
+}

@@ -65,6 +65,10 @@ pub fn open_webm(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<B
     MkvMuxer::new(output, streams, DocType::Webm).map(|m| Box::new(m) as Box<dyn Muxer>)
 }
 
+/// Least spacing of an audio track's CuePoints inside a Cluster (RFC
+/// 9559 §22.1: "once every 500 milliseconds at most").
+const AUDIO_CUE_SPACING_MS: i64 = 500;
+
 /// The EBML unknown-size marker in its 8-octet form (RFC 8794 §6.2: all
 /// VINT_DATA bits set). Readers in the field recognise this width; the
 /// 1-octet `0xFF` is refused by at least one widely used player.
@@ -738,6 +742,8 @@ pub struct MkvMuxer {
     /// reset whenever a new cluster opens. Keeps us from emitting a Cue
     /// for every keyframe in a cluster when the first is enough.
     cue_seen_in_cluster: Vec<bool>,
+    /// Block timestamp (ms) of each stream's last CuePoint.
+    last_cue_ms: Vec<Option<i64>>,
     /// Number of `Block` / `SimpleBlock` elements written to the currently
     /// open Cluster so far. Reset to `0` when a new Cluster opens; the next
     /// block written takes number `cluster_block_count + 1` (RFC 9559
@@ -3419,6 +3425,7 @@ impl MkvMuxer {
             cluster_size_abs: None,
             cues: Vec::new(),
             cue_seen_in_cluster: vec![false; n],
+            last_cue_ms: vec![None; n],
             cluster_block_count: 0,
             seek_cues_entry_offset: 0,
             seek_head_written: false,
@@ -8053,13 +8060,26 @@ impl MkvMuxer {
         let is_subtitle = media_type == MediaType::Subtitle;
         // Subtitle tracks index every frame; others index only once per
         // cluster (gated by `cue_seen_in_cluster`).
-        let dedup_allows = is_subtitle || !self.cue_seen_in_cluster[stream_idx];
+        // RFC 9559 §22.1: every key frame of a video track and every
+        // subtitle frame SHOULD have a CuePoint; audio is referenced
+        // "once every 500 milliseconds at most" — here the first Block
+        // of the track in each Cluster, and any Block half a second or
+        // more after the track's last CuePoint.
+        let dedup_allows = is_subtitle
+            || media_type == MediaType::Video
+            || !self.cue_seen_in_cluster[stream_idx]
+            || self.last_cue_ms[stream_idx].is_none_or(|t| pts_ms - t >= AUDIO_CUE_SPACING_MS);
         if dedup_allows {
             let indexable = match media_type {
                 MediaType::Video => packet.flags.keyframe,
                 _ => true,
             };
-            if indexable && (self.lacing_mode == LacingMode::None || group.is_some()) {
+            // Written right here: every Block outside the lacing buffer
+            // (which holds audio only).
+            let written_now = self.lacing_mode == LacingMode::None
+                || group.is_some()
+                || media_type != MediaType::Audio;
+            if indexable && written_now {
                 // Non-lacing path (and the BlockGroup-with-additions
                 // path, which always writes immediately): the block
                 // lands at `pre_block_pos`, emit the cue now with the
@@ -8081,6 +8101,7 @@ impl MkvMuxer {
                     duration_ms: cue_duration_ms,
                 });
                 self.cue_seen_in_cluster[stream_idx] = true;
+                self.last_cue_ms[stream_idx] = Some(pts_ms);
             }
             // Lacing path: cue emission happens in `flush_lace` once we
             // actually know where the (possibly laced) block lands.
@@ -8755,6 +8776,7 @@ impl MkvMuxer {
                     duration_ms: None,
                 });
                 self.cue_seen_in_cluster[stream_idx] = true;
+                self.last_cue_ms[stream_idx] = Some(pts_ms as i64);
             }
         }
         let block_bytes = build_simple_block(track_number, tc_offset, keyframe, mode, &frames);
