@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/OxideAV/oxideav-mkv/compare/v0.0.12...v0.0.13) - 2026-11-22
+
+### Other
+
+- Cues-less seeks learn the Cluster run, Cues seeks binary-search; index per RFC 9559 §22.1
+- Seek tracks the Cues do not list; matrix seeks and remux chain; tool-free pins
+- Ours -> foreign audit: sized Segment/Clusters, measured Duration, BlockDuration, lacing, remux helpers; live matrix test
+- Foreign-file audit: PCM depths, CodecDelay timestamps, discard flag, ProRes frames, 13 CodecIDs
+- elements overrunning their parent are damage; CRC probe and resync scan stop re-reading
+- mux_roundtrip target and streaming seeds; three fixes they found
+- buffered EBML I/O, single-copy Block payloads; bounds on retained state
+- seek lands on the track's key frame; priming and trim for trait consumers
+- concatenated Segments, growing files, lace timestamps; throughput bench
+- interpolated probe placement for the Cues-less seek ([#9](https://github.com/OxideAV/oxideav-mkv/pull/9))
+- API hygiene: #[non_exhaustive] on growable enums + every public record, with_* setters / constructors / Default
+
 ### Fixed
 
 Found by reading files a black-box muxer wrote (the foreign-file matrix):
