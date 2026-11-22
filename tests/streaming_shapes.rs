@@ -1075,9 +1075,19 @@ fn codec_delay_pre_roll_and_discard_padding_reach_the_consumer() {
             &BlockGroupOptions::default().with_discard_padding(Some(13_500_000)),
         )
         .unwrap();
-        // A frame that is padding from end to end.
+        // Padding as long as the stated duration: §5.1.3.5.3 does not
+        // say whether the duration counts the padding, so the frame is
+        // not declared silent.
         mux.write_packet_with_block_group(
             &packet(3),
+            &BlockGroupOptions::default().with_discard_padding(Some(20_000_000)),
+        )
+        .unwrap();
+        // A frame that is padding from end to end: nothing of it lasts.
+        let mut silent = packet(4);
+        silent.duration = Some(0);
+        mux.write_packet_with_block_group(
+            &silent,
             &BlockGroupOptions::default().with_discard_padding(Some(20_000_000)),
         )
         .unwrap();
@@ -1116,7 +1126,8 @@ fn codec_delay_pre_roll_and_discard_padding_reach_the_consumer() {
             (0, None, false, (0, 0)),
             (20, None, false, (0, 0)),
             (40, Some(20), false, (0, 648)),
-            (60, Some(20), true, (0, 960)),
+            (60, Some(20), false, (0, 960)),
+            (80, Some(0), true, (0, 960)),
         ]
     );
 }

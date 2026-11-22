@@ -1954,11 +1954,25 @@ to register every codec the build enables.
 Matroska `CodecID` string <-> oxideav `CodecId`. Both directions are
 implemented for roundtrip:
 
-- Audio: `A_FLAC`, `A_OPUS`, `A_VORBIS`, `A_PCM/INT/LIT`,
-  `A_PCM/INT/BIG`, `A_PCM/FLOAT/IEEE`, `A_AAC` (+ `MPEG4/LC` /
-  `MPEG2/LC` aliases), `A_MPEG/L3`, `A_AC3`, `A_EAC3`.
+- Audio: `A_FLAC`, `A_OPUS`, `A_VORBIS`, `A_AAC` (+ `MPEG4/LC` /
+  `MPEG2/LC` aliases), `A_MPEG/L3`, `A_MPEG/L2`, `A_MPEG/L1`, `A_AC3`,
+  `A_EAC3`, `A_DTS`, `A_TRUEHD`, `A_MLP`, `A_ALAC` (CodecPrivate = the
+  24-byte `ALACSpecificConfig`, passed as stored).
+- PCM: `A_PCM/INT/LIT`, `A_PCM/INT/BIG` and `A_PCM/FLOAT/IEEE` name a
+  coding and byte order; the track's `BitDepth` selects the codec id —
+  `pcm_u8` / `pcm_s16le` / `pcm_s24le` / `pcm_s32le`, `pcm_s16be` /
+  `pcm_s24be` / `pcm_s32be`, `pcm_f32le` / `pcm_f64le` — and the muxer
+  always writes that `BitDepth`. (Up to 0.0.12 every `A_PCM/INT/LIT`
+  track read as `pcm_s16le` whatever its depth.)
 - Video: `V_VP8`, `V_VP9`, `V_AV1`, `V_MPEG4/ISO/AVC`,
-  `V_MPEGH/ISO/HEVC`, `V_FFV1`, `V_THEORA`.
+  `V_MPEGH/ISO/HEVC`, `V_MPEG4/ISO/ASP` (also `SP` / `AP` on read; the
+  CodecID as read stays on `params.tag` and is written back),
+  `V_MPEG4/MS/V3`, `V_MPEG1`, `V_MPEG2`, `V_MJPEG`, `V_PRORES`,
+  `V_FFV1`, `V_THEORA`, `V_DIRAC`, `V_SNOW`; `V_UNCOMPRESSED` reads as
+  `rawvideo` (the layout is `video_uncompressed_fourcc`).
+- `V_PRORES` Blocks hold a ProRes frame from `frame_header()` on; the
+  demuxer puts the `frame_size` / `'icpf'` head (SMPTE RDD 36 §5.1)
+  back so a packet is a whole `frame()`, and the muxer removes it.
 - Compatibility modes (demux): `V_MS/VFW/FOURCC` resolves through the
   BITMAPINFOHEADER `biCompression` FourCC and `A_MS/ACM` through the
   WAVEFORMATEX `wFormatTag` (the SubFormat's legacy tag for
@@ -1969,7 +1983,10 @@ implemented for roundtrip:
   `mkv:acm:0xHHHH` (PCM / A-law / µ-law / `FFV1` / 24-bit `BI_RGB`
   map without a registry).
 - Subtitle: `S_TEXT/UTF8` (subrip), `S_TEXT/SSA`, `S_TEXT/ASS`,
-  `S_TEXT/WEBVTT`, `S_TEXT/USF`, `S_VOBSUB` (DVD), `S_HDMV/PGS` /
+  `S_TEXT/WEBVTT`, the WebM carriage `D_WEBVTT/SUBTITLES` / `CAPTIONS` /
+  `DESCRIPTIONS` / `METADATA` (codec id `webvtt`, the CodecID kept on
+  `params.tag`; a Block is the cue identifier line, the cue settings
+  line, then the payload), `S_TEXT/USF`, `S_VOBSUB` (DVD), `S_HDMV/PGS` /
   `S_HDMV/TEXTST` (Blu-ray), `S_DVBSUB`, `S_KATE`. Subtitle tracks
   surface with `MediaType::Subtitle`; their payload bytes pass through
   unchanged.
@@ -1988,17 +2005,25 @@ the muxer is opened):
    through the compatibility track with that FourCC / tag — so a remux
    of a track no codec claimed is lossless;
 4. `V_MS/VFW/FOURCC` (CodecPrivate = 40-byte `BITMAPINFOHEADER` +
-   extradata) for Motion JPEG (`MJPG`), Cinepak (`CVID`), HuffYUV
-   (`HFYU`), Lagarith (`LAGS`), 24-bit `BI_RGB` (`rgb24`), and any video
-   stream tagged with a FourCC; `A_MS/ACM` (CodecPrivate =
-   `WAVEFORMATEX` + `cbSize` extradata) for `pcm_u8` / `pcm_s24le` /
-   `pcm_s32le` / `pcm_f64le` / A-law / µ-law and any audio stream tagged
-   with a `wFormatTag`.
+   extradata) for Cinepak (`CVID`), HuffYUV (`HFYU`), Lagarith (`LAGS`),
+   24-bit `BI_RGB` (`rgb24`), and any video stream tagged with a FourCC;
+   `A_MS/ACM` (CodecPrivate = `WAVEFORMATEX` + `cbSize` extradata) for
+   `pcm_s64le` / A-law / µ-law and any audio stream tagged with a
+   `wFormatTag`.
+
+A `CodecTag::Matroska` naming one of the CodecIDs kept on read (the
+`D_WEBVTT/*` and `V_MPEG4/ISO/*` ids) comes before rule 1, provided it
+still maps to the stream's codec id.
+
+Not mapped, for want of a staged description of their CodecPrivate /
+Block layout (they read as `mkv:<CodecID>` and remux losslessly):
+`A_TTA1`, `A_WAVPACK4`, `A_REAL/*`, `V_REAL/*`, `V_QUICKTIME`,
+`A_QUICKTIME`.
 
 Anything else is refused with `Error::Unsupported` at open — earlier
 releases wrote an unregistered `X_<codec id>` that no reader resolved
 (files carrying one still read back as `<codec id>`). Pinned by the
-49-row mux → demux → remux matrix in `tests/codec_id_matrix.rs`; the
+64-row mux → demux → remux matrix in `tests/codec_id_matrix.rs`; the
 MJPEG / 24-bit PCM / A-law files it writes decode identically to their
 sources in `ffmpeg`.
 
@@ -2255,10 +2280,32 @@ and `track:<stream>:seek_pre_roll_ns` when the file states a non-zero
 value, next to the typed `TrackCodecTiming` (`priming_samples(rate)`,
 `seek_pre_roll_samples(rate)`). `DiscardPadding` stays on
 `block_group_meta()` (`trim_samples(rate)` gives the samples to drop
-from the start and the end of the Block), and a Block whose
-`DiscardPadding` covers its whole `BlockDuration` comes out with
-`PacketFlags::discard` set. Packet timestamps are the Block timestamps
-as written; subtracting `CodecDelay` (§11.2) is left to the consumer.
+from the start and the end of the Block). `PacketFlags::discard` is set
+only on a Block with `DiscardPadding` and a `BlockDuration` of 0: the
+RFC does not say whether `BlockDuration` counts the padding, and writers
+store the duration left after the trim (a last 20 ms Opus packet with
+13.5 ms of padding carries `BlockDuration` 7), so "padding at least as
+long as the duration" does not mean "nothing to play".
+
+## Packet timestamps and `CodecDelay`
+
+RFC 9559 §11.2: "When a CodecDelay element is set, its value MUST be
+subtracted from each Block timestamp of that track." A packet's `pts` /
+`dts` are therefore the Block timestamp minus the track's `CodecDelay`
+(rounded to the nearest tick of the stream time base) — the time the
+frame is played at. The first packets of an Opus / AAC / MP3 track
+usually come out slightly negative: content the decoder needs but that
+is not played. `seek_to` targets and landings are in the same terms.
+The muxer is the inverse: a Block is stamped `pts + CodecDelay` for a
+track written with a `CodecDelay` (Opus from the `OpusHead` pre-skip, or
+`set_track_codec_timing`), so the `pts` a caller writes is the `pts`
+any reader reports.
+
+`MkvDemuxer::set_timestamps_as_written(true)` and
+`MkvMuxer::set_timestamps_as_written(true)` switch either side to the
+Block timestamps as stored (what releases up to 0.0.12 did). Tracks
+without `CodecDelay` are the same in both readings. `Cues`, chapter and
+`BlockGroup` records always speak Block timestamps.
 
 ## Robustness
 

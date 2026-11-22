@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+Found by reading files a black-box muxer wrote (the foreign-file matrix):
+
+- Native PCM tracks read under the wrong codec id: `A_PCM/INT/LIT`
+  was `pcm_s16le` and `A_PCM/INT/BIG` `pcm_s16be` whatever the track's
+  `BitDepth`, `A_PCM/FLOAT/IEEE` always `pcm_f32le`. The depth now
+  selects `pcm_u8` / `pcm_s24le` / `pcm_s32le` / `pcm_s24be` /
+  `pcm_s32be` / `pcm_f64le`; the muxer writes those ids natively (with
+  `BitDepth`) instead of through `A_MS/ACM`. A 64-bit integer
+  `WAVEFORMATEX` reads as `pcm_s64le`.
+- Packet timestamps on a track with `CodecDelay` were the Block
+  timestamps; RFC 9559 §11.2 requires the delay to be subtracted. The
+  demuxer now subtracts it (packets, `seek_to` targets and landings),
+  the muxer adds it, and `set_timestamps_as_written(true)` on either
+  side restores the stored reading.
+- `PacketFlags::discard` was set on any Block whose `DiscardPadding`
+  reached its `BlockDuration` — which is every trimmed last packet a
+  writer stores with the duration left after the trim, so audible audio
+  was flagged as silent. Only a `BlockDuration` of 0 with padding sets
+  the flag now.
+- `V_PRORES` packets lacked the `frame_size` / `'icpf'` head of a
+  ProRes `frame()` (SMPTE RDD 36 §5.1), which the Block does not store:
+  rebuilt on read, removed on write.
+- CodecIDs that read as an unusable `mkv:<CodecID>`: `V_MPEG4/ISO/ASP`
+  / `SP` / `AP`, `V_MPEG4/MS/V3`, `V_MJPEG`, `V_PRORES`, `V_DIRAC`,
+  `V_SNOW`, `V_UNCOMPRESSED`, `A_MPEG/L2`, `A_MPEG/L1`, `A_ALAC`,
+  `A_MLP`, and the WebM WebVTT ids `D_WEBVTT/<kind>`. All but
+  `V_UNCOMPRESSED` are written too; Motion JPEG is written as
+  `V_MJPEG` instead of a `V_MS/VFW/FOURCC` track.
+
 ### Added
 
 - Concatenated Segments (RFC 9559 §4.5 / §23.2, RFC 8794 §9): the packet

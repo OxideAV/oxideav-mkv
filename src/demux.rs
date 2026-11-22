@@ -15,7 +15,9 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::codec_id::{ACM_CODEC_ID, AcmFormat, VFW_CODEC_ID, from_matroska, strip_compat_header};
+use crate::codec_id::{
+    ACM_CODEC_ID, AcmFormat, VFW_CODEC_ID, from_matroska_track, strip_compat_header,
+};
 use crate::ebml::{
     VINT_UNKNOWN_SIZE, read_bytes, read_element_header, read_float, read_int, read_string,
     read_uint, read_vint, skip,
@@ -629,8 +631,9 @@ fn open_typed_impl(
             }
             codec_id = codecs.resolve_tag(&wf_ctx);
         }
-        let codec_id =
-            codec_id.unwrap_or_else(|| from_matroska(&t.codec_id_string, &t.codec_private));
+        let codec_id = codec_id.unwrap_or_else(|| {
+            from_matroska_track(&t.codec_id_string, &t.codec_private, t.bit_depth)
+        });
         let mut params = match t.track_type {
             ids::TRACK_TYPE_VIDEO => CodecParameters::video(codec_id.clone()),
             ids::TRACK_TYPE_AUDIO => CodecParameters::audio(codec_id.clone()),
@@ -666,6 +669,11 @@ fn open_typed_impl(
             params.tag = Some(CodecTag::fourcc(&fcc));
         } else if let Some(f) = &acm {
             params.tag = Some(CodecTag::wave_format(f.format_tag));
+        } else if crate::codec_id::keeps_codec_id_tag(&t.codec_id_string) {
+            // CodecIDs that say more than the codec id does (the WebM
+            // WebVTT Block layout and kind, the MPEG-4 Part 2 profile)
+            // stay readable, and a remux writes them back.
+            params.tag = Some(CodecTag::matroska(t.codec_id_string.clone()));
         }
         if t.track_type == ids::TRACK_TYPE_AUDIO {
             params.sample_rate = Some(t.sample_rate.round() as u32);
@@ -715,8 +723,8 @@ fn open_typed_impl(
             }
             params.sample_format = match (params.codec_id.as_str(), t.bit_depth) {
                 ("pcm_u8", _) => Some(SampleFormat::U8),
-                ("pcm_s24le", _) => Some(SampleFormat::S24),
-                ("pcm_s32le", _) => Some(SampleFormat::S32),
+                ("pcm_s24le" | "pcm_s24be", _) => Some(SampleFormat::S24),
+                ("pcm_s32le" | "pcm_s32be", _) => Some(SampleFormat::S32),
                 ("pcm_f64le", _) => Some(SampleFormat::F64),
                 ("pcm_s16le", _) => Some(SampleFormat::S16),
                 ("pcm_s16be", _) => Some(SampleFormat::S16),
@@ -1247,6 +1255,10 @@ fn open_typed_impl(
         last_virtual_origin: None,
         content_encodings,
         header_strip_prefixes,
+        prores_streams: tracks
+            .iter()
+            .map(|t| t.codec_id_string == "V_PRORES")
+            .collect(),
         video_interlacings,
         video_geometries,
         video_colours,
@@ -1309,6 +1321,15 @@ fn open_typed_impl(
         max_end_out: 0,
         stream_params_generation: 0,
         incomplete_tail: None,
+        codec_delay_ticks: tracks
+            .iter()
+            .map(|t| {
+                let ns = t.codec_timing_raw.0.unwrap_or(0);
+                let scale = timecode_scale_ns.max(1);
+                i64::try_from(ns.saturating_add(scale / 2) / scale).unwrap_or(0)
+            })
+            .collect(),
+        timestamps_as_written: false,
         seek_precision: SeekPrecision::default(),
         active_streams: None,
         damage_events_total,
@@ -9610,6 +9631,10 @@ pub struct MkvDemuxer {
     /// encryption — in which case packets pass through encoded). See
     /// [`compute_header_strip_prefix`].
     header_strip_prefixes: Vec<Vec<u8>>,
+    /// Streams carried under `V_PRORES`, whose Blocks hold a ProRes
+    /// frame without its `frame_size` / `frame_identifier` head — see
+    /// [`crate::codec_id::prores_frame_from_block`].
+    prores_streams: Vec<bool>,
     /// Per-stream `VideoInterlacing` (RFC 9559 §5.1.4.1.28.1 +
     /// §5.1.4.1.28.2), indexed by stream index. `None` for non-video tracks
     /// and for video tracks whose `TrackEntry` carried no `Video` master —
@@ -9810,6 +9835,13 @@ pub struct MkvDemuxer {
     /// Offset of the unfinished element the last `next_packet` stopped
     /// in front of — see [`MkvDemuxer::incomplete_tail`].
     incomplete_tail: Option<u64>,
+    /// Per-stream `CodecDelay` (RFC 9559 §5.1.4.1.25) in this Segment's
+    /// ticks, rounded to nearest: what §11.2 subtracts from every Block
+    /// timestamp of the track.
+    codec_delay_ticks: Vec<i64>,
+    /// `true`: packets carry the Block timestamps as written — see
+    /// [`MkvDemuxer::set_timestamps_as_written`].
+    timestamps_as_written: bool,
     /// Landing rule of `seek_to` — see [`MkvDemuxer::set_seek_precision`].
     seek_precision: SeekPrecision,
     /// Per-stream "the consumer reads this stream" flags from
@@ -9986,7 +10018,13 @@ impl Demuxer for MkvDemuxer {
                 self.last_block_additions = q.additions;
                 self.last_block_group_meta = q.meta;
                 self.last_virtual_origin = q.origin;
-                return Ok(q.packet);
+                let mut packet = q.packet;
+                let delay = self.codec_delay_of(packet.stream_index);
+                if delay != 0 {
+                    packet.pts = packet.pts.map(|t| t.saturating_sub(delay));
+                    packet.dts = packet.dts.map(|t| t.saturating_sub(delay));
+                }
+                return Ok(packet);
             }
             let before = self
                 .input
@@ -10054,11 +10092,16 @@ impl Demuxer for MkvDemuxer {
     }
 
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        // Targets and landings are packet timestamps: §11.2 puts them
+        // `CodecDelay` before the Block timestamps the index speaks in.
+        let delay = self.codec_delay_of(stream_index);
+        let pts = pts.saturating_add(delay);
         let landed = self.seek_by_index(stream_index, pts)?;
-        match self.seek_precision {
-            SeekPrecision::Index => Ok(landed),
-            SeekPrecision::KeyFrame => Ok(self.refine_to_key_frame(stream_index, pts, landed)),
-        }
+        let landed = match self.seek_precision {
+            SeekPrecision::Index => landed,
+            SeekPrecision::KeyFrame => self.refine_to_key_frame(stream_index, pts, landed),
+        };
+        Ok(landed.saturating_sub(delay))
     }
 }
 
@@ -10540,6 +10583,47 @@ impl MkvDemuxer {
             }
         }
         best
+    }
+
+    /// What RFC 9559 §11.2 subtracts from the Block timestamps of
+    /// `stream_index`, in stream time base ticks; 0 while
+    /// [`set_timestamps_as_written`](Self::set_timestamps_as_written)
+    /// is on.
+    fn codec_delay_of(&self, stream_index: u32) -> i64 {
+        if self.timestamps_as_written {
+            return 0;
+        }
+        self.codec_delay_ticks
+            .get(stream_index as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Choose between the two readings of a packet timestamp on a track
+    /// with a `CodecDelay` (RFC 9559 §5.1.4.1.25).
+    ///
+    /// `false` (the default): `pts` / `dts` are the Block timestamp
+    /// minus the track's `CodecDelay`, as §11.2 requires ("its value
+    /// MUST be subtracted from each Block timestamp of that track") —
+    /// the time the frame is played at. The first packets of such a
+    /// track may come out with a negative timestamp: content that is
+    /// decoded but not played. `seek_to` targets and landings are in
+    /// the same terms.
+    ///
+    /// `true`: the Block timestamps exactly as stored, for a consumer
+    /// that applies `CodecDelay` itself (`track:<n>:codec_delay_ns` in
+    /// `metadata()`, [`TrackCodecTiming::codec_delay`]).
+    ///
+    /// Tracks without `CodecDelay` are not affected. The delay is
+    /// rounded to the nearest tick of the stream time base.
+    pub fn set_timestamps_as_written(&mut self, as_written: bool) {
+        self.timestamps_as_written = as_written;
+    }
+
+    /// The reading in effect — see
+    /// [`MkvDemuxer::set_timestamps_as_written`].
+    pub fn timestamps_as_written(&self) -> bool {
+        self.timestamps_as_written
     }
 
     /// How [`Demuxer::seek_to`] lands — see [`SeekPrecision`]. The
@@ -13821,15 +13905,18 @@ impl MkvDemuxer {
             i64::try_from(ns.saturating_add(scale / 2) / scale).ok()
         });
         let chain = self.chain;
-        // `DiscardPadding` (§5.1.3.5.7) covering the Block's whole stated
-        // duration: nothing of it is to be presented.
-        let all_padding = match (&meta, explicit_duration) {
-            (Some(m), Some(d)) if d > 0 => m.discard_padding.is_some_and(|pad| {
-                let scale = chain.map_or(self.timecode_scale_ns, |c| c.scale_ns);
-                pad.unsigned_abs() as u128 >= d as u128 * scale as u128
-            }),
-            _ => false,
-        };
+        // `DiscardPadding` (§5.1.3.5.7) on a Block whose `BlockDuration`
+        // is 0: nothing of it is to be presented. A non-zero
+        // `BlockDuration` at or below the padding does not say that —
+        // §5.1.3.5.3 does not state whether the duration counts the
+        // padding, and writers put the duration left after the trim
+        // there (a last Opus packet of 20 ms with 13.5 ms of padding is
+        // written with `BlockDuration` 7). Such a Block keeps its
+        // audible part; the trim stays on `block_group_meta()`.
+        let all_padding = explicit_duration == Some(0)
+            && meta
+                .as_ref()
+                .is_some_and(|m| m.discard_padding.is_some_and(|pad| pad != 0));
         let emit = |d: &mut Self, i: usize, f: Vec<u8>| {
             let pts = pts_base.saturating_add(per_frame.unwrap_or(0).saturating_mul(i as i64));
             // A chained Segment's ticks go onto the first Segment's
@@ -13854,7 +13941,11 @@ impl MkvDemuxer {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             let frame_bytes = if strip_prefix.is_empty() {
-                f
+                if d.prores_streams.get(stream_idx as usize) == Some(&true) {
+                    crate::codec_id::prores_frame_from_block(f)
+                } else {
+                    f
+                }
             } else {
                 let mut restored = Vec::with_capacity(strip_prefix.len() + f.len());
                 restored.extend_from_slice(strip_prefix);

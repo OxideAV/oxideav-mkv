@@ -125,12 +125,25 @@ fn matrix() -> Vec<Case> {
             .fmt(SampleFormat::S16),
         case("opus", Audio, "A_OPUS").extra(&opus_head()),
         case("vorbis", Audio, "A_VORBIS").extra(&[2, 30, 7, 1, b'v', b'o']),
+        // Native PCM: one CodecID per coding and byte order, the
+        // sample width in BitDepth (written even when the stream states
+        // no sample format).
+        case("pcm_u8", Audio, "A_PCM/INT/LIT").fmt(SampleFormat::U8),
         case("pcm_s16le", Audio, "A_PCM/INT/LIT").fmt(SampleFormat::S16),
+        case("pcm_s24le", Audio, "A_PCM/INT/LIT").fmt(SampleFormat::S24),
+        case("pcm_s32le", Audio, "A_PCM/INT/LIT").fmt(SampleFormat::S32),
         case("pcm_s16be", Audio, "A_PCM/INT/BIG").fmt(SampleFormat::S16),
+        case("pcm_s24be", Audio, "A_PCM/INT/BIG"),
+        case("pcm_s32be", Audio, "A_PCM/INT/BIG"),
         case("pcm_f32le", Audio, "A_PCM/FLOAT/IEEE").fmt(SampleFormat::F32),
+        case("pcm_f64le", Audio, "A_PCM/FLOAT/IEEE").fmt(SampleFormat::F64),
         // AAC-LC, 48 kHz, stereo AudioSpecificConfig.
         case("aac", Audio, "A_AAC").extra(&[0x11, 0x90]),
         case("mp3", Audio, "A_MPEG/L3"),
+        case("mp2", Audio, "A_MPEG/L2"),
+        case("mp1", Audio, "A_MPEG/L1"),
+        case("alac", Audio, "A_ALAC").extra(&[0, 0, 0x10, 0, 0, 0x10, 0x28, 0x0a]),
+        case("mlp", Audio, "A_MLP"),
         case("ac3", Audio, "A_AC3"),
         case("eac3", Audio, "A_EAC3"),
         case("dts", Audio, "A_DTS"),
@@ -144,12 +157,27 @@ fn matrix() -> Vec<Case> {
         case("h264", Video, "V_MPEG4/ISO/AVC").extra(&[1, 0x64, 0, 0x1F, 0xFF, 0xE0, 0]),
         case("h265", Video, "V_MPEGH/ISO/HEVC").extra(&[1, 2, 3, 4]),
         case("ffv1", Video, "V_FFV1").extra(&[3, 0, 0, 0]),
+        case("mpeg4video", Video, "V_MPEG4/ISO/ASP").extra(&[0, 0, 1, 0xB0, 0xF5]),
+        // A profile-named MPEG-4 Part 2 CodecID read from a file is
+        // written back as read.
+        case("mpeg4video", Video, "V_MPEG4/ISO/SP")
+            .tag(CodecTag::matroska("V_MPEG4/ISO/SP"))
+            .extra(&[0, 0, 1, 0xB0, 0x01]),
+        case("msmpeg4v3", Video, "V_MPEG4/MS/V3"),
+        case("mjpeg", Video, "V_MJPEG"),
+        case("prores", Video, "V_PRORES"),
+        case("dirac", Video, "V_DIRAC"),
+        case("snow", Video, "V_SNOW"),
         case("theora", Video, "V_THEORA").extra(&[2, 42, 9, 0x80, b't', b'h']),
         // Native subtitles.
         case("subrip", Subtitle, "S_TEXT/UTF8"),
         case("ssa", Subtitle, "S_TEXT/SSA").extra(b"[Script Info]\n"),
         case("ass", Subtitle, "S_TEXT/ASS").extra(b"[Script Info]\n"),
         case("webvtt", Subtitle, "S_TEXT/WEBVTT").extra(b"WEBVTT\n"),
+        // The WebM carriage of WebVTT keeps its CodecID through a remux.
+        case("webvtt", Subtitle, "D_WEBVTT/SUBTITLES")
+            .tag(CodecTag::matroska("D_WEBVTT/SUBTITLES")),
+        case("webvtt", Subtitle, "D_WEBVTT/CAPTIONS").tag(CodecTag::matroska("D_WEBVTT/CAPTIONS")),
         case("usf", Subtitle, "S_TEXT/USF"),
         case("dvd_subtitle", Subtitle, "S_VOBSUB").extra(b"size: 720x480\n"),
         case("hdmv_pgs_subtitle", Subtitle, "S_HDMV/PGS"),
@@ -157,7 +185,6 @@ fn matrix() -> Vec<Case> {
         case("dvb_subtitle", Subtitle, "S_DVBSUB").extra(&[0, 1, 0, 2]),
         case("kate", Subtitle, "S_KATE").extra(&[1, 2, 3]),
         // VFW compatibility track (docs/container/vfw FourCCs).
-        case("mjpeg", Video, "V_MS/VFW/FOURCC").tag(CodecTag::fourcc(b"MJPG")),
         case("cinepak", Video, "V_MS/VFW/FOURCC").tag(CodecTag::fourcc(b"CVID")),
         case("huffyuv", Video, "V_MS/VFW/FOURCC")
             .extra(&[0x02, 0x18, 0x00, 0x00])
@@ -175,18 +202,7 @@ fn matrix() -> Vec<Case> {
             .tag(CodecTag::fourcc(b"ZZ9A"))
             .extra(&[9, 8, 7]),
         // ACM compatibility track.
-        case("pcm_u8", Audio, "A_MS/ACM")
-            .fmt(SampleFormat::U8)
-            .tag(CodecTag::wave_format(0x0001)),
-        case("pcm_s24le", Audio, "A_MS/ACM")
-            .fmt(SampleFormat::S24)
-            .tag(CodecTag::wave_format(0x0001)),
-        case("pcm_s32le", Audio, "A_MS/ACM")
-            .fmt(SampleFormat::S32)
-            .tag(CodecTag::wave_format(0x0001)),
-        case("pcm_f64le", Audio, "A_MS/ACM")
-            .fmt(SampleFormat::F64)
-            .tag(CodecTag::wave_format(0x0003)),
+        case("pcm_s64le", Audio, "A_MS/ACM").tag(CodecTag::wave_format(0x0001)),
         case("pcm_alaw", Audio, "A_MS/ACM").tag(CodecTag::wave_format(0x0006)),
         case("pcm_mulaw", Audio, "A_MS/ACM").tag(CodecTag::wave_format(0x0007)),
         case("acmonly", Audio, "A_MS/ACM")
@@ -204,7 +220,7 @@ fn matrix() -> Vec<Case> {
             .extra(&[0, 0, 0, 8])
             .reads_as("mkv:V_QUICKTIME"),
         case("mkv:V_QUICKTIME", Video, "V_QUICKTIME").extra(&[0, 0, 0, 8]),
-        case("mkv:A_MPEG/L2", Audio, "A_MPEG/L2"),
+        case("mkv:A_TTA1", Audio, "A_TTA1"),
     ]
 }
 
@@ -218,6 +234,13 @@ fn packets(c: &Case) -> Vec<Packet> {
                 .collect();
             if c.codec == "opus" {
                 data[0] = 0xF8;
+            }
+            if c.codec == "prores" {
+                // A ProRes frame(): frame_size, 'icpf', then the rest.
+                let mut frame = ((data.len() + 8) as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(b"icpf");
+                frame.extend_from_slice(&data);
+                data = frame;
             }
             Packet::new(0, TimeBase::new(1, 1000), data)
                 .with_pts(i * 20)
@@ -326,33 +349,33 @@ fn every_written_codec_reads_back_under_its_registered_codec_id() {
         checked += 1;
     }
     assert_eq!(checked, rows.len());
-    assert!(checked >= 49, "matrix shrank to {checked} rows");
+    assert!(checked >= 64, "matrix shrank to {checked} rows");
 }
 
 #[test]
 fn plan_names_the_compatibility_header_fields() {
-    let mut p = CodecParameters::video(CodecId::new("mjpeg"));
+    let mut p = CodecParameters::video(CodecId::new("cinepak"));
     p.width = Some(320);
     p.height = Some(240);
     let plan = plan_track_codec(&p).unwrap();
     assert_eq!(
         plan,
         TrackCodec::Vfw {
-            fourcc: *b"MJPG",
+            fourcc: *b"CVID",
             bit_count: 24
         }
     );
-    let bih = oxideav_mkv::codec_id::bitmapinfoheader(*b"MJPG", 24, &p);
+    let bih = oxideav_mkv::codec_id::bitmapinfoheader(*b"CVID", 24, &p);
     assert_eq!(bih.len(), 40);
     assert_eq!(&bih[0..4], &40u32.to_le_bytes()); // biSize
     assert_eq!(&bih[4..8], &320i32.to_le_bytes());
     assert_eq!(&bih[8..12], &240i32.to_le_bytes());
     assert_eq!(&bih[12..14], &1u16.to_le_bytes()); // biPlanes
     assert_eq!(&bih[14..16], &24u16.to_le_bytes());
-    assert_eq!(&bih[16..20], b"MJPG");
+    assert_eq!(&bih[16..20], b"CVID");
     assert_eq!(&bih[20..24], &(320u32 * 3 * 240).to_le_bytes());
 
-    let mut a = CodecParameters::audio(CodecId::new("pcm_s24le"));
+    let mut a = CodecParameters::audio(CodecId::new("pcm_s64le"));
     a.sample_rate = Some(48_000);
     a.channels = Some(2);
     let plan = plan_track_codec(&a).unwrap();
@@ -371,9 +394,9 @@ fn plan_names_the_compatibility_header_fields() {
             &1u16.to_le_bytes()[..],
             &2u16.to_le_bytes(),
             &48_000u32.to_le_bytes(),
-            &(48_000u32 * 6).to_le_bytes(),
-            &6u16.to_le_bytes(),
-            &24u16.to_le_bytes(),
+            &(48_000u32 * 16).to_le_bytes(),
+            &16u16.to_le_bytes(),
+            &64u16.to_le_bytes(),
             &0u16.to_le_bytes(),
         ]
         .concat()

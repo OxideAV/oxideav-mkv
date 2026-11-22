@@ -43,10 +43,17 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "A_FLAC" => "flac",
         "A_OPUS" => "opus",
         "A_VORBIS" => "vorbis",
+        // Without a `BitDepth` the PCM ids name their 16-bit / 32-bit
+        // float layouts; [`from_matroska_track`] picks the id the
+        // track's `BitDepth` selects.
         "A_PCM/INT/LIT" => "pcm_s16le",
         "A_PCM/INT/BIG" => "pcm_s16be",
         "A_PCM/FLOAT/IEEE" => "pcm_f32le",
         "A_AAC" => "aac",
+        "A_MPEG/L2" => "mp2",
+        "A_MPEG/L1" => "mp1",
+        "A_ALAC" => "alac",
+        "A_MLP" => "mlp",
         // The deprecated profile-specific AAC ids (Matroska codec
         // mappings) — all AAC; the profile feeds a synthesised
         // AudioSpecificConfig when CodecPrivate is absent.
@@ -72,6 +79,15 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "V_MPEG2" => "mpeg2video",
         "V_MPEG4/ISO/AVC" => "h264",
         "V_MPEGH/ISO/HEVC" => "h265",
+        // MPEG-4 Part 2 under its three profile-named ids; the muxer
+        // writes the `ASP` one.
+        "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/AP" => "mpeg4video",
+        "V_MPEG4/MS/V3" => "msmpeg4v3",
+        "V_MJPEG" => "mjpeg",
+        "V_PRORES" => "prores",
+        "V_DIRAC" => "dirac",
+        "V_SNOW" => "snow",
+        "V_UNCOMPRESSED" => "rawvideo",
         "V_FFV1" => "ffv1",
         "V_THEORA" => "theora",
         // Files written by oxideav-mkv up to 0.0.11 carried every codec
@@ -93,6 +109,12 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         "S_TEXT/SSA" => "ssa",
         "S_TEXT/ASS" => "ass",
         "S_TEXT/WEBVTT" => "webvtt",
+        // WebM carriage of WebVTT (docs/container/webm, "WebVTT
+        // Guidelines"): `D_WEBVTT/<kind>`, each Block holding the cue
+        // identifier line, the cue settings line and the cue payload.
+        // The CodecID stays on `params.tag` so a consumer can tell the
+        // two Block layouts apart.
+        s if is_webm_webvtt(s) => "webvtt",
         "S_TEXT/USF" => "usf",
         "S_VOBSUB" => "dvd_subtitle",
         "S_HDMV/PGS" => "hdmv_pgs_subtitle",
@@ -102,6 +124,109 @@ pub fn from_matroska(s: &str, codec_private: &[u8]) -> CodecId {
         other => return CodecId::new(format!("mkv:{other}")),
     };
     CodecId::new(id)
+}
+
+/// The four WebM WebVTT CodecIDs (docs/container/webm, "Storing WebVTT
+/// data in a WebM Track"): `D_WEBVTT/` + SUBTITLES / CAPTIONS /
+/// DESCRIPTIONS / METADATA.
+pub fn is_webm_webvtt(matroska_codec_id: &str) -> bool {
+    matches!(
+        matroska_codec_id,
+        "D_WEBVTT/SUBTITLES" | "D_WEBVTT/CAPTIONS" | "D_WEBVTT/DESCRIPTIONS" | "D_WEBVTT/METADATA"
+    )
+}
+
+/// `true` for the CodecIDs the demuxer keeps on `params.tag` (as
+/// [`CodecTag::Matroska`]) because they state more than the codec id
+/// they map to: the WebM WebVTT ids, whose Block layout differs from
+/// `S_TEXT/WEBVTT`, and the MPEG-4 Part 2 profile ids.
+pub fn keeps_codec_id_tag(matroska_codec_id: &str) -> bool {
+    is_webm_webvtt(matroska_codec_id)
+        || matches!(
+            matroska_codec_id,
+            "V_MPEG4/ISO/SP" | "V_MPEG4/ISO/ASP" | "V_MPEG4/ISO/AP"
+        )
+}
+
+/// `frame_identifier` of a ProRes frame (SMPTE RDD 36 §6.1).
+const PRORES_FRAME_IDENTIFIER: [u8; 4] = *b"icpf";
+
+/// Rebuild the ProRes `frame()` (SMPTE RDD 36 §5.1) a `V_PRORES` Block
+/// carries. The Block starts at `frame_header()`: the two elements
+/// before it — `frame_size`, "the total size of the compressed frame in
+/// bytes (including the frame_size element itself)", and the
+/// `frame_identifier` `'icpf'` — are not stored and follow from the
+/// Block length. A Block that already starts with them is returned
+/// unchanged.
+pub fn prores_frame_from_block(block: Vec<u8>) -> Vec<u8> {
+    if block.get(4..8) == Some(&PRORES_FRAME_IDENTIFIER[..]) {
+        return block;
+    }
+    let Ok(frame_size) = u32::try_from(block.len() + 8) else {
+        return block;
+    };
+    let mut frame = Vec::with_capacity(block.len() + 8);
+    frame.extend_from_slice(&frame_size.to_be_bytes());
+    frame.extend_from_slice(&PRORES_FRAME_IDENTIFIER);
+    frame.extend_from_slice(&block);
+    frame
+}
+
+/// The part of a ProRes `frame()` a `V_PRORES` Block stores: everything
+/// after `frame_size` and `frame_identifier` (inverse of
+/// [`prores_frame_from_block`]). Data that does not start with a
+/// `frame_size` equal to its length followed by `'icpf'` is returned
+/// whole.
+pub fn prores_block_from_frame(frame: &[u8]) -> &[u8] {
+    match (frame.get(..4), frame.get(4..8)) {
+        (Some(size), Some(id))
+            if id == PRORES_FRAME_IDENTIFIER
+                && u32::from_be_bytes([size[0], size[1], size[2], size[3]]) as usize
+                    == frame.len() =>
+        {
+            &frame[8..]
+        }
+        _ => frame,
+    }
+}
+
+/// The native PCM CodecIDs: `(codec id, CodecID, BitDepth)`. One
+/// CodecID names a sample coding and byte order; the track's `BitDepth`
+/// (RFC 9559 §5.1.4.1.29.4) selects the sample width. 8-bit integer
+/// PCM is unsigned, wider integer PCM signed two's complement.
+pub const PCM_CODEC_IDS: &[(&str, &str, u16)] = &[
+    ("pcm_u8", "A_PCM/INT/LIT", 8),
+    ("pcm_s16le", "A_PCM/INT/LIT", 16),
+    ("pcm_s24le", "A_PCM/INT/LIT", 24),
+    ("pcm_s32le", "A_PCM/INT/LIT", 32),
+    ("pcm_s16be", "A_PCM/INT/BIG", 16),
+    ("pcm_s24be", "A_PCM/INT/BIG", 24),
+    ("pcm_s32be", "A_PCM/INT/BIG", 32),
+    ("pcm_f32le", "A_PCM/FLOAT/IEEE", 32),
+    ("pcm_f64le", "A_PCM/FLOAT/IEEE", 64),
+];
+
+/// `BitDepth` a native PCM codec id is written with, or `None` when
+/// `id` is not one of [`PCM_CODEC_IDS`].
+pub fn pcm_bit_depth(id: &CodecId) -> Option<u16> {
+    PCM_CODEC_IDS
+        .iter()
+        .find(|(c, _, _)| *c == id.as_str())
+        .map(|(_, _, bits)| *bits)
+}
+
+/// [`from_matroska`] with the track's `BitDepth` (0 = not stated): a
+/// native PCM CodecID resolves to the codec id of that sample width
+/// (`A_PCM/INT/LIT` + 24 → `pcm_s24le`). Other ids, a missing depth and
+/// a depth the table does not list resolve as [`from_matroska`] does.
+pub fn from_matroska_track(s: &str, codec_private: &[u8], bit_depth: u64) -> CodecId {
+    if let Some((id, _, _)) = PCM_CODEC_IDS
+        .iter()
+        .find(|(_, m, bits)| *m == s && u64::from(*bits) == bit_depth)
+    {
+        return CodecId::new(*id);
+    }
+    from_matroska(s, codec_private)
 }
 
 /// Prefix of the unregistered `X_<codec id>` CodecIDs earlier releases
@@ -235,6 +360,7 @@ fn from_bitmapinfoheader(cp: &[u8]) -> CodecId {
     }
     match &fourcc {
         b"FFV1" => return CodecId::new("ffv1"),
+        b"MJPG" | b"mjpg" => return CodecId::new("mjpeg"),
         // BI_RGB (0): uncompressed 24-bit RGB is the one layout with a
         // conventional fleet id (mirrors the AVI demuxer).
         [0, 0, 0, 0] if cp.get(14..16) == Some(&24u16.to_le_bytes()[..]) => {
@@ -267,6 +393,7 @@ fn from_waveformatex(cp: &[u8]) -> CodecId {
         (0x0001, 8) => "pcm_u8",
         (0x0001, 24) => "pcm_s24le",
         (0x0001, 32) => "pcm_s32le",
+        (0x0001, 64) => "pcm_s64le",
         (0x0001, _) => "pcm_s16le",
         (0x0003, 64) => "pcm_f64le",
         (0x0003, _) => "pcm_f32le",
@@ -306,11 +433,15 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "flac" => "A_FLAC",
         "opus" => "A_OPUS",
         "vorbis" => "A_VORBIS",
-        "pcm_s16le" => "A_PCM/INT/LIT",
-        "pcm_s16be" => "A_PCM/INT/BIG",
-        "pcm_f32le" => "A_PCM/FLOAT/IEEE",
+        "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" => "A_PCM/INT/LIT",
+        "pcm_s16be" | "pcm_s24be" | "pcm_s32be" => "A_PCM/INT/BIG",
+        "pcm_f32le" | "pcm_f64le" => "A_PCM/FLOAT/IEEE",
         "aac" => "A_AAC",
         "mp3" => "A_MPEG/L3",
+        "mp2" => "A_MPEG/L2",
+        "mp1" => "A_MPEG/L1",
+        "alac" => "A_ALAC",
+        "mlp" => "A_MLP",
         "ac3" => "A_AC3",
         "eac3" => "A_EAC3",
         // DTS family — see notes on `A_DTS` in `from_matroska`. The Matroska
@@ -327,6 +458,12 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "mpeg2video" => "V_MPEG2",
         "h264" => "V_MPEG4/ISO/AVC",
         "h265" => "V_MPEGH/ISO/HEVC",
+        "mpeg4video" => "V_MPEG4/ISO/ASP",
+        "msmpeg4v3" => "V_MPEG4/MS/V3",
+        "mjpeg" => "V_MJPEG",
+        "prores" => "V_PRORES",
+        "dirac" => "V_DIRAC",
+        "snow" => "V_SNOW",
         "ffv1" => "V_FFV1",
         "theora" => "V_THEORA",
         "subrip" => "S_TEXT/UTF8",
@@ -349,7 +486,6 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
 /// here is one docs/container/vfw names for that codec; the demuxer maps
 /// them back without a registry.
 pub const VFW_FOURCCS: &[(&str, [u8; 4])] = &[
-    ("mjpeg", *b"MJPG"),
     ("cinepak", *b"CVID"),
     ("huffyuv", *b"HFYU"),
     ("lagarith", *b"LAGS"),
@@ -360,10 +496,7 @@ pub const VFW_FOURCCS: &[(&str, [u8; 4])] = &[
 /// exact inverses of the depth-aware names the demuxer gives an
 /// unclaimed WAVEFORMATEX.
 const ACM_FORMATS: &[(&str, u16, u16)] = &[
-    ("pcm_u8", 0x0001, 8),
-    ("pcm_s24le", 0x0001, 24),
-    ("pcm_s32le", 0x0001, 32),
-    ("pcm_f64le", 0x0003, 64),
+    ("pcm_s64le", 0x0001, 64),
     ("pcm_alaw", 0x0006, 8),
     ("pcm_mulaw", 0x0007, 8),
 ];
@@ -474,6 +607,15 @@ fn stated_bits(params: &CodecParameters) -> u16 {
 /// stream instead of producing a file no reader resolves.
 pub fn plan_track_codec(params: &CodecParameters) -> Result<TrackCodec> {
     let id = params.codec_id.as_str();
+    // A CodecID the demuxer kept because it says more than the codec id
+    // ([`keeps_codec_id_tag`]) is written back as read, provided it
+    // still names this stream's codec.
+    if let Some(CodecTag::Matroska(s)) = &params.tag
+        && keeps_codec_id_tag(s)
+        && from_matroska(s, &[]) == params.codec_id
+    {
+        return Ok(TrackCodec::Verbatim(s.clone()));
+    }
     if let Some(native) = to_matroska(&params.codec_id) {
         return Ok(TrackCodec::Native(native));
     }
@@ -671,6 +813,84 @@ mod tests {
         assert_eq!(from_matroska("A_TRUEHD", &[]).as_str(), "truehd");
         assert_eq!(to_matroska(&CodecId::new("dts")), Some("A_DTS"));
         assert_eq!(to_matroska(&CodecId::new("truehd")), Some("A_TRUEHD"));
+    }
+
+    /// A native PCM CodecID names coding and byte order; BitDepth
+    /// selects the width, and each codec id is written back under the
+    /// CodecID and depth it reads from.
+    #[test]
+    fn pcm_codec_ids_follow_the_bit_depth() {
+        let read = |id: &str, bits: u64| from_matroska_track(id, &[], bits);
+        assert_eq!(read("A_PCM/INT/LIT", 8).as_str(), "pcm_u8");
+        assert_eq!(read("A_PCM/INT/LIT", 16).as_str(), "pcm_s16le");
+        assert_eq!(read("A_PCM/INT/LIT", 24).as_str(), "pcm_s24le");
+        assert_eq!(read("A_PCM/INT/LIT", 32).as_str(), "pcm_s32le");
+        assert_eq!(read("A_PCM/INT/BIG", 24).as_str(), "pcm_s24be");
+        assert_eq!(read("A_PCM/INT/BIG", 32).as_str(), "pcm_s32be");
+        assert_eq!(read("A_PCM/FLOAT/IEEE", 64).as_str(), "pcm_f64le");
+        // No BitDepth, or one the table does not list: the CodecID's
+        // base layout.
+        assert_eq!(read("A_PCM/INT/LIT", 0).as_str(), "pcm_s16le");
+        assert_eq!(read("A_PCM/FLOAT/IEEE", 0).as_str(), "pcm_f32le");
+        assert_eq!(read("A_PCM/INT/BIG", 20).as_str(), "pcm_s16be");
+        for (id, matroska, bits) in PCM_CODEC_IDS {
+            let cid = CodecId::new(*id);
+            assert_eq!(to_matroska(&cid), Some(*matroska), "{id}");
+            assert_eq!(pcm_bit_depth(&cid), Some(*bits), "{id}");
+            assert_eq!(read(matroska, u64::from(*bits)), cid, "{id}");
+        }
+        assert_eq!(pcm_bit_depth(&CodecId::new("flac")), None);
+    }
+
+    /// SMPTE RDD 36 §5.1: `frame_size` (the whole frame, itself
+    /// included) and `'icpf'` precede `frame_header()`; a `V_PRORES`
+    /// Block stores neither.
+    #[test]
+    fn prores_frame_head_is_rebuilt_and_removed() {
+        let body = vec![0x00, 0x94, 0x00, 0x00, b'a', b'b', b'c', b'd', 9, 9];
+        let frame = prores_frame_from_block(body.clone());
+        assert_eq!(&frame[..4], &18u32.to_be_bytes());
+        assert_eq!(&frame[4..8], b"icpf");
+        assert_eq!(&frame[8..], &body[..]);
+        assert_eq!(prores_block_from_frame(&frame), &body[..]);
+        // Already a whole frame: unchanged, in both directions.
+        assert_eq!(prores_frame_from_block(frame.clone()), frame);
+        assert_eq!(prores_block_from_frame(&body), &body[..]);
+        // 'icpf' with a frame_size that is not the data length is not
+        // a frame head.
+        let mut odd = frame.clone();
+        odd[3] ^= 1;
+        assert_eq!(prores_block_from_frame(&odd), &odd[..]);
+        assert_eq!(prores_block_from_frame(b"ic"), b"ic");
+    }
+
+    #[test]
+    fn codec_ids_that_say_more_than_the_codec_stay_on_the_tag() {
+        for id in [
+            "D_WEBVTT/SUBTITLES",
+            "D_WEBVTT/CAPTIONS",
+            "D_WEBVTT/DESCRIPTIONS",
+            "D_WEBVTT/METADATA",
+        ] {
+            assert!(keeps_codec_id_tag(id));
+            assert_eq!(from_matroska(id, &[]).as_str(), "webvtt");
+        }
+        assert_eq!(
+            from_matroska("D_WEBVTT/OTHER", &[]).as_str(),
+            "mkv:D_WEBVTT/OTHER"
+        );
+        for id in ["V_MPEG4/ISO/SP", "V_MPEG4/ISO/ASP", "V_MPEG4/ISO/AP"] {
+            assert!(keeps_codec_id_tag(id));
+            assert_eq!(from_matroska(id, &[]).as_str(), "mpeg4video");
+        }
+        assert!(!keeps_codec_id_tag("V_MPEG4/ISO/AVC"));
+        // The tag is honoured only while it names the stream's codec.
+        let mut p = CodecParameters::video(CodecId::new("h264"));
+        p.tag = Some(CodecTag::matroska("V_MPEG4/ISO/SP"));
+        assert_eq!(
+            plan_track_codec(&p).unwrap(),
+            TrackCodec::Native("V_MPEG4/ISO/AVC")
+        );
     }
 
     /// BD audio is big-endian LPCM (BD-ROM Part 3 §5.4). Make sure

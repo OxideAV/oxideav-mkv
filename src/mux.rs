@@ -572,6 +572,12 @@ pub struct MkvMuxer {
     /// synthesise per-packet timestamps when the input container only
     /// signals page/chunk granules (e.g. Ogg).
     stream_pts: Vec<i64>,
+    /// Per-stream `CodecDelay` written to the track header, in ms
+    /// (rounded to nearest); 0 for a track without one.
+    codec_delay_ms: Vec<i64>,
+    /// `true`: Block timestamps are the packet timestamps — see
+    /// [`MkvMuxer::set_timestamps_as_written`].
+    timestamps_as_written: bool,
     cluster_open: bool,
     /// `SilentTracks > SilentTrackNumber` (RFC 9559 Appendix A.1 / A.2)
     /// track numbers to emit on the **next** Cluster the muxer opens, set
@@ -3307,6 +3313,8 @@ impl MkvMuxer {
             track_codecs,
             track_numbers: stream_track_numbers,
             stream_pts: vec![0i64; n],
+            codec_delay_ms: vec![0i64; n],
+            timestamps_as_written: false,
             cluster_open: false,
             pending_silent_tracks: Vec::new(),
             cluster_timecode_ms: 0,
@@ -3823,6 +3831,30 @@ impl MkvMuxer {
     pub fn with_output_buffer(&mut self, bytes: usize) -> Result<&mut Self> {
         self.output.set_capacity(bytes)?;
         Ok(self)
+    }
+
+    /// Choose how packet timestamps become Block timestamps on a track
+    /// that is written with a `CodecDelay` (RFC 9559 §5.1.4.1.25 — an
+    /// Opus track, or one given a delay through
+    /// [`MkvMuxer::set_track_codec_timing`]).
+    ///
+    /// `false` (the default): a packet's `pts` is the time the frame is
+    /// played at, and the Block is stamped `pts + CodecDelay`, so a
+    /// reader that applies §11.2 ("its value MUST be subtracted from
+    /// each Block timestamp of that track") reports the same `pts`.
+    /// This is the inverse of what [`crate::demux::MkvDemuxer`] hands
+    /// out by default.
+    ///
+    /// `true`: the Block is stamped with `pts` itself — for packets
+    /// read with
+    /// [`MkvDemuxer::set_timestamps_as_written`](crate::demux::MkvDemuxer::set_timestamps_as_written)
+    /// on, or a caller that has already added the delay.
+    ///
+    /// Tracks without `CodecDelay` are not affected. Call before the
+    /// first packet.
+    pub fn set_timestamps_as_written(&mut self, as_written: bool) -> &mut Self {
+        self.timestamps_as_written = as_written;
+        self
     }
 
     /// Read-only accessor: the output buffer size in effect — see
@@ -6510,6 +6542,10 @@ impl Muxer for MkvMuxer {
             }
             if let Some(v) = codec_delay {
                 write_uint_element(&mut t, ids::CODEC_DELAY, v);
+                // Block timestamps of this track sit `CodecDelay` after
+                // the packet timestamps (§11.2), to the nearest tick.
+                self.codec_delay_ms[i] =
+                    i64::try_from(v.saturating_add(500_000) / 1_000_000).unwrap_or(0);
             }
             if let Some(v) = seek_pre_roll {
                 write_uint_element(&mut t, ids::SEEK_PRE_ROLL, v);
@@ -6556,11 +6592,16 @@ impl Muxer for MkvMuxer {
                 if let Some(ch) = channels {
                     write_uint_element(&mut audio, ids::CHANNELS, ch);
                 }
-                let bit_depth = hint.and_then(|h| h.bit_depth).or_else(|| {
-                    s.params
-                        .sample_format
-                        .map(|fmt| (fmt.bytes_per_sample() * 8) as u64)
-                });
+                // A native PCM CodecID names its sample width through
+                // BitDepth alone, so that depth is always written.
+                let bit_depth = hint
+                    .and_then(|h| h.bit_depth)
+                    .or_else(|| codec_id::pcm_bit_depth(&s.params.codec_id).map(u64::from))
+                    .or_else(|| {
+                        s.params
+                            .sample_format
+                            .map(|fmt| (fmt.bytes_per_sample() * 8) as u64)
+                    });
                 if let Some(bd) = bit_depth {
                     write_uint_element(&mut audio, ids::BIT_DEPTH, bd);
                 }
@@ -7311,6 +7352,18 @@ impl MkvMuxer {
                 }
                 _ => packet,
             }
+        } else if self.track_codecs[stream_idx].codec_id() == "V_PRORES" {
+            // `V_PRORES`: the Block starts at `frame_header()`; the
+            // `frame_size` / `frame_identifier` head is not stored.
+            let body = codec_id::prores_block_from_frame(&packet.data);
+            if body.len() != packet.data.len() {
+                let mut p = packet.clone();
+                p.data = body.to_vec();
+                stripped = p;
+                &stripped
+            } else {
+                packet
+            }
         } else {
             packet
         };
@@ -7337,7 +7390,16 @@ impl MkvMuxer {
             self.stream_pts[stream_idx] = effective_pts;
         }
 
-        let pts_ms = pts_to_ms(effective_pts, stream_time_base);
+        // RFC 9559 §11.2: a reader subtracts the track's `CodecDelay`
+        // from every Block timestamp, so the Block is stamped that much
+        // after the packet's timestamp.
+        let pts_ms = pts_to_ms(effective_pts, stream_time_base).saturating_add(
+            if self.timestamps_as_written {
+                0
+            } else {
+                self.codec_delay_ms[stream_idx]
+            },
+        );
         // Track the maximum packet end time for
         // `with_duration_finalization` (§5.1.2.10: Duration is the
         // Segment's duration in TimestampScale ticks — ms at this muxer's
