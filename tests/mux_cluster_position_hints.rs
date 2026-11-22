@@ -73,7 +73,7 @@ fn segment_payload_start(bytes: &[u8]) -> u64 {
         .windows(4)
         .position(|w| w == [0x18, 0x53, 0x80, 0x67])
         .expect("Segment element present") as u64;
-    idx + 5
+    idx + 12
 }
 
 fn drain_count(dmx: &mut oxideav_mkv::demux::MkvDemuxer) -> usize {
@@ -99,9 +99,9 @@ fn hints_round_trip_with_exact_offsets() {
     let records = dmx.cluster_records();
     assert_eq!(records.len(), 3, "13 s of 1 s packets → 3 clusters");
 
-    // The muxer writes each Cluster with a 4-byte ID + 1-byte unknown-size
-    // VINT, so a record's Cluster ID sits 5 bytes before its body.
-    const CLUSTER_HEADER_LEN: u64 = 5;
+    // The muxer writes each Cluster with a 4-byte ID + 8-byte size
+    // field, so a record's Cluster ID sits 12 bytes before its body.
+    const CLUSTER_HEADER_LEN: u64 = 12;
     for (i, r) in records.iter().enumerate() {
         let cluster_id_offset = r.body_offset - CLUSTER_HEADER_LEN;
         // §5.1.3.2: Position is the Cluster's Segment Position — its ID
@@ -183,7 +183,7 @@ fn position_hints_verify_after_damage_resync() {
     assert!(n > 0 && n < 13, "some packets lost to the damage: {n}");
     assert!(!dmx.damage_events().is_empty());
     // Every Cluster that survived still carries a verifiable Position.
-    const CLUSTER_HEADER_LEN: u64 = 5;
+    const CLUSTER_HEADER_LEN: u64 = 12;
     for r in dmx.cluster_records() {
         assert_eq!(r.position, Some(r.body_offset - CLUSTER_HEADER_LEN - sds));
     }

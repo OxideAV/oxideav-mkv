@@ -164,10 +164,10 @@ fn front_cues_land_before_first_cluster() {
 
     // The SeekHead agrees with the on-disk position.
     let target = seek_head_cues_target(bytes.clone()).expect("SeekHead Cues entry");
-    // Segment data start = EBML header len + 4 (Segment id) + 1 (0xFF).
+    // Segment data start = EBML header len + 4 (Segment id) + 8 (size).
     let mut cur = Cursor::new(&bytes);
     let ebml = read_element_header(&mut cur).expect("ebml");
-    let seg_data_start = ebml.header_len as u64 + ebml.size + 4 + 1;
+    let seg_data_start = ebml.header_len as u64 + ebml.size + 4 + 8;
     assert_eq!(seg_data_start + target, cues_abs);
 
     // The index is fully usable: open + seek to the last cluster's time.
@@ -266,7 +266,7 @@ fn too_small_reservation_falls_back_to_end_placement() {
     let target = seek_head_cues_target(bytes.clone()).expect("SeekHead Cues entry");
     let mut cur = Cursor::new(&bytes);
     let ebml = read_element_header(&mut cur).expect("ebml");
-    let seg_data_start = ebml.header_len as u64 + ebml.size + 4 + 1;
+    let seg_data_start = ebml.header_len as u64 + ebml.size + 4 + 8;
     assert_eq!(seg_data_start + target, layout[cues_idx].1);
     let rs: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let mut dmx =

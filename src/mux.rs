@@ -37,7 +37,7 @@ use crate::demux::{
     DocTypeExtension, FieldOrder, FlagInterlaced, MatrixCoefficients, OldStereoMode, Primaries,
     ProjectionType, SegmentLinking, StereoMode, TrackPlaneType, TransferCharacteristics,
 };
-use crate::ebml::{VINT_UNKNOWN_SIZE, crc32_ieee, write_element_id, write_vint};
+use crate::ebml::{crc32_ieee, write_element_id, write_vint};
 use crate::ids;
 
 /// Cluster every ~5 seconds (in MKV ms timecode units) — the RFC 9559
@@ -63,6 +63,68 @@ pub fn open(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dy
 /// [`Error::Unsupported`].
 pub fn open_webm(output: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
     MkvMuxer::new(output, streams, DocType::Webm).map(|m| Box::new(m) as Box<dyn Muxer>)
+}
+
+/// The EBML unknown-size marker in its 8-octet form (RFC 8794 §6.2: all
+/// VINT_DATA bits set). Readers in the field recognise this width; the
+/// 1-octet `0xFF` is refused by at least one widely used player.
+const UNKNOWN_SIZE_8: [u8; 8] = [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+/// `size` as an 8-octet Element Data Size, or `None` when it does not
+/// fit the 56 bits (or would read as the unknown-size marker).
+fn size_field_8(size: u64) -> Option<[u8; 8]> {
+    (size < (1u64 << 56) - 1).then(|| {
+        let mut field = size.to_be_bytes();
+        field[0] = 0x01;
+        field
+    })
+}
+
+/// What [`Muxer::set_metadata`] does with one key.
+enum MetadataKey<'a> {
+    Title,
+    CodecDelay(usize),
+    SeekPreRoll(usize),
+    TrackTag(usize, &'a str),
+    GlobalTag(&'a str),
+    NotStored,
+}
+
+fn classify_metadata_key(key: &str, n_streams: usize) -> MetadataKey<'_> {
+    fn stream_and_rest(rest: &str, n_streams: usize) -> Option<(usize, &str)> {
+        let (index, name) = rest.split_once(':')?;
+        let index: usize = index.parse().ok()?;
+        (index < n_streams && !name.is_empty()).then_some((index, name))
+    }
+    if key.is_empty() {
+        return MetadataKey::NotStored;
+    }
+    if let Some(rest) = key.strip_prefix("track:") {
+        return match stream_and_rest(rest, n_streams) {
+            Some((i, "codec_delay_ns")) => MetadataKey::CodecDelay(i),
+            Some((i, "seek_pre_roll_ns")) => MetadataKey::SeekPreRoll(i),
+            _ => MetadataKey::NotStored,
+        };
+    }
+    if let Some(rest) = key.strip_prefix("tag:track:") {
+        return match stream_and_rest(rest, n_streams) {
+            Some((_, "duration")) | None => MetadataKey::NotStored,
+            Some((i, name)) => MetadataKey::TrackTag(i, name),
+        };
+    }
+    if key.starts_with("tag:edition:")
+        || key.starts_with("tag:chapter:")
+        || key.starts_with("tag:attachment:")
+        || key.starts_with("chapter:")
+        || key.starts_with("attachment:")
+    {
+        return MetadataKey::NotStored;
+    }
+    match key {
+        "title" => MetadataKey::Title,
+        "muxer" | "encoder" | "date" | "duration" => MetadataKey::NotStored,
+        name => MetadataKey::GlobalTag(name),
+    }
 }
 
 /// Which on-disk flavour the muxer writes.
@@ -663,6 +725,10 @@ pub struct MkvMuxer {
     /// the Segment element header). `CueClusterPosition` values are stored
     /// relative to this position, per the Matroska spec.
     segment_data_start: u64,
+    /// Absolute offset of the Segment's 8-octet size field.
+    segment_size_abs: u64,
+    /// Absolute offset of the open Cluster's 8-octet size field.
+    cluster_size_abs: Option<u64>,
     /// Cue index built up while writing. One entry per (cluster, track) pair
     /// where the track produced a keyframe in that cluster — plus the first
     /// audio packet of each audio track in each cluster (audio frames are
@@ -756,6 +822,11 @@ pub struct MkvMuxer {
     /// the element. Written into the `Info` master between `TimestampScale`
     /// and `MuxingApp`, in §5.1.2 element order.
     info_title: Option<String>,
+    /// What the last [`Muxer::set_metadata`] call asked for: the title,
+    /// the tags, and per-stream `CodecDelay` / `SeekPreRoll`.
+    meta_title: Option<String>,
+    meta_tags: Vec<MkvTag>,
+    meta_codec_timing: Vec<MkvTrackCodecTiming>,
     /// `DateUTC` (RFC 9559 §5.1.2.11, id `0x4461`) — the Segment creation
     /// date, queued via [`MkvMuxer::set_date_utc_ns`] as nanoseconds since
     /// the Matroska epoch (2001-01-01T00:00:00 UTC). `None` (the default)
@@ -1285,6 +1356,9 @@ struct LaceBuffer {
     /// at append time. Lacing flushes carry this verbatim into the
     /// SimpleBlock header.
     first_timecode_offset: i16,
+    /// Cluster-relative timecode (ms) at which the last queued frame
+    /// ends, when it stated a duration.
+    next_offset: Option<i64>,
     /// KEY bit value to write on the resulting SimpleBlock —
     /// inherits from the first frame in the lace.
     keyframe: bool,
@@ -3287,7 +3361,11 @@ impl MkvMuxer {
         }
         if doc_type == DocType::Webm {
             for (i, s) in streams.iter().enumerate() {
-                if !codec_id::is_webm_codec(&s.params.codec_id) {
+                let webm_webvtt = matches!(
+                    &s.params.tag,
+                    Some(oxideav_core::CodecTag::Matroska(id)) if codec_id::is_webm_webvtt(id)
+                ) && s.params.codec_id.as_str() == "webvtt";
+                if !codec_id::is_webm_codec(&s.params.codec_id) && !webm_webvtt {
                     return Err(Error::unsupported(format!(
                         "WebM muxer: stream {i} uses codec '{}' which is not in the WebM whitelist (allowed: vp8, vp9, av1, vorbis, opus)",
                         s.params.codec_id.as_str()
@@ -3337,6 +3415,8 @@ impl MkvMuxer {
             prev_cluster_start_abs: None,
             live_streaming: false,
             segment_data_start: 0,
+            segment_size_abs: 0,
+            cluster_size_abs: None,
             cues: Vec::new(),
             cue_seen_in_cluster: vec![false; n],
             cluster_block_count: 0,
@@ -3353,6 +3433,9 @@ impl MkvMuxer {
             tags: Vec::new(),
             segment_linking: None,
             info_title: None,
+            meta_title: None,
+            meta_tags: Vec::new(),
+            meta_codec_timing: vec![MkvTrackCodecTiming::default(); n],
             info_date_utc_ns: None,
             info_duration_ticks: None,
             lacing_mode: LacingMode::None,
@@ -3831,6 +3914,331 @@ impl MkvMuxer {
     pub fn with_output_buffer(&mut self, bytes: usize) -> Result<&mut Self> {
         self.output.set_capacity(bytes)?;
         Ok(self)
+    }
+
+    /// Carry the `TrackEntry` records of one track read by
+    /// [`MkvDemuxer`](crate::demux::MkvDemuxer) over to one of this
+    /// muxer's streams, so a Matroska → Matroska remux keeps what
+    /// `StreamInfo` has no field for.
+    ///
+    /// Copied when the source track states them: `CodecDelay` /
+    /// `SeekPreRoll`; `DefaultDuration` / `DefaultDecodedFieldDuration`
+    /// / `TrackTimestampScale`; `Name`, `CodecName`, `FlagEnabled`,
+    /// `FlagDefault`, `FlagLacing`; the `FlagForced` /
+    /// hearing-impaired / visual-impaired / text-descriptions / original
+    /// / commentary flags; the Audio `OutputSamplingFrequency`,
+    /// `BitDepth` and `Emphasis`; the Video `FlagInterlaced` /
+    /// `FieldOrder`, `StereoMode`, `AlphaMode`, crop and display size,
+    /// `Colour` (with `MasteringMetadata`), `Projection` and
+    /// `UncompressedFourCC`; `MaxBlockAdditionID` and the
+    /// `BlockAdditionMapping`s. Codec id, CodecPrivate, dimensions,
+    /// sample rate, channel count and language already travel in the
+    /// `StreamInfo` the muxer was opened with.
+    ///
+    /// Each record goes through the same setter a caller would use
+    /// (`set_track_codec_timing`, `set_video_colour`, ...) and replaces
+    /// what was queued for the stream. A record that setter refuses —
+    /// a value outside the range RFC 9559 gives the element, an element
+    /// the WebM profile does not list — is left out; the rest is still
+    /// copied.
+    ///
+    /// Errors: called after `write_header`, or either index out of
+    /// range.
+    pub fn copy_track_header(
+        &mut self,
+        stream_index: usize,
+        source: &crate::demux::MkvDemuxer,
+        source_stream: u32,
+    ) -> Result<&mut Self> {
+        use oxideav_core::Demuxer as _;
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: copy_track_header called after write_header",
+            ));
+        }
+        if stream_index >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: copy_track_header stream_index {stream_index} out of range ({} streams)",
+                self.streams.len()
+            )));
+        }
+        if source_stream as usize >= source.streams().len() {
+            return Err(Error::invalid(format!(
+                "MKV muxer: copy_track_header source stream {source_stream} out of range ({} streams)",
+                source.streams().len()
+            )));
+        }
+        let i = stream_index;
+        let n = source_stream;
+        // A refused record is skipped, not fatal — see the doc comment.
+        if let Some(t) = source.track_codec_timing(n).filter(|t| !t.is_empty()) {
+            let _ = self.set_track_codec_timing(
+                i,
+                MkvTrackCodecTiming {
+                    codec_delay: t.codec_delay_explicit(),
+                    seek_pre_roll: t.seek_pre_roll_explicit(),
+                },
+            );
+        }
+        if let Some(t) = source.track_timing(n).filter(|t| !t.is_empty()) {
+            let _ = self.set_track_timing(
+                i,
+                MkvTrackTiming {
+                    default_duration: t.default_duration(),
+                    default_decoded_field_duration: t.default_decoded_field_duration(),
+                    track_timestamp_scale: t.track_timestamp_scale_explicit(),
+                },
+            );
+        }
+        if let Some(t) = source.track_identity(n) {
+            let identity = MkvTrackIdentity {
+                name: t.name().filter(|v| !v.is_empty()).map(str::to_owned),
+                codec_name: t.codec_name().filter(|v| !v.is_empty()).map(str::to_owned),
+                // The language is in `StreamInfo`.
+                language: None,
+                language_bcp47: None,
+                flag_enabled: t.enabled_explicit(),
+                flag_default: t.default_explicit(),
+                flag_lacing: t.lacing_allowed_explicit(),
+                attachment_link: None,
+            };
+            if identity != MkvTrackIdentity::default() {
+                let _ = self.set_track_identity(i, identity);
+            }
+        }
+        if let Some(t) = source.track_audience_flags(n) {
+            let flags = MkvTrackAudienceFlags {
+                forced: t.forced().then_some(true),
+                hearing_impaired: t.hearing_impaired(),
+                visual_impaired: t.visual_impaired(),
+                text_descriptions: t.text_descriptions(),
+                original: t.original(),
+                commentary: t.commentary(),
+            };
+            if flags != MkvTrackAudienceFlags::default() {
+                let _ = self.set_track_audience_flags(i, flags);
+            }
+        }
+        if let Some(t) = source.track_audio(n) {
+            let audio = MkvTrackAudio {
+                // SamplingFrequency and Channels follow from `StreamInfo`
+                // (for SBR AAC, from the AudioSpecificConfig).
+                sampling_frequency: None,
+                output_sampling_frequency: t.output_sampling_frequency_explicit(),
+                channels: None,
+                bit_depth: t.bit_depth().filter(|b| *b != 0),
+                emphasis: t.emphasis_explicit(),
+            };
+            if audio != MkvTrackAudio::default() {
+                let _ = self.set_track_audio(i, audio);
+            }
+        }
+        // The demuxer materialises the defaults of the Video children;
+        // a value equal to its default is not written back (an absent
+        // element reads as that default).
+        if let Some(t) = source
+            .video_interlacing(n)
+            .filter(|t| t.flag() != FlagInterlaced::default())
+        {
+            let _ = self.set_video_interlacing(i, t.flag(), t.field_order());
+        }
+        if let Some(mode) = source
+            .video_stereo_mode(n)
+            .filter(|m| *m != StereoMode::from_raw(0))
+        {
+            let _ = self.set_video_stereo_mode(i, mode);
+        }
+        if let Some(mode) = source
+            .video_alpha_mode(n)
+            .filter(|m| *m != AlphaMode::from_raw(0))
+        {
+            let _ = self.set_video_alpha_mode(i, mode);
+        }
+        if let Some(g) = source.video_geometry(n).filter(|g| !g.is_default()) {
+            let _ = self.set_video_geometry(
+                i,
+                MkvVideoGeometry {
+                    crop_top: g.pixel_crop_top(),
+                    crop_bottom: g.pixel_crop_bottom(),
+                    crop_left: g.pixel_crop_left(),
+                    crop_right: g.pixel_crop_right(),
+                    display_width: g.display_width_explicit(),
+                    display_height: g.display_height_explicit(),
+                    display_unit: g.display_unit(),
+                },
+            );
+        }
+        if let Some(c) = source.video_colour(n) {
+            let _ = self.set_video_colour(
+                i,
+                MkvVideoColour {
+                    matrix_coefficients: c.matrix_coefficients(),
+                    bits_per_channel: c.bits_per_channel(),
+                    chroma_subsampling_horz: c.chroma_subsampling_horz(),
+                    chroma_subsampling_vert: c.chroma_subsampling_vert(),
+                    cb_subsampling_horz: c.cb_subsampling_horz(),
+                    cb_subsampling_vert: c.cb_subsampling_vert(),
+                    chroma_siting_horz: c.chroma_siting_horz(),
+                    chroma_siting_vert: c.chroma_siting_vert(),
+                    range: c.range(),
+                    transfer_characteristics: c.transfer_characteristics(),
+                    primaries: c.primaries(),
+                    max_cll: c.max_cll(),
+                    max_fall: c.max_fall(),
+                    mastering_metadata: c.mastering_metadata().map(|m| MkvMasteringMetadata {
+                        primary_r_chromaticity_x: m.primary_r_chromaticity_x(),
+                        primary_r_chromaticity_y: m.primary_r_chromaticity_y(),
+                        primary_g_chromaticity_x: m.primary_g_chromaticity_x(),
+                        primary_g_chromaticity_y: m.primary_g_chromaticity_y(),
+                        primary_b_chromaticity_x: m.primary_b_chromaticity_x(),
+                        primary_b_chromaticity_y: m.primary_b_chromaticity_y(),
+                        white_point_chromaticity_x: m.white_point_chromaticity_x(),
+                        white_point_chromaticity_y: m.white_point_chromaticity_y(),
+                        luminance_max: m.luminance_max(),
+                        luminance_min: m.luminance_min(),
+                    }),
+                },
+            );
+        }
+        if let Some(p) = source.video_projection(n) {
+            let _ = self.set_video_projection(
+                i,
+                MkvProjection {
+                    projection_type: p.projection_type(),
+                    private: p.private().map(<[u8]>::to_vec),
+                    pose_yaw: p.pose_yaw(),
+                    pose_pitch: p.pose_pitch(),
+                    pose_roll: p.pose_roll(),
+                },
+            );
+        }
+        if let Some(fourcc) = source.video_uncompressed_fourcc(n).and_then(|f| f.fourcc()) {
+            let _ = self.set_video_uncompressed_fourcc(i, fourcc);
+        }
+        if let Some(max) = source.max_block_addition_id(n) {
+            let _ = self.set_max_block_addition_id(i, max);
+        }
+        let mappings = source.block_addition_mappings(n);
+        if !mappings.is_empty() {
+            let _ = self.set_block_addition_mappings(i, mappings.to_vec());
+        }
+        Ok(self)
+    }
+
+    /// Queue the chapters and attachments of a file read by
+    /// [`MkvDemuxer`](crate::demux::MkvDemuxer): every chapter of its
+    /// first edition (times, UIDs, hidden / enabled flags, display
+    /// strings; nested chapters are flattened in document order) through
+    /// [`add_chapter_full`](Self::add_chapter_full), and every attached
+    /// file (name, media type, description, UID, bytes) through
+    /// [`add_attachment`](Self::add_attachment). A record the muxer
+    /// refuses — the WebM profile carries no attachments — is left out.
+    /// Returns how many chapters and attachments were queued.
+    ///
+    /// Errors: called after `write_header`, or the source fails while
+    /// an attachment's bytes are read.
+    pub fn copy_chapters_and_attachments(
+        &mut self,
+        source: &mut crate::demux::MkvDemuxer,
+    ) -> Result<(usize, usize)> {
+        if self.header_written {
+            return Err(Error::other(
+                "MKV muxer: copy_chapters_and_attachments called after write_header",
+            ));
+        }
+        fn flatten<'a>(
+            list: &'a [crate::demux::Chapter],
+            out: &mut Vec<&'a crate::demux::Chapter>,
+        ) {
+            for c in list {
+                out.push(c);
+                flatten(&c.children, out);
+            }
+        }
+        let mut chapters = Vec::new();
+        if let Some(edition) = source.chapters().first() {
+            flatten(&edition.chapters, &mut chapters);
+        }
+        let mut copied_chapters = 0;
+        for c in chapters {
+            let chapter = MkvChapter {
+                time_start_ns: c.time_start_ns,
+                time_end_ns: c.time_end_ns,
+                uid: c.uid.filter(|u| *u != 0),
+                string_uid: c.string_uid.clone(),
+                hidden: c.hidden,
+                enabled: c.enabled,
+                display: c
+                    .displays
+                    .iter()
+                    .map(|d| ChapterDisplay {
+                        title: d.string.clone(),
+                        language: d.language.clone(),
+                        country: d.country.clone(),
+                        language_bcp47: d.language_bcp47.clone(),
+                    })
+                    .collect(),
+                ..MkvChapter::default()
+            };
+            if self.add_chapter_full(chapter).is_ok() {
+                copied_chapters += 1;
+            }
+        }
+        let attachments: Vec<crate::demux::Attachment> = source.attachments().to_vec();
+        let mut copied_attachments = 0;
+        for a in attachments {
+            let data = source.attachment_data(a.index)?;
+            let attachment = MkvAttachment {
+                filename: a.filename.clone(),
+                mime_type: a.mime_type.clone(),
+                data,
+                uid: Some(a.uid).filter(|u| *u != 0),
+                description: Some(a.description.clone()).filter(|d| !d.is_empty()),
+                ..MkvAttachment::default()
+            };
+            if self.add_attachment(attachment).is_ok() {
+                copied_attachments += 1;
+            }
+        }
+        Ok((copied_chapters, copied_attachments))
+    }
+
+    /// Write a packet [`MkvDemuxer`](crate::demux::MkvDemuxer) has just
+    /// returned, together with what its Block carried next to the frame:
+    /// the `BlockAdditions` (alpha planes, codec side data) and the
+    /// `DiscardPadding`. `source` must still be positioned on that
+    /// packet — its `block_additions()` / `block_group_meta()` describe
+    /// the packet returned last. A packet without either is written as
+    /// [`write_packet`](oxideav_core::Muxer::write_packet) does.
+    ///
+    /// The destination track needs a `MaxBlockAdditionID` covering the
+    /// additions ([`MkvMuxer::copy_track_header`] carries the source
+    /// track's over).
+    pub fn write_packet_from(
+        &mut self,
+        packet: &Packet,
+        source: &crate::demux::MkvDemuxer,
+    ) -> Result<()> {
+        let additions: Vec<MkvBlockAddition> = source
+            .block_additions()
+            .iter()
+            .map(|a| MkvBlockAddition {
+                id: a.block_add_id(),
+                data: a.data().to_vec(),
+            })
+            .collect();
+        let discard_padding = source.block_group_meta().and_then(|m| m.discard_padding());
+        if additions.is_empty() && discard_padding.is_none() {
+            return self.write_packet_inner(packet, None);
+        }
+        self.write_packet_with_block_group(
+            packet,
+            &BlockGroupOptions {
+                additions,
+                discard_padding,
+                ..BlockGroupOptions::default()
+            },
+        )
     }
 
     /// Choose how packet timestamps become Block timestamps on a track
@@ -6006,7 +6414,12 @@ impl MkvMuxer {
         self.info_duration_ticks
     }
 
-    /// Opt in to two-pass `Duration` finalization (RFC 9559 §5.1.2.10):
+    /// Two-pass `Duration` finalization (RFC 9559 §5.1.2.10). Since
+    /// 0.0.13 this is what every non-live muxer does unless
+    /// [`MkvMuxer::set_duration`] supplied the value, so calling this
+    /// only records the intent (and makes a later `set_duration` /
+    /// `with_live_streaming` an error instead of a silent override).
+    ///
     /// `write_header` reserves a `Duration`-sized `Void` inside `Info` (at
     /// the §5.1.2 element-order position), and `write_trailer` patches it
     /// in place with the **measured** duration — the maximum packet end
@@ -6055,6 +6468,13 @@ impl MkvMuxer {
     /// [`MkvMuxer::with_duration_finalization`] was called.
     pub fn duration_finalization(&self) -> bool {
         self.duration_finalization
+    }
+
+    /// Whether `write_trailer` states the measured `Duration`: on every
+    /// layout that can go back to the header — i.e. not the live one —
+    /// unless the caller gave the value with [`MkvMuxer::set_duration`].
+    fn finalizes_duration(&self) -> bool {
+        !self.live_streaming && self.info_duration_ticks.is_none()
     }
 
     /// Queue the EBML-header `DocTypeExtension` declarations (RFC 8794 §11.2.9)
@@ -6230,9 +6650,11 @@ impl Muxer for MkvMuxer {
         let mut all = Vec::new();
         write_master_element(&mut all, ids::EBML_HEADER, &ebml_body);
 
-        // Segment with unknown size.
+        // Segment with unknown size, in the 8-octet form so the
+        // trailer can put the real size in its place.
         all.extend_from_slice(&write_element_id(ids::SEGMENT));
-        all.extend_from_slice(&write_vint(VINT_UNKNOWN_SIZE, 0));
+        let segment_size_in_buf = all.len() as u64;
+        all.extend_from_slice(&UNKNOWN_SIZE_8);
         // Record the file offset of the Segment payload start — Cues
         // cluster positions are stored as byte offsets from this point.
         let segment_data_start_in_buf = all.len() as u64;
@@ -6292,7 +6714,7 @@ impl Muxer for MkvMuxer {
         // order, so `write_trailer` can patch the measured value in place.
         // If the trailer never runs (a crashed producer), the file carries
         // a harmless Void instead of a bogus duration.
-        let duration_slot_in_info_body = if self.duration_finalization {
+        let duration_slot_in_info_body = if self.finalizes_duration() {
             let off = info_body.len();
             info_body.push(ids::VOID as u8);
             info_body.push(0x89); // size VINT: 9 padding bytes follow
@@ -6313,7 +6735,7 @@ impl Muxer for MkvMuxer {
             // §5.1.2.11 `date`: signed nanoseconds since the 2001-01-01 epoch.
             write_date_element(&mut info_body, ids::DATE_UTC, ns);
         }
-        if let Some(title) = &self.info_title {
+        if let Some(title) = self.info_title.as_ref().or(self.meta_title.as_ref()) {
             write_string_element(&mut info_body, ids::TITLE, title);
         }
         write_string_element(&mut info_body, ids::MUXING_APP, "oxideav");
@@ -6532,6 +6954,12 @@ impl Muxer for MkvMuxer {
             } else {
                 (None, None)
             };
+            // `track:<n>:codec_delay_ns` / `seek_pre_roll_ns` handed to
+            // `set_metadata` (what the demuxer lists for a track that
+            // has them) come next; an explicit hint has the last word.
+            let from_metadata = self.meta_codec_timing[i];
+            codec_delay = from_metadata.codec_delay.or(codec_delay);
+            seek_pre_roll = from_metadata.seek_pre_roll.or(seek_pre_roll);
             if let Some(hint) = self.track_codec_timing[i] {
                 if let Some(v) = hint.codec_delay {
                     codec_delay = Some(v);
@@ -6725,8 +7153,18 @@ impl Muxer for MkvMuxer {
                 // `CodecID == "V_UNCOMPRESSED"`). The element is `binary`
                 // with a fixed `length: 4`, so the 4-byte payload is
                 // written verbatim.
-                if let Some(fourcc) = self.video_uncompressed_fourccs[i] {
+                let uncompressed_fourcc = self.video_uncompressed_fourccs[i].or_else(|| {
+                    // What the demuxer kept for a `V_UNCOMPRESSED` track.
+                    let kept = s.params.options.get(codec_id::UNCOMPRESSED_FOURCC_OPTION)?;
+                    <[u8; 4]>::try_from(codec_id::hex_decode(kept)?).ok()
+                });
+                if let Some(fourcc) = uncompressed_fourcc {
                     write_bytes_element(&mut video, ids::UNCOMPRESSED_FOURCC, &fourcc);
+                } else if plan.codec_id() == "V_UNCOMPRESSED" {
+                    return Err(Error::unsupported(format!(
+                        "MKV muxer: stream {i} is V_UNCOMPRESSED without an UncompressedFourCC \
+                         (RFC 9559 §5.1.4.1.28.15 requires one) — call set_video_uncompressed_fourcc"
+                    )));
                 }
                 // Colour master (§5.1.4.1.28.16). Emitted only when the
                 // caller explicitly opted in via `set_video_colour`. Each
@@ -7163,11 +7601,19 @@ impl Muxer for MkvMuxer {
         // sitting it here keeps the demuxer's pre-Cluster header walk
         // single-pass. If no tags were queued, the SeekHead Tags slot
         // stays at its placeholder zero and gets voided below.
-        let tags_offset_opt: Option<u64> = if self.tags.is_empty() {
+        let tags_offset_opt: Option<u64> = if self.tags.is_empty() && self.meta_tags.is_empty() {
             None
         } else {
             let tags_offset_in_buf = all.len() as u64 - segment_data_start_in_buf;
-            let tags_bytes = build_tags_element(&self.tags, self.webm_strict);
+            // `add_tag` tags first, then the ones `set_metadata` built.
+            let merged;
+            let tags: &[MkvTag] = if self.meta_tags.is_empty() {
+                &self.tags
+            } else {
+                merged = [self.tags.as_slice(), self.meta_tags.as_slice()].concat();
+                &merged
+            };
+            let tags_bytes = build_tags_element(tags, self.webm_strict);
             all.extend_from_slice(&tags_bytes);
             Some(tags_offset_in_buf)
         };
@@ -7256,6 +7702,7 @@ impl Muxer for MkvMuxer {
         }
 
         self.segment_data_start = base_pos + segment_data_start_in_buf;
+        self.segment_size_abs = base_pos + segment_size_in_buf;
         self.output.write_all(&all)?;
         self.deliver_if_live()?;
         self.header_written = true;
@@ -7264,6 +7711,85 @@ impl Muxer for MkvMuxer {
 
     fn write_packet(&mut self, packet: &Packet) -> Result<()> {
         self.write_packet_inner(packet, None)
+    }
+
+    /// Container metadata as flat pairs — the keys
+    /// [`Demuxer::metadata`](oxideav_core::Demuxer::metadata) of this
+    /// crate lists, so the pairs read from one file can be handed to
+    /// the muxer of the next:
+    ///
+    /// * `title` → the Segment `Title` (an explicit
+    ///   [`MkvMuxer::set_title`] wins).
+    /// * `track:<stream>:codec_delay_ns` / `track:<stream>:seek_pre_roll_ns`
+    ///   → that track's `CodecDelay` / `SeekPreRoll` (an explicit
+    ///   [`MkvMuxer::set_track_codec_timing`] field wins).
+    /// * `tag:track:<stream>:<name>` → a `SimpleTag` in a `Tag` that
+    ///   targets the track; any other key that is not listed below → a
+    ///   `SimpleTag` in a global `Tag`. `TagName` is the upper-cased
+    ///   name.
+    /// * Accepted and not stored, because the file states them through
+    ///   other elements or they describe the source file: `muxer`,
+    ///   `encoder`, `date`, `duration`, `track:<stream>:priming_samples`,
+    ///   every other `track:…` key, `tag:track:<stream>:duration`, and
+    ///   the `chapter:…`, `attachment:…`, `tag:edition:…`,
+    ///   `tag:chapter:…` and `tag:attachment:…` families (queue those
+    ///   records with [`MkvMuxer::add_chapter_full`],
+    ///   [`MkvMuxer::add_attachment`], [`MkvMuxer::add_tag`]).
+    ///
+    /// A later call replaces what the earlier one set; `&[]` clears it.
+    /// Tags queued with [`MkvMuxer::add_tag`] are untouched. Refused
+    /// after `write_header`.
+    fn set_metadata(&mut self, metadata: &[(String, String)]) -> Result<()> {
+        if self.header_written {
+            return Err(Error::invalid(
+                "MKV muxer: set_metadata called after write_header",
+            ));
+        }
+        let mut title = None;
+        let mut global: Vec<MkvSimpleTag> = Vec::new();
+        let mut per_track: Vec<Vec<MkvSimpleTag>> = vec![Vec::new(); self.streams.len()];
+        let mut timing = vec![MkvTrackCodecTiming::default(); self.streams.len()];
+        for (key, value) in metadata {
+            match classify_metadata_key(key, self.streams.len()) {
+                MetadataKey::Title => title = Some(value.clone()),
+                MetadataKey::CodecDelay(i) => timing[i].codec_delay = value.parse().ok(),
+                MetadataKey::SeekPreRoll(i) => timing[i].seek_pre_roll = value.parse().ok(),
+                MetadataKey::TrackTag(i, name) => {
+                    per_track[i].push(MkvSimpleTag::new(name.to_ascii_uppercase(), value.clone()));
+                }
+                MetadataKey::GlobalTag(name) => {
+                    global.push(MkvSimpleTag::new(name.to_ascii_uppercase(), value.clone()));
+                }
+                MetadataKey::NotStored => {}
+            }
+        }
+        let mut tags = Vec::new();
+        if !global.is_empty() {
+            tags.push(MkvTag {
+                targets: MkvTagTargets::default(),
+                simple_tags: global,
+            });
+        }
+        for (i, simple_tags) in per_track.into_iter().enumerate() {
+            if !simple_tags.is_empty() {
+                // TrackUID is written equal to the TrackNumber.
+                tags.push(MkvTag {
+                    targets: MkvTagTargets::track(self.track_numbers[i]),
+                    simple_tags,
+                });
+            }
+        }
+        self.meta_title = title;
+        self.meta_tags = tags;
+        self.meta_codec_timing = timing;
+        Ok(())
+    }
+
+    fn carries_metadata_key(&self, key: &str) -> bool {
+        !matches!(
+            classify_metadata_key(key, self.streams.len()),
+            MetadataKey::NotStored
+        )
     }
 
     fn write_trailer(&mut self) -> Result<()> {
@@ -7285,6 +7811,7 @@ impl Muxer for MkvMuxer {
         // top-level Cues element id, which is outside the cluster subtree).
         // The live-streaming layout (§25.3.4) writes no Cues at all — a
         // live stream has no known end to index.
+        self.close_cluster()?;
         let cues_offset_rel = if self.live_streaming {
             None
         } else if let Some(slot_abs) = self.front_cues_slot_abs {
@@ -7304,8 +7831,23 @@ impl Muxer for MkvMuxer {
         // measured duration and refresh the Info CRC-32 the patch
         // invalidates. A zero-packet mux leaves the Void in place — an
         // absent Duration is the truthful signal.
-        if let (Some(patch_abs), Some(end_ms)) = (self.duration_patch_abs, self.max_end_ms) {
+        // (so is a measured 0: §5.1.2.10 ranges Duration above 0.)
+        if let (Some(patch_abs), Some(end_ms)) = (self.duration_patch_abs, self.max_end_ms)
+            && end_ms > 0
+        {
             self.patch_info_duration(patch_abs, end_ms)?;
+        }
+        // The Segment ends here: state its size. A live Segment keeps
+        // the unknown size (§23.2), as does a file whose trailer never
+        // ran.
+        if !self.live_streaming && self.header_written {
+            let end = self.output.stream_position().unwrap_or(0);
+            if let Some(field) = end
+                .checked_sub(self.segment_data_start)
+                .and_then(size_field_8)
+            {
+                self.output.patch_at(self.segment_size_abs, &field)?;
+            }
         }
         self.output.flush()?;
         self.trailer_written = true;
@@ -7374,11 +7916,20 @@ impl MkvMuxer {
 
         // Effective per-packet pts. If the source set one, use it; otherwise
         // derive from accumulated stream_pts and codec-specific durations.
-        let derived_duration: Option<i64> = if is_opus {
-            opus_packet_duration_samples(&packet.data).map(|s| s as i64)
-        } else {
-            packet.duration
-        };
+        // The packet's own duration, in the stream time base; an Opus
+        // packet that states none gets the one its TOC implies (48 kHz
+        // samples, converted).
+        let derived_duration: Option<i64> = packet.duration.or_else(|| {
+            if !is_opus {
+                return None;
+            }
+            let samples = opus_packet_duration_samples(&packet.data)? as i128;
+            let tb = stream_time_base.as_rational();
+            if tb.num <= 0 || tb.den <= 0 {
+                return None;
+            }
+            i64::try_from(samples * tb.den as i128 / (48_000 * tb.num as i128)).ok()
+        });
         let effective_pts = match packet.pts {
             Some(v) => v,
             None => self.stream_pts[stream_idx],
@@ -7390,6 +7941,20 @@ impl MkvMuxer {
             self.stream_pts[stream_idx] = effective_pts;
         }
 
+        // A duration a reader could not work out by itself has to be
+        // written, and only a BlockGroup can hold it (§5.1.3.5.3): a
+        // subtitle's (the next Block says nothing about when it ends),
+        // and one that differs from the track's DefaultDuration (the
+        // shortened last frame of an audio track).
+        let stated_duration;
+        let group = match group {
+            Some(g) => Some(g),
+            None if self.duration_needs_block_group(stream_idx, derived_duration) => {
+                stated_duration = BlockGroupOptions::default();
+                Some(&stated_duration)
+            }
+            None => None,
+        };
         // RFC 9559 §11.2: a reader subtracts the track's `CodecDelay`
         // from every Block timestamp, so the Block is stamped that much
         // after the packet's timestamp.
@@ -7596,8 +8161,29 @@ impl MkvMuxer {
             // One SimpleBlock written to the open Cluster — advances the
             // 1-based `CueBlockNumber` counter (RFC 9559 §5.1.5.1.2.5).
             self.cluster_block_count += 1;
+        } else if media_type != MediaType::Audio {
+            // §10.3.5: the frames of a lace are contiguous and only the
+            // first has a timestamp — the case for audio, not for video
+            // (reordered, large) or subtitles (gaps). Those are written
+            // one frame per Block whatever the lacing mode.
+            if !self.lace_pending[stream_idx].frames.is_empty() {
+                self.flush_lace(stream_idx)?;
+            }
+            let block_bytes = build_simple_block(
+                track_number,
+                timecode_offset as i16,
+                packet.flags.keyframe,
+                LacingMode::None,
+                std::slice::from_ref(&packet.data),
+            );
+            self.output.write_all(&block_bytes)?;
+            self.cluster_bytes += block_bytes.len() as u64;
+            self.cluster_block_count += 1;
         } else {
-            self.append_to_lace(stream_idx, timecode_offset as i16, packet)?;
+            let duration_ms = derived_duration
+                .map(|d| pts_to_ms(d, stream_time_base))
+                .filter(|d| *d > 0);
+            self.append_to_lace(stream_idx, timecode_offset as i16, duration_ms, packet)?;
         }
         // Remember this Block's timestamp so a later non-keyframe
         // BlockGroup on the same track can derive its ReferenceBlock
@@ -7741,7 +8327,13 @@ impl MkvMuxer {
                 "MKV muxer: unknown stream index {stream_idx}"
             )));
         }
-        let declared = self.max_block_addition_ids[stream_idx].unwrap_or(0);
+        // The WebM profile lists BlockAdditions as supported and
+        // MaxBlockAdditionID as unsupported: a strict WebM track cannot
+        // declare a maximum, so none is asked of it.
+        let declared = match self.max_block_addition_ids[stream_idx].unwrap_or(0) {
+            0 if self.webm_strict => u64::MAX,
+            d => d,
+        };
         if declared == 0 {
             return Err(Error::invalid(format!(
                 "MKV muxer: stream {stream_idx} has MaxBlockAdditionID 0 — RFC 9559 §5.1.4.1.16 \
@@ -7774,15 +8366,60 @@ impl MkvMuxer {
         Ok(())
     }
 
+    /// Whether a packet of `stream_idx` with this duration (stream time
+    /// base) must be written as a BlockGroup so `BlockDuration` can
+    /// state it.
+    fn duration_needs_block_group(&self, stream_idx: usize, duration: Option<i64>) -> bool {
+        let Some(duration) = duration.filter(|d| *d >= 0) else {
+            return false;
+        };
+        let stream = &self.streams[stream_idx];
+        if stream.params.media_type == MediaType::Subtitle {
+            return true;
+        }
+        let Some(default_ns) = self.track_timing[stream_idx]
+            .and_then(|t| t.default_duration)
+            .filter(|ns| *ns > 0)
+        else {
+            return false;
+        };
+        // Equal to DefaultDuration within the 1 ms tick: nothing to add.
+        let ms = pts_to_ms(duration, stream.time_base);
+        let floor = (default_ns / 1_000_000) as i64;
+        let ceil = default_ns.div_ceil(1_000_000) as i64;
+        ms < floor || ms > ceil
+    }
+
+    /// End the open Cluster: on a seekable layout its unknown size is
+    /// replaced by the size it turned out to have. The live layout
+    /// never goes back, so a live Cluster keeps the unknown size and
+    /// ends where the next Top-Level element starts (RFC 8794 §6.2).
+    fn close_cluster(&mut self) -> Result<()> {
+        let Some(size_abs) = self.cluster_size_abs.take() else {
+            return Ok(());
+        };
+        if self.live_streaming {
+            return Ok(());
+        }
+        let end = self.output.stream_position().unwrap_or(0);
+        if let Some(field) = end.checked_sub(size_abs + 8).and_then(size_field_8) {
+            self.output.patch_at(size_abs, &field)?;
+        }
+        Ok(())
+    }
+
     fn start_cluster(&mut self, timecode_ms: i64) -> Result<()> {
         // Capture the absolute file offset of the Cluster element header —
         // Cues will store (offset - segment_data_start) as
         // CueClusterPosition.
+        self.close_cluster()?;
         let cluster_abs = self.output.stream_position().unwrap_or(0);
         self.cluster_offset_rel = cluster_abs.saturating_sub(self.segment_data_start);
-        // Write Cluster element id + unknown-size sentinel.
+        // Write Cluster element id + unknown size, in the 8-octet form
+        // `close_cluster` overwrites with the real size.
         self.output.write_all(&write_element_id(ids::CLUSTER))?;
-        self.output.write_all(&write_vint(VINT_UNKNOWN_SIZE, 0))?;
+        self.cluster_size_abs = Some(self.output.stream_position().unwrap_or(0));
+        self.output.write_all(&UNKNOWN_SIZE_8)?;
         // Right after the id+size header is the "first possible element
         // position" inside the Cluster — the anchor that
         // `CueRelativePosition` (RFC 9559 §5.1.5.1.2.3) is measured
@@ -8000,8 +8637,45 @@ impl MkvMuxer {
         &mut self,
         stream_idx: usize,
         timecode_offset: i16,
+        duration_ms: Option<i64>,
         packet: &Packet,
     ) -> Result<()> {
+        // Where a reader will place this frame if it joins the pending
+        // lace (§10.3.5: only the first frame is timestamped, the rest
+        // follow contiguously): `DefaultDuration` after the previous
+        // one when the track states it, else the previous frame's own
+        // duration. A frame that belongs elsewhere starts a new Block.
+        // Only the first frame of a lace is timestamped (§10.3.5); a
+        // reader places the others one DefaultDuration apart. So a
+        // track without a DefaultDuration is not laced (its later
+        // frames would have no timestamp at all), and neither is one
+        // whose DefaultDuration is not a whole number of ticks (readers
+        // round the per-frame step each their own way and disagree by
+        // a tick). Those tracks are written one frame per Block.
+        let default_ns = self.track_timing[stream_idx].and_then(|t| t.default_duration);
+        if default_ns.is_none_or(|ns| ns == 0 || !ns.is_multiple_of(1_000_000)) {
+            self.flush_lace(stream_idx)?;
+            self.lace_pending[stream_idx].first_timecode_offset = timecode_offset;
+            self.lace_pending[stream_idx].keyframe = packet.flags.keyframe;
+            self.lace_pending[stream_idx].next_offset = None;
+            self.lace_pending[stream_idx]
+                .frames
+                .push(packet.data.clone());
+            return self.flush_lace(stream_idx);
+        }
+        let expected_offset = {
+            let buf = &self.lace_pending[stream_idx];
+            let n = buf.frames.len() as u64;
+            match default_ns {
+                Some(ns) => Some(
+                    buf.first_timecode_offset as i64
+                        + (n.saturating_mul(ns).saturating_add(500_000) / 1_000_000) as i64,
+                ),
+                None => buf.next_offset,
+            }
+        };
+        let misplaced = !self.lace_pending[stream_idx].frames.is_empty()
+            && expected_offset.is_some_and(|e| e != timecode_offset as i64);
         // Decide if the buffer can absorb this frame. Conditions
         // for "incompatible with current lace" (flush + restart):
         //   * keyframe flag differs (KEY bit applies to the whole
@@ -8014,7 +8688,8 @@ impl MkvMuxer {
             if buf.frames.is_empty() {
                 false
             } else {
-                buf.keyframe != packet.flags.keyframe
+                misplaced
+                    || buf.keyframe != packet.flags.keyframe
                     || buf.frames.len() >= MAX_FRAMES_PER_LACE
                     || (self.lacing_mode == LacingMode::FixedSize
                         && buf.frames[0].len() != packet.data.len())
@@ -8028,6 +8703,7 @@ impl MkvMuxer {
             buf.first_timecode_offset = timecode_offset;
             buf.keyframe = packet.flags.keyframe;
         }
+        buf.next_offset = duration_ms.map(|d| timecode_offset as i64 + d);
         buf.frames.push(packet.data.clone());
         Ok(())
     }

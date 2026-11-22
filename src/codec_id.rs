@@ -464,6 +464,9 @@ pub fn to_matroska(id: &CodecId) -> Option<&'static str> {
         "prores" => "V_PRORES",
         "dirac" => "V_DIRAC",
         "snow" => "V_SNOW",
+        // Needs an `UncompressedFourCC` (RFC 9559 §5.1.4.1.28.15); the
+        // muxer refuses the track at `write_header` without one.
+        "rawvideo" => "V_UNCOMPRESSED",
         "ffv1" => "V_FFV1",
         "theora" => "V_THEORA",
         "subrip" => "S_TEXT/UTF8",
@@ -692,6 +695,71 @@ pub fn plan_track_codec(params: &CodecParameters) -> Result<TrackCodec> {
     )))
 }
 
+/// `CodecParameters::options` key under which the demuxer keeps the
+/// Win32 header of a compatibility track — the `BITMAPINFOHEADER` of
+/// `V_MS/VFW/FOURCC`, the `WAVEFORMATEX` (with its EXTENSIBLE extension)
+/// of `A_MS/ACM` — as lowercase hex, without the codec extradata that
+/// follows it. The muxer writes it back in front of the extradata when
+/// it still names the track's FourCC / `wFormatTag`, so fields a codec
+/// needs and `StreamInfo` cannot hold (`nBlockAlign`, `biBitCount`,
+/// `biSizeImage`, the channel mask) survive a remux.
+pub const COMPAT_HEADER_OPTION: &str = "mkv:compat_header";
+
+/// `CodecParameters::options` key holding the `UncompressedFourCC` of a
+/// `V_UNCOMPRESSED` track (8 hex digits), which names the pixel layout.
+pub const UNCOMPRESSED_FOURCC_OPTION: &str = "mkv:uncompressed_fourcc";
+
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(text.get(2 * i..2 * i + 2)?, 16).ok())
+        .collect()
+}
+
+/// The part of a compatibility CodecPrivate that precedes the codec's
+/// extradata (see [`strip_compat_header`]), or `None` for other
+/// CodecIDs and headers too short to hold the fixed structure.
+pub fn compat_header(codec_id: &str, codec_private: &[u8]) -> Option<Vec<u8>> {
+    let min = match codec_id {
+        VFW_CODEC_ID => BITMAPINFOHEADER_LEN,
+        ACM_CODEC_ID => WAVEFORMATEX_LEN,
+        _ => return None,
+    };
+    let extra = strip_compat_header(codec_id, codec_private).len();
+    let head = codec_private.len().checked_sub(extra)?;
+    (head >= min).then(|| codec_private[..head].to_vec())
+}
+
+/// The header a stream carries under [`COMPAT_HEADER_OPTION`], when it
+/// is a `BITMAPINFOHEADER` whose `biCompression` is `fourcc`.
+fn kept_vfw_header(params: &CodecParameters, fourcc: [u8; 4]) -> Option<Vec<u8>> {
+    let head = hex_decode(params.options.get(COMPAT_HEADER_OPTION)?)?;
+    (head.len() == BITMAPINFOHEADER_LEN && head[16..20].eq_ignore_ascii_case(&fourcc))
+        .then_some(head)
+}
+
+/// The header a stream carries under [`COMPAT_HEADER_OPTION`], when it
+/// is a `WAVEFORMATEX` (18 bytes, or 40 with the EXTENSIBLE extension)
+/// whose `wFormatTag` — or EXTENSIBLE SubFormat tag — is `format_tag`.
+fn kept_acm_header(params: &CodecParameters, format_tag: u16) -> Option<Vec<u8>> {
+    let head = hex_decode(params.options.get(COMPAT_HEADER_OPTION)?)?;
+    if head.len() != WAVEFORMATEX_LEN && head.len() != WAVEFORMATEX_LEN + EXTENSIBLE_EXT_LEN {
+        return None;
+    }
+    let parsed = AcmFormat::parse(&head)?;
+    (parsed.format_tag == format_tag || parsed.effective_tag == format_tag).then_some(head)
+}
+
 /// Build the `V_MS/VFW/FOURCC` CodecPrivate: a `BITMAPINFOHEADER`
 /// (docs/container/vfw, §BITMAPINFOHEADER — 40 bytes, little-endian)
 /// followed by the codec's extradata. `biSize` counts the header plus
@@ -699,6 +767,15 @@ pub fn plan_track_codec(params: &CodecParameters) -> Result<TrackCodec> {
 /// bottom-up for BI_RGB); `biSizeImage` is the DWORD-aligned
 /// `stride * height` of a `biBitCount` picture.
 pub fn bitmapinfoheader(fourcc: [u8; 4], bit_count: u16, params: &CodecParameters) -> Vec<u8> {
+    // A header read from a file for this FourCC is written back as it
+    // was (see [`COMPAT_HEADER_OPTION`]); only `biSize` follows the
+    // extradata.
+    if let Some(mut head) = kept_vfw_header(params, fourcc) {
+        let size = (BITMAPINFOHEADER_LEN + params.extradata.len()) as u32;
+        head[0..4].copy_from_slice(&size.to_le_bytes());
+        head.extend_from_slice(&params.extradata);
+        return head;
+    }
     let w = params.width.unwrap_or(0);
     let h = params.height.unwrap_or(0);
     let stride = ((u64::from(w) * u64::from(bit_count)).div_ceil(32) * 4) as u32;
@@ -732,6 +809,17 @@ pub fn waveformatex(
     pcm: bool,
     params: &CodecParameters,
 ) -> Result<Vec<u8>> {
+    // A header read from a file for this tag is written back as it was
+    // (see [`COMPAT_HEADER_OPTION`]); only `cbSize` follows the
+    // extradata.
+    if let Some(mut head) = kept_acm_header(params, format_tag) {
+        let cb = u16::try_from(head.len() - WAVEFORMATEX_LEN + params.extradata.len()).map_err(
+            |_| Error::invalid("Matroska muxer: A_MS/ACM extradata exceeds the 65535-byte cbSize"),
+        )?;
+        head[16..18].copy_from_slice(&cb.to_le_bytes());
+        head.extend_from_slice(&params.extradata);
+        return Ok(head);
+    }
     let cb_size = u16::try_from(params.extradata.len()).map_err(|_| {
         Error::invalid("Matroska muxer: A_MS/ACM extradata exceeds the 65535-byte cbSize")
     })?;

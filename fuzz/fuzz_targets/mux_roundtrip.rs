@@ -32,7 +32,7 @@ use oxideav_core::{
     SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_mkv::demux::MkvDemuxer;
-use oxideav_mkv::mux::{LacingMode, MkvMuxer};
+use oxideav_mkv::mux::{LacingMode, MkvMuxer, MkvTrackTiming};
 
 #[derive(Clone, Default)]
 struct Sink(Arc<Mutex<Cursor<Vec<u8>>>>);
@@ -58,6 +58,7 @@ struct Plan {
     lacing: LacingMode,
     cluster_ms: u32,
     cluster_bytes: u64,
+    default_ms: u64,
     packets: Vec<Packet>,
 }
 
@@ -102,12 +103,18 @@ fn plan(data: &[u8]) -> Option<Plan> {
     };
     let cluster_ms = [20u32, 100, 1000, 5000][(data[4] % 4) as usize];
     let cluster_bytes = [1024u64, 4096, 5_000_000][(data[5] % 3) as usize];
+    let default_ms = (data[5] >> 4) as u64 % 8;
     let tb = TimeBase::new(1, 1000);
     let mut clock = 0i64;
     let mut packets = Vec::new();
     for (i, rec) in data[8..].chunks_exact(4).take(400).enumerate() {
         let stream = (rec[0] as usize % n_streams) as u32;
-        clock += (rec[1] % 64) as i64;
+        // Half the steps are the DefaultDuration, so laces form.
+        clock += if rec[1] & 0x80 != 0 && default_ms > 0 {
+            default_ms as i64
+        } else {
+            (rec[1] % 64) as i64
+        };
         let len = 1 + ((rec[2] as usize) << 2 | (rec[3] as usize & 3)) % 700;
         let mut p = Packet::new(stream, tb, vec![(i as u8).wrapping_mul(13) ^ rec[3]; len]);
         p.pts = Some(clock);
@@ -120,6 +127,7 @@ fn plan(data: &[u8]) -> Option<Plan> {
         lacing,
         cluster_ms,
         cluster_bytes,
+        default_ms,
         packets,
     })
 }
@@ -145,6 +153,20 @@ fn mux(plan: &Plan, buffer: usize) -> Vec<u8> {
         }
     }
     m.with_block_lacing(plan.lacing).expect("lacing");
+    // Audio tracks state a DefaultDuration (0 = none): what lets the
+    // muxer lace frames that are exactly that far apart.
+    if plan.default_ms > 0 {
+        for (i, &k) in plan.kinds.iter().enumerate() {
+            if k == 1 {
+                m.set_track_timing(
+                    i,
+                    MkvTrackTiming::default()
+                        .with_default_duration(Some(plan.default_ms * 1_000_000)),
+                )
+                .expect("track timing");
+            }
+        }
+    }
     m.with_output_buffer(buffer).expect("buffer");
     m.write_header().expect("header");
     for p in &plan.packets {
@@ -177,22 +199,24 @@ fn drain(dmx: &mut MkvDemuxer) -> Vec<Packet> {
 
 fn check_read_back(plan: &Plan, got: &[Packet], what: &str) {
     assert_eq!(got.len(), plan.packets.len(), "{what}: packet count");
-    let exact = plan.lacing == LacingMode::None;
+    // A lace holds only frames a reader places where they were
+    // written (one DefaultDuration apart), so timestamps and key flags
+    // are exact in every lacing mode; only the storage order differs
+    // (a lace is written when it is complete).
+    let in_order = plan.lacing == LacingMode::None;
     for stream in 0..plan.kinds.len() as u32 {
         let want = plan.packets.iter().filter(|p| p.stream_index == stream);
         let have = got.iter().filter(|p| p.stream_index == stream);
         for (i, (w, h)) in want.zip(have).enumerate() {
             assert!(w.data == h.data, "{what}: stream {stream} packet {i} bytes");
-            if exact {
-                assert_eq!(w.pts, h.pts, "{what}: stream {stream} packet {i} pts");
-                assert_eq!(
-                    w.flags.keyframe, h.flags.keyframe,
-                    "{what}: stream {stream} packet {i} key flag"
-                );
-            }
+            assert_eq!(w.pts, h.pts, "{what}: stream {stream} packet {i} pts");
+            assert_eq!(
+                w.flags.keyframe, h.flags.keyframe,
+                "{what}: stream {stream} packet {i} key flag"
+            );
         }
     }
-    if exact {
+    if in_order {
         // Storage order is write order.
         for (i, (w, h)) in plan.packets.iter().zip(got).enumerate() {
             assert_eq!(w.stream_index, h.stream_index, "{what}: packet {i} stream");

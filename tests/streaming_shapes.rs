@@ -695,7 +695,7 @@ fn laced_frames_are_spaced_by_default_duration_or_block_duration() {
 
 #[test]
 fn ebml_lace_sizes_at_the_top_of_a_width_round_trip() {
-    use oxideav_mkv::mux::{LacingMode, MkvMuxer};
+    use oxideav_mkv::mux::{LacingMode, MkvMuxer, MkvTrackTiming};
     // Table 37: each width's signed range ends on the all-ones pattern
     // (+2^6 in one octet, +2^13 in two). A reader that takes all-ones
     // for the Element Data Size "unknown" marker cannot read a frame 64
@@ -721,6 +721,12 @@ fn ebml_lace_sizes_at_the_top_of_a_width_round_trip() {
         let f = std::fs::File::create(&path).unwrap();
         let mut mux = MkvMuxer::new_matroska(Box::new(f), &streams).unwrap();
         mux.with_block_lacing(LacingMode::Ebml).unwrap();
+        // One frame per tick: the DefaultDuration a lace needs.
+        mux.set_track_timing(
+            0,
+            MkvTrackTiming::default().with_default_duration(Some(1_000_000)),
+        )
+        .unwrap();
         mux.write_header().unwrap();
         for (i, &n) in sizes.iter().enumerate() {
             let mut p = Packet::new(0, tb, vec![i as u8 + 1; n]);

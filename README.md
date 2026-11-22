@@ -1055,7 +1055,42 @@ to register every codec the build enables.
 
 ### Muxer (`mux::open` and `mux::open_webm`)
 
-- EBML header + Segment (unknown size) for a streaming-friendly layout.
+- EBML header + Segment. Segment and Clusters are opened with the
+  unknown size in its 8-octet form and, on every layout that can go
+  back (everything but `with_live_streaming`), closed with their real
+  size: `write_trailer` leaves a file with a sized Segment, sized
+  Clusters and a measured `Duration`. A capture that never reaches
+  `write_trailer` keeps the unknown sizes and still reads. (Up to
+  0.0.12 both stayed unknown, written as the 1-octet `0xFF` — valid per
+  RFC 8794 §6.2, and refused as corrupt by a widely used player.)
+- **Remux helpers** for a Matroska → Matroska copy:
+  `MkvMuxer::copy_track_header(stream, &demuxer, source_stream)` carries
+  the `TrackEntry` records `StreamInfo` has no field for (`CodecDelay` /
+  `SeekPreRoll`, `DefaultDuration`, name and flags, the Audio and Video
+  children, `Colour`, `Projection`, `MaxBlockAdditionID` and mappings),
+  `copy_chapters_and_attachments(&mut demuxer)` queues the first
+  edition's chapters and every attached file, and
+  `write_packet_from(&packet, &demuxer)` writes a packet together with
+  its Block's `BlockAdditions` and `DiscardPadding`.
+  `examples/remux.rs` is the whole loop.
+- **`Muxer::set_metadata`**: the flat pairs `Demuxer::metadata()` lists
+  go back in — `title` → `Info\Title`, `track:<n>:codec_delay_ns` /
+  `track:<n>:seek_pre_roll_ns` → that track's `CodecDelay` /
+  `SeekPreRoll`, `tag:track:<n>:<name>` → a track-targeted `SimpleTag`,
+  any other free key → a global `SimpleTag` (`TagName` upper-cased).
+  `muxer` / `encoder` / `date` / `duration`, per-track `duration`
+  statistics and the `chapter:` / `attachment:` / `tag:edition:` /
+  `tag:chapter:` / `tag:attachment:` families are accepted and not
+  stored (`carries_metadata_key` says which). So a caller that only
+  knows the `Demuxer` / `Muxer` traits keeps title, tags and audio
+  priming across a copy.
+- **`BlockDuration` where a reader needs it** (§5.1.3.5.3): a packet
+  with a duration is written as a `BlockGroup` carrying it when the
+  track is a subtitle track, or when the duration differs from the
+  track's `DefaultDuration` (the shortened last frame of an audio
+  track). Everything else stays a `SimpleBlock`. An Opus packet without
+  a duration gets the one its TOC implies, converted to the stream time
+  base.
 - **`DocTypeExtension` on write** (RFC 8794 §11.2.9..§11.2.11):
   `MkvMuxer::set_doc_type_extensions(Vec<DocTypeExtension>)` queues the
   EBML-header extension declarations, emitted after `DocTypeReadVersion` in
@@ -1210,16 +1245,18 @@ to register every codec the build enables.
   the `Void` in between. Conflicts with `with_live_streaming` in both
   directions (§25.3.4 writes no SeekHead). In-profile under strict
   WebM (`Void` is guidelines-Supported).
-- **Two-pass `Duration` finalization** (RFC 9559 §5.1.2.10): opt-in via
-  `MkvMuxer::with_duration_finalization()`. `write_header` reserves a
+- **Two-pass `Duration` finalization** (RFC 9559 §5.1.2.10): what every
+  non-live muxer does unless `set_duration` supplied the value
+  (`MkvMuxer::with_duration_finalization()` now only records the
+  intent). `write_header` reserves a
   `Duration`-sized `Void` inside `Info` (at the §5.1.2 element-order
   position) and `write_trailer` patches it in place with the *measured*
   duration — the maximum packet end time (`pts + duration`) across all
   streams — then rewrites the Info `CRC-32` payload over the patched
   body (RFC 8794 §11.3.1; skipped in strict WebM mode where no CRC
   child exists). Failure modes are truthful: a crashed producer (no
-  trailer) or a zero-packet mux leaves a harmless `Void`, never a bogus
-  duration. Conflicts are rejected in both directions with
+  trailer), a zero-packet mux or a measured duration of 0 leaves a
+  harmless `Void`, never a bogus duration. Conflicts are rejected in both directions with
   `set_duration` (explicit vs measured) and `with_live_streaming`
   (forward-only output has no known end to patch). Black-box validated:
   a widely-deployed prober reads the patched duration.
@@ -1228,9 +1265,10 @@ to register every codec the build enables.
   writes no `Cues` in `write_trailer` ("SeekHead and Cues are useless" in
   a live stream; §23.2 says a stream with neither at its start SHOULD be
   considered non-seekable — the signal a live producer wants to send).
-  Everything other than Clusters still lands before the Clusters, and the
-  Segment / Cluster unknown-size VINTs §23.2 mandates were already the
-  muxer's default, so the output can be cut at any Cluster boundary.
+  Everything other than Clusters still lands before the Clusters, and
+  Segment and Clusters keep the unknown size §23.2 mandates (the other
+  layouts replace it when the element ends), so the output can be cut
+  at any Cluster boundary.
   Combined with `with_cluster_position_hints()`, each Cluster's
   `Position` is written as `0` — the §5.1.3.2 live-stream convention —
   while `PrevSize` stays real. Pairs with the resilient demuxer: a live
@@ -1283,9 +1321,9 @@ to register every codec the build enables.
   verifies every emitted master round-trips to a matching stored /
   computed pair. `SeekHead` is deliberately not CRC'd — its Cues entry
   is patched in `write_trailer`, which would invalidate any CRC computed
-  up front. `Cluster` is not CRC'd because the muxer streams Clusters
-  with the unknown-size VINT and RFC 8794 §11.3.1 requires a bounded
-  body for CRC.
+  up front. `Cluster` is not CRC'd: its body is streamed to the sink
+  as it is written, and the leading `CRC-32` child would have to be
+  known before the first Block.
 - **`Video > FlagInterlaced` + `FieldOrder` on write** (RFC 9559
   §5.1.4.1.28.1 + §5.1.4.1.28.2): `MkvMuxer::set_video_interlacing(
   stream_index, FlagInterlaced, Option<FieldOrder>)` queues a per-track
@@ -1571,8 +1609,15 @@ to register every codec the build enables.
 - Opt-in **block lacing** on write (RFC 9559 §5.1.4.5.5, §10.3):
   `MkvMuxer::with_block_lacing(LacingMode::{Xiph,Ebml,FixedSize})`
   before `write_header` aggregates same-track, same-keyframe-status
-  consecutive frames (up to 8 per Block, never crossing a cluster
-  boundary) into a single laced `SimpleBlock`. Default stays
+  consecutive audio frames (up to 8 per Block, never crossing a cluster
+  boundary) into a single laced `SimpleBlock`. Only the first frame of a
+  lace has a timestamp (§10.3.5) and readers place the rest one
+  `DefaultDuration` apart, so a frame joins a lace only on an audio
+  track whose `DefaultDuration` is a whole number of ticks
+  (`set_track_timing`) and only when it sits exactly that far after the
+  previous one; video, subtitles, tracks without `DefaultDuration`, a
+  21.33 ms AAC frame and any frame off the grid get a Block of their
+  own. Every timestamp therefore survives a laced copy. Default stays
   `LacingMode::None` (one frame per Block, `FlagLacing = 0`) for
   byte-identical back-compat. When lacing is on, the muxer writes
   `TrackEntry.FlagLacing = 1`, sets the LACING bits in the
@@ -1968,8 +2013,8 @@ implemented for roundtrip:
   `V_MPEGH/ISO/HEVC`, `V_MPEG4/ISO/ASP` (also `SP` / `AP` on read; the
   CodecID as read stays on `params.tag` and is written back),
   `V_MPEG4/MS/V3`, `V_MPEG1`, `V_MPEG2`, `V_MJPEG`, `V_PRORES`,
-  `V_FFV1`, `V_THEORA`, `V_DIRAC`, `V_SNOW`; `V_UNCOMPRESSED` reads as
-  `rawvideo` (the layout is `video_uncompressed_fourcc`).
+  `V_FFV1`, `V_THEORA`, `V_DIRAC`, `V_SNOW`, and `V_UNCOMPRESSED`
+  (`rawvideo`; the layout is the track's `UncompressedFourCC`).
 - `V_PRORES` Blocks hold a ProRes frame from `frame_header()` on; the
   demuxer puts the `frame_size` / `'icpf'` head (SMPTE RDD 36 §5.1)
   back so a packet is a whole `frame()`, and the muxer removes it.
@@ -2050,6 +2095,77 @@ never rewrites a header to match.
   matroska scores 100 on `probe_matroska` and 0 on `probe_webm`. Files
   with an ambiguous DocType fall through to the matroska entry.
 
+## Black-box interoperability matrix
+
+`tests/foreign_matrix.rs` runs when `ffmpeg` and `ffprobe` are installed
+(it skips otherwise; `mpv` adds a second reader). Everything is
+generated in a temporary directory.
+
+**Foreign → ours, 129 files, 129 pass.** The black-box muxer writes every
+codec it will put in Matroska / WebM — 38 video rows (H.264 with and
+without B-frames, HEVC 8 / 10 bit, AV1, VP8, VP9, MPEG-4 Part 2,
+MPEG-1 / 2, Motion JPEG, FFV1 levels 1 / 3, ProRes, the HuffYUV family
+and 14 more through `V_MS/VFW/FOURCC`, `V_QUICKTIME`, `V_UNCOMPRESSED`,
+raw BGR) and 41 audio rows (AAC LC / HE / 5.1, MP3, MP2, AC-3, E-AC-3,
+DTS, Opus mono / 5.1, Vorbis, FLAC 16 / 24 bit / 8 channels / 96 kHz,
+ALAC, TTA, WavPack, TrueHD, MLP, every native PCM layout, 64-bit PCM,
+A-law, µ-law, four `A_MS/ACM` codecs, RealAudio 14.4) — plus 7 WebM rows
+(VP8 / VP9 / AV1 with Vorbis / Opus, live, DASH, VP8 and VP9 alpha in
+`BlockAdditional`), 36 layout rows (Cues at the end / moved to the front
+/ in reserved space, live, piped, CRC-32 off, three Cluster size limits,
+four Cluster time limits, start at −0.5 s / 10 s / 1 h, VFR, 60 fps,
+29.97 fps, 1 frame, 1 audio packet, 2 minutes, 33×17, 1080p, four
+tracks with languages / titles / flags, HDR colour, sample aspect ratio,
+interlaced, stereo 3D, trimmed Opus, chapters, an attachment) and 7 text
+subtitle rows (SRT, ASS, SSA, plain text, WebVTT in Matroska and WebM,
+SRT next to video). Per track, this crate's reading is compared with the
+black-box reader's: packet count, payload size and CRC-32, timestamp,
+key flag, duration, codec id, dimensions, sample rate, channels,
+language, extradata. Where the reader reports something the file does
+not contain, the row says so and states what is checked instead: key
+flags the reader forces on (H.261, H.263, VC-2), extradata it
+synthesises (MPEG-1 / 2, TTA, the EXTENSIBLE extension), payloads it
+rebuilds (WavPack, WebVTT), timestamps before zero, and two
+`V_QUICKTIME` rows it cannot read at all.
+
+**Ours → foreign, 884 copies, 884 pass.** Each file the reader can read
+is demuxed and muxed back in every writer mode — file with the index at
+the end, index at the front, live, a Cluster every 100 ms, a Cluster
+every 2000 bytes, laced audio, a copy through the `Demuxer` / `Muxer`
+traits alone, and the WebM profile for WebM sources. The black-box
+reader must report the same packets (timestamp, duration, key flag,
+size, CRC-32) and stream parameters for the copy as for the source and
+print nothing on its warning channel (a live Segment's "duration
+estimated" notice is the one exception: §23.2 gives a live Segment no
+Duration); this crate must read the copy back to the same packets; and
+the second reader must play the file-mode and WebM copies and exit
+cleanly.
+
+What the matrix found is listed under `[Unreleased]` in the changelog.
+Not covered, because the local tools produce none: Theora (no encoder
+in this build), bitmap subtitles (PGS, VobSub, DVB), laced Blocks and
+EBML / fixed-size lacing written by another muxer, `ContentEncodings`,
+ordered chapters, and files written by a second muxer.
+
+## Track records in `CodecParameters::options`
+
+Two keys, both under the `mkv:` prefix, carry track records that have no
+field in `CodecParameters`; the demuxer sets them and the muxer reads
+them back:
+
+- `mkv:compat_header` — lowercase hex of the Win32 header of a
+  compatibility track, without the codec extradata that follows it: the
+  40-byte `BITMAPINFOHEADER` of `V_MS/VFW/FOURCC`, or the `WAVEFORMATEX`
+  of `A_MS/ACM` (18 bytes, 40 with the EXTENSIBLE extension). The muxer
+  writes it back in front of the extradata while it still names the
+  track's FourCC / `wFormatTag`, so `nBlockAlign`, `biBitCount`,
+  `biSizeImage` and the channel mask survive a copy (a WMA track is
+  undecodable without its `nBlockAlign`).
+- `mkv:uncompressed_fourcc` — 8 hex digits, the `UncompressedFourCC` of
+  a `V_UNCOMPRESSED` track; the muxer writes it when
+  `set_video_uncompressed_fourcc` was not called, and refuses a
+  `V_UNCOMPRESSED` track that has neither.
+
 ## What's NOT implemented
 
 - Concatenated Segments are read forward only: `seek_to`, the Cues /
@@ -2072,8 +2188,8 @@ never rewrites a header to match.
   `Chapters` and `Attachments` when those are queued. `SeekHead` and
   `Cluster` are deliberately not CRC'd on the mux side: the `SeekHead`
   Cues entry is patched in `write_trailer` (which would invalidate any
-  CRC computed up front), and `Cluster` is streamed with the unknown-size
-  VINT (RFC 8794 §11.3.1's bounded-body requirement).
+  CRC computed up front), and a `Cluster` body goes to the sink as it
+  is written, before a leading `CRC-32` could be known.
 - The reclaimed content-signing quartet (RFC 9559 Appendix A.33..A.36 —
   `ContentSignature` `0x47E3`, `ContentSigKeyID` `0x47E4`, `ContentSigAlgo`
   `0x47E5`, `ContentSigHashAlgo` `0x47E6`) is now decoded and written on both
@@ -2224,8 +2340,10 @@ definitions and pins what the demuxer does with it.
   A following EBML Document of another DocType ends the stream.
 - **Lacing** (§10.3). All three kinds de-lace; the frames of a lace are
   spaced by `BlockDuration / frames` when the BlockGroup has one, else
-  by the track's `DefaultDuration`, else they share the Block's
-  timestamp (the lace says no more). A one-frame lace is read as the one
+  by the track's `DefaultDuration` (frame `i` at `i` × the duration in
+  nanoseconds, rounded once — not `i` × a rounded tick count, which
+  drifts on a 21.33 ms frame), else they share the Block's timestamp
+  (the lace says no more). A one-frame lace is read as the one
   frame it describes. A track's `DefaultDuration` is also the packet
   duration of Blocks that state none; Block timestamps are always taken
   as written. A lace whose sizes do not fit the Block is refused — on
@@ -2489,8 +2607,8 @@ into a stream set, a layout (index at the end, at the front in reserved
 space, or the live layout), a lacing mode, Cluster budgets and a packet
 schedule, muxes it twice (buffered and write-through — the bytes must
 match), reads it back through the strict and the resilient demuxer
-(every packet's bytes on its stream in write order; without lacing also
-its timestamp and key flag; no damage events on the muxer's own output),
+(every packet's bytes, timestamp and key flag on its stream in write
+order, laced or not; no damage events on the muxer's own output),
 and then seeks: on every stream with a key frame, `seek_to` must return
 the timestamp of the last key frame at or before the target and the
 stream's next packet must be that key frame.

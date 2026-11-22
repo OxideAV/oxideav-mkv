@@ -273,6 +273,28 @@ impl BufOutput {
         Ok(())
     }
 
+    /// Overwrite `data.len()` bytes at absolute position `pos`, which
+    /// must lie wholly before the write position. Bytes still in the
+    /// buffer are patched there; bytes already handed to the sink are
+    /// rewritten with one positioned write, after which the sink is
+    /// back at the write position.
+    pub(crate) fn patch_at(&mut self, pos: u64, data: &[u8]) -> std::io::Result<()> {
+        self.learn_base();
+        if pos >= self.base {
+            let start = (pos - self.base) as usize;
+            if let Some(slot) = self.buf.get_mut(start..start + data.len()) {
+                slot.copy_from_slice(data);
+                return Ok(());
+            }
+        }
+        self.write_out()?;
+        let end = self.base;
+        self.inner.seek(SeekFrom::Start(pos))?;
+        self.inner.write_all(data)?;
+        self.inner.seek(SeekFrom::Start(end))?;
+        Ok(())
+    }
+
     /// Write the buffered bytes followed by `data`.
     fn write_pair(&mut self, data: &[u8]) -> std::io::Result<()> {
         let mut head: &[u8] = &self.buf;

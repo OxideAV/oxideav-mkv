@@ -28,7 +28,7 @@ use oxideav_core::{
 };
 use oxideav_mkv::ebml::{VINT_UNKNOWN_SIZE, read_element_header, read_uint};
 use oxideav_mkv::ids;
-use oxideav_mkv::mux::{LacingMode, MkvMuxer};
+use oxideav_mkv::mux::{LacingMode, MkvMuxer, MkvTrackTiming};
 
 /// Counter ensures every temp file produced by the parallel test
 /// runner gets a unique name.
@@ -75,6 +75,18 @@ fn mux_with_lacing(mode: LacingMode, packets: &[Packet]) -> Vec<u8> {
         let stream = pcm_stream();
         let mut mx = MkvMuxer::new_matroska(ws, &[stream]).expect("muxer construct");
         mx.with_block_lacing(mode).expect("with_block_lacing");
+        // A lace timestamps its first frame only (RFC 9559 §10.3.5);
+        // the reader spaces the rest by DefaultDuration, so the muxer
+        // laces a track only when it states one. The packets here are
+        // evenly spaced: that spacing is the DefaultDuration.
+        if let [a, b, ..] = packets {
+            let step_ms = (b.pts.unwrap() - a.pts.unwrap()) as u64;
+            mx.set_track_timing(
+                0,
+                MkvTrackTiming::default().with_default_duration(Some(step_ms * 1_000_000)),
+            )
+            .expect("set_track_timing");
+        }
         mx.write_header().expect("write_header");
         for p in packets {
             mx.write_packet(p).expect("write_packet");

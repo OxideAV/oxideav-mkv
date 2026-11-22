@@ -656,6 +656,25 @@ fn open_typed_impl(
         //   * `A_MS/ACM`: the WAVEFORMATEX header (and the EXTENSIBLE
         //     extension) wraps the codec's `cbSize` bytes.
         let stripped = strip_compat_header(&t.codec_id_string, &t.codec_private);
+        // The Win32 header that was in front of it stays reachable, so
+        // a remux can put it back (`nBlockAlign`, `biBitCount`, ...).
+        if let Some(head) = crate::codec_id::compat_header(&t.codec_id_string, &t.codec_private) {
+            params.options.insert(
+                crate::codec_id::COMPAT_HEADER_OPTION,
+                crate::codec_id::hex_encode(&head),
+            );
+        }
+        if t.codec_id_string == "V_UNCOMPRESSED"
+            && let Some(fourcc) = t
+                .uncompressed_fourcc_raw
+                .as_deref()
+                .filter(|f| f.len() == 4)
+        {
+            params.options.insert(
+                crate::codec_id::UNCOMPRESSED_FOURCC_OPTION,
+                crate::codec_id::hex_encode(fourcc),
+            );
+        }
         params.extradata = match codec_id.as_str() {
             "flac" if stripped.starts_with(b"fLaC") => stripped[4..].to_vec(),
             _ => stripped,
@@ -1181,6 +1200,8 @@ fn open_typed_impl(
                         display_width,
                         display_height,
                         display_unit: unit,
+                        display_width_explicit: (dw_raw != 0).then_some(dw_raw),
+                        display_height_explicit: (dh_raw != 0).then_some(dh_raw),
                     }
                 })
         })
@@ -6088,9 +6109,36 @@ pub struct VideoGeometry {
     display_width: Option<u64>,
     display_height: Option<u64>,
     display_unit: DisplayUnit,
+    display_width_explicit: Option<u64>,
+    display_height_explicit: Option<u64>,
 }
 
 impl VideoGeometry {
+    /// `DisplayWidth` as the file states it: `None` when the element is
+    /// absent (where [`display_width`](Self::display_width) derives the
+    /// value from `PixelWidth` and the crop).
+    pub fn display_width_explicit(&self) -> Option<u64> {
+        self.display_width_explicit
+    }
+
+    /// `DisplayHeight` as the file states it — see
+    /// [`display_width_explicit`](Self::display_width_explicit).
+    pub fn display_height_explicit(&self) -> Option<u64> {
+        self.display_height_explicit
+    }
+
+    /// `true` when the track states no crop, no display size and the
+    /// default unit: nothing a writer has to store.
+    pub fn is_default(&self) -> bool {
+        self.pixel_crop_top == 0
+            && self.pixel_crop_bottom == 0
+            && self.pixel_crop_left == 0
+            && self.pixel_crop_right == 0
+            && self.display_width_explicit.is_none()
+            && self.display_height_explicit.is_none()
+            && self.display_unit == DisplayUnit::Pixels
+    }
+
     /// `PixelCropTop` (RFC 9559 §5.1.4.1.28.9): number of pixel rows to hide
     /// at the top of the encoded image. Default `0`.
     pub fn pixel_crop_top(&self) -> u64 {
@@ -13917,8 +13965,29 @@ impl MkvDemuxer {
             && meta
                 .as_ref()
                 .is_some_and(|m| m.discard_padding.is_some_and(|pad| pad != 0));
+        // Where frame `i` of a lace starts, in ticks after the first
+        // (§10.3.5: the frames are contiguous): an even share of the
+        // Block's own duration, else `i` DefaultDurations — taken in
+        // nanoseconds and rounded once, so a 21.33 ms frame does not
+        // drift a third of a tick per frame.
+        let default_ns = self
+            .default_duration_ns
+            .get(stream_idx as usize)
+            .copied()
+            .flatten();
+        let scale_ns = chain.map_or(self.timecode_scale_ns, |c| c.scale_ns).max(1);
+        let lace_offset = |i: usize| -> i64 {
+            match (explicit_duration, default_ns) {
+                (Some(d), _) => d.saturating_mul(i as i64) / n_frames.max(1),
+                (None, Some(ns)) => i64::try_from(
+                    (i as u64).saturating_mul(ns).saturating_add(scale_ns / 2) / scale_ns,
+                )
+                .unwrap_or(i64::MAX),
+                (None, None) => 0,
+            }
+        };
         let emit = |d: &mut Self, i: usize, f: Vec<u8>| {
-            let pts = pts_base.saturating_add(per_frame.unwrap_or(0).saturating_mul(i as i64));
+            let pts = pts_base.saturating_add(lace_offset(i));
             // A chained Segment's ticks go onto the first Segment's
             // timeline and scale.
             let (pts, per_frame) = match chain {

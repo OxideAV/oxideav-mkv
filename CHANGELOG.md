@@ -38,7 +38,56 @@ Found by reading files a black-box muxer wrote (the foreign-file matrix):
   `V_UNCOMPRESSED` are written too; Motion JPEG is written as
   `V_MJPEG` instead of a `V_MS/VFW/FOURCC` track.
 
+Found by having a black-box reader and a player read what this crate
+writes:
+
+- Segment and Clusters were written with the 1-octet unknown size
+  (`0xFF`) and never closed; a widely used player reports such a file as
+  corrupt and does not play it. Both are now opened with the 8-octet
+  unknown size and, outside the live layout, closed with their real
+  size.
+- No `Duration` unless the caller asked: readers estimated one from the
+  bit rate. The measured duration is now written by every non-live
+  muxer (`set_duration` still wins).
+- Subtitle packets lost their duration (a `SimpleBlock` cannot state
+  one), and so did the shortened last frame of an audio track. Both are
+  written as a `BlockGroup` with `BlockDuration`.
+- An Opus packet's TOC duration (48 kHz samples) was written as if it
+  were in the stream time base: `BlockDuration` 960 for a 20 ms packet
+  on a millisecond stream. A packet's own duration now wins, and the
+  TOC-derived one is converted.
+- Lacing put any consecutive frames of a track into one Block — video
+  with reordered timestamps included — and a reader got back timestamps
+  the frames never had. Laces now hold only audio frames exactly one
+  whole-tick `DefaultDuration` apart; the demuxer places laced frames
+  from the duration in nanoseconds instead of a rounded tick count.
+- A copy of a `V_MS/VFW/FOURCC` / `A_MS/ACM` track rebuilt the Win32
+  header from `StreamInfo` and lost `nBlockAlign`, `biBitCount` and the
+  EXTENSIBLE extension (WMA unplayable). The header read from the file
+  is kept (`mkv:compat_header` in `CodecParameters::options`) and
+  written back.
+- The strict WebM muxer could not write alpha: it refuses
+  `MaxBlockAdditionID` (unsupported in the WebM guidelines) and then
+  refused `BlockAdditions` for want of it. `D_WEBVTT/<kind>` tracks were
+  refused by the WebM codec list.
+
 ### Added
+
+- `tests/foreign_matrix.rs`: the live black-box matrix — 129 files from
+  a black-box muxer read here and by a black-box reader, 884 copies
+  written here and read back by that reader and a player. Skips without
+  the tools.
+- `MkvMuxer::copy_track_header`, `copy_chapters_and_attachments` and
+  `write_packet_from` for a Matroska → Matroska copy; `examples/remux.rs`
+  and `examples/dump_packets.rs`.
+- `Muxer::set_metadata` / `carries_metadata_key` on the muxer (title,
+  global and per-track tags, per-track `CodecDelay` / `SeekPreRoll`).
+- `rawvideo` is written as `V_UNCOMPRESSED` (needs an
+  `UncompressedFourCC`; `mkv:uncompressed_fourcc` in the options carries
+  the one read from a file).
+- `VideoGeometry::display_width_explicit` / `display_height_explicit` /
+  `is_default`; `MkvDemuxer::set_timestamps_as_written` and
+  `MkvMuxer::set_timestamps_as_written`.
 
 - Concatenated Segments (RFC 9559 §4.5 / §23.2, RFC 8794 §9): the packet
   walk continues into a Matroska / WebM EBML Document that follows the

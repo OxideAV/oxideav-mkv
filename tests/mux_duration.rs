@@ -111,12 +111,21 @@ fn duration_roundtrips_through_demuxer() {
 }
 
 #[test]
-fn omitted_duration_stays_off_disk() {
+fn omitted_duration_is_measured_on_a_finished_file() {
+    // No `set_duration`: the trailer states the end of the last packet
+    // (two packets at 0 and 1000 ms without a duration → 1000 ms).
     let bytes = mux_video(|_mx| {});
-    assert!(
-        !has_duration(&bytes),
-        "omitted Duration must not be on disk"
-    );
+    assert!(has_duration(&bytes), "measured Duration must be on disk");
+    let dmx = demux(bytes);
+    assert_eq!(dmx.duration_micros(), Some(1_000_000));
+}
+
+#[test]
+fn live_layout_states_no_duration() {
+    let bytes = mux_video(|mx| {
+        mx.with_live_streaming().expect("live");
+    });
+    assert!(!has_duration(&bytes), "a live Segment has no known end");
     let dmx = demux(bytes);
     assert_eq!(dmx.duration_micros(), None);
 }
