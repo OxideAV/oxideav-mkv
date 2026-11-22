@@ -2121,7 +2121,12 @@ subtitle rows (SRT, ASS, SSA, plain text, WebVTT in Matroska and WebM,
 SRT next to video). Per track, this crate's reading is compared with the
 black-box reader's: packet count, payload size and CRC-32, timestamp,
 key flag, duration, codec id, dimensions, sample rate, channels,
-language, extradata. Where the reader reports something the file does
+language, extradata. Every track is then sought, on the resilient path,
+to six targets from before its first packet to past its last — whatever
+index the file has (Cues at the end, at the front, none on the live and
+piped rows): the landing must be the track's last key frame at or before
+the target and the track's next packet that key frame. Where the reader
+reports something the file does
 not contain, the row says so and states what is checked instead: key
 flags the reader forces on (H.261, H.263, VC-2), extradata it
 synthesises (MPEG-1 / 2, TTA, the EXTENSIBLE extension), payloads it
@@ -2137,9 +2142,15 @@ reader must report the same packets (timestamp, duration, key flag,
 size, CRC-32) and stream parameters for the copy as for the source and
 print nothing on its warning channel (a live Segment's "duration
 estimated" notice is the one exception: §23.2 gives a live Segment no
-Duration); this crate must read the copy back to the same packets; and
-the second reader must play the file-mode and WebM copies and exit
-cleanly.
+Duration); this crate must read the copy back to the same packets (and,
+on the two container rows, the same chapters, title and attachment);
+the black-box muxer must accept the file-mode copy as input and its
+stream copy of it must still hold the source's packets (the chain
+foreign → ours → foreign); and the second reader must play the
+file-mode and WebM copies and exit cleanly.
+
+`tests/interop_pins.rs` pins each defect the matrix found on small
+files built in the test, without the tools.
 
 What the matrix found is listed under `[Unreleased]` in the changelog.
 Not covered, because the local tools produce none: Theora (no encoder
@@ -2354,7 +2365,11 @@ definitions and pins what the demuxer does with it.
 
 `seek_to(stream, pts)` lands on the last key frame of that track at or
 before the target and returns that key frame's timestamp; a target
-before the track's first key frame lands on the first. The index gets
+before the track's first key frame lands on the first. A track the
+`Cues` do not list — the audio and subtitle tracks of the many files
+that index their video track only — is sought through the other tracks'
+`CuePoint`s: they name the Cluster, and the key-frame pass below finds
+the track's own frame in it (up to 0.0.12 such a seek was refused). The index gets
 the reader close — a `CuePoint` (trust-but-verified on the resilient
 path), or without usable `Cues` the Cluster search — and then Block
 headers are read forward from that landing up to the target, payloads

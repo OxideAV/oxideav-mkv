@@ -10231,13 +10231,40 @@ impl MkvDemuxer {
             // real tracks, so when application is enabled and the target
             // stream is a virtual track with no Cues rows of its own,
             // seek through its source tracks' Cues instead.
-            None => self
-                .virtual_seek_cue(stream_index, target_ticks)
-                .ok_or_else(|| {
-                    Error::unsupported(format!(
-                        "MKV: no Cues entries for track {track_number} (stream {stream_index})"
-                    ))
-                })?,
+            None => match self.virtual_seek_cue(stream_index, target_ticks) {
+                Some(cue) => cue,
+                // The index has no row for this track at all — the usual
+                // shape of a file that indexes its video track only
+                // (§22.1 leaves the choice of indexed tracks to the
+                // writer). Any track's CuePoint still names the Cluster
+                // the target lies in: land on that Cluster's start (the
+                // CueRelativePosition / CueBlockNumber belong to the
+                // other track's Block) and let the key-frame pass find
+                // this track's frame from there.
+                None => {
+                    // A virtual track (§18.8) whose TrackOperation is
+                    // not being applied has no Blocks to land on.
+                    if self
+                        .track_operations
+                        .get(stream_index as usize)
+                        .is_some_and(Option::is_some)
+                    {
+                        return Err(Error::unsupported(format!(
+                            "MKV: no Cues entries for track {track_number} (stream {stream_index})"
+                        )));
+                    }
+                    let mut near: Option<&CueEntry> = None;
+                    for c in &self.cues {
+                        if c.time <= target_ticks && near.is_none_or(|n| c.time >= n.time) {
+                            near = Some(c);
+                        }
+                    }
+                    match near.or_else(|| self.cues.iter().min_by_key(|c| c.time)) {
+                        Some(c) => (c.time, c.cluster_offset, None, None),
+                        None => return self.seek_cueless(stream_index, pts),
+                    }
+                }
+            },
         };
 
         // Trust-but-verify (resilient only): RFC 9559 §26 leaves error

@@ -994,6 +994,9 @@ fn check_foreign(row: &Row, path: &Path) -> Vec<String> {
     if ours.iter().any(|t| t.packets.is_empty()) {
         issues.push("a track with no packets".into());
     }
+    if row.flags & NEGATIVE_START == 0 {
+        issues.extend(check_seeks(path, &ours));
+    }
     if row.flags & READER_BLIND != 0 {
         return issues;
     }
@@ -1106,6 +1109,80 @@ fn check_foreign(row: &Row, path: &Path) -> Vec<String> {
         }
         if ours[1].packets[0].pts != Some(-521) {
             issues.push(format!("first audio pts {:?}", ours[1].packets[0].pts));
+        }
+    }
+    issues
+}
+
+/// Seek every track of a foreign file — whatever index it has: Cues at
+/// the end, at the front, or none (live, piped) — to targets before,
+/// inside and after its packets, on the resilient path (which also
+/// seeks the live shape). The landing must be the track's last key
+/// frame at or before the target (the first key frame for a target
+/// before it), and the track's next packet must be that key frame.
+fn check_seeks(path: &Path, tracks: &[Track]) -> Vec<String> {
+    let mut issues = Vec::new();
+    let bytes = std::fs::read(path).unwrap();
+    for (stream, track) in tracks.iter().enumerate() {
+        let keys: Vec<i64> = track
+            .packets
+            .iter()
+            .filter(|p| p.key)
+            .filter_map(|p| p.pts)
+            .collect();
+        let (Some(&first), Some(&last)) = (keys.first(), keys.last()) else {
+            continue;
+        };
+        let end = track
+            .packets
+            .iter()
+            .filter_map(|p| p.pts)
+            .max()
+            .unwrap_or(last);
+        let middle = keys[keys.len() / 2];
+        for target in [
+            first - 10,
+            first,
+            middle - 1,
+            middle,
+            (first + end) / 2,
+            end + 100,
+        ] {
+            let reader: Box<dyn ReadSeek> = Box::new(std::io::Cursor::new(bytes.clone()));
+            let mut dmx = match oxideav_mkv::demux::open_resilient_typed(reader, &NullCodecResolver)
+            {
+                Ok(d) => d,
+                Err(e) => return vec![format!("resilient open: {e}")],
+            };
+            // Key frames are in timestamp order on every track here.
+            let want = keys
+                .iter()
+                .rev()
+                .find(|k| **k <= target)
+                .copied()
+                .unwrap_or(first);
+            let landed = match dmx.seek_to(stream as u32, target) {
+                Ok(t) => t,
+                Err(e) => {
+                    issues.push(format!("track {stream}: seek to {target}: {e}"));
+                    break;
+                }
+            };
+            let next = loop {
+                match dmx.next_packet() {
+                    Ok(p) if p.stream_index == stream as u32 => break Some(p),
+                    Ok(_) => {}
+                    Err(_) => break None,
+                }
+            };
+            let next = next.map(|p| (p.pts, p.flags.keyframe));
+            if landed != want || next != Some((Some(want), true)) {
+                issues.push(format!(
+                    "track {stream}: seek to {target} landed {landed} (next packet {next:?}), \
+                     expected the key frame at {want}"
+                ));
+                break;
+            }
         }
     }
     issues
@@ -1326,6 +1403,41 @@ fn check_copy(
                 pb[n], pa[n]
             ));
         }
+    }
+    // The chain foreign → ours → foreign: the black-box muxer copies
+    // this crate's file, and its reader must still see the source's
+    // packets in the result.
+    if mode == Mode::File {
+        let chained = out.with_extension(format!("chain.{}", row.ext.replace("pipe", "mkv")));
+        let copied = Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(out)
+            .args(["-map", "0", "-c", "copy", "-copyts"])
+            .args(["-allow_raw_vfw", "1", "-strict", "-2"])
+            .arg(&chained)
+            .output()
+            .expect("run ffmpeg");
+        if !copied.status.success() {
+            issues.push(format!(
+                "black-box muxer refuses the copy as input: {}",
+                String::from_utf8_lossy(&copied.stderr).trim()
+            ));
+        } else {
+            let (again, _) = probe(&chained);
+            for (i, (a, b)) in original.iter().zip(&again).enumerate() {
+                let same = a.packets.len() == b.packets.len()
+                    && a.packets.iter().zip(&b.packets).all(|(x, y)| {
+                        (x.pts, x.key, x.size, x.crc) == (y.pts, y.key, y.size, y.crc)
+                    });
+                if !same {
+                    issues.push(format!("track {i}: the chain's packets differ"));
+                }
+            }
+            if again.len() != original.len() {
+                issues.push(format!("the chain has {} tracks", again.len()));
+            }
+        }
+        let _ = std::fs::remove_file(&chained);
     }
     if player {
         let played = Command::new("mpv")

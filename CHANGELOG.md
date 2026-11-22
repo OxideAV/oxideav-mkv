@@ -38,6 +38,11 @@ Found by reading files a black-box muxer wrote (the foreign-file matrix):
   `V_UNCOMPRESSED` are written too; Motion JPEG is written as
   `V_MJPEG` instead of a `V_MS/VFW/FOURCC` track.
 
+- `seek_to` on a track the `Cues` do not list (the audio track of
+  nearly every file a black-box muxer writes: it indexes video only)
+  failed with `Unsupported`. Another track's `CuePoint` now names the
+  Cluster and the key-frame pass finds the track's frame.
+
 Found by having a black-box reader and a player read what this crate
 writes:
 
@@ -75,8 +80,10 @@ writes:
 
 - `tests/foreign_matrix.rs`: the live black-box matrix — 129 files from
   a black-box muxer read here and by a black-box reader, 884 copies
-  written here and read back by that reader and a player. Skips without
-  the tools.
+  written here and read back by that reader and a player, plus seeks
+  on every foreign track and the chain foreign → ours → foreign. Skips
+  without the tools. `tests/interop_pins.rs` pins each finding on small
+  built-in files.
 - `MkvMuxer::copy_track_header`, `copy_chapters_and_attachments` and
   `write_packet_from` for a Matroska → Matroska copy; `examples/remux.rs`
   and `examples/dump_packets.rs`.
